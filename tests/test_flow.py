@@ -28,8 +28,10 @@ def test_embed_and_count_recursion_fix(mock_flow):
     assert mock_flow._mem.embed_artifact.called
     assert mock_flow.state.daily_artifacts_created == 1
 
-@patch("flow.Crew") # Mock Crew so it doesn't try to run real LLMs or open files
-def test_incident_logic_variable_scope(mock_crew_class, mock_flow):
+@patch("flow.Crew")
+@patch("flow.Task")   # Pydantic validates Task.agent — must mock Task too or it rejects the mocked Agent
+@patch("flow.Agent")
+def test_incident_logic_variable_scope(mock_agent_class, mock_task_class, mock_crew_class, mock_flow):
     """
     Verifies that _handle_incident uses correctly defined variables 
     (involves_gap vs involves_bill).
@@ -66,7 +68,12 @@ def test_memory_context_retrieval(mock_flow):
     """Tests semantic context window construction."""
     from memory import Memory, SimEvent
 
-    mem = Memory() # Real memory object, but safe because MongoClient is mocked globally
+    mem = Memory()  # Safe: MongoClient, build_embedder, and _init_vector_indexes are all mocked by autouse fixture
+
+    # Wire up the instance so context_for_prompt has something to work with
+    mem._embedder.embed = MagicMock(return_value=[0.1] * 1024)
+    mem._artifacts.estimated_document_count = MagicMock(return_value=10)
+    mem._artifacts.aggregate = MagicMock(return_value=[])
     mem.recall_events = MagicMock(return_value=[
         SimEvent(type="test", day=1, date="2026-01-01", actors=[], artifact_ids={}, facts={}, summary="Test Event")
     ])
@@ -124,8 +131,15 @@ def test_temporal_memory_isolation(mock_flow):
     """Ensures context_for_prompt respects the day limit."""
     from memory import Memory
     
-    mem = Memory()
+    mem = Memory()  # Safe: mocked by autouse fixture
+    mem._embedder.embed = MagicMock(return_value=[0.1] * 1024)
+    mem._artifacts.estimated_document_count = MagicMock(return_value=10)
     mem._artifacts.aggregate = MagicMock(return_value=[])
+    # recall_events chains .find().sort().limit() — mock the full cursor chain
+    mock_cursor = MagicMock()
+    mock_cursor.sort.return_value = mock_cursor
+    mock_cursor.limit.return_value = iter([])
+    mem._events.find = MagicMock(return_value=mock_cursor)
 
     mem.context_for_prompt("incident", as_of_day=5)
     
@@ -219,7 +233,8 @@ def test_memory_log_event():
     from memory import Memory, SimEvent
     from unittest.mock import MagicMock
     
-    mem = Memory()
+    mem = Memory()  # Safe: mocked by autouse fixture
+    mem._embedder.embed = MagicMock(return_value=[0.1] * 1024)
     mem._events.update_one = MagicMock()
     
     event = SimEvent(
