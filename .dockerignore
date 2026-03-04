@@ -1,0 +1,26 @@
+# .dockerignore
+# Git
+.git
+.gitignore
+
+# Python caching and environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Local configuration and secrets
+.env
+
+# Simulation output (prevents copying old runs into the container)
+export/
+
+# Tests (we don't need test files inside the production container)
+tests/
+.pytest_cache/

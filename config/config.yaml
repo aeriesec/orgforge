@@ -1,0 +1,284 @@
+# ═══════════════════════════════════════════════════════════════
+# OrgForge — World Configuration
+# ═══════════════════════════════════════════════════════════════
+# This file is the SINGLE SOURCE OF TRUTH for the simulation.
+# Change the values below to simulate any company or industry.
+# No Python changes required for most customizations.
+
+# ── QUALITY PRESET ────────────────────────────────────────────
+# Controls which model profile is active.
+# Options: "local_cpu" | "local_gpu" | "cloud"
+#
+#   local_cpu  — optimized for laptops / no GPU. Runs fully offline.
+#                Good for iterating on config, testing the pipeline,
+#                and quick parameter tuning. Expect slower inference.
+#
+#   local_gpu  — for machines with a CUDA/Metal GPU running Ollama.
+#                Significantly faster; same offline/private guarantee.
+#
+#   cloud      — AWS Bedrock (LLMs) + OpenAI (embeddings).
+#                Best output quality. Requires AWS credentials and
+#                OPENAI_API_KEY. Use for production dataset generation.
+#
+quality_preset: "local_cpu"
+
+model_presets:
+  local_cpu:
+    provider: "ollama"
+    planner: "ollama/qwen2.5:7b-instruct-q4_K_M"
+    worker: "ollama/qwen2.5:1.5b-instruct"
+    base_url: "http://localhost:11434"
+    embed_provider: "ollama"
+    embed_model: "mxbai-embed-large"
+    embed_dims: 1024
+
+  local_gpu:
+    provider: "ollama"
+    planner: "ollama/llama3.3:70b"
+    worker: "ollama/llama3.1:8b-instruct"
+    base_url: "http://localhost:11434"
+    embed_provider: "ollama"
+    embed_model: "mxbai-embed-large"
+    embed_dims: 1024
+
+  cloud:
+    provider: "bedrock"
+    # Claude 3.5 Sonnet on Bedrock — best for long-form corporate doc generation
+    planner: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    # Llama 3.1 8B on Bedrock — fast, cheap for high-volume worker calls
+    worker: "meta.llama3-1-8b-instruct-v1:0"
+    aws_region: "us-east-1"
+    embed_provider: "openai"
+    embed_model: "text-embedding-3-large"
+    embed_dims: 3072
+
+# ── SIMULATION ────────────────────────────────────────────────
+simulation:
+  company_name: "Apex Athletics"
+  industry: "sports technology"
+  domain: "apexathletics.io"
+  output_dir: "./export"
+  db_name: "orgforge"
+  max_days: 2
+  start_date: "2026-03-02"
+
+  adhoc_confluence_prob: 0.3
+  aws_alert_prob: 0.4
+  snyk_alert_prob: 0.2
+  sprint_tickets_per_planning: 4
+  max_incident_email_threads: 3
+  new_hire: "Elena"
+  new_hire_dept: "Product"
+
+# ── MORALE ────────────────────────────────────────────────────
+morale:
+  initial: 0.75
+  daily_decay: 0.97
+  good_day_recovery: 0.02
+  intervention_threshold: 0.55
+
+# ── LEGACY SYSTEMS ────────────────────────────────────────────
+legacy_system:
+  name: "TitanDB"
+  project_name: "Project Titan"
+  description: "legacy sports-tracking system"
+  aws_alert_message: "TitanDB provisioned IOPS costs remain elevated."
+
+# ── INCIDENT TRIGGERS ─────────────────────────────────────────
+incident_triggers:
+  - "crash"
+  - "fail"
+  - "error"
+  - "latency"
+  - "timeout"
+  - "outage"
+  - "down"
+  - "spike"
+
+# ── SPRINT TICKET THEMES ──────────────────────────────────────
+sprint_ticket_themes:
+  - "Refactor {legacy_system} connection pool"
+  - "Add retry logic to auth service"
+  - "Update {product_page} landing page"
+  - "Fix 500 errors on leaderboard endpoint"
+  - "QA regression suite"
+  - "Design onboarding flow"
+  - "Implement rate limiting middleware"
+  - "Improve error logging and alerting"
+  - "Performance audit on search API"
+  - "Update dependency versions"
+
+# ── AD-HOC CONFLUENCE TOPICS ──────────────────────────────────
+adhoc_confluence_topics:
+  - ["ENG", "API Rate Limiting Strategy"]
+  - ["MKT", "{product_page} Campaign Brief"]
+  - ["HR", "Remote Work Policy"]
+  - ["ENG", "On-Call Runbook"]
+  - ["PROD", "Q2 Roadmap Priorities"]
+
+# ── GENESIS DOCUMENTS ─────────────────────────────────────────
+genesis_docs:
+  technical:
+    count: 3
+    id_prefix: "CONF-ENG"
+    prompt: >
+      Write {count} separate Confluence pages about {project_name} and {legacy_system}.
+      Reference these engineers: {engineers}.
+      IDs: {ids}.
+      Separate pages with '---PAGE BREAK---'.
+  business:
+    count: 2
+    id_prefix: "CONF-MKT"
+    prompt: >
+      Write a {product_page} Campaign Brief (CONF-MKT-001) and a Sales OKR doc (CONF-MKT-002).
+      Reference these team members: {sales_members}.
+      Separate with '---PAGE BREAK---'.
+
+# ── SPRINT GOAL TEMPLATE ──────────────────────────────────────
+sprint_goal_template: "Stabilize {legacy_system} and deliver sprint features"
+
+# ── SALES PIPELINE ACCOUNTS ───────────────────────────────────
+sales_accounts:
+  - "RunnersPeak Corp"
+  - "MarathonTech LLC"
+  - "FitNation Group"
+  - "EliteStride Inc"
+  - "PaceTrack Systems"
+
+# ── PRODUCT PAGE NAME ─────────────────────────────────────────
+product_page: "Spring Marathon"
+
+# ── ROLES ─────────────────────────────────────────────────────
+roles:
+  on_call_engineer: "Engineering_Backend"
+  incident_commander: "Product"
+  hr_lead: "HR_Ops"
+  postmortem_writer: "Engineering_Backend"
+  sprint_email_sender: "Product"
+  sales_email_sender: "Sales_Marketing"
+  scrum_master: "HR_Ops"
+
+# ── KNOWLEDGE GAPS ────────────────────────────────────────────
+knowledge_gaps:
+  - name: "Bill"
+    left: "2024-06"
+    role: "CTO"
+    knew_about:
+      - "TitanDB"
+      - "legacy auth service"
+      - "AWS cost structure"
+      - "Project Titan"
+    documented_pct: 0.20
+
+# ── ORG CHART ─────────────────────────────────────────────────
+org_chart:
+  Product: ["Sarah", "Mike", "Elena", "Chris", "Jamie"]
+  Engineering_Backend:
+    ["Jax", "Deepa", "Liam", "Sanjay", "Kaitlyn", "Yusuf", "Hanna"]
+  Engineering_Mobile:
+    ["Chloe", "Raj", "Miki", "Alex", "Jordan", "Sam", "Taylor"]
+  Design: ["Priya", "Marc", "Sophie", "Desmond"]
+  Sales_Marketing:
+    ["Marcus", "Jenna", "Blake", "Tasha", "Vince", "Ariana", "Cooper"]
+  HR_Ops: ["Karen", "Tom", "Patty", "Dave"]
+  QA_Support: ["Nadia", "Ben", "Zoe", "Felix", "Umji"]
+
+leads:
+  Product: "Sarah"
+  Engineering_Backend: "Jax"
+  Engineering_Mobile: "Chloe"
+  Design: "Priya"
+  Sales_Marketing: "Marcus"
+  HR_Ops: "Karen"
+  QA_Support: "Nadia"
+
+# ── PERSONAS ──────────────────────────────────────────────────
+personas:
+  Jax:
+    style: "terse, cynical"
+    stress: 70
+    expertise: ["backend", "TitanDB"]
+    tenure: "5yr"
+    is_lead: true
+  Sarah:
+    style: "urgent, pushy"
+    stress: 85
+    expertise: ["roadmap", "OKRs"]
+    tenure: "2yr"
+    is_lead: true
+  Deepa:
+    style: "methodical, thorough"
+    stress: 40
+    expertise: ["backend", "infra"]
+    tenure: "3yr"
+    is_lead: false
+  Mike:
+    style: "diplomatic"
+    stress: 50
+    expertise: ["product", "specs"]
+    tenure: "4yr"
+    is_lead: false
+  Elena:
+    style: "optimistic"
+    stress: 30
+    expertise: ["roadmap", "UX"]
+    tenure: "1yr"
+    is_lead: false
+  Priya:
+    style: "creative, verbose"
+    stress: 45
+    expertise: ["design", "brand"]
+    tenure: "3yr"
+    is_lead: true
+  Marcus:
+    style: "high-energy, salesy"
+    stress: 60
+    expertise: ["sales", "GTM"]
+    tenure: "2yr"
+    is_lead: true
+  Karen:
+    style: "warm, procedural"
+    stress: 35
+    expertise: ["HR", "compliance"]
+    tenure: "6yr"
+    is_lead: true
+  Nadia:
+    style: "detail-obsessed"
+    stress: 55
+    expertise: ["QA", "testing"]
+    tenure: "2yr"
+    is_lead: true
+  Chloe:
+    style: "fast, opinionated"
+    stress: 65
+    expertise: ["mobile", "iOS"]
+    tenure: "3yr"
+    is_lead: true
+
+default_persona:
+  style: "professional"
+  stress: 50
+  expertise: ["general tasks"]
+  tenure: "1yr"
+  is_lead: false
+
+# ── EXTERNAL PERSONAS ─────────────────────────────────────────
+
+external_contacts:
+  - name: "AWS_Support"
+    display_name: "AWS Support"
+    org: "AWS"
+    role: "Support Engineer"
+    trigger_events: ["incident_opened", "fix_in_progress"]
+    trigger_health_threshold: 70 # only contacts AWS if system_health drops below this
+    internal_liaison: "Engineering" # which dept's lead gets the summary
+    summary_tone: "technical and reassuring, but noncommittal about SLA"
+
+  - name: "CustomerSuccess_Acme"
+    display_name: "Acme Corp (Customer)"
+    org: "Acme Corp"
+    role: "IT Director"
+    trigger_events: ["incident_opened"]
+    trigger_health_threshold: 60 # only surfaces for severe incidents
+    internal_liaison: "Sales"
+    summary_tone: "concerned about uptime, asking for ETA and root cause"

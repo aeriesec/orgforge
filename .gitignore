@@ -1,0 +1,30 @@
+# ── OrgForge Specific ──
+export/
+simulation.log
+simulation_snapshot.json
+
+# ── Environments & Secrets ──
+.env
+venv/
+env/
+.venv/
+
+# ── Python Caching ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+
+# ── Testing ──
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── IDEs & OS ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,123 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════
+# OrgForge — Docker Compose
+# ═══════════════════════════════════════════════════════════════
+#
+# LOCAL PRESET (local_cpu / local_gpu):
+#   docker-compose up
+#   All three services start. Ollama pulls models on first run.
+#
+# CLOUD PRESET:
+#   1. Set quality_preset: "cloud" in config.yaml
+#   2. Create a .env file with your credentials (see below)
+#   3. docker-compose up mongodb orgforge
+#      (skip the ollama service — it's not needed for cloud preset)
+#
+# RUNNING WITH LOCAL OLLAMA (no ollama container):
+#   1. Ensure Ollama is running on your host machine
+#   2. docker-compose up mongodb orgforge
+#      (skip the ollama service — orgforge will hit host.docker.internal:11434)
+#
+# .env file for cloud preset:
+#   AWS_ACCESS_KEY_ID=...
+#   AWS_SECRET_ACCESS_KEY=...
+#   AWS_DEFAULT_REGION=us-east-1
+#   OPENAI_API_KEY=...
+# ═══════════════════════════════════════════════════════════════
+
+services:
+  # ── MongoDB Atlas Local ──────────────────────
+  mongodb:
+    image: mongodb/mongodb-atlas-local:latest
+    container_name: orgforge_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Ollama (local presets only) ──────────────
+  # Not needed for quality_preset: "cloud".
+  # To skip: docker-compose up mongodb orgforge
+  ollama:
+    image: ollama/ollama:latest
+    container_name: orgforge_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    environment:
+      - QUALITY_PRESET=${QUALITY_PRESET:-local_cpu}
+    configs:
+      - source: ollama_entrypoint
+        target: /entrypoint.sh
+        mode: 0755
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    profiles:
+      - local-ollama
+    # Uncomment for NVIDIA GPU passthrough (requires NVIDIA Container Toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ── Simulation App ──────────────────────
+  orgforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - INSTALL_CLOUD_DEPS=${INSTALL_CLOUD_DEPS:-false}
+    container_name: orgforge_app
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+    environment:
+      - MONGO_URI=${MONGO_URI:-mongodb://mongodb:27017/?directConnection=true}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+
+      # Embedding config — must match config.yaml model_presets[quality_preset]
+      - EMBED_PROVIDER=${EMBED_PROVIDER:-ollama}
+      - EMBED_MODEL=${EMBED_MODEL:-mxbai-embed-large}
+      - EMBED_DIMS=${EMBED_DIMS:-1024}
+
+      # Cloud preset credentials — sourced from .env file or host environment.
+      # Safe to leave blank for local presets (values will be empty strings).
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+
+    volumes:
+      - ./export:/app/export # Simulation output — persists on host
+      - ./config/config.yaml:/app/config.yaml # Config — edit on host, picked up at runtime
+      - ./src:/app/src
+    command: ["python", "flow.py"]
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+configs:
+  ollama_entrypoint:
+    file: ./scripts/ollama-entrypoint.sh
+
+volumes:
+  mongodb_data:
+  ollama_models:
