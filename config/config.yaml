@@ -192,6 +192,62 @@ leads:
   HR_Ops: "Karen"
   QA_Support: "Nadia"
 
+org_lifecycle:
+  # ── Scheduled departures ──────────────────────────────────────────────────
+  # Each entry fires exactly once on the specified day, before planning runs.
+  scheduled_departures:
+    - name: "Jordan"
+      day: 12
+      reason: "voluntary" # voluntary | layoff | performance
+      role: "Senior Backend Engineer"
+      knowledge_domains:
+        - "auth-service"
+        - "redis-cache"
+        - "oauth2-flow"
+      documented_pct: 0.25 # only 25% written down — high gap risk
+
+    - name: "Morgan"
+      day: 30
+      reason: "layoff"
+      role: "DevOps Engineer"
+      knowledge_domains:
+        - "kubernetes-deploy"
+        - "terraform-infra"
+      documented_pct: 0.60
+
+  # ── Scheduled hires ───────────────────────────────────────────────────────
+  # New engineers enter the graph at edge_weight_floor on the specified day.
+  # The DepartmentPlanner will propose warmup_1on1 and onboarding_session
+  # events naturally once the roster context shows them as "still warming up".
+  scheduled_hires:
+    - name: "Taylor"
+      day: 15 # arrives 3 days after Jordan leaves
+      dept: "Engineering"
+      role: "Backend Engineer"
+      expertise:
+        - "Python"
+        - "FastAPI"
+        - "PostgreSQL"
+      style: "methodical, asks lots of questions before writing code"
+      tenure: "new"
+
+    - name: "Reese"
+      day: 35
+      dept: "Engineering"
+      role: "DevOps Engineer"
+      expertise:
+        - "Kubernetes"
+        - "Terraform"
+        - "AWS"
+      style: "direct, prefers async communication, strong documentation habit"
+      tenure: "new"
+
+  # ── Random attrition (optional, off by default) ───────────────────────────
+  # When enabled, every non-lead employee has a daily probability of leaving.
+  # Useful for longer simulations (60+ days) to stress-test RAG evaluation.
+  enable_random_attrition: false
+  random_attrition_daily_prob: 0.005 # 0.5% per employee per day ≈ ~1 departure/month
+
 # ── PERSONAS ──────────────────────────────────────────────────
 personas:
   Jax:

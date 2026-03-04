@@ -77,6 +77,7 @@ class GraphDynamics:
 
         self._org_chart: Dict[str, List[str]] = config.get("org_chart", {})
         self._leads: Dict[str, str] = config.get("leads", {})
+        self._departed_names: set = set()
 
     # ── 1. STRESS / BURNOUT PROPAGATION ──────────────────────────────────────
 
@@ -170,6 +171,20 @@ class GraphDynamics:
     def record_incident_collaboration(self, actors: List[str]) -> None:
         """Boost edges among incident co-responders. Call in _handle_incident()."""
         self._boost_pairs(actors, self.cfg["incident_boost"])
+
+    def warm_up_edge(self, new_hire: str, colleague: str, boost: float) -> None:
+        """
+        Deliberately warm a new hire's edge to a specific colleague.
+        Called by org_lifecycle when an onboarding_session or warmup_1on1 fires.
+        The boost is added on top of the current weight, respecting the floor.
+        """
+        if not self.G.has_edge(new_hire, colleague):
+            floor = self.cfg.get("edge_weight_floor", 0.5)
+            self.G.add_edge(new_hire, colleague, weight=floor)
+        self.G[new_hire][colleague]["weight"] = round(
+            self.G[new_hire][colleague].get("weight", 0.5) + boost, 4
+        )
+        self._centrality_dirty = True
 
     def decay_edges(self) -> None:
         """

@@ -27,6 +27,7 @@ from planner_models import (
 
 logger = logging.getLogger("orgforge.validator")
 
+_DEPARTED_NAMES: set = set()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PLAUSIBILITY RULES
@@ -53,6 +54,9 @@ _COOLDOWN_DAYS: Dict[str, int] = {
     "hr_checkin":           3,
     "leadership_sync":      2,
     "vendor_meeting":       3,
+    "onboarding_session":   1,
+    "farewell_message":   999,
+    "warmup_1on1":          2,
 }
 
 
@@ -146,6 +150,19 @@ class PlanValidator:
                 approved=False, event=event,
                 rejection_reason=f"Unknown actors: {unknown_actors}. "
                                  f"LLM invented names not in org_chart.",
+            )
+        
+        # ── 1b. Departed-actor guard ──────────────────────────────────────────
+        # patch_validator_for_lifecycle() keeps _valid_actors pruned,
+        # but this explicit check gives a clearer rejection message.
+        departed_actors = [a for a in event.actors if a in _DEPARTED_NAMES]
+        if departed_actors:
+            return ValidationResult(
+                approved=False, event=event,
+                rejection_reason=(
+                    f"Actors {departed_actors} have departed the organisation. "
+                    f"Remove them from this event."
+                ),
             )
 
         # ── 2. Novel event type ───────────────────────────────────────────────
