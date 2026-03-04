@@ -1,0 +1,1117 @@
+"""
+normal_day.py
+=============
+Drop-in enrichment for OrgForge's _handle_normal_day().
+
+WHAT CHANGED AND WHY:
+  Before: one random Slack thread driven by a theme string. Everyone's day
+  looked the same. An incident day and a quiet day had the same texture
+  in the corpus — just different Slack content.
+
+  After: each engineer's actual agenda items from the OrgDayPlan drive
+  what happens. Ticket progress generates a JIRA status update + Slack
+  message. PR reviews generate a code review comment thread. A 1:1 generates
+  a DM. An async question generates a short cross-dept thread. Deep work
+  generates nothing visible — which is itself realistic.
+
+  The result is a corpus where you can look at any engineer's activity on
+  any day and see a coherent workday, not a random theme-driven conversation.
+
+HOW TO INTEGRATE:
+  1. Copy this file alongside flow.py
+  2. In flow.py, add the import:
+         from normal_day import NormalDayHandler
+  3. In Flow.__init__(), add:
+         self._normal_day = NormalDayHandler(
+             config=CONFIG,
+             mem=self._mem,
+             state=self.state,
+             graph_dynamics=self.graph_dynamics,
+             social_graph=self.social_graph,
+             git=self._git,
+             worker_llm=WORKER_MODEL,
+             planner_llm=PLANNER_MODEL,
+         )
+  4. Replace _handle_normal_day() call in daily_cycle() with:
+         self._normal_day.handle(self.state.org_day_plan)
+  5. Keep _generate_adhoc_confluence_page() in flow.py — it's called from here.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import random
+from typing import Dict, List, Optional, Tuple
+
+from crewai import Agent, Task, Crew
+
+from memory import Memory, SimEvent
+from graph_dynamics import GraphDynamics
+from planner_models import (
+    AgendaItem,
+    DepartmentDayPlan,
+    EngineerDayPlan,
+    OrgDayPlan,
+)
+
+logger = logging.getLogger("orgforge.normalday")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACTIVITY HANDLERS
+# One method per agenda item activity_type.
+# Each returns a list of artifacts written and actors involved.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NormalDayHandler:
+
+    def __init__(
+        self,
+        config,
+        mem:            Memory,
+        state,
+        graph_dynamics: GraphDynamics,
+        social_graph,
+        git,
+        worker_llm,
+        planner_llm,
+    ):
+        self._config         = config
+        self._mem            = mem
+        self._state          = state
+        self._gd             = graph_dynamics
+        self._graph          = social_graph
+        self._git            = git
+        self._worker         = worker_llm
+        self._planner        = planner_llm
+        self._base           = config["simulation"].get("output_dir", "./export")
+        self._domain         = config["simulation"]["domain"]
+        self._company        = config["simulation"]["company_name"]
+        self._all_names      = [n for dept in config["org_chart"].values() for n in dept]
+        self._org_chart      = config["org_chart"]
+
+    # ─── PUBLIC ENTRY POINT ───────────────────────────────────────────────────
+
+    def handle(self, org_plan: Optional[OrgDayPlan]) -> None:
+        """
+        Main entry point — called from flow.py in place of _handle_normal_day().
+        Falls back gracefully if org_plan is None (e.g. during early days before
+        the planner is warm).
+        """
+        logger.info(f"  [bold blue]💬 Normal Day Activity[/bold blue]")
+        date_str = str(self._state.current_date.date())
+
+        if org_plan is None:
+            # Fallback: old behaviour
+            self._legacy_slack_chatter(date_str)
+        else:
+            self._execute_agenda_items(org_plan, date_str)
+
+        # These fire regardless — they're ambient signals, not agenda-driven
+        self._maybe_bot_alerts()
+        self._maybe_adhoc_confluence()
+
+    # ─── AGENDA EXECUTION ─────────────────────────────────────────────────────
+
+    def _execute_agenda_items(self, org_plan: OrgDayPlan, date_str: str) -> None:
+        """
+        Walk every engineer's agenda across all departments.
+        Dispatch each non-deferred item to the appropriate activity handler.
+        Deferred items are logged as SimEvents so the record shows the interruption.
+        """
+        all_participants: List[str] = []
+
+        for dept, dept_plan in org_plan.dept_plans.items():
+            for eng_plan in dept_plan.engineer_plans:
+
+                for item in eng_plan.agenda:
+                    if item.deferred:
+                        self._log_deferred_item(eng_plan.name, item, date_str)
+                        continue
+
+                    participants = self._dispatch(eng_plan, item, dept_plan, date_str)
+                    all_participants.extend(participants)
+
+        # Boost social graph edges for everyone who interacted today
+        if all_participants:
+            unique = list(set(all_participants))
+            self.graph_dynamics_record(unique)
+
+    def _dispatch(
+        self,
+        eng_plan:  EngineerDayPlan,
+        item:      AgendaItem,
+        dept_plan: DepartmentDayPlan,
+        date_str:  str,
+    ) -> List[str]:
+        """Route an agenda item to the right handler. Returns actors involved."""
+
+        t = item.activity_type
+
+        if t == "ticket_progress":
+            return self._handle_ticket_progress(eng_plan, item, date_str)
+        elif t == "pr_review":
+            return self._handle_pr_review(eng_plan, item, date_str)
+        elif t == "1on1":
+            return self._handle_one_on_one(eng_plan, item, date_str)
+        elif t == "async_question":
+            return self._handle_async_question(eng_plan, item, dept_plan, date_str)
+        elif t == "design_discussion":
+            return self._handle_design_discussion(eng_plan, item, dept_plan, date_str)
+        elif t == "mentoring":
+            return self._handle_mentoring(eng_plan, item, date_str)
+        elif t == "deep_work":
+            # Deep work is intentionally silent — no artifact, no Slack
+            # But we log a SimEvent so the day_summary knows who was heads-down
+            self._log_deep_work(eng_plan.name, item, date_str)
+            return [eng_plan.name]
+        elif t == "code_review_comment":
+            return self._handle_pr_review(eng_plan, item, date_str)
+        else:
+            # Unknown activity type — generate a generic Slack message
+            return self._handle_generic_activity(eng_plan, item, date_str)
+
+    # ─── ACTIVITY HANDLERS ───────────────────────────────────────────────────
+
+    def _handle_ticket_progress(
+        self,
+        eng_plan: EngineerDayPlan,
+        item:     AgendaItem,
+        date_str: str,
+    ) -> List[str]:
+        """
+        Engineer makes progress on a ticket.
+        Generates: JIRA status comment + optional Slack message if blocked.
+        """
+        name      = eng_plan.name
+        ticket_id = item.related_id
+        ticket    = self._find_ticket(ticket_id)
+
+        if not ticket:
+            return [name]
+
+        # Move ticket to In Progress if it's still To Do
+        if ticket.get("status") == "To Do":
+            ticket["status"] = "In Progress"
+            self._save_ticket(ticket)
+
+        # Generate a realistic JIRA comment from this engineer
+        ctx = self._mem.context_for_prompt(
+            f"{ticket['title']} {ticket_id}", n=2, as_of_day=self._state.day
+        )
+        tone_hint = self._gd.stress_tone_hint(name)
+
+        agent = Agent(
+            role="Software Engineer",
+            goal="Write a realistic JIRA ticket progress comment.",
+            backstory=(
+                f"You are {name}, working on [{ticket_id}]: {ticket['title']}. "
+                f"{tone_hint} Write like a real engineer — terse, specific, "
+                f"reference what you actually did today."
+            ),
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Write a JIRA comment for ticket [{ticket_id}]: {ticket['title']}.\n"
+                f"Context: {ctx}\n"
+                f"1-3 sentences. Mention what you did, any blockers, next step. "
+                f"Do not invent ticket IDs or people not mentioned above."
+            ),
+            expected_output="A short JIRA comment. Plain text.",
+            agent=agent,
+        )
+        comment_text = str(
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        ).strip()
+
+        # Append comment to the ticket JSON
+        comment = {
+            "author":  name,
+            "date":    date_str,
+            "text":    comment_text,
+            "day":     self._state.day,
+        }
+        ticket.setdefault("comments", []).append(comment)
+        self._save_ticket(ticket)
+
+        # If the engineer mentions a blocker, generate a short Slack question
+        actors = [name]
+        blocker_keywords = ["blocked", "waiting", "need", "unclear", "can't", "cannot"]
+        if any(kw in comment_text.lower() for kw in blocker_keywords):
+            collaborator = item.collaborator or self._closest_colleague(name)
+            if collaborator:
+                actors = self._emit_blocker_slack(
+                    name, collaborator, ticket_id, ticket["title"],
+                    comment_text, date_str
+                )
+
+        self._mem.log_event(SimEvent(
+            type="ticket_progress",
+            day=self._state.day,
+            date=date_str,
+            actors=actors,
+            artifact_ids={"jira": ticket_id},
+            facts={
+                "ticket_id":    ticket_id,
+                "title":        ticket["title"],
+                "comment":      comment_text,
+                "new_status":   ticket["status"],
+                "has_blocker":  any(kw in comment_text.lower() for kw in blocker_keywords),
+            },
+            summary=f"{name} progressed [{ticket_id}]: {ticket['title'][:50]}",
+            tags=["ticket_progress", "jira"],
+        ))
+
+        self._state.daily_artifacts_created += 1
+        logger.info(f"    [dim]📝 {name} → [{ticket_id}][/dim]")
+        return actors
+
+    def _handle_pr_review(
+        self,
+        eng_plan: EngineerDayPlan,
+        item:     AgendaItem,
+        date_str: str,
+    ) -> List[str]:
+        """
+        Engineer reviews a PR.
+        Generates: GitHub review comment thread in Slack #engineering.
+        """
+        reviewer = eng_plan.name
+        pr_id    = item.related_id
+
+        # Find the PR — if no specific ID, pick an open one the reviewer is on
+        pr = self._find_pr(pr_id) or self._find_reviewable_pr(reviewer)
+        if not pr:
+            return [reviewer]
+
+        author   = pr.get("author", reviewer)
+        pr_title = pr.get("title", "Unknown PR")
+        ctx      = self._mem.context_for_prompt(pr_title, n=2, as_of_day=self._state.day)
+
+        # Generate review comment
+        agent = Agent(
+            role="Code Reviewer",
+            goal="Write a realistic PR review comment.",
+            backstory=(
+                f"You are {reviewer}, reviewing {author}'s PR: {pr_title}. "
+                f"{self._gd.stress_tone_hint(reviewer)}"
+            ),
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Write a GitHub PR review comment for: {pr_title}\n"
+                f"Context: {ctx}\n"
+                f"1-4 sentences. Be specific — mention code patterns, potential "
+                f"edge cases, or ask a clarifying question. "
+                f"Tone reflects the reviewer's current stress level."
+            ),
+            expected_output="A realistic code review comment.",
+            agent=agent,
+        )
+        review_text = str(
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        ).strip()
+
+        # Emit as a GitHub bot message in #engineering
+        self._emit_bot_message(
+            "engineering",
+            "GitHub",
+            f"💬 {reviewer} reviewed {pr.get('pr_id', pr_id)}: \"{review_text[:120]}\""
+        )
+
+        # Author acknowledges in Slack if the review raises a question
+        actors = [reviewer, author]
+        if "?" in review_text:
+            actors = self._emit_review_reply(
+                author, reviewer, pr.get("pr_id", "PR"), review_text, date_str
+            )
+
+        # Boost PR review edge
+        self._gd.record_pr_review(author, [reviewer])
+
+        self._mem.log_event(SimEvent(
+            type="pr_review",
+            day=self._state.day,
+            date=date_str,
+            actors=actors,
+            artifact_ids={"pr": pr.get("pr_id", pr_id or "")},
+            facts={
+                "reviewer":    reviewer,
+                "author":      author,
+                "pr_title":    pr_title,
+                "review_text": review_text,
+                "has_question": "?" in review_text,
+            },
+            summary=f"{reviewer} reviewed {pr.get('pr_id', 'PR')} by {author}.",
+            tags=["pr_review", "engineering"],
+        ))
+
+        logger.info(f"    [dim]🔍 {reviewer} reviewed {pr.get('pr_id', 'PR')}[/dim]")
+        return actors
+
+    def _handle_one_on_one(
+        self,
+        eng_plan: EngineerDayPlan,
+        item:     AgendaItem,
+        date_str: str,
+    ) -> List[str]:
+        """
+        Engineer has a 1:1 with their lead or a collaborator.
+        Generates: DM thread (2-4 messages).
+        """
+        name         = eng_plan.name
+        collaborator = item.collaborator or self._find_lead_for(name)
+        if not collaborator or collaborator == name:
+            return [name]
+
+        stress_a = self._gd.stress_tone_hint(name)
+        stress_b = self._gd.stress_tone_hint(collaborator)
+        ctx      = self._mem.context_for_prompt(
+            f"1on1 {name} {collaborator} workload", n=2, as_of_day=self._state.day
+        )
+
+        agent = Agent(
+            role="Workplace Conversation Writer",
+            goal="Write a realistic 1:1 DM exchange.",
+            backstory="You write authentic, unscripted workplace conversations.",
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Write a 3-5 message DM between {name} and {collaborator}.\n"
+                f"{name}: {stress_a}\n"
+                f"{collaborator}: {stress_b}\n"
+                f"Context: {ctx}\n"
+                f"Topics might include: workload, current sprint, a decision that "
+                f"needs to be made, or something personal-professional (lunch, PTO).\n"
+                f"Format EXACTLY: Name: [Message]"
+            ),
+            expected_output="DM transcript. Name: [Message] format.",
+            agent=agent,
+        )
+        result = str(
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        )
+
+        messages = self._parse_slack_messages(
+            result, [name, collaborator], hour_range=(9, 11)
+        )
+        if not messages:
+            return [name, collaborator]
+
+        p1, p2    = sorted([name, collaborator])
+        channel   = f"dm_{p1.lower()}_{p2.lower()}"
+        path      = f"{self._base}/slack/channels/{channel}/{date_str}_1on1.json"
+        self._save_slack(path, messages, channel)
+
+        self._mem.log_event(SimEvent(
+            type="1on1",
+            day=self._state.day,
+            date=date_str,
+            actors=[name, collaborator],
+            artifact_ids={"slack": path},
+            facts={"participants": [name, collaborator], "message_count": len(messages)},
+            summary=f"1:1 between {name} and {collaborator}.",
+            tags=["1on1", "slack"],
+        ))
+
+        self._gd.record_slack_interaction([name, collaborator])
+        logger.info(f"    [dim]👥 1:1 {name} ↔ {collaborator}[/dim]")
+        return [name, collaborator]
+
+    def _handle_async_question(
+        self,
+        eng_plan:  EngineerDayPlan,
+        item:      AgendaItem,
+        dept_plan: DepartmentDayPlan,
+        date_str:  str,
+    ) -> List[str]:
+        """
+        Engineer asks a question in a channel.
+        Generates: Slack thread with 2-4 replies from colleagues.
+        The question is grounded in the engineer's current ticket or blocker.
+        """
+        asker        = eng_plan.name
+        collaborator = item.collaborator or self._closest_colleague(asker)
+        ticket_id    = item.related_id
+        ticket       = self._find_ticket(ticket_id)
+        ticket_title = ticket["title"] if ticket else item.description
+
+        # Pick the channel — same dept = dept channel, cross-dept = digital-hq
+        asker_dept = dept_of_name(asker, self._org_chart)
+        if collaborator:
+            collab_dept = dept_of_name(collaborator, self._org_chart)
+            channel = (
+                asker_dept.lower().replace(" ", "-")
+                if asker_dept == collab_dept
+                else "digital-hq"
+            )
+        else:
+            channel = asker_dept.lower().replace(" ", "-")
+
+        # Pull in 1-2 more people from the channel naturally
+        channel_members = self._channel_members(channel, asker)
+        responders = [collaborator] if collaborator else []
+        extras = [n for n in channel_members if n != asker and n not in responders]
+        responders.extend(random.sample(extras, min(1, len(extras))))
+        all_actors = list({asker} | set(responders))
+
+        ctx = self._mem.context_for_prompt(ticket_title, n=2, as_of_day=self._state.day)
+
+        agent = Agent(
+            role="Slack Thread Writer",
+            goal="Write a realistic async question thread.",
+            backstory="You write authentic Slack conversations in engineering teams.",
+            llm=self._worker,
+        )
+        profiles = "\n".join(
+            f"  - {n} ({dept_of_name(n, self._org_chart)}): "
+            f"{self._gd.stress_tone_hint(n)}"
+            for n in all_actors
+        )
+        task = Task(
+            description=(
+                f"{asker} has a question related to: {ticket_title}\n"
+                f"Participants:\n{profiles}\n"
+                f"Context: {ctx}\n\n"
+                f"Write a 3-5 message Slack thread. {asker} asks first, "
+                f"others respond with genuine help, follow-up questions, or "
+                f"'I don't know but try X'. Keep it realistic — not everyone "
+                f"knows the answer immediately.\n"
+                f"Format EXACTLY: Name: [Message]"
+            ),
+            expected_output="Slack thread. Name: [Message] format.",
+            agent=agent,
+        )
+        result = str(
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        )
+
+        messages = self._parse_slack_messages(result, all_actors, hour_range=(10, 16))
+        if not messages:
+            return all_actors
+
+        path = f"{self._base}/slack/channels/{channel}/{date_str}_{asker.lower()}_q.json"
+        self._save_slack(path, messages, channel)
+
+        self._mem.log_event(SimEvent(
+            type="async_question",
+            day=self._state.day,
+            date=date_str,
+            actors=all_actors,
+            artifact_ids={"slack": path, "jira": ticket_id or ""},
+            facts={
+                "asker":     asker,
+                "channel":   channel,
+                "topic":     ticket_title,
+                "responders": responders,
+                "message_count": len(messages),
+            },
+            summary=f"{asker} asked a question in #{channel} about {ticket_title[:50]}.",
+            tags=["async_question", "slack"],
+        ))
+
+        self._gd.record_slack_interaction(all_actors)
+        logger.info(f"    [dim]❓ {asker} → #{channel} ({len(messages)} msgs)[/dim]")
+        return all_actors
+
+    def _handle_design_discussion(
+        self,
+        eng_plan:  EngineerDayPlan,
+        item:      AgendaItem,
+        dept_plan: DepartmentDayPlan,
+        date_str:  str,
+    ) -> List[str]:
+        """
+        Small group design discussion — typically 2-3 engineers.
+        Generates: Slack thread + optional Confluence stub.
+        """
+        initiator = eng_plan.name
+        collaborator = item.collaborator or self._closest_colleague(initiator)
+        participants = list({initiator, collaborator} if collaborator else {initiator})
+
+        # Pull one more person with relevant expertise if available
+        if len(participants) < 3:
+            topic_lower = item.description.lower()
+            for name in self._all_names:
+                if name in participants:
+                    continue
+                p = self._config.get("personas", {}).get(name, {})
+                expertise = [e.lower() for e in p.get("expertise", [])]
+                if any(kw in topic_lower for kw in expertise):
+                    participants.append(name)
+                    break
+
+        ctx = self._mem.context_for_prompt(item.description, n=3, as_of_day=self._state.day)
+
+        agent = Agent(
+            role="Engineering Team",
+            goal="Write a realistic design discussion Slack thread.",
+            backstory="You write authentic technical discussions between engineers.",
+            llm=self._planner,
+        )
+        profiles = "\n".join(
+            f"  - {n}: {self._gd.stress_tone_hint(n)}" for n in participants
+        )
+        task = Task(
+            description=(
+                f"Write a 5-8 message Slack design discussion about: {item.description}\n"
+                f"Participants:\n{profiles}\n"
+                f"Context: {ctx}\n\n"
+                f"This should feel like engineers working through a real technical "
+                f"decision — trade-offs, constraints, 'what about X' questions. "
+                f"Someone should land on a tentative conclusion or next step.\n"
+                f"Format EXACTLY: Name: [Message]"
+            ),
+            expected_output="Slack thread. Name: [Message] format.",
+            agent=agent,
+        )
+        result = str(
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        )
+
+        messages = self._parse_slack_messages(result, participants, hour_range=(10, 15))
+
+        dept_channel = dept_of_name(initiator, self._org_chart).lower().replace(" ", "-")
+        path = (
+            f"{self._base}/slack/channels/{dept_channel}/"
+            f"{date_str}_{initiator.lower()}_design.json"
+        )
+        if messages:
+            self._save_slack(path, messages, dept_channel)
+
+        # 30% chance a design discussion spawns a Confluence stub
+        conf_id = None
+        if random.random() < 0.30 and messages:
+            conf_id = self._create_design_doc_stub(
+                initiator, participants, item.description, ctx, date_str
+            )
+
+        self._mem.log_event(SimEvent(
+            type="design_discussion",
+            day=self._state.day,
+            date=date_str,
+            actors=participants,
+            artifact_ids={"slack": path, "confluence": conf_id or ""},
+            facts={
+                "topic":         item.description,
+                "participants":  participants,
+                "spawned_doc":   conf_id is not None,
+                "message_count": len(messages),
+            },
+            summary=(
+                f"{initiator} led design discussion on '{item.description[:50]}' "
+                f"with {', '.join(p for p in participants if p != initiator)}."
+            ),
+            tags=["design_discussion", "slack"],
+        ))
+
+        self._gd.record_slack_interaction(participants)
+        logger.info(
+            f"    [dim]🏗️  Design discussion: {item.description[:40]} "
+            f"({len(participants)} engineers)[/dim]"
+        )
+        return participants
+
+    def _handle_mentoring(
+        self,
+        eng_plan: EngineerDayPlan,
+        item:     AgendaItem,
+        date_str: str,
+    ) -> List[str]:
+        """
+        Senior engineer mentors a junior colleague.
+        Generates: DM thread. Boosts social graph edge significantly.
+        """
+        mentor   = eng_plan.name
+        mentee   = item.collaborator or self._find_junior_colleague(mentor)
+        if not mentee or mentee == mentor:
+            return [mentor]
+
+        ctx = self._mem.context_for_prompt(
+            f"mentoring {mentee} learning growth", n=2, as_of_day=self._state.day
+        )
+
+        agent = Agent(
+            role="Workplace Mentor",
+            goal="Write a realistic mentoring DM exchange.",
+            backstory=(
+                f"You are {mentor}, an experienced engineer helping {mentee} grow. "
+                f"{self._gd.stress_tone_hint(mentor)}"
+            ),
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Write a 4-6 message DM between mentor {mentor} and mentee {mentee}.\n"
+                f"Context: {ctx}\n"
+                f"Topics: career growth, a technical concept {mentee} is learning, "
+                f"feedback on recent work, or advice on handling a situation.\n"
+                f"Format EXACTLY: Name: [Message]"
+            ),
+            expected_output="DM transcript. Name: [Message] format.",
+            agent=agent,
+        )
+        result = str(
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        )
+
+        messages = self._parse_slack_messages(
+            result, [mentor, mentee], hour_range=(14, 17)
+        )
+        if not messages:
+            return [mentor, mentee]
+
+        p1, p2  = sorted([mentor, mentee])
+        channel = f"dm_{p1.lower()}_{p2.lower()}"
+        path    = f"{self._base}/slack/channels/{channel}/{date_str}_mentoring.json"
+        self._save_slack(path, messages, channel)
+
+        # Mentoring is a strong relationship signal
+        self._gd.record_slack_interaction([mentor, mentee])
+        self._gd.record_slack_interaction([mentor, mentee])  # double boost
+
+        self._mem.log_event(SimEvent(
+            type="mentoring",
+            day=self._state.day,
+            date=date_str,
+            actors=[mentor, mentee],
+            artifact_ids={"slack": path},
+            facts={"mentor": mentor, "mentee": mentee, "message_count": len(messages)},
+            summary=f"{mentor} mentored {mentee}.",
+            tags=["mentoring", "slack"],
+        ))
+
+        logger.info(f"    [dim]🎓 {mentor} → {mentee} (mentoring)[/dim]")
+        return [mentor, mentee]
+
+    def _handle_generic_activity(
+        self,
+        eng_plan: EngineerDayPlan,
+        item:     AgendaItem,
+        date_str: str,
+    ) -> List[str]:
+        """
+        Fallback for unknown activity types — generates a short Slack mention.
+        """
+        name    = eng_plan.name
+        channel = dept_of_name(name, self._org_chart).lower().replace(" ", "-")
+
+        self._emit_bot_message(
+            channel,
+            name,
+            f"Working on: {item.description}"
+        )
+        return [name]
+
+    # ─── ARTIFACT GENERATORS ─────────────────────────────────────────────────
+
+    def _emit_blocker_slack(
+        self,
+        asker:       str,
+        collaborator: str,
+        ticket_id:   str,
+        ticket_title: str,
+        blocker_text: str,
+        date_str:    str,
+    ) -> List[str]:
+        """Short 2-message Slack exchange when an engineer is blocked."""
+        asker_dept = dept_of_name(asker, self._org_chart)
+        channel    = asker_dept.lower().replace(" ", "-")
+
+        agent = Agent(
+            role="Engineer",
+            goal="Write a realistic blocker Slack message.",
+            backstory=f"You are {asker}. {self._gd.stress_tone_hint(asker)}",
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Write 2 Slack messages: {asker} mentions being blocked on "
+                f"[{ticket_id}]: {ticket_title}, then {collaborator} responds.\n"
+                f"Blocker context: {blocker_text[:100]}\n"
+                f"Format: Name: [Message]"
+            ),
+            expected_output="Two Slack messages.",
+            agent=agent,
+        )
+        result  = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+        messages = self._parse_slack_messages(
+            result, [asker, collaborator], hour_range=(10, 15)
+        )
+
+        if messages:
+            path = (
+                f"{self._base}/slack/channels/{channel}/"
+                f"{date_str}_{asker.lower()}_blocked.json"
+            )
+            self._save_slack(path, messages, channel)
+            self._gd.record_slack_interaction([asker, collaborator])
+
+        return [asker, collaborator]
+
+    def _emit_review_reply(
+        self,
+        author:    str,
+        reviewer:  str,
+        pr_id:     str,
+        review_text: str,
+        date_str:  str,
+    ) -> List[str]:
+        """Author replies to a review question in #engineering."""
+        agent = Agent(
+            role="PR Author",
+            goal="Reply to a code review question.",
+            backstory=f"You are {author}. {self._gd.stress_tone_hint(author)}",
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"{reviewer} asked in a PR review: {review_text[:120]}\n"
+                f"Write {author}'s reply — answer the question, clarify intent, "
+                f"or push back if you disagree. 1-2 sentences.\n"
+                f"Format: {author}: [reply]"
+            ),
+            expected_output="One reply message.",
+            agent=agent,
+        )
+        reply = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+
+        self._emit_bot_message(
+            "engineering", "GitHub",
+            f"💬 {author} replied to {reviewer}'s review on {pr_id}: "
+            f"\"{reply[:100]}\""
+        )
+        return [author, reviewer]
+
+    def _create_design_doc_stub(
+        self,
+        author:       str,
+        participants: List[str],
+        topic:        str,
+        ctx:          str,
+        date_str:     str,
+    ) -> Optional[str]:
+        """Creates a brief Confluence stub from a design discussion."""
+        conf_id = f"CONF-ENG-{len(self._state.confluence_pages) + 1:03d}"
+
+        agent = Agent(
+            role="Technical Writer",
+            goal="Write a Confluence design doc stub.",
+            backstory=f"You are {author}, capturing a design decision.",
+            llm=self._planner,
+        )
+        task = Task(
+            description=(
+                f"Write a brief Confluence design doc stub for: {topic}\n"
+                f"ID: {conf_id}. Authors: {', '.join(participants)}.\n"
+                f"Context: {ctx}\n"
+                f"Sections: Problem Statement, Options Considered, Decision, Next Steps.\n"
+                f"Keep it short — this is a working doc, not a final RFC."
+            ),
+            expected_output="Markdown document.",
+            agent=agent,
+        )
+        content = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+        full    = (
+            f"# Design: {topic}\n"
+            f"**ID:** {conf_id}  \n"
+            f"**Authors:** {', '.join(participants)}  \n"
+            f"**Date:** {date_str}\n\n"
+            + content
+        )
+        path = f"{self._base}/confluence/design/{conf_id}.md"
+        self._save_md(path, full)
+
+        entry = {"id": conf_id, "title": f"Design: {topic[:50]}", "path": path}
+        self._state.confluence_pages.append(entry)
+        self._mem.embed_artifact(
+            id=conf_id, type="confluence",
+            title=entry["title"], content=full,
+            day=self._state.day, date=date_str,
+            metadata={"authors": str(participants), "type": "design_doc"},
+        )
+        self._state.daily_artifacts_created += 1
+
+        self._mem.log_event(SimEvent(
+            type="confluence_created",
+            day=self._state.day, date=date_str,
+            actors=participants,
+            artifact_ids={"confluence": conf_id},
+            facts={"title": entry["title"], "type": "design_doc"},
+            summary=f"{author} created design doc {conf_id}: {topic[:50]}",
+            tags=["confluence", "design_doc"],
+        ))
+
+        logger.info(f"    [dim]📄 Design doc stub: {conf_id}[/dim]")
+        return conf_id
+
+    # ─── LOGGING HELPERS ─────────────────────────────────────────────────────
+
+    def _log_deferred_item(
+        self, name: str, item: AgendaItem, date_str: str
+    ) -> None:
+        """Log a deferred agenda item so the record shows the interruption."""
+        self._mem.log_event(SimEvent(
+            type="agenda_item_deferred",
+            day=self._state.day,
+            date=date_str,
+            actors=[name],
+            artifact_ids={"jira": item.related_id or ""},
+            facts={
+                "name":          name,
+                "activity_type": item.activity_type,
+                "description":   item.description,
+                "defer_reason":  item.defer_reason or "unspecified",
+            },
+            summary=(
+                f"{name}'s '{item.description[:50]}' deferred: "
+                f"{item.defer_reason or 'unspecified'}"
+            ),
+            tags=["deferred", "agenda"],
+        ))
+
+    def _log_deep_work(
+        self, name: str, item: AgendaItem, date_str: str
+    ) -> None:
+        self._mem.log_event(SimEvent(
+            type="deep_work_session",
+            day=self._state.day,
+            date=date_str,
+            actors=[name],
+            artifact_ids={},
+            facts={"name": name, "focus": item.description},
+            summary=f"{name} in deep work: {item.description[:50]}",
+            tags=["deep_work"],
+        ))
+
+    # ─── AMBIENT SIGNALS (unchanged from original) ────────────────────────────
+
+    def _maybe_bot_alerts(self) -> None:
+        if random.random() < self._config["simulation"].get("aws_alert_prob", 0.4):
+            legacy = self._config.get("legacy_system", {})
+            self._emit_bot_message(
+                "system-alerts", "AWS Cost Explorer",
+                f"⚠️ Daily budget threshold exceeded. "
+                f"{legacy.get('aws_alert_message', 'Cloud costs remain elevated.')}"
+            )
+        elif random.random() < self._config["simulation"].get("snyk_alert_prob", 0.2):
+            self._emit_bot_message(
+                "engineering", "Snyk Security",
+                "🔒 3 new medium-severity vulnerabilities detected in npm dependencies."
+            )
+
+    def _maybe_adhoc_confluence(self) -> None:
+        if random.random() < self._config["simulation"].get("adhoc_confluence_prob", 0.3):
+            # Delegates back to flow.py's existing method via the state reference
+            # flow.py should call self._normal_day.handle() then check if it needs
+            # to also call self._generate_adhoc_confluence_page() separately,
+            # OR pass a callback here. Simplest: keep the prob check in flow.py
+            # and call both. See integration note at top of file.
+            pass
+
+    def _legacy_slack_chatter(self, date_str: str) -> None:
+        """Original _handle_normal_day() behaviour — used as fallback."""
+        seed_person = random.choice(self._all_names)
+        edges       = self._graph[seed_person]
+        colleagues  = random.choices(
+            list(edges.keys()),
+            weights=[edges[n]["weight"] for n in edges.keys()],
+            k=random.randint(2, 4),
+        )
+        participants = list(set([seed_person] + colleagues))
+        ctx          = self._mem.context_for_prompt(
+            self._state.daily_theme, n=2, as_of_day=self._state.day
+        )
+        profiles = [f"{n} ({dept_of_name(n, self._org_chart)})" for n in participants]
+
+        agent = Agent(
+            role="Slack Observer",
+            goal="Write casual Slack thread.",
+            backstory="You observe real humans chatting.",
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Write a 4-6 message Slack conversation between:\n"
+                f"{chr(10).join(profiles)}\n\n"
+                f"Theme: {self._state.daily_theme}\nContext: {ctx}\n"
+                f"Format EXACTLY: Name: [Message]"
+            ),
+            expected_output="Slack conversation.",
+            agent=agent,
+        )
+        result   = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+        messages = self._parse_slack_messages(result, participants)
+
+        if messages:
+            depts    = {dept_of_name(p, self._org_chart) for p in participants}
+            channel  = (
+                f"dm_{sorted(participants)[0].lower()}_{sorted(participants)[1].lower()}"
+                if len(participants) == 2
+                else (list(depts)[0].lower().replace(" ", "-") if len(depts) == 1
+                      else "digital-hq")
+            )
+            path = f"{self._base}/slack/channels/{channel}/{date_str}_{seed_person}.json"
+            self._save_slack(path, messages, channel)
+            self._gd.record_slack_interaction(participants)
+
+    # ─── LOW-LEVEL UTILITIES ──────────────────────────────────────────────────
+
+    def _parse_slack_messages(
+        self,
+        raw:         str,
+        valid_names: List[str],
+        hour_range:  Tuple[int, int] = (9, 17),
+    ) -> List[dict]:
+        messages = []
+        for line in raw.split("\n"):
+            if ":" not in line:
+                continue
+            name, text = line.split(":", 1)
+            name = name.strip()
+            if name in valid_names:
+                messages.append({
+                    "user": name,
+                    "text": text.strip(),
+                    "ts":   self._state.current_date.replace(
+                        hour=random.randint(*hour_range),
+                        minute=random.randint(0, 59),
+                    ).isoformat(),
+                })
+        return messages
+
+    def _save_slack(self, path: str, messages: List[dict], channel: str) -> None:
+        import os
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(messages, f, indent=2)
+        self._state.slack_threads.append({
+            "date":          str(self._state.current_date.date()),
+            "channel":       channel,
+            "message_count": len(messages),
+        })
+
+    def _save_md(self, path: str, content: str) -> None:
+        import os
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+
+    def _save_ticket(self, ticket: dict) -> None:
+        import os, json as _json
+        path = f"{self._base}/jira/{ticket['id']}.json"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            _json.dump(ticket, f, indent=2)
+
+    def _emit_bot_message(self, channel: str, bot_name: str, text: str) -> None:
+        import os
+        date_str   = str(self._state.current_date.date())
+        slack_path = f"{self._base}/slack/channels/{channel}/{date_str}_bots.json"
+        messages   = []
+        if os.path.exists(slack_path):
+            with open(slack_path) as f:
+                messages = json.load(f)
+        messages.append({
+            "user":   bot_name,
+            "email":  f"{bot_name.lower()}@bot.{self._domain}",
+            "text":   text,
+            "ts":     self._state.current_date.replace(
+                hour=random.randint(8, 17),
+                minute=random.randint(0, 59),
+            ).isoformat(),
+            "is_bot": True,
+        })
+        os.makedirs(os.path.dirname(slack_path), exist_ok=True)
+        with open(slack_path, "w") as f:
+            json.dump(messages, f, indent=2)
+
+    def _find_ticket(self, ticket_id: Optional[str]) -> Optional[dict]:
+        if not ticket_id:
+            return None
+        return next(
+            (t for t in self._state.jira_tickets if t["id"] == ticket_id), None
+        )
+
+    def _find_pr(self, pr_id: Optional[str]) -> Optional[dict]:
+        if not pr_id:
+            return None
+        import os
+        path = f"{self._base}/git/prs/{pr_id}.json"
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+        return None
+
+    def _find_reviewable_pr(self, reviewer: str) -> Optional[dict]:
+        """Find an open PR where this person is listed as a reviewer."""
+        import os, glob
+        for path in glob.glob(f"{self._base}/git/prs/PR-*.json"):
+            with open(path) as f:
+                pr = json.load(f)
+            if pr.get("status") == "open" and reviewer in pr.get("reviewers", []):
+                return pr
+        return None
+
+    def _closest_colleague(self, name: str) -> Optional[str]:
+        """Returns the highest-weight neighbour in the social graph."""
+        if name not in self._graph:
+            return None
+        neighbours = [
+            (n, self._graph[name][n].get("weight", 0))
+            for n in self._graph.neighbors(name)
+            if n in self._all_names
+        ]
+        if not neighbours:
+            return None
+        return max(neighbours, key=lambda x: x[1])[0]
+
+    def _find_lead_for(self, name: str) -> Optional[str]:
+        dept  = dept_of_name(name, self._org_chart)
+        leads = self._config.get("leads", {})
+        return leads.get(dept)
+
+    def _find_junior_colleague(self, senior: str) -> Optional[str]:
+        """Find a colleague with lower tenure — crude proxy for junior status."""
+        dept    = dept_of_name(senior, self._org_chart)
+        members = self._org_chart.get(dept, [])
+        personas = self._config.get("personas", {})
+        senior_tenure = personas.get(senior, {}).get("tenure", "mid")
+
+        # Tenure ordering: intern < junior < mid < senior < staff < principal
+        _RANK = {"intern": 0, "junior": 1, "mid": 2, "senior": 3,
+                 "staff": 4, "principal": 5}
+        senior_rank = _RANK.get(str(senior_tenure).lower().split()[0], 2)
+
+        juniors = [
+            n for n in members if n != senior
+            and _RANK.get(
+                str(personas.get(n, {}).get("tenure", "mid")).lower().split()[0], 2
+            ) < senior_rank
+        ]
+        return random.choice(juniors) if juniors else None
+
+    def _channel_members(self, channel: str, exclude: str) -> List[str]:
+        """Returns likely members of a channel based on dept name."""
+        for dept, members in self._org_chart.items():
+            if dept.lower().replace(" ", "-") == channel:
+                return [n for n in members if n != exclude]
+        return [n for n in self._all_names if n != exclude]
+
+    def graph_dynamics_record(self, participants: List[str]) -> None:
+        self._gd.record_slack_interaction(participants)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY — dept lookup without importing flow globals
+# ─────────────────────────────────────────────────────────────────────────────
+
+def dept_of_name(name: str, org_chart: Dict[str, List[str]]) -> str:
+    for dept, members in org_chart.items():
+        if name in members:
+            return dept
+    return "Unknown"
