@@ -413,7 +413,9 @@ class Memory:
 
         # Re-rank by relevance to query if you have embeddings on events,
         # otherwise just return the most recent n within the day window
-        events = [SimEvent(**e) for e in results]
+        # Strip MongoDB-internal fields (_id, embedding) before constructing SimEvent
+        _MONGO_FIELDS = {"_id", "embedding"}
+        events = [SimEvent(**{k: v for k, v in e.items() if k not in _MONGO_FIELDS}) for e in results]
         return events[:n]
 
     # ─── HELPERS ──────────────────────────────
