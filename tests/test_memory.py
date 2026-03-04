@@ -30,7 +30,8 @@ from unittest.mock import patch, MagicMock
 
 @patch("memory.build_embedder")
 @patch("memory.MongoClient")
-def test_memory_recall_pipeline_filters(mock_mongo, mock_build_embedder):
+@patch("memory.Memory._init_vector_indexes")
+def test_memory_recall_pipeline_filters(mock_init_indexes, mock_mongo, mock_build_embedder):
     """Verifies Memory.recall builds the correct MongoDB aggregation pipeline with filters."""
     from memory import Memory
     
