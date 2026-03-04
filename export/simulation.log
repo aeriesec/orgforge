@@ -1,7 +1,0 @@
-2026-03-03 19:26:03 - INFO - [config] planner → Ollama/ollama/qwen2.5:7b-instruct-q4_K_M (http://localhost:11434)
-2026-03-03 19:26:03 - INFO - [config] worker → Ollama/ollama/qwen2.5:1.5b-instruct (http://localhost:11434)
-2026-03-03 19:26:04 - INFO - [dim]Memory: provider=ollama model=mxbai-embed-large dims=1024 MongoDB=✓[/dim]
-2026-03-03 19:26:04 - INFO - Flow started with ID: 84fe794f-c179-4878-bb4d-f8efda078a5a
-2026-03-03 19:26:04 - INFO - <rich.panel.Panel object at 0x7e21e2db5480>
-2026-03-03 19:26:04 - INFO - 
-LiteLLM completion() model= qwen2.5:7b-instruct-q4_K_M; provider = ollama
