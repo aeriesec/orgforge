@@ -134,7 +134,7 @@ def build_llm(model_key: str):
     base_url = env_base_url if env_base_url else config_base_url
     
     logger.info(f"[config] {model_key} → Ollama/{model} ({base_url})")
-    return OllamaLLM(model=model, base_url=base_url)
+    return OllamaLLM(model=model, base_url=base_url, timeout=1200)
 
 PLANNER_MODEL = build_llm("planner")
 WORKER_MODEL  = build_llm("worker")
@@ -544,7 +544,7 @@ class Flow(Flow[State]):
     # ─── THEME ────────────────────────────────
     def _generate_theme(self) -> str:
         ctx = self._mem.context_for_prompt(f"day {self.state.day} system health sprint incidents", n=3, as_of_day=self.state.day)
-        planner = Agent(role="CEO", goal="Decide today's dominant theme.", backstory="You see patterns across the company.", llm=PLANNER_MODEL)
+        planner = Agent(role="CEO", goal="Decide today's dominant theme.", backstory="You see patterns across the company.", llm=WORKER_MODEL)
         task = Task(description=f"Day {self.state.day}. Health: {self.state.system_health}. Morale: {self.state.team_morale:.2f}.\nContext:\n{ctx}\nWrite ONE sentence for today's theme.", expected_output="One sentence.", agent=planner)
         return str(Crew(agents=[planner], tasks=[task], verbose=False, llm=PLANNER_MODEL).kickoff()).strip()
 
@@ -983,7 +983,8 @@ class Flow(Flow[State]):
         self.state.daily_artifacts_created  = 0
 
         self.graph_dynamics.decay_edges()
-        prop = self.graph_dynamics.propagate_stress()
+        self._last_stress_prop = self.graph_dynamics.propagate_stress()
+        prop = self._last_stress_prop
         if prop.burnt_out:
             logger.info(f"    [red]🔥 Burnout spreading:[/red] "
                         f"{', '.join(prop.burnt_out)} stressed; "
@@ -1019,8 +1020,8 @@ class Flow(Flow[State]):
             "system_health": self.state.system_health, "event_log": [e.to_dict() for e in self._mem.get_event_log()],
         }
         snapshot["top_relationships"] = self.graph_dynamics.relationship_summary(10)
-        snapshot["estranged_pairs"]   = self.graph_dynamics.estranged_pairs()
-        snapshot["stress_snapshot"]   = prop.stress_snapshot
+        snapshot["estranged_pairs"] = self.graph_dynamics.estranged_pairs()
+        snapshot["stress_snapshot"] = self._last_stress_prop.stress_snapshot if hasattr(self, '_last_stress_prop') else {}
         save_json(f"{BASE}/simulation_snapshot.json", snapshot)
 
     def _handle_external_contact(self, inc: ActiveIncident, contact: dict) -> None:
@@ -1141,5 +1142,12 @@ class Flow(Flow[State]):
         )
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reset", action="store_true", help="Wipe MongoDB and export dir before running")
+    args = parser.parse_args()
+
     flow = Flow()
+    if args.reset:
+        flow._mem.reset(export_dir=BASE)
     flow.kickoff()

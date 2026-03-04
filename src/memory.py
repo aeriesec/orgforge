@@ -27,6 +27,8 @@ from pymongo import MongoClient
 from pymongo.operations import SearchIndexModel
 
 import requests
+import shutil
+from pathlib import Path
 
 logger = logging.getLogger("orgforge.memory")
 
@@ -519,3 +521,32 @@ class Memory:
             "embedder_ok":      embedder_ok,
             "mongodb_ok":       True,
         }
+
+    def reset(self, export_dir: Optional[str] = None):
+        """Drop and recreate collections. Optionally wipe export directory."""
+        self._artifacts.drop()
+        self._events.drop()
+        self._event_log = []
+        self._init_vector_indexes()
+        logger.info("[memory] 🗑️  Collections reset.")
+
+        if export_dir:
+            export_path = Path(export_dir)
+            if export_path.exists():
+                shutil.rmtree(export_path)
+            export_path.mkdir(parents=True, exist_ok=True)
+
+            # Re-attach file handler since the log file was wiped
+            log_path = export_path / "simulation.log"
+            root_logger = logging.getLogger()  # root logger, not orgforge.flow
+            for handler in root_logger.handlers[:]:
+                if isinstance(handler, logging.FileHandler):
+                    handler.close()
+                    root_logger.removeHandler(handler)
+            new_handler = logging.FileHandler(log_path, mode='a')
+            new_handler.setFormatter(logging.Formatter(
+                "%(asctime)s - %(levelname)s - %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S"
+            ))
+            root_logger.addHandler(new_handler)
+            logger.info(f"[memory] 🗑️  Export directory cleared: {export_path}")
