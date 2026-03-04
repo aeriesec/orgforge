@@ -14,10 +14,12 @@ from pathlib import Path
 import yaml
 import networkx as nx
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+from day_planner import DayPlannerOrchestrator
+from normal_day import NormalDayHandler
 from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.table import Table
@@ -263,6 +265,10 @@ class State(BaseModel):
     daily_artifacts_created:  int = 0
     daily_external_contacts:  int = 0
 
+    org_day_plan: Optional[Any] = None
+    daily_active_actors: List[str] = []
+    daily_event_type_counts: Dict[str, int] = {}
+
 # ─────────────────────────────────────────────
 # 3. FILE I/O
 # ─────────────────────────────────────────────
@@ -410,6 +416,13 @@ class Flow(Flow[State]):
         self.graph_dynamics = GraphDynamics(build_social_graph(), CONFIG)
         self.social_graph   = self.graph_dynamics.G
         self._git = GitSimulator(self.state, self._mem, self.social_graph)
+        self._day_planner = DayPlannerOrchestrator(CONFIG, WORKER_MODEL, PLANNER_MODEL)
+        self._normal_day = NormalDayHandler(
+            config=CONFIG, mem=self._mem, state=self.state,
+            graph_dynamics=self.graph_dynamics, social_graph=self.social_graph,
+            git=self._git, worker_llm=WORKER_MODEL, planner_llm=PLANNER_MODEL,
+        )
+
         stats = self._mem.stats()
         logger.info(f"[dim]Memory: provider={stats['embed_provider']} model={stats['embed_model']} dims={stats['embed_dims']} MongoDB={'✓' if stats['mongodb_ok'] else '⚠'}[/dim]")
 
@@ -425,6 +438,30 @@ class Flow(Flow[State]):
     def _embed_and_count(self, **kwargs):
         self._mem.embed_artifact(**kwargs)
         self.state.daily_artifacts_created += 1
+
+    def _record_daily_actor(self, *names: str):
+        """
+        Call this whenever a named actor participates in any event today.
+        Appends to daily_active_actors; dedup happens at EOD.
+
+        Usage (sprinkle at existing event-firing sites):
+            self._record_daily_actor(on_call, incident_lead)
+            self._record_daily_actor(*attendees)
+        """
+        self.state.daily_active_actors.extend(names)
+
+
+    def _record_daily_event(self, event_type: str):
+        """
+        Call this once per event fired during the day loop.
+        Drives dominant_event and event_type_counts in the summary.
+
+        Usage (one line added wherever a SimEvent is logged):
+            self._record_daily_event("incident_opened")
+            self._record_daily_event("standup")
+        """
+        counts = self.state.daily_event_type_counts
+        counts[event_type] = counts.get(event_type, 0) + 1
 
     # ─── GENESIS ─────────────────────────────
     @start()
@@ -517,7 +554,9 @@ class Flow(Flow[State]):
                 self.state.current_date += timedelta(days=1)
                 continue
 
-            self.state.daily_theme = self._generate_theme()
+            org_plan = self._day_planner.plan(self.state, self._mem, self.graph_dynamics)
+            self.state.daily_theme  = org_plan.org_theme
+            self.state.org_day_plan = org_plan
             self._print_day_header()
 
             for inc in self.state.active_incidents: inc.days_active += 1
@@ -533,7 +572,7 @@ class Flow(Flow[State]):
             if any(x in theme_lower for x in incident_triggers):
                 self._handle_incident()
             else:
-                self._handle_normal_day()
+                self._normal_day.handle(self.state.org_day_plan)
 
             self._end_of_day()
             self.state.day += 1
@@ -582,6 +621,10 @@ class Flow(Flow[State]):
             actors=attendees, artifact_ids={"jira_tickets": json.dumps([t["id"] for t in new_tickets])},
             facts=sprint_facts, summary=f"Sprint #{sprint_facts['sprint_number']} planned.", tags=["sprint", "planning"],
         ))
+
+        self._record_daily_actor(*attendees)
+        self._record_daily_event("sprint_planned")
+
         logger.info(f"    [green]✓[/green] {[t['id'] for t in new_tickets]}")
 
     # ─── STANDUP (LLM) ────────────────────────
@@ -619,6 +662,9 @@ class Flow(Flow[State]):
         self.state.slack_threads.append({"date": date_str, "channel": "standup", "message_count": len(messages)})
         self._mem.log_event(SimEvent(type="standup", day=self.state.day, date=date_str, actors=[m["user"] for m in messages], artifact_ids={"slack": slack_path}, facts={"attendee_count": len(messages)}, summary=f"Standup: {len(messages)} attendees shared updates.", tags=["standup"]))
 
+        self._record_daily_actor(*[m["user"] for m in messages])
+        self._record_daily_event("standup")
+
     # ─── RETROSPECTIVE ────────────────────────
     def _handle_retrospective(self):
         logger.info(f"  [bold blue]🔄 Retro — Sprint #{self.state.sprint.sprint_number}[/bold blue]")
@@ -636,6 +682,9 @@ class Flow(Flow[State]):
         self._mem.log_event(SimEvent(type="retrospective", day=self.state.day, date=str(self.state.current_date.date()), actors=list(LEADS.values()), artifact_ids={"confluence": conf_id}, facts={"sprint_number": self.state.sprint.sprint_number}, summary=f"Sprint #{self.state.sprint.sprint_number} retrospective.", tags=["retrospective", "sprint"]))
         self.state.sprint.sprint_number += 1
         self.state.sprint.tickets_in_sprint = []
+
+        self._record_daily_actor(*list(LEADS.values()))
+        self._record_daily_event("retrospective")
         logger.info(f"    [green]✓[/green] {conf_id}")
 
     # ─── INCIDENT DETECTION ───────────────────
@@ -695,6 +744,9 @@ class Flow(Flow[State]):
             summary=f"P1 incident {ticket_id}: {root_cause}", tags=["incident", "P1"]
         ))
 
+        self._record_daily_actor(on_call, incident_lead)
+        self._record_daily_event("incident_opened")
+
         self.graph_dynamics.apply_incident_stress([on_call, incident_lead])
         self.graph_dynamics.record_incident_collaboration([on_call, incident_lead])
 
@@ -729,6 +781,17 @@ class Flow(Flow[State]):
                 summary=f"Knowledge gap detected during {ticket_id}: systems owned by departed employee.",
                 tags=["knowledge_gap"]
             ))
+
+        if self.state.org_day_plan:
+           eng_key = next((k for k in self.state.org_day_plan.dept_plans
+                           if "eng" in k.lower()), None)
+           if eng_key:
+               eng_dept_plan = self.state.org_day_plan.dept_plans[eng_key]
+               for ep in eng_dept_plan.engineer_plans:
+                   if ep.name in [on_call, incident_lead]:
+                       ep.apply_incident_pressure(inc.title, hrs_lost=3.5)
+                   elif ep.name == eng_peer:
+                       ep.apply_incident_pressure(inc.title, hrs_lost=1.5)
 
         logger.info(f"    [red]🚨 {ticket_id}:[/red] {root_cause[:65]}")
 
@@ -842,81 +905,6 @@ class Flow(Flow[State]):
         
         save_json(slack_path, messages)
 
-    # ─── NORMAL DAY (LLM + NetworkX) ──────────
-    def _handle_normal_day(self):
-        logger.info(f"  [bold blue]💬 Digital-HQ Chatter[/bold blue]")
-        date_str = str(self.state.current_date.date())
-        seed_person = random.choice(ALL_NAMES)
-        edges = self.social_graph[seed_person]
-        colleagues = random.choices(list(edges.keys()), weights=[edges[n]['weight'] for n in edges.keys()], k=random.randint(2, 4))
-        participants = list(set([seed_person] + colleagues))
-        
-        ctx = self._mem.context_for_prompt(self.state.daily_theme, n=2, as_of_day=self.state.day)
-        profiles = [f"{name} ({dept_of(name)})" for name in participants]
-
-        chat_agent = Agent(role="Slack Observer", goal="Write casual Slack thread.", backstory="You observe real humans chatting.", llm=WORKER_MODEL)
-        task = Task(
-            description=f"Write a 4-6 message Slack conversation between:\n{chr(10).join(profiles)}\n\nTheme: {self.state.daily_theme}\nContext: {ctx}\nFormat EXACTLY: Name: [Message]",
-            expected_output="Slack conversation.", agent=chat_agent
-        )
-        result = str(Crew(agents=[chat_agent], tasks=[task], verbose=False, llm=WORKER_MODEL).kickoff())
-        
-        messages = []
-        for line in result.split("\n"):
-            if ":" in line:
-                name, text = line.split(":", 1)
-                name = name.strip()
-                if name in ALL_NAMES:
-                    messages.append({"user": name, "text": text.strip(), "ts": self.state.current_date.replace(hour=random.randint(10, 16)).isoformat()})
-
-        if messages:
-            channel_name = "digital-hq" # Default fallback
-        
-            if len(participants) == 2:
-                # If it's just two people, it's a DM
-                p1, p2 = sorted(participants)
-                channel_name = f"dm_{p1.lower()}_{p2.lower()}"
-            else:
-                # Check if everyone is in the same department
-                depts = {dept_of(p) for p in participants}
-                if len(depts) == 1:
-                    # E.g., "Engineering_Backend" becomes "engineering-backend"
-                    channel_name = list(depts)[0].lower().replace("_", "-")
-
-            if messages:
-                slack_path = f"{BASE}/slack/channels/{channel_name}/{date_str}_{seed_person}.json"
-                save_json(slack_path, messages)
-                self.state.slack_threads.append({"date": date_str, "channel": channel_name, "message_count": len(messages)})
-                
-                # Update the SimEvent to log the correct channel
-                self._mem.log_event(SimEvent(
-                    type="normal_day_slack", day=self.state.day, date=date_str, 
-                    actors=participants, artifact_ids={"slack": slack_path}, 
-                    facts={"message_count": len(messages), "channel": channel_name}, 
-                    summary=f"Slack chatter in #{channel_name} involving {', '.join(participants)}.", 
-                    tags=["slack", "normal"]
-                ))
-                logger.info(f"    [dim]💬 {len(messages)} messages in #{channel_name}[/dim]")
-
-            if participants:
-                self.graph_dynamics.record_slack_interaction(participants)
-
-        if random.random() < CONFIG["simulation"].get("aws_alert_prob", 0.4):
-            self._emit_bot_message(
-                "system-alerts", 
-                "AWS Cost Explorer", 
-                f"⚠️ Daily budget threshold exceeded. {LEGACY.get('aws_alert_message', 'Cloud costs remain elevated.')}"
-            )
-        elif random.random() < CONFIG["simulation"].get("snyk_alert_prob", 0.2):
-            self._emit_bot_message(
-                "engineering", 
-                "Snyk Security", 
-                "🔒 3 new medium-severity vulnerabilities detected in npm dependencies."
-            )
-
-        if random.random() < CONFIG["simulation"].get("adhoc_confluence_prob", 0.3):
-            self._generate_adhoc_confluence_page()
-
     def _generate_adhoc_confluence_page(self):
         raw_topics = CONFIG.get("adhoc_confluence_topics", [["ENG", "Documentation"], ["HR", "Policy Update"]])
         rendered   = [(t[0], render_template(t[1])) for t in raw_topics]
@@ -944,25 +932,53 @@ class Flow(Flow[State]):
         decay    = CONFIG["morale"]["daily_decay"]
         recovery = CONFIG["morale"]["good_day_recovery"]
 
-        # Decay every day; add recovery bonus on days with no active incidents
         self.state.team_morale = round(self.state.team_morale * decay, 3)
         if not self.state.active_incidents:
             self.state.team_morale = round(min(1.0, self.state.team_morale + recovery), 3)
 
         self.state.morale_history.append(self.state.team_morale)
+
+        # ── end_of_day event (unchanged) ─────────────────────────────────────────
         self._mem.log_event(SimEvent(
             type="end_of_day", day=self.state.day, date=date_str, actors=[], artifact_ids={},
             facts={"morale": self.state.team_morale, "system_health": self.state.system_health},
             summary=f"Day {self.state.day} end.", tags=["eod"]
         ))
 
+        # ── Derive enrichment fields from accumulated daily state ─────────────────
+
+        # Deduplicated actors seen in any event today, ordered by frequency
+        unique_actors = list(dict.fromkeys(self.state.daily_active_actors))
+
+        # Dominant event type fired most often today (e.g. "incident_opened")
+        event_counts  = self.state.daily_event_type_counts
+        dominant_event = max(event_counts, key=event_counts.get) if event_counts else "normal_day"
+
+        # Departments represented by today's active actors
+        departments_involved = list({
+            dept_of(name)
+            for name in unique_actors
+            if dept_of(name) != "Unknown"
+        })
+
+        # Still-open incidents at EOD (not yet resolved)
+        open_incident_ids = [inc.ticket_id for inc in self.state.active_incidents]
+
+        # Stress snapshot for today's active actors only — keeps the summary tight
+        stress_today = {
+            name: self.graph_dynamics._stress.get(name, 0)
+            for name in unique_actors
+        }
+
+        # ── Enriched day_summary SimEvent ────────────────────────────────────────
         self._mem.log_event(SimEvent(
             type="day_summary",
             day=self.state.day,
             date=date_str,
-            actors=[],
+            actors=unique_actors,                          # populated — was always []
             artifact_ids={},
             facts={
+                # ── Original numeric fields (unchanged) ──
                 "incidents_opened":   self.state.daily_incidents_opened,
                 "incidents_resolved": self.state.daily_incidents_resolved,
                 "artifacts_created":  self.state.daily_artifacts_created,
@@ -970,25 +986,59 @@ class Flow(Flow[State]):
                 "morale":             self.state.team_morale,
                 "system_health":      self.state.system_health,
                 "theme":              self.state.daily_theme,
+
+                # ── New enrichment fields ──
+                "active_actors":        unique_actors,
+                "dominant_event":       dominant_event,
+                "event_type_counts":    event_counts,
+                "departments_involved": departments_involved,
+                "open_incidents":       open_incident_ids,
+                "stress_snapshot":      stress_today,
+
+                # Trajectory signal — gives DayPlanner a one-glance health picture
+                "health_trend":  (
+                    "declining"  if self.state.system_health < 60 else
+                    "recovering" if self.state.daily_incidents_resolved > self.state.daily_incidents_opened else
+                    "stable"
+                ),
+                "morale_trend": (
+                    "low"      if self.state.team_morale < 0.45 else
+                    "moderate" if self.state.team_morale < 0.70 else
+                    "healthy"
+                ),
             },
-            summary=f"Day {self.state.day}: {self.state.daily_incidents_opened} incident(s) opened, "
-                    f"{self.state.daily_incidents_resolved} resolved. "
-                    f"Health: {self.state.system_health}. Morale: {self.state.team_morale:.2f}.",
+            summary=(
+                f"Day {self.state.day} ({date_str}): "
+                f"{self.state.daily_incidents_opened} incident(s) opened, "
+                f"{self.state.daily_incidents_resolved} resolved. "
+                f"Health: {self.state.system_health} "
+                f"({'declining' if self.state.system_health < 60 else 'recovering' if self.state.daily_incidents_resolved > self.state.daily_incidents_opened else 'stable'}). "
+                f"Morale: {self.state.team_morale:.2f}. "
+                f"Active actors: {', '.join(unique_actors) or 'none'}. "
+                f"Depts: {', '.join(departments_involved) or 'none'}. "
+                f"Dominant event: {dominant_event}."
+            ),
             tags=["day_summary"],
         ))
 
-        # Reset daily counters
+        # ── Reset all daily counters ──────────────────────────────────────────────
         self.state.daily_incidents_opened   = 0
         self.state.daily_incidents_resolved = 0
         self.state.daily_artifacts_created  = 0
+        self.state.daily_external_contacts  = 0
+        self.state.daily_active_actors      = []   # new
+        self.state.daily_event_type_counts  = {}   # new
 
         self.graph_dynamics.decay_edges()
         self._last_stress_prop = self.graph_dynamics.propagate_stress()
         prop = self._last_stress_prop
         if prop.burnt_out:
-            logger.info(f"    [red]🔥 Burnout spreading:[/red] "
-                        f"{', '.join(prop.burnt_out)} stressed; "
-                        f"neighbours affected: {', '.join(prop.affected) or 'none'}")
+            logger.info(
+                f"    [red]🔥 Burnout spreading:[/red] "
+                f"{', '.join(prop.burnt_out)} stressed; "
+                f"neighbours affected: {', '.join(prop.affected) or 'none'}"
+            )
+
 
     def _print_day_header(self):
         m = int(self.state.team_morale * 10)
@@ -1135,6 +1185,9 @@ class Flow(Flow[State]):
                 "causal_parent":   inc.ticket_id,
             },
         )
+
+        self._record_daily_actor(liaison_name)
+        self._record_daily_event("external_contact_summarized")
 
         logger.info(
             f"    [cyan]🌐 External contact:[/cyan] {liaison_name} summarized "
