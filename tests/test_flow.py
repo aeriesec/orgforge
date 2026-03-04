@@ -28,8 +28,10 @@ def test_embed_and_count_recursion_fix(mock_flow):
     assert mock_flow._mem.embed_artifact.called
     assert mock_flow.state.daily_artifacts_created == 1
 
-@patch("flow.Crew") # Mock Crew so it doesn't try to run real LLMs or open files
-def test_incident_logic_variable_scope(mock_crew_class, mock_flow):
+@patch("flow.Crew")
+@patch("flow.Task")   # Pydantic validates Task.agent — must mock Task too or it rejects the mocked Agent
+@patch("flow.Agent")
+def test_incident_logic_variable_scope(mock_agent_class, mock_task_class, mock_crew_class, mock_flow):
     """
     Verifies that _handle_incident uses correctly defined variables 
     (involves_gap vs involves_bill).
