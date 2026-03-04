@@ -95,6 +95,16 @@ class CrossDeptSignal:
     day:          int
     relevance:    str   # "direct" | "indirect" — how strongly it shapes today
 
+@dataclass
+class LifecycleContext:
+    """
+    Recent hire/departure activity surfaced to the DepartmentPlanner.
+    Included in the roster section of the planning prompt so the LLM
+    can propose onboarding_session or warmup_1on1 events naturally.
+    """
+    recent_departures: List[Dict[str, Any]]   # [{name, dept, day, domains}]
+    recent_hires:      List[Dict[str, Any]]   # [{name, dept, day, role}]
+    active_gaps:       List[str]              # knowledge domain strings still unresolved
 
 @dataclass
 class ProposedEvent:
@@ -188,4 +198,6 @@ KNOWN_EVENT_TYPES = {
     "external_contact_summarized", "vendor_meeting", "customer_escalation",
     # Org
     "normal_day_slack", "confluence_created", "day_summary",
+    "employee_departed", "employee_hired", "knowledge_gap_detected",
+    "onboarding_session", "farewell_message", "warmup_1on1",
 }

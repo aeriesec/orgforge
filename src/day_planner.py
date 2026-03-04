@@ -80,6 +80,8 @@ class DepartmentPlanner:
     CROSS-DEPARTMENT SIGNALS (what other teams are dealing with):
     {cross_signals}
 
+    {lifecycle_context}
+
     KNOWN EVENT TYPES YOU CAN PROPOSE:
     {known_types}
 
@@ -154,6 +156,7 @@ class DepartmentPlanner:
         graph_dynamics:  GraphDynamics,
         cross_signals:   List[CrossDeptSignal],
         eng_plan:        Optional[DepartmentDayPlan] = None,  # None for Engineering itself
+        lifecycle_context: str = "",
     ) -> DepartmentDayPlan:
         """
         Produce a DepartmentDayPlan. eng_plan is provided to non-Engineering
@@ -167,6 +170,10 @@ class DepartmentPlanner:
         morale_label  = (
             "low" if state.team_morale < 0.45 else
             "moderate" if state.team_morale < 0.70 else "healthy"
+        )
+        lifecycle_context=(
+            f"\nROSTER CHANGES (recent hires/departures):\n{lifecycle_context}\n"
+            if lifecycle_context else ""
         )
 
         prompt = self._PLAN_PROMPT.format(
@@ -182,6 +189,7 @@ class DepartmentPlanner:
             dept_history=dept_history,
             cross_signals=cross_str,
             known_types=known_str,
+            lifecycle_context=lifecycle_context,
         )
 
         agent = Agent(
@@ -628,6 +636,7 @@ class DayPlannerOrchestrator:
         state,
         mem:            Memory,
         graph_dynamics: GraphDynamics,
+        lifecycle_context: str = "",
     ) -> OrgDayPlan:
         """
         Full planning pass for one day.
@@ -675,6 +684,7 @@ class DayPlannerOrchestrator:
                 graph_dynamics=graph_dynamics,
                 cross_signals=cross_signals_by_dept.get(dept, []),
                 eng_plan=eng_plan,
+                lifecycle_context=lifecycle_context,
             )
             self._patch_stress_levels(plan, graph_dynamics)
             dept_plans[dept] = plan

@@ -6,6 +6,122 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.0] — 2026-03-04
+
+### Added
+
+- **`org_lifecycle.py` — `OrgLifecycleManager`** — new module that owns all
+  dynamic roster mutations. The engine controls every side-effect; LLMs only
+  produce narrative prose after the fact. Three public entry points called from
+  `flow.py` before planning runs each day:
+  - `process_departures()` — fires scheduled departures and optional random
+    attrition; executes three deterministic side-effects in strict order before
+    removing the node (see below)
+  - `process_hires()` — adds new engineer nodes at `edge_weight_floor` with
+    cold-start edges, bootstraps a persona, and emits an `employee_hired` SimEvent
+  - `scan_for_knowledge_gaps()` — scans any free text (incident root cause,
+    Confluence body) against all departed employees' `knowledge_domains` and
+    emits a `knowledge_gap_detected` SimEvent on first hit per domain; deduplicates
+    across the full simulation run
+  - `get_roster_context()` — compact string injected into `DepartmentPlanner`
+    prompts so the LLM naturally proposes `warmup_1on1` and `onboarding_session`
+    events for new hires and references recent departures by name
+    _File: `org_lifecycle.py` (new)_
+
+- **Departure side-effect 1 — Active incident handoff** — before the departing
+  node is removed, every active incident whose linked JIRA ticket is assigned to
+  that engineer triggers a Dijkstra escalation chain while the node is still
+  present. Ownership transfers to the first non-departing person in the chain,
+  falling back to the dept lead if no path exists. The JIRA `assignee` field is
+  mutated deterministically; an `escalation_chain` SimEvent with
+  `trigger: "forced_handoff_on_departure"` is emitted.
+  _File: `org_lifecycle.py` — `OrgLifecycleManager._handoff_active_incidents()`_
+
+- **Departure side-effect 2 — JIRA ticket reassignment** — all non-Done tickets
+  owned by the departing engineer are reassigned to the dept lead. Status logic:
+  `"To Do"` tickets keep their status; `"In Progress"` tickets with no linked PR
+  are reset to `"To Do"` so the new owner starts fresh; `"In Progress"` tickets
+  with a linked PR retain their status so the existing PR review/merge flow closes
+  them naturally. Tickets already handled by the incident handoff are not
+  double-logged. Each reassignment emits a `ticket_progress` SimEvent with
+  `reason: "departure_reassignment"`.
+  _File: `org_lifecycle.py` — `OrgLifecycleManager._reassign_jira_tickets()`_
+
+- **Departure side-effect 3 — Centrality vacuum stress** — after the node is
+  removed, betweenness centrality is recomputed on the smaller graph and diffed
+  against the pre-departure snapshot. Nodes whose score increased have absorbed
+  bridging load; each receives `stress_delta = Δc × multiplier` (default `40`,
+  configurable via `centrality_vacuum_stress_multiplier`, hard-capped at 20 points
+  per departure). This reflects the real phenomenon where a connector's departure
+  leaves adjacent nodes as sole bridges across previously-separate clusters.
+  _File: `org_lifecycle.py` — `OrgLifecycleManager._apply_centrality_vacuum()`_
+
+- **New hire cold-start edges** — hired engineers enter the graph with edges at
+  `edge_weight_floor` to cross-dept nodes and `floor × 2` to same-dept peers.
+  Both values sit below `warmup_threshold` (default `2.0`) so `DepartmentPlanner`
+  will propose `warmup_1on1` and `onboarding_session` events organically until
+  enough collaboration has occurred to warm the edges past the threshold.
+  `OrgLifecycleManager.warm_up_edge()` is called from `flow.py` whenever one of
+  those events fires.
+  _File: `org_lifecycle.py` — `OrgLifecycleManager._execute_hire()`_
+
+- **`patch_validator_for_lifecycle()`** — call once per day after
+  `process_departures()` / `process_hires()` to prune departed names from
+  `PlanValidator._valid_actors` and add new hire names. Keeps the actor integrity
+  check honest without rebuilding the validator from scratch each day.
+  _File: `org_lifecycle.py`_
+
+- **`recompute_escalation_after_departure()`** — thin wrapper called from
+  `flow.py._end_of_day()` that rebuilds the escalation chain from the dept's
+  remaining first responder after the departed node has been removed. Logs the
+  updated path as an `escalation_chain` SimEvent for ground-truth retrieval.
+  _File: `org_lifecycle.py`_
+
+- **New `KNOWN_EVENT_TYPES`** — `employee_departed`, `employee_hired`,
+  `knowledge_gap_detected`, `onboarding_session`, `farewell_message`,
+  `warmup_1on1` added to the validator vocabulary so the planner can propose
+  them without triggering the novel event fallback path.
+  _File: `planner_models.py`_
+
+- **New `State` fields** — `departed_employees: Dict[str, Dict]` and
+  `new_hires: Dict[str, Dict]` added to track dynamic roster changes across
+  the simulation; both are populated by `OrgLifecycleManager` and included in
+  `simulation_snapshot.json` at EOD.
+  _File: `flow.py` — `State`_
+
+- **`simulation_snapshot.json` lifecycle sections** — `departed_employees`,
+  `new_hires`, and `knowledge_gap_events` arrays appended to the final snapshot
+  so the full roster history is available alongside relationship and stress data.
+  _File: `flow.py` — `Flow._print_final_report()`_
+
+- **`org_lifecycle` config block** — new top-level config section supports
+  `scheduled_departures`, `scheduled_hires`, `enable_random_attrition`, and
+  `random_attrition_daily_prob`. Random attrition is off by default; when
+  enabled it fires at most one unscheduled departure per day, skipping leads.
+  _File: `config.yaml`_
+
+### Changed
+
+- **`DepartmentPlanner` prompt** — accepts a `lifecycle_context` string injected
+  between the cross-dept signals and known event types sections. When non-empty
+  it surfaces recent departures (with reassigned tickets), recent hires (with
+  warm edge count), and unresolved knowledge domains so the LLM plan reflects
+  actual roster state rather than a static org chart.
+  _File: `day_planner.py` — `DepartmentPlanner._PLAN_PROMPT`, `DepartmentPlanner.plan()`_
+
+- **`DayPlannerOrchestrator`** — holds a `validator` reference so
+  `patch_validator_for_lifecycle()` can update `_valid_actors` before each day's
+  plan is generated, without rebuilding the validator on every call.
+  _File: `day_planner.py` — `DayPlannerOrchestrator.__init__()`_
+
+- **`flow.py` module-level org state** — `ORG_CHART` and `PERSONAS` are now
+  copied into `LIVE_ORG_CHART` and `LIVE_PERSONAS` at startup. All roster-sensitive
+  code paths reference the live copies; the frozen originals remain available for
+  config introspection. `OrgLifecycleManager` mutates the live copies in place.
+  _File: `flow.py`_
+
+---
+
 ## [v0.2.0] — 2026-03-04
 
 ### Added
@@ -43,7 +159,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `ValidationResult` — outcome of a `PlanValidator` check
   - `KNOWN_EVENT_TYPES` — the vocabulary set the validator enforces; novel proposals
     outside this set are logged rather than silently dropped
-  _File: `planner_models.py` (new)_
+    _File: `planner_models.py` (new)_
 
 - **`plan_validator.py`** — integrity boundary between LLM proposals and the
   execution engine. Checks every `ProposedEvent` against five rules before the
@@ -57,7 +173,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
      `team_celebration` when `system_health < 40`)
   4. **Cooldown windows** — configurable per-event-type minimum days between firings
   5. **Morale gating** — `morale_intervention` only fires when morale is actually low
-  _File: `plan_validator.py` (new)_
+     _File: `plan_validator.py` (new)_
 
 - **`day_planner.py`** — LLM-driven planning layer that replaces `_generate_theme()`
   in `flow.py`. Three classes:
@@ -73,22 +189,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     Engineering's plan before `OrgCoordinator` looks for collision points.
     Rejected and novel events each produce their own SimEvent types so nothing
     is silently discarded.
-  _File: `day_planner.py` (new)_
+    _File: `day_planner.py` (new)_
 
 - **`normal_day.py` — `NormalDayHandler`** — replaces `_handle_normal_day()` in
   `flow.py` entirely. Dispatches each engineer's non-deferred agenda items to typed
   handlers that produce specific artifacts:
 
-  | `activity_type`    | Artifacts produced                                       |
-  |--------------------|----------------------------------------------------------|
-  | `ticket_progress`  | JIRA comment + optional blocker Slack thread             |
-  | `pr_review`        | GitHub bot message + optional author reply               |
-  | `1on1`             | DM thread (3–5 messages)                                 |
-  | `async_question`   | Slack thread (3–5 messages) in appropriate channel       |
-  | `design_discussion`| Slack thread + 30% chance Confluence design doc stub     |
-  | `mentoring`        | DM thread + double social graph edge boost               |
-  | `deep_work`        | SimEvent only — intentionally produces no artifact       |
-  | deferred (any)     | `agenda_item_deferred` SimEvent logging the interruption |
+  | `activity_type`     | Artifacts produced                                       |
+  | ------------------- | -------------------------------------------------------- |
+  | `ticket_progress`   | JIRA comment + optional blocker Slack thread             |
+  | `pr_review`         | GitHub bot message + optional author reply               |
+  | `1on1`              | DM thread (3–5 messages)                                 |
+  | `async_question`    | Slack thread (3–5 messages) in appropriate channel       |
+  | `design_discussion` | Slack thread + 30% chance Confluence design doc stub     |
+  | `mentoring`         | DM thread + double social graph edge boost               |
+  | `deep_work`         | SimEvent only — intentionally produces no artifact       |
+  | deferred (any)      | `agenda_item_deferred` SimEvent logging the interruption |
 
   Falls back to original random Slack chatter if `org_day_plan` is `None`,
   preserving compatibility with runs that predate the planning layer.

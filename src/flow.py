@@ -34,6 +34,11 @@ from langchain_ollama import OllamaLLM
 
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
+from org_lifecycle import (
+         OrgLifecycleManager,
+         patch_validator_for_lifecycle,
+         recompute_escalation_after_departure,
+     )
 
 os.makedirs("./export", exist_ok=True)
 
@@ -86,6 +91,8 @@ DEPARTED_EMPLOYEES: Dict[str, Dict] = {
 }
 
 ALL_NAMES = [name for dept in ORG_CHART.values() for name in dept]
+LIVE_ORG_CHART  = {dept: list(members) for dept, members in ORG_CHART.items()}
+LIVE_PERSONAS   = {k: dict(v) for k, v in PERSONAS.items()}
 
 # ── Active preset ─────────────────────────────
 _PRESET_NAME = CONFIG.get("quality_preset", "local_cpu")
@@ -268,6 +275,9 @@ class State(BaseModel):
     org_day_plan: Optional[Any] = None
     daily_active_actors: List[str] = []
     daily_event_type_counts: Dict[str, int] = {}
+    departed_employees: Dict[str, Dict] = {}   # name → {left, role, knew_about, documented_pct}
+    new_hires: Dict[str, Dict] = {}   # name → {joined, role, dept, expertise}
+
 
 # ─────────────────────────────────────────────
 # 3. FILE I/O
@@ -422,6 +432,16 @@ class Flow(Flow[State]):
             graph_dynamics=self.graph_dynamics, social_graph=self.social_graph,
             git=self._git, worker_llm=WORKER_MODEL, planner_llm=PLANNER_MODEL,
         )
+        self._lifecycle = OrgLifecycleManager(
+            config=CONFIG,
+            graph_dynamics=self.graph_dynamics,
+            mem=self._mem,
+            org_chart=LIVE_ORG_CHART,
+            personas=LIVE_PERSONAS,
+            all_names=ALL_NAMES,
+            leads=LEADS,
+            worker_llm=WORKER_MODEL,
+        )
 
         stats = self._mem.stats()
         logger.info(f"[dim]Memory: provider={stats['embed_provider']} model={stats['embed_model']} dims={stats['embed_dims']} MongoDB={'✓' if stats['mongodb_ok'] else '⚠'}[/dim]")
@@ -554,6 +574,18 @@ class Flow(Flow[State]):
                 self.state.current_date += timedelta(days=1)
                 continue
 
+            date_str = str(self.state.current_date.date())
+            departures = self._lifecycle.process_departures(self.state.day, date_str, self.state)
+            hires      = self._lifecycle.process_hires(self.state.day, date_str, self.state)
+
+            if departures or hires:
+                # Patch the day planner's validator to reflect the new roster
+                patch_validator_for_lifecycle(self._day_planner.validator, self._lifecycle)
+
+            org_plan = self._day_planner.plan(
+                self.state, self._mem, self.graph_dynamics,
+                lifecycle_context=self._lifecycle.get_roster_context(),
+            )
             org_plan = self._day_planner.plan(self.state, self._mem, self.graph_dynamics)
             self.state.daily_theme  = org_plan.org_theme
             self.state.org_day_plan = org_plan
@@ -694,16 +726,24 @@ class Flow(Flow[State]):
         incident_lead = resolve_role("incident_commander")
         eng_peer      = next((n for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), []) if n != on_call), on_call)
 
-        # Check if any departed employee's known systems appear in today's theme
-        involves_gap = any(
-            k.lower() in self.state.daily_theme.lower()
-            for emp in DEPARTED_EMPLOYEES.values()
-            for k in emp["knew_about"]
-        )
 
         rc_agent = Agent(role="Senior Engineer", goal="Diagnose root cause.", backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics), llm=WORKER_MODEL)
         rc_task  = Task(description=f"Theme: {self.state.daily_theme}\nWrite ONE specific technical root cause (max 20 words).", expected_output="One sentence.", agent=rc_agent)
         root_cause = str(Crew(agents=[rc_agent], tasks=[rc_task], verbose=False, llm=PLANNER_MODEL).kickoff()).strip()
+
+        involves_gap = any(
+            k.lower() in root_cause.lower()
+            for emp in DEPARTED_EMPLOYEES.values()
+            for k in emp["knew_about"]
+        )
+
+        self._lifecycle.scan_for_knowledge_gaps(
+            text=root_cause,
+            triggered_by=ticket_id,
+            day=self.state.day,
+            date_str=str(self.state.current_date.date()),
+            state=self.state,
+        )
 
         title  = f"{LEGACY['name']}: {self.state.daily_theme[:60]}"
         ticket = {"id": ticket_id, "title": title, "status": "In Progress", "assignee": on_call, "root_cause": root_cause, "linked_prs": []}
@@ -918,6 +958,15 @@ class Flow(Flow[State]):
         content = str(Crew(agents=[writer], tasks=[task], verbose=False, llm=PLANNER_MODEL).kickoff())
 
         full_content = f"# {title}\n**ID:** {conf_id}  \n**Author:** {author}\n\n" + content + bill_gap_warning(title)
+
+        self._lifecycle.scan_for_knowledge_gaps(
+            text=full_content,
+            triggered_by=conf_id,
+            day=self.state.day,
+            date_str=str(self.state.current_date.date()),
+            state=self.state,
+        )
+        
         path = f"{BASE}/confluence/general/{conf_id}.md"
         save_md(path, full_content)
         entry = {"id": conf_id, "title": title, "path": path}
@@ -1029,6 +1078,36 @@ class Flow(Flow[State]):
         self.state.daily_active_actors      = []   # new
         self.state.daily_event_type_counts  = {}   # new
 
+        date_str = str(self.state.current_date.date())
+        for dep in self._lifecycle._departed:
+            if dep.day != self.state.day:
+                continue   # only process today's departures
+            # Pick the on-call engineer or first dept member as first responder
+            dept_members = [
+                n for n in LIVE_ORG_CHART.get(dep.dept, [])
+                if n != dep.name
+            ]
+            if dept_members:
+                note = recompute_escalation_after_departure(
+                    self.graph_dynamics,
+                    departed=dep,
+                    first_responder=dept_members[0],
+                )
+                self._mem.log_event(SimEvent(
+                    type="escalation_chain",
+                    day=self.state.day,
+                    date=date_str,
+                    actors=dept_members[:2],
+                    artifact_ids={},
+                    facts={
+                        "trigger":       "post_departure_reroute",
+                        "departed":      dep.name,
+                        "new_path_note": note,
+                    },
+                    summary=f"Escalation path updated after {dep.name} departure. {note}",
+                    tags=["escalation_chain", "lifecycle"],
+                ))
+
         self.graph_dynamics.decay_edges()
         self._last_stress_prop = self.graph_dynamics.propagate_stress()
         prop = self._last_stress_prop
@@ -1057,6 +1136,9 @@ class Flow(Flow[State]):
             ("Git PRs", str(len(self.state.pr_registry))),
             ("Incidents Resolved", str(len(self.state.resolved_incidents))),
             ("Embedded Artifacts", str(s["artifact_count"])),
+            ("Employees Departed", str(len(self._lifecycle._departed))),
+            ("Employees Hired",    str(len(self._lifecycle._hired))),
+            ("Knowledge Gaps Surfaced", str(len(self._lifecycle._gap_events))),
             ("MongoDB Active", "✓" if s["mongodb_ok"] else "⚠"),
         ]:
             table.add_row(*row)
@@ -1071,6 +1153,43 @@ class Flow(Flow[State]):
         }
         snapshot["top_relationships"] = self.graph_dynamics.relationship_summary(10)
         snapshot["estranged_pairs"] = self.graph_dynamics.estranged_pairs()
+        snapshot["departed_employees"] = [
+            {
+                "name":              d.name,
+                "dept":              d.dept,
+                "day":               d.day,
+                "reason":            d.reason,
+                "knowledge_domains": d.knowledge_domains,
+                "documented_pct":    d.documented_pct,
+                "peak_stress":       d.peak_stress,
+            }
+            for d in self._lifecycle._departed
+        ]
+        snapshot["new_hires"] = [
+            {
+                "name":      h.name,
+                "dept":      h.dept,
+                "day":       h.day,
+                "role":      h.role,
+                "expertise": h.expertise,
+                "warm_edges_at_end": sum(
+                    1 for nb in self.social_graph.neighbors(h.name)
+                    if self.social_graph.has_node(h.name)
+                    and self.social_graph[h.name][nb].get("weight", 0) >= h.warmup_threshold
+                ) if self.social_graph.has_node(h.name) else 0,
+            }
+            for h in self._lifecycle._hired
+        ]
+        snapshot["knowledge_gap_events"] = [
+            {
+                "departed":       g.departed_name,
+                "domain":         g.domain_hit,
+                "triggered_by":   g.triggered_by,
+                "day":            g.triggered_on_day,
+                "documented_pct": g.documented_pct,
+            }
+            for g in self._lifecycle._gap_events
+        ]
         snapshot["stress_snapshot"] = self._last_stress_prop.stress_snapshot if hasattr(self, '_last_stress_prop') else {}
         save_json(f"{BASE}/simulation_snapshot.json", snapshot)
 
