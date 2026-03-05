@@ -562,7 +562,7 @@ class Flow(Flow[State]):
             self._embed_and_count(
                 id=doc_id, type="confluence", title=title, content=content,
                 day=self.state.day, date=str(self.state.current_date.date()),
-                metadata={"authors": str(eng_members)},
+                metadata={"authors": str(eng_members)}, timestamp=genesis_time
             )
 
             
@@ -653,7 +653,8 @@ class Flow(Flow[State]):
             self.state.sprint.tickets_in_sprint.append(tid)
             new_tickets.append(ticket)
             save_json(f"{BASE}/jira/{tid}.json", ticket)
-            self._embed_and_count(id=tid, type="jira", title=theme, content=json.dumps(ticket), day=self.state.day, date=str(self.state.current_date.date()), metadata={"assignee": assignee})
+            self._embed_and_count(id=tid, type="jira", title=theme, content=json.dumps(ticket), day=self.state.day, 
+                                  date=str(self.state.current_date.date()), metadata={"assignee": assignee}, timestamp=timestamp_str)
 
         sprint_facts = {
             "sprint_number": self.state.sprint.sprint_number,
@@ -736,7 +737,8 @@ class Flow(Flow[State]):
         save_md(path, content)
         entry = {"id": conf_id, "title": f"Retro Sprint #{self.state.sprint.sprint_number}", "summary": "Sprint Retrospective", "path": path}
         self.state.confluence_pages.append(entry)
-        self._embed_and_count(id=conf_id, type="confluence", title=entry["title"], content=content, day=self.state.day, date=str(self.state.current_date.date()))
+        self._embed_and_count(id=conf_id, type="confluence", title=entry["title"], content=content, day=self.state.day, date=str(self.state.current_date.date()),
+                              timestamp=meeting_time_iso)
         self._mem.log_event(SimEvent(type="retrospective", timestamp=meeting_time_iso, day=self.state.day, date=str(self.state.current_date.date()), 
                             actors=list(LEADS.values()), artifact_ids={"confluence": conf_id}, facts={"sprint_number": self.state.sprint.sprint_number}, 
                             summary=f"Sprint #{self.state.sprint.sprint_number} retrospective.", tags=["retrospective", "sprint"]))
@@ -1387,6 +1389,7 @@ class Flow(Flow[State]):
                 "incident":       inc.ticket_id,
                 "causal_parent":   inc.ticket_id,
             },
+            timestamp=interaction_start_iso
         )
 
         self._record_daily_actor(liaison_name)

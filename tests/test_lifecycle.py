@@ -5,6 +5,7 @@ from memory import SimEvent
 from org_lifecycle import OrgLifecycleManager, patch_validator_for_lifecycle
 
 from datetime import datetime
+from sim_clock import SimClock
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -660,3 +661,301 @@ def test_get_roster_context_reflects_departure_and_hire(lifecycle, mock_clock):
     assert "Bob"     in context
     assert "Taylor"  in context
     assert "redis-cache" in context
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED HELPER — real SimClock wired to a minimal state stub
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_real_clock(date: datetime) -> SimClock:
+    """
+    Returns a real SimClock backed by a minimal state stub.
+    Mirrors what Flow.__init__ does without pulling in the full State model.
+    """
+    state_stub = MagicMock()
+    state_stub.current_date = date
+    state_stub.actor_cursors = {}
+    return SimClock(state_stub)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. DEPARTURE CLOCK — timestamp correctness
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_departure_simevent_timestamp_is_early_morning(lifecycle):
+    """
+    _execute_departure calls clock.schedule_meeting([name], min_hour=9,
+    max_hour=9, duration_mins=15).  With a real SimClock the returned datetime
+    must be 09:00 on the current sim date — confirming the degenerate
+    min_hour==max_hour range produces a valid, not an erroring, result.
+    """
+    mgr, gd, org_chart, all_names, state = lifecycle
+    state.jira_tickets     = []
+    state.active_incidents = []
+
+    sim_date = datetime(2026, 1, 5, 0, 0, 0)
+    clock    = _make_real_clock(sim_date)
+    clock.reset_to_business_start(all_names)
+
+    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
+               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    mgr._scheduled_departures = {5: [dep_cfg]}
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=clock)
+
+    departed_events = [
+        c.args[0] for c in mgr._mem.log_event.call_args_list
+        if c.args[0].type == "employee_departed"
+    ]
+    assert len(departed_events) == 1
+
+    stamped = datetime.fromisoformat(departed_events[0].timestamp)
+    # Must be on the correct calendar date
+    assert stamped.date() == sim_date.date(), (
+        f"Departure timestamp on wrong date: {stamped}"
+    )
+    # Must be within business hours (09:00 – 17:30)
+    assert stamped.hour >= 9, f"Departure timestamp before 09:00: {stamped}"
+    assert (stamped.hour, stamped.minute) <= (17, 30), (
+        f"Departure timestamp after 17:30: {stamped}"
+    )
+
+
+def test_departure_degenerate_hour_range_does_not_raise(lifecycle):
+    """
+    The call clock.schedule_meeting([name], min_hour=9, max_hour=9) uses an
+    identical min and max hour. This must not raise a ValueError from randint
+    and must return a usable datetime.
+
+    This is a targeted regression guard for the latent crash described in the
+    gap analysis.
+    """
+    mgr, gd, org_chart, all_names, state = lifecycle
+    state.jira_tickets     = []
+    state.active_incidents = []
+
+    clock = _make_real_clock(datetime(2026, 1, 5, 0, 0, 0))
+    clock.reset_to_business_start(all_names)
+
+    dep_cfg = {"name": "Bob", "reason": "layoff", "role": "Engineer",
+               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    mgr._scheduled_departures = {5: [dep_cfg]}
+
+    try:
+        mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=clock)
+    except ValueError as e:
+        pytest.fail(
+            f"process_departures raised ValueError with degenerate hour range: {e}"
+        )
+
+    assert not gd.G.has_node("Bob"), "Bob should have been removed from the graph"
+
+
+def test_departure_and_hire_same_day_timestamps_are_in_business_hours(lifecycle):
+    """
+    When a departure and a hire both fire on the same day, both SimEvent
+    timestamps must be valid ISO strings that fall within business hours
+    (09:00–17:30) on the correct calendar date.
+
+    Ordering between departure and hire is NOT guaranteed by the code —
+    each call to schedule_meeting only sees its own single actor's cursor,
+    so they are independent. This test checks each event's own validity
+    rather than asserting a cross-event ordering that doesn't exist.
+    """
+    mgr, gd, org_chart, all_names, state = lifecycle
+    state.jira_tickets     = []
+    state.active_incidents = []
+
+    sim_date = datetime(2026, 1, 5, 0, 0, 0)
+    clock    = _make_real_clock(sim_date)
+    clock.reset_to_business_start(all_names + ["Taylor"])
+
+    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
+               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
+                "expertise": ["Python"], "style": "methodical", "tenure": "new",
+                "day": 5}
+    mgr._scheduled_departures = {5: [dep_cfg]}
+    mgr._scheduled_hires      = {5: [hire_cfg]}
+
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=clock)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=clock)
+
+    all_calls = mgr._mem.log_event.call_args_list
+
+    dep_evt  = next(c.args[0] for c in all_calls if c.args[0].type == "employee_departed")
+    hire_evt = next(c.args[0] for c in all_calls if c.args[0].type == "employee_hired")
+
+    for label, evt in [("departure", dep_evt), ("hire", hire_evt)]:
+        ts = datetime.fromisoformat(evt.timestamp)
+        assert ts.date() == sim_date.date(), (
+            f"{label} timestamp on wrong date: {ts}"
+        )
+        assert ts.hour >= 9, f"{label} timestamp before 09:00: {ts}"
+        assert (ts.hour, ts.minute) <= (17, 30), (
+            f"{label} timestamp after 17:30: {ts}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. HIRE CLOCK — timestamp correctness
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_hire_simevent_timestamp_not_before_0930(lifecycle):
+    """
+    _execute_hire post-corrects the hire timestamp to be ≥ 09:30 when
+    schedule_meeting returns a minute < 30 at 09:xx.
+
+    With a real SimClock we cannot guarantee which minute slot is chosen, so
+    we run 10 trials and assert every resulting timestamp respects ≥ 09:30.
+    """
+    mgr_orig, gd_orig, org_chart_orig, all_names_orig, state_orig = lifecycle
+
+    for i in range(10):
+        # Re-use the lifecycle fixture data but with a fresh manager each trial
+        import networkx as nx
+        from graph_dynamics import GraphDynamics
+
+        all_names = ["Alice", "Carol"]  # smaller roster to keep setup fast
+        G = nx.Graph()
+        for n in all_names:
+            G.add_node(n, dept="Engineering", is_lead=(n == "Alice"), external=False)
+        G.add_edge("Alice", "Carol", weight=5.0)
+
+        config = {
+            "org_lifecycle": {},
+            "graph_dynamics": {},
+            "personas": {n: {"style": "direct", "expertise": [], "tenure": "1y", "stress": 20} for n in all_names},
+            "org_chart": {"Engineering": list(all_names)},
+            "leads": {"Engineering": "Alice"},
+        }
+        from org_lifecycle import OrgLifecycleManager
+        gd = GraphDynamics(G, config)
+        mgr = OrgLifecycleManager(
+            config=config, graph_dynamics=gd,
+            mem=MagicMock(), org_chart=config["org_chart"],
+            personas=config["personas"], all_names=list(all_names),
+            leads=config["leads"],
+        )
+
+        state = MagicMock()
+        state.new_hires = {}
+
+        sim_date = datetime(2026, 1, 5, 0, 0, 0)
+        clock    = _make_real_clock(sim_date)
+        clock.reset_to_business_start(all_names)
+
+        hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
+                    "expertise": ["Python"], "style": "methodical", "tenure": "new",
+                    "day": 5}
+        mgr._scheduled_hires = {5: [hire_cfg]}
+        mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=clock)
+
+        hire_events = [
+            c.args[0] for c in mgr._mem.log_event.call_args_list
+            if c.args[0].type == "employee_hired"
+        ]
+        assert len(hire_events) == 1, f"Trial {i}: expected 1 hire event"
+
+        stamped = datetime.fromisoformat(hire_events[0].timestamp)
+        assert not (stamped.hour == 9 and stamped.minute < 30), (
+            f"Trial {i}: hire timestamp {stamped} is before 09:30 — "
+            "post-correction in _execute_hire did not fire"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. CENTRALITY VACUUM — timestamp field correctness
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
+    """
+    _apply_centrality_vacuum receives `timestamp_iso` (a pre-formatted string)
+    via a parameter misleadingly named `clock`. The resulting SimEvent's
+    timestamp field must be a parseable ISO-8601 string, not a raw clock
+    object or None.
+
+    Topology: Bob bridges a left triangle (Alice–Carol–Dave) to a right pair
+    (Eve–Frank), with a single thin back-channel Dave–Frank that keeps the
+    graph connected after Bob is removed. Dave and Frank then become the sole
+    path between the two sides, so their betweenness centrality increases
+    and stress_hit clears the int(delta * multiplier) floor.
+
+    A simple linear chain does NOT work here: when the bridge node is removed
+    from a chain, the graph splits into disconnected components, all remaining
+    nodes drop to zero betweenness, and no positive delta is produced. The
+    graph must stay connected after the departure for the vacuum to fire.
+    """
+    import networkx as nx
+    from graph_dynamics import GraphDynamics
+    from org_lifecycle import OrgLifecycleManager
+
+    nodes = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"]
+    G = nx.Graph()
+    for n in nodes:
+        G.add_node(n, dept="Engineering", is_lead=(n == "Alice"), external=False)
+    # Left triangle — stays intact after Bob leaves
+    G.add_edge("Alice", "Carol", weight=8.0)
+    G.add_edge("Alice", "Dave",  weight=8.0)
+    G.add_edge("Carol", "Dave",  weight=8.0)
+    # Right pair
+    G.add_edge("Eve",   "Frank", weight=8.0)
+    # Bob is the primary bridge left↔right
+    G.add_edge("Bob",   "Alice", weight=8.0)
+    G.add_edge("Bob",   "Eve",   weight=8.0)
+    # Thin back-channel — keeps graph connected so Dave/Frank gain centrality
+    G.add_edge("Dave",  "Frank", weight=0.1)
+
+    config = {
+        # High multiplier ensures int(delta * multiplier) >= 1 even for small deltas
+        "org_lifecycle": {"centrality_vacuum_stress_multiplier": 1000},
+        "graph_dynamics": {},
+        "personas": {n: {"style": "direct", "expertise": [], "tenure": "1y", "stress": 25}
+                     for n in nodes},
+        "org_chart": {"Engineering": list(nodes)},
+        "leads": {"Engineering": "Alice"},
+    }
+    gd  = GraphDynamics(G, config)
+    mem = MagicMock()
+
+    mgr = OrgLifecycleManager(
+        config=config, graph_dynamics=gd, mem=mem,
+        org_chart=config["org_chart"], personas=config["personas"],
+        all_names=list(nodes), leads=config["leads"],
+    )
+    for n in nodes:
+        gd._stress[n] = 25
+
+    state = MagicMock()
+    state.jira_tickets     = []
+    state.active_incidents = []
+
+    sim_date = datetime(2026, 1, 5, 0, 0, 0)
+    clock    = _make_real_clock(sim_date)
+    clock.reset_to_business_start(nodes)
+
+    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
+               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    mgr._scheduled_departures = {5: [dep_cfg]}
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=clock)
+
+    vacuum_events = [
+        c.args[0] for c in mem.log_event.call_args_list
+        if c.args[0].type == "knowledge_gap_detected"
+        and c.args[0].facts.get("trigger") == "centrality_vacuum"
+    ]
+
+    assert len(vacuum_events) >= 1, (
+        "Expected at least one centrality_vacuum SimEvent. "
+        "Dave and Frank must absorb Bob's bridging load via the back-channel."
+    )
+
+    for evt in vacuum_events:
+        ts = evt.timestamp
+        assert isinstance(ts, str), (
+            f"centrality_vacuum SimEvent.timestamp is {type(ts)}, expected str"
+        )
+        try:
+            datetime.fromisoformat(ts)
+        except (ValueError, TypeError) as e:
+            pytest.fail(
+                f"centrality_vacuum SimEvent.timestamp '{ts}' is not valid ISO-8601: {e}"
+            )
