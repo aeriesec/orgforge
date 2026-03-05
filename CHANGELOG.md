@@ -6,6 +6,15 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.1] — 2026-03-04
+
+### Changed
+
+- remove doubled inc.days_active += 1 call
+- remove duplicate \_day_planner.plan() call
+
+---
+
 ## [v0.3.0] — 2026-03-04
 
 ### Added
