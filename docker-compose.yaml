@@ -109,7 +109,7 @@ services:
       - ./export:/app/export # Simulation output — persists on host
       - ./config/config.yaml:/app/config.yaml # Config — edit on host, picked up at runtime
       - ./src:/app/src
-    command: ["python", "flow.py"]
+    command: ["python", "src/flow.py"]
 
     extra_hosts:
       - "host.docker.internal:host-gateway"
