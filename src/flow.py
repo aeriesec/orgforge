@@ -34,6 +34,7 @@ from langchain_ollama import OllamaLLM
 
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
+from sim_clock import SimClock
 from org_lifecycle import (
          OrgLifecycleManager,
          patch_validator_for_lifecycle,
@@ -117,12 +118,13 @@ def build_llm(model_key: str):
 
     if _PROVIDER == "bedrock":
         try:
-            from langchain_aws import ChatBedrock
+            from crewai import LLM
             region = _PRESET.get("aws_region", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
-            llm = ChatBedrock(
-                model_id=model,
+            llm = LLM(
+                model=model,
                 region_name=region,
-                model_kwargs={"max_tokens": 4096, "temperature": 0.7},
+                max_tokens=4096,
+                temperature=0.7,
             )
             logger.info(f"[config] {model_key} → Bedrock/{model} (region={region})")
             return llm
@@ -265,6 +267,7 @@ class State(BaseModel):
     sprint: SprintState = Field(default_factory=SprintState)
     daily_theme: str = ""
     persona_stress: Dict[str, int] = {}
+    actor_cursors: Dict[str, Any] = Field(default_factory=dict)
 
     # Daily counters — reset each morning, read at end of day
     daily_incidents_opened:   int = 0
@@ -325,7 +328,7 @@ class GitSimulator:
         self._mem = mem
         self._graph = social_graph
 
-    def create_pr(self, author: str, ticket_id: str, title: str, reviewers: Optional[List[str]] = None) -> Dict:
+    def create_pr(self, author: str, ticket_id: str, title: str,timestamp: str, reviewers: Optional[List[str]] = None) -> Dict:
         pr_id = f"PR-{len(self._state.pr_registry) + 100}"
         
         if not reviewers:
@@ -345,7 +348,7 @@ class GitSimulator:
             "pr_id": pr_id, "ticket_id": ticket_id, "title": title,
             "author": author, "author_email": email_of(author),
             "reviewers": reviewers, "status": "open", "comments": [],
-            "created_day": self._state.day,
+            "created_at": timestamp,
         }
         path = f"{BASE}/git/prs/{pr_id}.json"
         save_json(path, pr)
@@ -353,6 +356,7 @@ class GitSimulator:
         self._mem.embed_artifact(
             id=pr_id, type="pr", title=title, content=json.dumps(pr),
             day=self._state.day, date=str(self._state.current_date.date()),
+            timestamp=timestamp,
             metadata={"author": author, "ticket_id": ticket_id},
         )
         self._state.daily_artifacts_created += 1
@@ -427,10 +431,12 @@ class Flow(Flow[State]):
         self.social_graph   = self.graph_dynamics.G
         self._git = GitSimulator(self.state, self._mem, self.social_graph)
         self._day_planner = DayPlannerOrchestrator(CONFIG, WORKER_MODEL, PLANNER_MODEL)
+        self._clock = SimClock(self.state)
         self._normal_day = NormalDayHandler(
             config=CONFIG, mem=self._mem, state=self.state,
             graph_dynamics=self.graph_dynamics, social_graph=self.social_graph,
             git=self._git, worker_llm=WORKER_MODEL, planner_llm=PLANNER_MODEL,
+            clock=self._clock
         )
         self._lifecycle = OrgLifecycleManager(
             config=CONFIG,
@@ -535,8 +541,11 @@ class Flow(Flow[State]):
         tech_task = Task(description=tech_prompt, expected_output=f"{tech_count} full Markdown pages separated by '---PAGE BREAK---'.", agent=historian)
         biz_task  = Task(description=biz_prompt,  expected_output="Two full Markdown pages separated by '---PAGE BREAK---'.", agent=historian)
 
-        crew   = Crew(agents=[historian], tasks=[tech_task, biz_task], verbose=False, llm=PLANNER_MODEL)
+        crew   = Crew(agents=[historian], tasks=[tech_task, biz_task], verbose=False)
         result = str(crew.kickoff())
+
+        from datetime import datetime, time
+        genesis_time = datetime.combine(self.state.current_date.date(), time(8, 0)).isoformat()
 
         for raw in result.split("---PAGE BREAK---"):
             ids = re.findall(r"CONF-[A-Z]+-\d+", raw)
@@ -555,8 +564,11 @@ class Flow(Flow[State]):
                 day=self.state.day, date=str(self.state.current_date.date()),
                 metadata={"authors": str(eng_members)},
             )
+
+            
             self._mem.log_event(SimEvent(
-                type="confluence_created", day=self.state.day, date=str(self.state.current_date.date()),
+                type="confluence_created", timestamp=genesis_time,
+                day=self.state.day, date=str(self.state.current_date.date()),
                 actors=eng_members, artifact_ids={"confluence": doc_id},
                 facts={"title": title, "phase": "genesis"},
                 summary=f"Archive page {doc_id} created: {title}", tags=["genesis", "confluence"],
@@ -574,9 +586,10 @@ class Flow(Flow[State]):
                 self.state.current_date += timedelta(days=1)
                 continue
 
+            self._clock.reset_to_business_start(ALL_NAMES)
             date_str = str(self.state.current_date.date())
-            departures = self._lifecycle.process_departures(self.state.day, date_str, self.state)
-            hires      = self._lifecycle.process_hires(self.state.day, date_str, self.state)
+            departures = self._lifecycle.process_departures(self.state.day, date_str, self.state, self._clock)
+            hires      = self._lifecycle.process_hires(self.state.day, date_str, self.state, self._clock)
 
             if departures or hires:
                 # Patch the day planner's validator to reflect the new roster
@@ -585,6 +598,7 @@ class Flow(Flow[State]):
             org_plan = self._day_planner.plan(
                 self.state, self._mem, self.graph_dynamics,
                 lifecycle_context=self._lifecycle.get_roster_context(),
+                clock=self._clock
             )
             self.state.daily_theme  = org_plan.org_theme
             self.state.org_day_plan = org_plan
@@ -620,6 +634,9 @@ class Flow(Flow[State]):
         raw_themes = CONFIG.get("sprint_ticket_themes", ["Refactor legacy system", "Add retry logic", "Fix errors", "QA regression"])
         ticket_themes = [render_template(t) for t in raw_themes]
         n_tickets = CONFIG["simulation"].get("sprint_tickets_per_planning", 4)
+
+        meeting_time = self._clock.schedule_meeting(attendees, min_hour=9, max_hour=11)
+        timestamp_str = meeting_time.isoformat()
         
         new_tickets = []
         for theme in random.sample(ticket_themes, min(n_tickets, len(ticket_themes))):
@@ -629,6 +646,8 @@ class Flow(Flow[State]):
             ticket = {
                 "id": tid, "title": theme, "status": "To Do", "assignee": assignee,
                 "sprint": self.state.sprint.sprint_number, "story_points": pts, "linked_prs": [],
+                "created_at": timestamp_str,
+                "updated_at": timestamp_str
             }
             self.state.jira_tickets.append(ticket)
             self.state.sprint.tickets_in_sprint.append(tid)
@@ -642,8 +661,9 @@ class Flow(Flow[State]):
             "total_points": sum(t["story_points"] for t in new_tickets),
             "sprint_goal": render_template(CONFIG.get("sprint_goal_template", "Stabilize {legacy_system} and deliver sprint features")),
         }
+
         self._mem.log_event(SimEvent(
-            type="sprint_planned", day=self.state.day, date=str(self.state.current_date.date()),
+            type="sprint_planned", day=self.state.day, date=str(self.state.current_date.date()), timestamp=timestamp_str,
             actors=attendees, artifact_ids={"jira_tickets": json.dumps([t["id"] for t in new_tickets])},
             facts=sprint_facts, summary=f"Sprint #{sprint_facts['sprint_number']} planned.", tags=["sprint", "planning"],
         ))
@@ -657,7 +677,13 @@ class Flow(Flow[State]):
     def _handle_standup(self):
         logger.info(f"  [bold blue]☕ Standup[/bold blue]")
         attendees = random.sample(ALL_NAMES, min(8, len(ALL_NAMES)))
-        ctx = self._mem.context_for_prompt("current sprint active tickets and incidents", n=4, as_of_day=self.state.day)
+        meeting_time = self._clock.schedule_meeting(attendees, min_hour=9, max_hour=10, duration_mins=15)
+        meeting_time_iso = meeting_time.isoformat()
+        ctx = self._mem.context_for_prompt(
+            "current sprint active tickets and incidents", 
+            n=4, 
+            as_of_time=meeting_time_iso
+        )
         
         profiles = []
         for name in attendees:
@@ -686,7 +712,9 @@ class Flow(Flow[State]):
         slack_path = f"{BASE}/slack/channels/standup/{date_str}.json"
         save_json(slack_path, messages)
         self.state.slack_threads.append({"date": date_str, "channel": "standup", "message_count": len(messages)})
-        self._mem.log_event(SimEvent(type="standup", day=self.state.day, date=date_str, actors=[m["user"] for m in messages], artifact_ids={"slack": slack_path}, facts={"attendee_count": len(messages)}, summary=f"Standup: {len(messages)} attendees shared updates.", tags=["standup"]))
+        self._mem.log_event(SimEvent(type="standup", timestamp=meeting_time_iso, day=self.state.day, date=date_str, actors=[m["user"] for m in messages], 
+                                     artifact_ids={"slack": slack_path}, facts={"attendee_count": len(messages)}, 
+                                     summary=f"Standup: {len(messages)} attendees shared updates.", tags=["standup"]))
 
         self._record_daily_actor(*[m["user"] for m in messages])
         self._record_daily_event("standup")
@@ -695,7 +723,11 @@ class Flow(Flow[State]):
     def _handle_retrospective(self):
         logger.info(f"  [bold blue]🔄 Retro — Sprint #{self.state.sprint.sprint_number}[/bold blue]")
         conf_id = next_conf_id(self.state, "RETRO")
-        ctx = self._mem.context_for_prompt(f"sprint {self.state.sprint.sprint_number} incidents velocity", n=4, as_of_day=self.state.day)
+
+        attendees = ALL_NAMES
+        meeting_time = self._clock.schedule_meeting(attendees, min_hour=14, max_hour=16, duration_mins=60)
+        meeting_time_iso = meeting_time.isoformat()
+        ctx = self._mem.context_for_prompt(f"sprint {self.state.sprint.sprint_number} incidents velocity", n=4, as_of_time=meeting_time_iso)
         scrum_master = resolve_role("scrum_master")
         historian = Agent(role="Scrum Master", goal="Write retro.", backstory=persona_backstory(scrum_master, self._mem, graph_dynamics=self.graph_dynamics), llm=PLANNER_MODEL)
         task = Task(description=f"Write retro Confluence {conf_id} for Sprint #{self.state.sprint.sprint_number}.\nContext:\n{ctx}\nSections: What went well, What didn't, Action items.", expected_output="Markdown.", agent=historian)
@@ -705,7 +737,9 @@ class Flow(Flow[State]):
         entry = {"id": conf_id, "title": f"Retro Sprint #{self.state.sprint.sprint_number}", "summary": "Sprint Retrospective", "path": path}
         self.state.confluence_pages.append(entry)
         self._embed_and_count(id=conf_id, type="confluence", title=entry["title"], content=content, day=self.state.day, date=str(self.state.current_date.date()))
-        self._mem.log_event(SimEvent(type="retrospective", day=self.state.day, date=str(self.state.current_date.date()), actors=list(LEADS.values()), artifact_ids={"confluence": conf_id}, facts={"sprint_number": self.state.sprint.sprint_number}, summary=f"Sprint #{self.state.sprint.sprint_number} retrospective.", tags=["retrospective", "sprint"]))
+        self._mem.log_event(SimEvent(type="retrospective", timestamp=meeting_time_iso, day=self.state.day, date=str(self.state.current_date.date()), 
+                            actors=list(LEADS.values()), artifact_ids={"confluence": conf_id}, facts={"sprint_number": self.state.sprint.sprint_number}, 
+                            summary=f"Sprint #{self.state.sprint.sprint_number} retrospective.", tags=["retrospective", "sprint"]))
         self.state.sprint.sprint_number += 1
         self.state.sprint.tickets_in_sprint = []
 
@@ -720,6 +754,10 @@ class Flow(Flow[State]):
         incident_lead = resolve_role("incident_commander")
         eng_peer      = next((n for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), []) if n != on_call), on_call)
 
+        incident_start = self._clock.tick_system(min_mins=30, max_mins=240)
+        incident_start_iso = incident_start.isoformat()
+
+        self._clock.sync_to_system([on_call])
 
         rc_agent = Agent(role="Senior Engineer", goal="Diagnose root cause.", backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics), llm=PLANNER_MODEL)
         rc_task  = Task(description=f"Theme: {self.state.daily_theme}\nWrite ONE specific technical root cause (max 20 words).", expected_output="One sentence.", agent=rc_agent)
@@ -737,13 +775,15 @@ class Flow(Flow[State]):
             day=self.state.day,
             date_str=str(self.state.current_date.date()),
             state=self.state,
+            timestamp=incident_start_iso
         )
 
         title  = f"{LEGACY['name']}: {self.state.daily_theme[:60]}"
         ticket = {"id": ticket_id, "title": title, "status": "In Progress", "assignee": on_call, "root_cause": root_cause, "linked_prs": []}
         self.state.jira_tickets.append(ticket)
         save_json(f"{BASE}/jira/{ticket_id}.json", ticket)
-        self._embed_and_count(id=ticket_id, type="jira", title=title, content=json.dumps(ticket), day=self.state.day, date=str(self.state.current_date.date()))
+        self._embed_and_count(id=ticket_id, type="jira", title=title, content=json.dumps(ticket), day=self.state.day, 
+                              date=str(self.state.current_date.date()), timestamp=incident_start_iso)
 
         inc = ActiveIncident(ticket_id=ticket_id, title=title, day_started=self.state.day, involves_gap_knowledge=involves_gap, root_cause=root_cause)
         self.state.active_incidents.append(inc)
@@ -753,12 +793,14 @@ class Flow(Flow[State]):
         self._emit_bot_message(
             "system-alerts", 
             "Datadog", 
-            f"🚨 [CRITICAL] Anomaly detected: {root_cause[:40]}... Error rate spiked 400%. System health dropped to {self.state.system_health}."
+            f"🚨 [CRITICAL] Anomaly detected: {root_cause[:40]}... Error rate spiked 400%. System health dropped to {self.state.system_health}.",
+            incident_start_iso
         )
         self._emit_bot_message(
             "incidents", 
             "PagerDuty", 
-            f"📞 Paging on-call engineer: {on_call}. Incident linked to [{ticket_id}]."
+            f"📞 Paging on-call engineer: {on_call}. Incident linked to [{ticket_id}].",
+            incident_start_iso
         )
         self.state.system_health = max(0, self.state.system_health - 15)
 
@@ -771,7 +813,8 @@ class Flow(Flow[State]):
             self._handle_external_contact(inc, contact)
 
         self._mem.log_event(SimEvent(
-            type="incident_opened", day=self.state.day, date=str(self.state.current_date.date()),
+            type="incident_opened", timestamp=incident_start_iso,
+            day=self.state.day, date=str(self.state.current_date.date()),
             actors=[on_call, incident_lead],
             artifact_ids={"jira": ticket_id},
             facts={"title": title, "root_cause": root_cause, "involves_gap": involves_gap},
@@ -790,7 +833,9 @@ class Flow(Flow[State]):
             domain_keywords=gap_kw if involves_gap else None,
         )
         self._mem.log_event(SimEvent(
-            type="escalation_chain", day=self.state.day,
+            type="escalation_chain", 
+            timestamp=incident_start_iso,
+            day=self.state.day,
             date=str(self.state.current_date.date()),
             actors=[n for n, _ in chain.chain],
             artifact_ids={"jira": ticket_id},
@@ -808,7 +853,9 @@ class Flow(Flow[State]):
                 if k.lower() in self.state.daily_theme.lower()
             ]
             self._mem.log_event(SimEvent(
-                type="knowledge_gap_detected", day=self.state.day, date=str(self.state.current_date.date()),
+                type="knowledge_gap_detected", 
+                timestamp=incident_start_iso,
+                day=self.state.day, date=str(self.state.current_date.date()),
                 actors=[on_call, eng_peer],
                 artifact_ids={"jira": ticket_id},
                 facts={"gap_area": gap_areas or [LEGACY["name"]], "involves_gap": True},
@@ -821,11 +868,20 @@ class Flow(Flow[State]):
                            if "eng" in k.lower()), None)
            if eng_key:
                eng_dept_plan = self.state.org_day_plan.dept_plans[eng_key]
+
+               # 1. Primary rolls their independent time (2.0 to 5.5 hours)
+               primary_hrs_lost = round(random.uniform(2.0, 5.5), 1)
+               
+               # 2. Peer rolls a DEPENDENT time (e.g., 20% to 60% of the primary's time)
+               # This guarantees the peer never works longer than the primary.
+               peer_fraction = random.uniform(0.2, 0.6)
+               peer_hrs_lost = round(primary_hrs_lost * peer_fraction, 1)
+
                for ep in eng_dept_plan.engineer_plans:
                    if ep.name in [on_call, incident_lead]:
-                       ep.apply_incident_pressure(inc.title, hrs_lost=3.5)
+                       ep.apply_incident_pressure(inc.title, hrs_lost=primary_hrs_lost)
                    elif ep.name == eng_peer:
-                       ep.apply_incident_pressure(inc.title, hrs_lost=1.5)
+                       ep.apply_incident_pressure(inc.title, hrs_lost=peer_hrs_lost)
 
         logger.info(f"    [red]🚨 {ticket_id}:[/red] {root_cause[:65]}")
 
@@ -834,6 +890,8 @@ class Flow(Flow[State]):
         on_call  = resolve_role("on_call_engineer")
         eng_peer = next((n for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), []) if n != on_call), on_call)
 
+        cron_time_iso = self._clock.now("system").isoformat()
+
         for inc in self.state.active_incidents:
             if inc.stage == "detected":
                 inc.stage = "investigating"
@@ -841,11 +899,13 @@ class Flow(Flow[State]):
 
             elif inc.stage == "investigating":
                 inc.stage = "fix_in_progress"
-                pr = self._git.create_pr(author=on_call, ticket_id=inc.ticket_id, title=f"[{inc.ticket_id}] Fix: {inc.root_cause[:60]}")
+                pr = self._git.create_pr(author=on_call, ticket_id=inc.ticket_id, title=f"[{inc.ticket_id}] Fix: {inc.root_cause[:60]}",
+                                          timestamp=cron_time_iso)
                 self._emit_bot_message(
                     "engineering",
                     "GitHub",
-                    f"🛠️ {on_call} opened PR {pr['pr_id']}: [{inc.ticket_id}] Fix. Reviewers requested: {', '.join(pr['reviewers'])}."
+                    f"🛠️ {on_call} opened PR {pr['pr_id']}: [{inc.ticket_id}] Fix. Reviewers requested: {', '.join(pr['reviewers'])}.",
+                    cron_time_iso
                 )
                 inc.pr_id = pr["pr_id"]
                 logger.info(f"    [yellow]🔧 {inc.ticket_id}:[/yellow] {pr['pr_id']} opened.")
@@ -868,14 +928,16 @@ class Flow(Flow[State]):
                 self._emit_bot_message(
                     "engineering",
                     "GitHub Actions",
-                    f"✅ Build passed for PR {inc.pr_id}. Deploying to production..."
+                    f"✅ Build passed for PR {inc.pr_id}. Deploying to production...",
+                    cron_time_iso
                 )
                 self.state.system_health = min(100, self.state.system_health + 20)
                 self._write_postmortem(inc)
                 self.state.resolved_incidents.append(inc.ticket_id)
                 self.state.daily_incidents_resolved += 1
                 self._mem.log_event(SimEvent(
-                    type="incident_resolved", day=self.state.day, date=str(self.state.current_date.date()),
+                    type="incident_resolved", timestamp=cron_time_iso,
+                    day=self.state.day, date=str(self.state.current_date.date()),
                     actors=[on_call, eng_peer], artifact_ids={"jira": inc.ticket_id, "pr": inc.pr_id or ""},
                     facts={"root_cause": inc.root_cause, "duration_days": inc.days_active},
                     summary=f"{inc.ticket_id} resolved in {inc.days_active}d.", tags=["incident_resolved"]
@@ -893,6 +955,11 @@ class Flow(Flow[State]):
         on_call  = resolve_role("postmortem_writer")
         eng_peer = next((n for n in ORG_CHART.get(CONFIG["roles"].get("postmortem_writer", ""), []) if n != on_call), on_call)
         conf_id  = next_conf_id(self.state, "ENG")
+
+        pm_duration_hours = random.randint(60, 180) / 60.0
+        artifact_time, new_cursor = self._clock.advance_actor(on_call, hours=pm_duration_hours)
+        artifact_time_iso = artifact_time.isoformat()
+
         writer   = Agent(role="Senior Engineer", goal="Write a postmortem.", backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics), llm=PLANNER_MODEL)
         task = Task(
             description=f"Write Confluence postmortem for {inc.ticket_id}.\nActual Root Cause: {inc.root_cause}\nDuration: {inc.days_active} days.\nFormat as Markdown.",
@@ -904,16 +971,19 @@ class Flow(Flow[State]):
         save_md(path, full_content)
         entry = {"id": conf_id, "title": f"Postmortem: {inc.ticket_id}", "path": path}
         self.state.confluence_pages.append(entry)
-        self._embed_and_count(id=conf_id, type="confluence", title=entry["title"], content=full_content, day=self.state.day, date=str(self.state.current_date.date()))
+        self._embed_and_count(id=conf_id, type="confluence", title=entry["title"], content=full_content, day=self.state.day, date=str(self.state.current_date.date()),
+                               timestamp=artifact_time_iso)
         self._mem.log_event(SimEvent(
-            type="postmortem_created", day=self.state.day, date=str(self.state.current_date.date()),
+            type="postmortem_created", 
+            timestamp=artifact_time_iso,
+            day=self.state.day, date=str(self.state.current_date.date()),
             actors=[on_call, eng_peer],
             artifact_ids={"confluence": conf_id, "jira": inc.ticket_id}, facts={"root_cause": inc.root_cause},
             summary=f"Postmortem {conf_id} written for {inc.ticket_id}.", tags=["postmortem"]
         ))
         logger.info(f"    [green]📄 Postmortem Generated:[/green] {conf_id}")
 
-    def _emit_bot_message(self, channel: str, bot_name: str, text: str):
+    def _emit_bot_message(self, channel: str, bot_name: str, text: str, timestamp: str):
         """Injects a contextual bot message into a specific Slack channel."""
         date_str = str(self.state.current_date.date())
         slack_path = f"{BASE}/slack/channels/{channel}/{date_str}_bots.json"
@@ -928,10 +998,7 @@ class Flow(Flow[State]):
             "user": bot_name, 
             "email": f"{bot_name.lower()}@bot.{COMPANY_DOMAIN}",
             "text": text, 
-            "ts": self.state.current_date.replace(
-                hour=random.randint(8, 17), 
-                minute=random.randint(0, 59)
-            ).isoformat(),
+            "ts": timestamp,
             "is_bot": True
         })
         
@@ -943,7 +1010,11 @@ class Flow(Flow[State]):
         prefix, title = random.choice(rendered)
         conf_id = next_conf_id(self.state, prefix)
         author  = random.choice(ALL_NAMES)
-        ctx     = self._mem.context_for_prompt(title, n=3, as_of_day=self.state.day)
+        session_mins = random.randint(30, 90)
+        session_hours = session_mins / 60.0
+        artifact_time, new_cursor = self._clock.advance_actor(author, hours=session_hours)
+        artifact_time_iso = artifact_time.isoformat()
+        ctx     = self._mem.context_for_prompt(title, n=3, as_of_time=artifact_time_iso)
         
         writer = Agent(role="Corporate Writer", goal="Write documentation.", backstory=f"You are {author}.", llm=PLANNER_MODEL)
         task = Task(description=f"Write Confluence page titled '{title}'.\nContext:\n{ctx}\nFormat as Markdown.", expected_output="Markdown.", agent=writer)
@@ -957,6 +1028,7 @@ class Flow(Flow[State]):
             day=self.state.day,
             date_str=str(self.state.current_date.date()),
             state=self.state,
+            timestamp=artifact_time_iso
         )
         
         path = f"{BASE}/confluence/general/{conf_id}.md"
@@ -964,7 +1036,9 @@ class Flow(Flow[State]):
         entry = {"id": conf_id, "title": title, "path": path}
         self.state.confluence_pages.append(entry)
         self._embed_and_count(id=conf_id, type="confluence", title=title, content=full_content, day=self.state.day, date=str(self.state.current_date.date()))
-        self._mem.log_event(SimEvent(type="confluence_created", day=self.state.day, date=str(self.state.current_date.date()), actors=[author], artifact_ids={"confluence": conf_id}, facts={"title": title}, summary=f"{author} created {conf_id}.", tags=["confluence"]))
+        self._mem.log_event(SimEvent(type="confluence_created", timestamp=artifact_time_iso,
+                                     day=self.state.day, date=str(self.state.current_date.date()), 
+                                     actors=[author], artifact_ids={"confluence": conf_id}, facts={"title": title}, summary=f"{author} created {conf_id}.", tags=["confluence"]))
         logger.info(f"    [dim]📝 Generated Confluence Page: {conf_id} — {title}[/dim]")
 
     # ─── END OF DAY ───────────────────────────
@@ -979,9 +1053,17 @@ class Flow(Flow[State]):
 
         self.state.morale_history.append(self.state.team_morale)
 
+        all_cursors = [self._clock.now(a) for a in ALL_NAMES]
+        latest_time_worked = max(all_cursors) if all_cursors else self.state.current_date
+
+        # Ensure the summary doesn't happen before 17:30
+        eod_baseline = self.state.current_date.replace(hour=17, minute=30, second=0)
+        summary_time = max(latest_time_worked, eod_baseline)
+        housekeeping_time = summary_time + timedelta(minutes=1)
+
         # ── end_of_day event (unchanged) ─────────────────────────────────────────
         self._mem.log_event(SimEvent(
-            type="end_of_day", day=self.state.day, date=date_str, actors=[], artifact_ids={},
+            type="end_of_day", timestamp=housekeeping_time.isoformat(), day=self.state.day, date=date_str, actors=[], artifact_ids={},
             facts={"morale": self.state.team_morale, "system_health": self.state.system_health},
             summary=f"Day {self.state.day} end.", tags=["eod"]
         ))
@@ -1014,6 +1096,7 @@ class Flow(Flow[State]):
         # ── Enriched day_summary SimEvent ────────────────────────────────────────
         self._mem.log_event(SimEvent(
             type="day_summary",
+            timestamp=housekeeping_time.isoformat(),
             day=self.state.day,
             date=date_str,
             actors=unique_actors,                          # populated — was always []
@@ -1087,6 +1170,7 @@ class Flow(Flow[State]):
                 )
                 self._mem.log_event(SimEvent(
                     type="escalation_chain",
+                    timestamp=housekeeping_time.isoformat(),
                     day=self.state.day,
                     date=date_str,
                     actors=dept_members[:2],
@@ -1197,6 +1281,13 @@ class Flow(Flow[State]):
         tone         = contact.get("summary_tone", "professional")
         date_str     = str(self.state.current_date.date())
 
+        participants = [liaison_name, display_name]
+        interaction_mins = random.randint(15, 45)
+        interaction_hours = interaction_mins / 60.0
+
+        start_time, end_time = self._clock.sync_and_advance(participants, hours=interaction_hours)
+        interaction_start_iso = start_time.isoformat()
+
         # Boost the edge between liaison and external node — they just talked
         external_node = contact["name"]
         if self.social_graph.has_edge(liaison_name, external_node):
@@ -1205,7 +1296,7 @@ class Flow(Flow[State]):
             )
 
         # Generate the Slack summary message
-        ctx = self._mem.context_for_prompt(inc.root_cause, n=2, as_of_day=self.state.day)
+        ctx = self._mem.context_for_prompt(inc.root_cause, n=2, as_of_time=interaction_start_iso)
 
         agent = Agent(
             role="Employee",
@@ -1262,6 +1353,7 @@ class Flow(Flow[State]):
         # SimEvent — this is what makes it retrievable as ground truth
         self._mem.log_event(SimEvent(
             type="external_contact_summarized",
+            timestamp=interaction_start_iso,
             day=self.state.day,
             date=date_str,
             actors=[liaison_name, external_node],

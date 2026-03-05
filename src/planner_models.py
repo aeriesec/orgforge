@@ -26,7 +26,7 @@ class AgendaItem:
                                 # "1on1", "async_question", "mentoring", "deep_work"
     description:   str          # human-readable, e.g. "Continue ORG-101 retry logic"
     related_id:    Optional[str] = None   # ticket ID, PR ID, or Confluence ID if applicable
-    collaborator:  Optional[str] = None   # another engineer this touches (drives Slack)
+    collaborator:  List[str] = field(default_factory=list)  # engineers this touches (drives Slack)
     estimated_hrs: float        = 2.0    # rough time weight — used to detect overload
     deferred:      bool         = False  # set True by incident pressure at runtime
     defer_reason:  Optional[str] = None

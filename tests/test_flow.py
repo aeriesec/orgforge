@@ -75,11 +75,11 @@ def test_memory_context_retrieval(mock_flow):
     mem._artifacts.estimated_document_count = MagicMock(return_value=10)
     mem._artifacts.aggregate = MagicMock(return_value=[])
     mem.recall_events = MagicMock(return_value=[
-        SimEvent(type="test", day=1, date="2026-01-01", actors=[], artifact_ids={}, facts={}, summary="Test Event")
+        SimEvent(type="test", day=1, date="2026-01-01", actors=[], artifact_ids={}, facts={}, summary="Test Event", timestamp="2026-03-05T13:33:51.027Z")
     ])
 
     mock_flow._mem.recall_events.return_value = [
-        SimEvent(type="test", day=1, date="2026-01-01", actors=[], artifact_ids={}, facts={}, summary="Test Event")
+        SimEvent(type="test", day=1, date="2026-01-01", actors=[], artifact_ids={}, facts={}, summary="Test Event", timestamp="2026-03-05T13:33:51.027Z")
     ]
     
     context = mem.context_for_prompt("server crash")
@@ -141,14 +141,15 @@ def test_temporal_memory_isolation(mock_flow):
     mock_cursor.limit.return_value = iter([])
     mem._events.find = MagicMock(return_value=mock_cursor)
 
-    mem.context_for_prompt("incident", as_of_day=5)
+    mem.context_for_prompt("incident", as_of_time="2026-03-05T13:33:51.027Z")
     
     args, kwargs = mem._artifacts.aggregate.call_args
     pipeline = args[0]
     
-    # Check if $match day <= 5 exists in the pipeline
-    has_temporal_filter = any("$match" in stage and "day" in stage["$match"] for stage in pipeline)
-    assert has_temporal_filter
+    vector_search_stage = next(s for s in pipeline if "$vectorSearch" in s)
+    assert "filter" in vector_search_stage["$vectorSearch"]
+    assert "timestamp" in vector_search_stage["$vectorSearch"]["filter"]
+    assert vector_search_stage["$vectorSearch"]["filter"]["timestamp"] == {"$lte": "2026-03-05T13:33:51.027Z"}
 
 def test_graph_interaction_boost(mock_flow):
     """Verifies that Slack interactions boost edge weights between participants."""
@@ -177,7 +178,7 @@ def test_git_simulator_reviewer_selection(mock_flow):
     mock_flow.social_graph.add_edge("Alice", "Bob", weight=10.0) 
     mock_flow.social_graph.add_edge("Alice", "Charlie", weight=1.0) 
     
-    pr = mock_flow._git.create_pr(author="Alice", ticket_id="TKT-1", title="Fixing stuff")
+    pr = mock_flow._git.create_pr(author="Alice", ticket_id="TKT-1", title="Fixing stuff", timestamp="2026-03-05T13:33:51.027Z")
     
     # The simulator should automatically pick Bob as the primary reviewer
     assert pr["reviewers"][0] == "Bob"
@@ -239,7 +240,8 @@ def test_memory_log_event():
     
     event = SimEvent(
         type="test_event", day=1, date="2026-01-01", 
-        actors=["Alice"], artifact_ids={}, facts={"foo": "bar"}, summary="Test"
+        actors=["Alice"], artifact_ids={}, facts={"foo": "bar"}, summary="Test",
+        timestamp="2026-03-05T13:33:51.027Z"
     )
     
     mem.log_event(event)
