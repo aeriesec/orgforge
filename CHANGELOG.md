@@ -6,6 +6,15 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.2] — 2026-03-04
+
+### Changed
+
+- Use requirements.txt instead of hard-coded requirements in Dockerfile
+- `docker-compose.py` should start the app from src/
+
+---
+
 ## [v0.3.1] — 2026-03-04
 
 ### Changed

@@ -26,30 +26,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ── Core Python dependencies ──────────────────────────────────
-# Installed explicitly rather than via -r requirements.txt so commented-out
-# cloud dep blocks in requirements.txt don't cause parse errors.
-RUN pip install --no-cache-dir \
-    "crewai>=0.28.0" \
-    "crewai-tools>=0.1.0" \
-    "langchain-community>=0.0.20" \
-    "pymongo>=4.6.0" \
-    "requests>=2.31.0" \
-    "pyyaml>=6.0" \
-    "pydantic>=2.0.0" \
-    "networkx>=3.0" \
-    "vaderSentiment>=3.3.2" \
-    "rich>=13.0.0" \
-    "ollama>=0.1.7"
+COPY requirements.txt .
+COPY requirements-cloud.txt .
 
-# ── Optional: cloud preset deps ───────────────────────────────
-# Only installed when INSTALL_CLOUD_DEPS=true.
-# Not needed for local_cpu or local_gpu presets.
+RUN pip install --no-cache-dir -r requirements.txt
+
 RUN if [ "$INSTALL_CLOUD_DEPS" = "true" ]; then \
-        pip install --no-cache-dir \
-            "boto3>=1.34.0" \
-            "langchain-aws>=0.1.0" \
-            "openai>=1.12.0"; \
+        pip install --no-cache-dir -r requirements-cloud.txt; \
     fi
 
 # ── Application code ──────────────────────────────────────────
