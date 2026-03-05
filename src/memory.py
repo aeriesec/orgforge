@@ -50,6 +50,7 @@ class SimEvent:
     type: str
     day: int
     date: str
+    timestamp: str
     actors: List[str]
     artifact_ids: Dict[str, str]
     facts: Dict[str, Any]
@@ -75,6 +76,7 @@ class SimEvent:
             type=d.get("type", ""),
             day=d.get("day", 0),
             date=d.get("date", ""),
+            timestamp=d.get("timestamp", ""),
             actors=d.get("actors", []),
             artifact_ids=d.get("artifact_ids", {}),
             facts=d.get("facts", {}),
@@ -279,7 +281,7 @@ class Memory:
                 },
                 {
                     "type": "filter",
-                    "path": "day"
+                    "path": "timestamp"
                 }
             ]
         }
@@ -312,7 +314,7 @@ class Memory:
 
     # ─── WRITE ────────────────────────────────
 
-    def embed_artifact(self, id: str, type: str, title: str, content: str, day: int, date: str, metadata: Optional[Dict] = None):
+    def embed_artifact(self, id: str, type: str, title: str, content: str, day: int, date: str, timestamp: str, metadata: Optional[Dict] = None):
         """Upsert artifact into MongoDB with vector embedding."""
         embed_text = f"{title}\n\n{content[:2000]}"
         vector = self._embedder.embed(embed_text)
@@ -324,6 +326,7 @@ class Memory:
             "content": content,
             "day": day,
             "date": date,
+            "timestamp": timestamp,
             "embedding": vector,
             "metadata": metadata or {}
         }
@@ -395,31 +398,35 @@ class Memory:
         self,
         query: str,
         n: int = 3,
-        as_of_day: Optional[int] = None,
+        as_of_time: Optional[str] = None
     ) -> List[SimEvent]:
         """
         Returns the n most relevant SimEvents for the query.
         If as_of_day is provided, restricts to events on or before that day.
         """
         query_filter = {}
-        if as_of_day is not None:
-            query_filter["day"] = {"$lte": as_of_day}
+        
+        # Apply the strict chronological cutoff
+        if as_of_time is not None:
+            query_filter["timestamp"] = {"$lte": as_of_time}
 
-        # Assuming recall_events currently does a text/vector search —
-        # add the day filter to whatever query it's already building.
-        # If it's a simple find(), it becomes:
+        # Query MongoDB events collection directly
         results = (
             self._events
             .find(query_filter)
-            .sort("day", -1)
+            .sort("timestamp", -1)  # Sort descending so the most recent events come first
             .limit(n * 3)
         )
 
-        # Re-rank by relevance to query if you have embeddings on events,
-        # otherwise just return the most recent n within the day window
-        # Strip MongoDB-internal fields (_id, embedding) before constructing SimEvent
         _MONGO_FIELDS = {"_id", "embedding"}
-        events = [SimEvent(**{k: v for k, v in e.items() if k not in _MONGO_FIELDS}) for e in results]
+        events = [
+            SimEvent(**{k: v for k, v in e.items() if k not in _MONGO_FIELDS}) 
+            for e in results
+        ]
+        
+        # Note: If you have vector embeddings on SimEvents, you would re-rank them 
+        # by the `query` text here. Otherwise, this just returns the n most recent 
+        # events that occurred before the actor's current cursor.
         return events[:n]
 
     # ─── HELPERS ──────────────────────────────
@@ -438,7 +445,7 @@ class Memory:
         self,
         query: str,
         n: int = 4,
-        as_of_day: Optional[int] = None,
+        as_of_time: Optional[str] = None,
     ) -> str:
         """
         Semantic search over embedded artifacts and events.
@@ -457,15 +464,16 @@ class Memory:
                     "queryVector":  self._embedder.embed(query),
                     "path":         "embedding",
                     "numCandidates": oversample,
-                    "limit":        n if as_of_day is None else oversample,
+                    "limit":        n,
                     "index":        "vector_index",
                 }
             }
         ]
 
-        if as_of_day is not None:
-            pipeline.append({"$match": {"day": {"$lte": as_of_day}}})
-            pipeline.append({"$limit": n})
+        if as_of_time is not None:
+            pipeline[0]["$vectorSearch"]["filter"] = {
+                "timestamp": {"$lte": as_of_time}
+            }
 
         pipeline.append({
             "$project": {
@@ -474,6 +482,7 @@ class Memory:
                 "day":     1,
                 "type":    1,
                 "id":      1,
+                "timestamp": 1,
                 "score":   {"$meta": "vectorSearchScore"},
             }
         })
@@ -491,7 +500,7 @@ class Memory:
                 )
 
         # ── Event search (temporal filter applied here too) ───────────────
-        events = self.recall_events(query, n=3, as_of_day=as_of_day)
+        events = self.recall_events(query, n=3, as_of_time=as_of_time) # <-- Updated parameter
 
         if events:
             lines.append("=== RELEVANT EVENTS ===")

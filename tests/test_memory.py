@@ -77,7 +77,8 @@ def test_simevent_serialization():
         artifact_ids={"jira": "ORG-105", "pr": "PR-100"}, 
         facts={"duration_days": 2, "root_cause": "DNS failure"}, 
         summary="Alice fixed the DNS", 
-        tags=["incident", "p1"]
+        tags=["incident", "p1"],
+        timestamp="2026-03-05T13:33:51.027Z"
     )
     
     # Simulate saving to DB and reading back

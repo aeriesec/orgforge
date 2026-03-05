@@ -76,6 +76,7 @@ class NormalDayHandler:
         git,
         worker_llm,
         planner_llm,
+        clock
     ):
         self._config         = config
         self._mem            = mem
@@ -90,6 +91,7 @@ class NormalDayHandler:
         self._company        = config["simulation"]["company_name"]
         self._all_names      = [n for dept in config["org_chart"].values() for n in dept]
         self._org_chart      = config["org_chart"]
+        self._clock = clock
 
     # ─── PUBLIC ENTRY POINT ───────────────────────────────────────────────────
 
@@ -190,6 +192,9 @@ class NormalDayHandler:
 
         if not ticket:
             return [name]
+        
+        artifact_time, new_cursor = self._clock.advance_actor(name, hours=item.estimated_hrs)
+        current_actor_time = artifact_time.isoformat()
 
         # Move ticket to In Progress if it's still To Do
         if ticket.get("status") == "To Do":
@@ -197,8 +202,9 @@ class NormalDayHandler:
             self._save_ticket(ticket)
 
         # Generate a realistic JIRA comment from this engineer
+
         ctx = self._mem.context_for_prompt(
-            f"{ticket['title']} {ticket_id}", n=2, as_of_day=self._state.day
+            f"{ticket['title']} {ticket_id}", n=2, as_of_time=current_actor_time
         )
         tone_hint = self._gd.stress_tone_hint(name)
 
@@ -233,6 +239,7 @@ class NormalDayHandler:
             "text":    comment_text,
             "day":     self._state.day,
         }
+        ticket["updated_at"] = current_actor_time
         ticket.setdefault("comments", []).append(comment)
         self._save_ticket(ticket)
 
@@ -240,19 +247,20 @@ class NormalDayHandler:
         actors = [name]
         blocker_keywords = ["blocked", "waiting", "need", "unclear", "can't", "cannot"]
         if any(kw in comment_text.lower() for kw in blocker_keywords):
-            collaborator = item.collaborator or self._closest_colleague(name)
-            if collaborator:
+            collaborator = next(iter(item.collaborator), None) or self._closest_colleague(name)
+            if collaborator and ticket_id:
                 actors = self._emit_blocker_slack(
                     name, collaborator, ticket_id, ticket["title"],
-                    comment_text, date_str
+                    comment_text, date_str, current_actor_time
                 )
 
         self._mem.log_event(SimEvent(
             type="ticket_progress",
+            timestamp=current_actor_time,
             day=self._state.day,
             date=date_str,
             actors=actors,
-            artifact_ids={"jira": ticket_id},
+            artifact_ids={"jira": ticket_id} if ticket_id else {},
             facts={
                 "ticket_id":    ticket_id,
                 "title":        ticket["title"],
@@ -260,7 +268,7 @@ class NormalDayHandler:
                 "new_status":   ticket["status"],
                 "has_blocker":  any(kw in comment_text.lower() for kw in blocker_keywords),
             },
-            summary=f"{name} progressed [{ticket_id}]: {ticket['title'][:50]}",
+            summary=f"{name} progressed [{ticket_id or 'unknown'}]: {ticket['title'][:50]}",
             tags=["ticket_progress", "jira"],
         ))
 
@@ -288,7 +296,10 @@ class NormalDayHandler:
 
         author   = pr.get("author", reviewer)
         pr_title = pr.get("title", "Unknown PR")
-        ctx      = self._mem.context_for_prompt(pr_title, n=2, as_of_day=self._state.day)
+        artifact_time, new_cursor = self._clock.advance_actor(author, hours=item.estimated_hrs)
+        current_actor_time = artifact_time.isoformat()
+
+        ctx      = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
 
         # Generate review comment
         agent = Agent(
@@ -319,14 +330,16 @@ class NormalDayHandler:
         self._emit_bot_message(
             "engineering",
             "GitHub",
-            f"💬 {reviewer} reviewed {pr.get('pr_id', pr_id)}: \"{review_text[:120]}\""
+            f"💬 {reviewer} reviewed {pr.get('pr_id', pr_id)}: \"{review_text[:120]}\"",
+            current_actor_time
         )
 
         # Author acknowledges in Slack if the review raises a question
         actors = [reviewer, author]
         if "?" in review_text:
             actors = self._emit_review_reply(
-                author, reviewer, pr.get("pr_id", "PR"), review_text, date_str
+                author, reviewer, pr.get("pr_id", "PR"), review_text, date_str,
+                current_actor_time
             )
 
         # Boost PR review edge
@@ -334,6 +347,7 @@ class NormalDayHandler:
 
         self._mem.log_event(SimEvent(
             type="pr_review",
+            timestamp=current_actor_time,
             day=self._state.day,
             date=date_str,
             actors=actors,
@@ -363,14 +377,21 @@ class NormalDayHandler:
         Generates: DM thread (2-4 messages).
         """
         name         = eng_plan.name
-        collaborator = item.collaborator or self._find_lead_for(name)
+        collaborator = next(iter(item.collaborator), None) or self._find_lead_for(name)
+        participants = [name, collaborator]
         if not collaborator or collaborator == name:
             return [name]
+        
+        meeting_start, meeting_end = self._clock.sync_and_advance(
+            participants, 
+            hours=item.estimated_hrs
+        )
+        meeting_time_iso = meeting_start.isoformat()
 
         stress_a = self._gd.stress_tone_hint(name)
         stress_b = self._gd.stress_tone_hint(collaborator)
         ctx      = self._mem.context_for_prompt(
-            f"1on1 {name} {collaborator} workload", n=2, as_of_day=self._state.day
+            f"1on1 {name} {collaborator} workload", n=2, as_of_time=meeting_time_iso
         )
 
         agent = Agent(
@@ -401,6 +422,18 @@ class NormalDayHandler:
         )
         if not messages:
             return [name, collaborator]
+        
+        from datetime import datetime, timedelta
+        import random
+
+        current_msg_time = datetime.fromisoformat(meeting_time_iso)
+
+        for msg in messages:
+            # Stamp the message with our exact, mathematically safe time
+            msg["ts"] = current_msg_time.isoformat()
+            
+            # Add 1 to 4 random minutes so the reply looks like a human typing
+            current_msg_time += timedelta(minutes=random.randint(1, 4))
 
         p1, p2    = sorted([name, collaborator])
         channel   = f"dm_{p1.lower()}_{p2.lower()}"
@@ -409,6 +442,7 @@ class NormalDayHandler:
 
         self._mem.log_event(SimEvent(
             type="1on1",
+            timestamp=meeting_time_iso,
             day=self._state.day,
             date=date_str,
             actors=[name, collaborator],
@@ -435,7 +469,7 @@ class NormalDayHandler:
         The question is grounded in the engineer's current ticket or blocker.
         """
         asker        = eng_plan.name
-        collaborator = item.collaborator or self._closest_colleague(asker)
+        collaborator = next(iter(item.collaborator), None) or self._closest_colleague(asker)
         ticket_id    = item.related_id
         ticket       = self._find_ticket(ticket_id)
         ticket_title = ticket["title"] if ticket else item.description
@@ -459,7 +493,16 @@ class NormalDayHandler:
         responders.extend(random.sample(extras, min(1, len(extras))))
         all_actors = list({asker} | set(responders))
 
-        ctx = self._mem.context_for_prompt(ticket_title, n=2, as_of_day=self._state.day)
+        chat_duration_mins = random.randint(5, 20)
+        chat_duration_hours = chat_duration_mins / 60.0
+
+        meeting_start, meeting_end = self._clock.sync_and_advance(
+            all_actors, 
+            hours=chat_duration_hours
+        )
+        meeting_time_iso = meeting_start.isoformat()
+
+        ctx = self._mem.context_for_prompt(ticket_title, n=2, as_of_time=meeting_time_iso)
 
         agent = Agent(
             role="Slack Thread Writer",
@@ -493,12 +536,25 @@ class NormalDayHandler:
         messages = self._parse_slack_messages(result, all_actors, hour_range=(10, 16))
         if not messages:
             return all_actors
+        
+        from datetime import datetime, timedelta
+        import random
+
+        current_msg_time = datetime.fromisoformat(meeting_time_iso)
+
+        for msg in messages:
+            # Stamp the message with our exact, mathematically safe time
+            msg["ts"] = current_msg_time.isoformat()
+            
+            # Add 1 to 4 random minutes so the reply looks like a human typing
+            current_msg_time += timedelta(minutes=random.randint(1, 4))
 
         path = f"{self._base}/slack/channels/{channel}/{date_str}_{asker.lower()}_q.json"
         self._save_slack(path, messages, channel)
 
         self._mem.log_event(SimEvent(
             type="async_question",
+            timestamp=meeting_time_iso,
             day=self._state.day,
             date=date_str,
             actors=all_actors,
@@ -530,8 +586,10 @@ class NormalDayHandler:
         Generates: Slack thread + optional Confluence stub.
         """
         initiator = eng_plan.name
-        collaborator = item.collaborator or self._closest_colleague(initiator)
-        participants = list({initiator, collaborator} if collaborator else {initiator})
+        collaborators = item.collaborator or (
+            [c] if (c := self._closest_colleague(initiator)) else []
+        )
+        participants = list({initiator} | set(collaborators))
 
         # Pull one more person with relevant expertise if available
         if len(participants) < 3:
@@ -545,7 +603,16 @@ class NormalDayHandler:
                     participants.append(name)
                     break
 
-        ctx = self._mem.context_for_prompt(item.description, n=3, as_of_day=self._state.day)
+        chat_duration_mins = random.randint(5, 45)
+        chat_duration_hours = chat_duration_mins / 60.0
+
+        meeting_start, meeting_end = self._clock.sync_and_advance(
+            participants, 
+            hours=chat_duration_hours
+        )
+        meeting_time_iso = meeting_start.isoformat()
+
+        ctx = self._mem.context_for_prompt(item.description, n=3, as_of_time=meeting_time_iso)
 
         agent = Agent(
             role="Engineering Team",
@@ -581,6 +648,18 @@ class NormalDayHandler:
             f"{date_str}_{initiator.lower()}_design.json"
         )
         if messages:
+            from datetime import datetime, timedelta
+            import random
+
+            current_msg_time = datetime.fromisoformat(meeting_time_iso)
+
+            for msg in messages:
+                # Stamp the message with our exact, mathematically safe time
+                msg["ts"] = current_msg_time.isoformat()
+                
+                # Add 1 to 4 random minutes so the reply looks like a human typing
+                current_msg_time += timedelta(minutes=random.randint(1, 8))
+
             self._save_slack(path, messages, dept_channel)
 
         # 30% chance a design discussion spawns a Confluence stub
@@ -592,6 +671,7 @@ class NormalDayHandler:
 
         self._mem.log_event(SimEvent(
             type="design_discussion",
+            timestamp=meeting_time_iso,
             day=self._state.day,
             date=date_str,
             actors=participants,
@@ -627,12 +707,22 @@ class NormalDayHandler:
         Generates: DM thread. Boosts social graph edge significantly.
         """
         mentor   = eng_plan.name
-        mentee   = item.collaborator or self._find_junior_colleague(mentor)
+        mentee = next(iter(item.collaborator), None) or self._find_junior_colleague(mentor)
         if not mentee or mentee == mentor:
             return [mentor]
+        
+        participants = [mentor, mentee]
+
+        session_mins = random.randint(30, 90)
+        session_hours = session_mins / 60.0
+        meeting_start, meeting_end = self._clock.sync_and_advance(
+            participants, 
+            hours=session_hours
+        )
+        meeting_time_iso = meeting_start.isoformat()
 
         ctx = self._mem.context_for_prompt(
-            f"mentoring {mentee} learning growth", n=2, as_of_day=self._state.day
+            f"mentoring {mentee} learning growth", n=2, as_of_time=meeting_time_iso
         )
 
         agent = Agent(
@@ -676,6 +766,7 @@ class NormalDayHandler:
 
         self._mem.log_event(SimEvent(
             type="mentoring",
+            timestamp=meeting_time_iso,
             day=self._state.day,
             date=date_str,
             actors=[mentor, mentee],
@@ -700,10 +791,13 @@ class NormalDayHandler:
         name    = eng_plan.name
         channel = dept_of_name(name, self._org_chart).lower().replace(" ", "-")
 
+        cron_time_iso = self._clock.now("system").isoformat()
+
         self._emit_bot_message(
             channel,
             name,
-            f"Working on: {item.description}"
+            f"Working on: {item.description}",
+            cron_time_iso
         )
         return [name]
 
@@ -717,6 +811,7 @@ class NormalDayHandler:
         ticket_title: str,
         blocker_text: str,
         date_str:    str,
+        timestamp: str
     ) -> List[str]:
         """Short 2-message Slack exchange when an engineer is blocked."""
         asker_dept = dept_of_name(asker, self._org_chart)
@@ -744,12 +839,36 @@ class NormalDayHandler:
         )
 
         if messages:
+            from datetime import datetime, timedelta
+            import random
+
+            current_msg_time = datetime.fromisoformat(timestamp)
+
+            for msg in messages:
+                # Stamp the message with our exact, mathematically safe time
+                msg["ts"] = current_msg_time.isoformat()
+                
+                # Add 1 to 4 random minutes so the reply looks like a human typing
+                current_msg_time += timedelta(minutes=random.randint(1, 4))
+
             path = (
                 f"{self._base}/slack/channels/{channel}/"
                 f"{date_str}_{asker.lower()}_blocked.json"
             )
             self._save_slack(path, messages, channel)
             self._gd.record_slack_interaction([asker, collaborator])
+
+            self._mem.log_event(SimEvent(
+                type="blocker_flagged",
+                day=self._state.day,
+                date=date_str,
+                timestamp=timestamp,
+                actors=[asker, collaborator],
+                artifact_ids={"jira": ticket_id},
+                facts={"blocker_reason": blocker_text},
+                summary=f"{asker} is blocked on {ticket_id}, pinged {collaborator}.",
+                tags=["slack", "blocker"]
+            ))
 
         return [asker, collaborator]
 
@@ -760,6 +879,7 @@ class NormalDayHandler:
         pr_id:     str,
         review_text: str,
         date_str:  str,
+        timestamp:   str
     ) -> List[str]:
         """Author replies to a review question in #engineering."""
         agent = Agent(
@@ -783,7 +903,8 @@ class NormalDayHandler:
         self._emit_bot_message(
             "engineering", "GitHub",
             f"💬 {author} replied to {reviewer}'s review on {pr_id}: "
-            f"\"{reply[:100]}\""
+            f"\"{reply[:100]}\"",
+            timestamp
         )
         return [author, reviewer]
 
@@ -797,6 +918,15 @@ class NormalDayHandler:
     ) -> Optional[str]:
         """Creates a brief Confluence stub from a design discussion."""
         conf_id = f"CONF-ENG-{len(self._state.confluence_pages) + 1:03d}"
+
+        artifact_time, new_cursor = self._clock.advance_actor(author, hours=0.5)
+        artifact_time_iso = artifact_time.isoformat()
+
+        safe_ctx = self._mem.context_for_prompt(
+            f"{topic} design discussion", 
+            n=3, 
+            as_of_time=artifact_time_iso
+        )
 
         agent = Agent(
             role="Technical Writer",
@@ -826,10 +956,13 @@ class NormalDayHandler:
         path = f"{self._base}/confluence/design/{conf_id}.md"
         self._save_md(path, full)
 
+        
+
         entry = {"id": conf_id, "title": f"Design: {topic[:50]}", "path": path}
         self._state.confluence_pages.append(entry)
         self._mem.embed_artifact(
             id=conf_id, type="confluence",
+            timestamp=artifact_time_iso,
             title=entry["title"], content=full,
             day=self._state.day, date=date_str,
             metadata={"authors": str(participants), "type": "design_doc"},
@@ -838,6 +971,7 @@ class NormalDayHandler:
 
         self._mem.log_event(SimEvent(
             type="confluence_created",
+            timestamp=artifact_time_iso,
             day=self._state.day, date=date_str,
             actors=participants,
             artifact_ids={"confluence": conf_id},
@@ -855,8 +989,11 @@ class NormalDayHandler:
         self, name: str, item: AgendaItem, date_str: str
     ) -> None:
         """Log a deferred agenda item so the record shows the interruption."""
+        current_time_iso = self._clock.now(name).isoformat()
+
         self._mem.log_event(SimEvent(
             type="agenda_item_deferred",
+            timestamp=current_time_iso,
             day=self._state.day,
             date=date_str,
             actors=[name],
@@ -877,8 +1014,14 @@ class NormalDayHandler:
     def _log_deep_work(
         self, name: str, item: AgendaItem, date_str: str
     ) -> None:
+        
+        # 1. Deep work takes time! Advance their cursor by the estimated hours.
+        # This prevents anyone else from scheduling a 1-on-1 with them during this block.
+        artifact_time, new_cursor = self._clock.advance_actor(name, hours=item.estimated_hrs)
+
         self._mem.log_event(SimEvent(
             type="deep_work_session",
+            timestamp=artifact_time.isoformat(),
             day=self._state.day,
             date=date_str,
             actors=[name],
@@ -891,17 +1034,21 @@ class NormalDayHandler:
     # ─── AMBIENT SIGNALS (unchanged from original) ────────────────────────────
 
     def _maybe_bot_alerts(self) -> None:
+        cron_time_iso = self._clock.now("system").isoformat()
+
         if random.random() < self._config["simulation"].get("aws_alert_prob", 0.4):
             legacy = self._config.get("legacy_system", {})
             self._emit_bot_message(
                 "system-alerts", "AWS Cost Explorer",
                 f"⚠️ Daily budget threshold exceeded. "
-                f"{legacy.get('aws_alert_message', 'Cloud costs remain elevated.')}"
+                f"{legacy.get('aws_alert_message', 'Cloud costs remain elevated.')}",
+                cron_time_iso
             )
         elif random.random() < self._config["simulation"].get("snyk_alert_prob", 0.2):
             self._emit_bot_message(
                 "engineering", "Snyk Security",
-                "🔒 3 new medium-severity vulnerabilities detected in npm dependencies."
+                "🔒 3 new medium-severity vulnerabilities detected in npm dependencies.",
+                cron_time_iso
             )
 
     def _maybe_adhoc_confluence(self) -> None:
@@ -923,9 +1070,21 @@ class NormalDayHandler:
             k=random.randint(2, 4),
         )
         participants = list(set([seed_person] + colleagues))
-        ctx          = self._mem.context_for_prompt(
-            self._state.daily_theme, n=2, as_of_day=self._state.day
+        # 1. Randomize the duration between 5 and 30 minutes
+        #    (Convert to hours because sync_and_advance expects hours)
+        chat_duration_mins = random.randint(5, 30)
+        chat_duration_hours = chat_duration_mins / 60.0
+
+        thread_start, thread_end = self._clock.sync_and_advance(participants, hours=chat_duration_hours)
+        thread_start_iso = thread_start.isoformat()
+
+        # 2. Mathematically restrict the context to the exact moment the chat begins
+        ctx = self._mem.context_for_prompt(
+            self._state.daily_theme, 
+            n=2, 
+            as_of_time=thread_start_iso 
         )
+
         profiles = [f"{n} ({dept_of_name(n, self._org_chart)})" for n in participants]
 
         agent = Agent(
@@ -1008,7 +1167,7 @@ class NormalDayHandler:
         with open(path, "w") as f:
             _json.dump(ticket, f, indent=2)
 
-    def _emit_bot_message(self, channel: str, bot_name: str, text: str) -> None:
+    def _emit_bot_message(self, channel: str, bot_name: str, text: str, timestamp: str) -> None:
         import os
         date_str   = str(self._state.current_date.date())
         slack_path = f"{self._base}/slack/channels/{channel}/{date_str}_bots.json"

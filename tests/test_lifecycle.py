@@ -4,6 +4,8 @@ from flow import Flow, ActiveIncident
 from memory import SimEvent
 from org_lifecycle import OrgLifecycleManager, patch_validator_for_lifecycle
 
+from datetime import datetime
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIXTURES
@@ -17,6 +19,12 @@ def mock_flow():
         flow.state.day = 5
         flow.state.system_health = 80
         return flow
+    
+@pytest.fixture
+def mock_clock():
+    clock = MagicMock()
+    clock.schedule_meeting.return_value = datetime(2026, 1, 5, 9, 0, 0)
+    return clock
 
 
 @pytest.fixture
@@ -72,7 +80,7 @@ def lifecycle(mock_flow):
 # 1. JIRA TICKET REASSIGNMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_departure_reassigns_open_tickets(lifecycle):
+def test_departure_reassigns_open_tickets(lifecycle, mock_clock):
     """
     Verifies that non-Done JIRA tickets owned by a departing engineer are
     reassigned to the dept lead and reset to 'To Do' when no PR is linked.
@@ -92,7 +100,7 @@ def test_departure_reassigns_open_tickets(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     t101 = next(t for t in state.jira_tickets if t["id"] == "ORG-101")
     t102 = next(t for t in state.jira_tickets if t["id"] == "ORG-102")
@@ -110,7 +118,7 @@ def test_departure_reassigns_open_tickets(lifecycle):
     assert t103["assignee"] == "Bob"
 
 
-def test_departure_preserves_in_progress_ticket_with_pr(lifecycle):
+def test_departure_preserves_in_progress_ticket_with_pr(lifecycle, mock_clock):
     """
     An 'In Progress' ticket that already has a linked PR must keep its status
     so the existing PR review/merge flow can close it naturally.
@@ -126,7 +134,7 @@ def test_departure_preserves_in_progress_ticket_with_pr(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "layoff", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     t200 = next(t for t in state.jira_tickets if t["id"] == "ORG-200")
     assert t200["assignee"] == "Alice"
@@ -137,7 +145,7 @@ def test_departure_preserves_in_progress_ticket_with_pr(lifecycle):
 # 2. ACTIVE INCIDENT HANDOFF
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_departure_hands_off_active_incident(lifecycle):
+def test_departure_hands_off_active_incident(lifecycle, mock_clock):
     """
     When a departing engineer owns an active incident's JIRA ticket, ownership
     must transfer to another person before the node is removed.
@@ -156,7 +164,7 @@ def test_departure_hands_off_active_incident(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     t300 = next(t for t in state.jira_tickets if t["id"] == "ORG-300")
     # Bob is gone — ticket must now belong to someone still in the graph
@@ -164,7 +172,7 @@ def test_departure_hands_off_active_incident(lifecycle):
     assert t300["assignee"] in all_names or t300["assignee"] == "Alice"
 
 
-def test_handoff_emits_escalation_chain_simevent(lifecycle):
+def test_handoff_emits_escalation_chain_simevent(lifecycle, mock_clock):
     """
     The forced handoff must emit an escalation_chain SimEvent with
     trigger='forced_handoff_on_departure' so the ground-truth log is accurate.
@@ -183,7 +191,7 @@ def test_handoff_emits_escalation_chain_simevent(lifecycle):
     dep_cfg = {"name": "Carol", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.8, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     logged_types = [call.args[0].type for call in mgr._mem.log_event.call_args_list]
     assert "escalation_chain" in logged_types
@@ -200,7 +208,7 @@ def test_handoff_emits_escalation_chain_simevent(lifecycle):
 # 3. CENTRALITY VACUUM
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_centrality_vacuum_stresses_neighbours(lifecycle):
+def test_centrality_vacuum_stresses_neighbours(lifecycle, mock_clock):
     """
     Removing a bridge shortcut node should increase stress on remaining nodes
     that absorb its rerouted traffic.
@@ -253,7 +261,7 @@ def test_centrality_vacuum_stresses_neighbours(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     stress_increased = any(
         gd_ring._stress.get(n, 0) > stress_before[n]
@@ -263,7 +271,7 @@ def test_centrality_vacuum_stresses_neighbours(lifecycle):
     assert stress_increased
 
 
-def test_centrality_vacuum_stress_capped_at_20(lifecycle):
+def test_centrality_vacuum_stress_capped_at_20(lifecycle, mock_clock):
     """
     The per-departure stress cap of 20 points must never be exceeded regardless
     of how extreme the centrality shift is.
@@ -280,7 +288,7 @@ def test_centrality_vacuum_stress_capped_at_20(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     for name in ["Alice", "Carol"]:
         if not gd.G.has_node(name):
@@ -293,7 +301,7 @@ def test_centrality_vacuum_stress_capped_at_20(lifecycle):
 # 4. NODE REMOVAL & GRAPH INTEGRITY
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_departed_node_removed_from_graph(lifecycle):
+def test_departed_node_removed_from_graph(lifecycle, mock_clock):
     """The departing engineer's node must not exist in the graph after departure."""
     mgr, gd, org_chart, all_names, state = lifecycle
     state.jira_tickets     = []
@@ -304,14 +312,14 @@ def test_departed_node_removed_from_graph(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     assert not gd.G.has_node("Bob")
     assert "Bob" not in all_names
     assert "Bob" not in org_chart.get("Engineering", [])
 
 
-def test_departed_node_stress_entry_removed(lifecycle):
+def test_departed_node_stress_entry_removed(lifecycle, mock_clock):
     """The departing engineer's stress entry must be cleaned up from GraphDynamics."""
     mgr, gd, org_chart, all_names, state = lifecycle
     state.jira_tickets     = []
@@ -322,12 +330,12 @@ def test_departed_node_stress_entry_removed(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     assert "Bob" not in gd._stress
 
 
-def test_departure_emits_employee_departed_simevent(lifecycle):
+def test_departure_emits_employee_departed_simevent(lifecycle, mock_clock):
     """A departure must emit exactly one employee_departed SimEvent."""
     mgr, gd, org_chart, all_names, state = lifecycle
     state.jira_tickets     = []
@@ -336,7 +344,7 @@ def test_departure_emits_employee_departed_simevent(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "layoff", "role": "Engineer",
                "knowledge_domains": ["auth-service"], "documented_pct": 0.2, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     departed_events = [
         call.args[0] for call in mgr._mem.log_event.call_args_list
@@ -349,7 +357,7 @@ def test_departure_emits_employee_departed_simevent(lifecycle):
     assert "auth-service" in evt.facts["knowledge_domains"]
 
 
-def test_departure_record_stored_on_state(lifecycle):
+def test_departure_record_stored_on_state(lifecycle, mock_clock):
     """state.departed_employees must be populated after a departure."""
     mgr, gd, org_chart, all_names, state = lifecycle
     state.jira_tickets     = []
@@ -358,7 +366,7 @@ def test_departure_record_stored_on_state(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Senior Engineer",
                "knowledge_domains": ["redis-cache"], "documented_pct": 0.4, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     assert "Bob" in state.departed_employees
     assert state.departed_employees["Bob"]["role"] == "Senior Engineer"
@@ -369,7 +377,7 @@ def test_departure_record_stored_on_state(lifecycle):
 # 5. KNOWLEDGE GAP SCANNING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_knowledge_gap_scan_detects_domain_hit(lifecycle):
+def test_knowledge_gap_scan_detects_domain_hit(lifecycle, mock_clock):
     """
     scan_for_knowledge_gaps must emit a knowledge_gap_detected SimEvent when
     the incident root cause mentions a departed employee's known domain.
@@ -383,7 +391,7 @@ def test_knowledge_gap_scan_detects_domain_hit(lifecycle):
                "knowledge_domains": ["auth-service", "redis-cache"],
                "documented_pct": 0.25, "day": 3}
     mgr._scheduled_departures = {3: [dep_cfg]}
-    mgr.process_departures(day=3, date_str="2026-01-03", state=state)
+    mgr.process_departures(day=3, date_str="2026-01-03", state=state, clock=mock_clock)
     mgr._mem.log_event.reset_mock()
 
     # Now trigger a scan with text that mentions the domain
@@ -393,6 +401,7 @@ def test_knowledge_gap_scan_detects_domain_hit(lifecycle):
         day=5,
         date_str="2026-01-05",
         state=state,
+        timestamp=mock_clock
     )
 
     assert len(gaps) == 1
@@ -408,7 +417,7 @@ def test_knowledge_gap_scan_detects_domain_hit(lifecycle):
     assert len(gap_events) == 1
 
 
-def test_knowledge_gap_scan_deduplicates(lifecycle):
+def test_knowledge_gap_scan_deduplicates(lifecycle, mock_clock):
     """
     The same domain must only surface once per simulation run regardless of
     how many times the text is scanned.
@@ -420,14 +429,14 @@ def test_knowledge_gap_scan_deduplicates(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": ["redis-cache"], "documented_pct": 0.5, "day": 3}
     mgr._scheduled_departures = {3: [dep_cfg]}
-    mgr.process_departures(day=3, date_str="2026-01-03", state=state)
+    mgr.process_departures(day=3, date_str="2026-01-03", state=state, clock=mock_clock)
     mgr._mem.log_event.reset_mock()
 
     text = "redis-cache connection pool exhausted"
     mgr.scan_for_knowledge_gaps(text=text, triggered_by="ORG-401",
-                                day=5, date_str="2026-01-05", state=state)
+                                day=5, date_str="2026-01-05", state=state, timestamp=mock_clock)
     mgr.scan_for_knowledge_gaps(text=text, triggered_by="ORG-402",
-                                day=6, date_str="2026-01-06", state=state)
+                                day=6, date_str="2026-01-06", state=state, timestamp=mock_clock)
 
     gap_events = [
         call.args[0] for call in mgr._mem.log_event.call_args_list
@@ -436,7 +445,7 @@ def test_knowledge_gap_scan_deduplicates(lifecycle):
     assert len(gap_events) == 1   # second scan must be a no-op
 
 
-def test_knowledge_gap_scan_no_false_positives(lifecycle):
+def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):
     """Unrelated text must not trigger any knowledge gap events."""
     mgr, gd, org_chart, all_names, state = lifecycle
     state.jira_tickets     = []
@@ -445,13 +454,14 @@ def test_knowledge_gap_scan_no_false_positives(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": ["auth-service"], "documented_pct": 0.5, "day": 3}
     mgr._scheduled_departures = {3: [dep_cfg]}
-    mgr.process_departures(day=3, date_str="2026-01-03", state=state)
+    mgr.process_departures(day=3, date_str="2026-01-03", state=state, clock=mock_clock)
     mgr._mem.log_event.reset_mock()
 
     gaps = mgr.scan_for_knowledge_gaps(
         text="Disk I/O throughput degraded on worker-node-3.",
         triggered_by="ORG-403",
         day=5, date_str="2026-01-05", state=state,
+        timestamp=mock_clock
     )
     assert len(gaps) == 0
 
@@ -460,7 +470,7 @@ def test_knowledge_gap_scan_no_false_positives(lifecycle):
 # 6. NEW HIRE COLD START
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_new_hire_added_to_graph(lifecycle):
+def test_new_hire_added_to_graph(lifecycle, mock_clock):
     """A hired engineer must appear in the graph and org_chart after process_hires."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
@@ -468,14 +478,14 @@ def test_new_hire_added_to_graph(lifecycle):
                 "expertise": ["Python", "Kafka"], "style": "methodical", "tenure": "new",
                 "day": 5}
     mgr._scheduled_hires = {5: [hire_cfg]}
-    mgr.process_hires(day=5, date_str="2026-01-05", state=state)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     assert gd.G.has_node("Taylor")
     assert "Taylor" in org_chart["Engineering"]
     assert "Taylor" in all_names
 
 
-def test_new_hire_cold_start_edges(lifecycle):
+def test_new_hire_cold_start_edges(lifecycle, mock_clock):
     """
     All edges for a new hire must start at or below floor × 2, ensuring they
     sit below warmup_threshold (2.0) so the planner proposes onboarding events.
@@ -487,7 +497,7 @@ def test_new_hire_cold_start_edges(lifecycle):
                 "expertise": ["Python"], "style": "methodical", "tenure": "new",
                 "day": 5}
     mgr._scheduled_hires = {5: [hire_cfg]}
-    mgr.process_hires(day=5, date_str="2026-01-05", state=state)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     for nb in gd.G.neighbors("Taylor"):
         weight = gd.G["Taylor"][nb]["weight"]
@@ -496,7 +506,7 @@ def test_new_hire_cold_start_edges(lifecycle):
         )
 
 
-def test_new_hire_warm_up_edge(lifecycle):
+def test_new_hire_warm_up_edge(lifecycle, mock_clock):
     """warm_up_edge must increase the edge weight between the hire and a colleague."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
@@ -504,7 +514,7 @@ def test_new_hire_warm_up_edge(lifecycle):
                 "expertise": ["Python"], "style": "methodical", "tenure": "new",
                 "day": 5}
     mgr._scheduled_hires = {5: [hire_cfg]}
-    mgr.process_hires(day=5, date_str="2026-01-05", state=state)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     weight_before = gd.G["Taylor"]["Alice"]["weight"]
     mgr.warm_up_edge("Taylor", "Alice", boost=1.5)
@@ -513,7 +523,7 @@ def test_new_hire_warm_up_edge(lifecycle):
     assert weight_after == round(weight_before + 1.5, 4)
 
 
-def test_new_hire_emits_simevent(lifecycle):
+def test_new_hire_emits_simevent(lifecycle, mock_clock):
     """process_hires must emit an employee_hired SimEvent with correct facts."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
@@ -521,7 +531,7 @@ def test_new_hire_emits_simevent(lifecycle):
                 "expertise": ["Python", "Kafka"], "style": "methodical", "tenure": "new",
                 "day": 5}
     mgr._scheduled_hires = {5: [hire_cfg]}
-    mgr.process_hires(day=5, date_str="2026-01-05", state=state)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     hired_events = [
         call.args[0] for call in mgr._mem.log_event.call_args_list
@@ -534,7 +544,7 @@ def test_new_hire_emits_simevent(lifecycle):
     assert "Kafka" in evt.facts["expertise"]
 
 
-def test_new_hire_stress_initialised_low(lifecycle):
+def test_new_hire_stress_initialised_low(lifecycle, mock_clock):
     """New hires must start with a low stress score, not inherit the org average."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
@@ -542,12 +552,12 @@ def test_new_hire_stress_initialised_low(lifecycle):
                 "expertise": ["Python"], "style": "methodical", "tenure": "new",
                 "day": 5}
     mgr._scheduled_hires = {5: [hire_cfg]}
-    mgr.process_hires(day=5, date_str="2026-01-05", state=state)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     assert gd._stress.get("Taylor", 0) == 20
 
 
-def test_new_hire_record_stored_on_state(lifecycle):
+def test_new_hire_record_stored_on_state(lifecycle, mock_clock):
     """state.new_hires must be populated with the hire's metadata."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
@@ -555,7 +565,7 @@ def test_new_hire_record_stored_on_state(lifecycle):
                 "expertise": ["Python"], "style": "methodical", "tenure": "new",
                 "day": 5}
     mgr._scheduled_hires = {5: [hire_cfg]}
-    mgr.process_hires(day=5, date_str="2026-01-05", state=state)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     assert hasattr(state, "new_hires")
     assert "Taylor" in state.new_hires
@@ -566,7 +576,7 @@ def test_new_hire_record_stored_on_state(lifecycle):
 # 7. VALIDATOR PATCH
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_patch_validator_removes_departed_actor(lifecycle):
+def test_patch_validator_removes_departed_actor(lifecycle, mock_clock):
     """
     After a departure, patch_validator_for_lifecycle must remove the departed
     name from PlanValidator._valid_actors so the actor integrity check holds.
@@ -587,14 +597,14 @@ def test_patch_validator_removes_departed_actor(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr.process_departures(day=5, date_str="2026-01-05", state=state)
+    mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     patch_validator_for_lifecycle(validator, mgr)
 
     assert "Bob" not in validator._valid_actors
 
 
-def test_patch_validator_adds_new_hire(lifecycle):
+def test_patch_validator_adds_new_hire(lifecycle, mock_clock):
     """
     After a hire, patch_validator_for_lifecycle must add the new name to
     PlanValidator._valid_actors so the planner can propose events with them.
@@ -614,7 +624,7 @@ def test_patch_validator_adds_new_hire(lifecycle):
                 "expertise": ["Python"], "style": "methodical", "tenure": "new",
                 "day": 5}
     mgr._scheduled_hires = {5: [hire_cfg]}
-    mgr.process_hires(day=5, date_str="2026-01-05", state=state)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     patch_validator_for_lifecycle(validator, mgr)
 
@@ -625,7 +635,7 @@ def test_patch_validator_adds_new_hire(lifecycle):
 # 8. ROSTER CONTEXT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_get_roster_context_reflects_departure_and_hire(lifecycle):
+def test_get_roster_context_reflects_departure_and_hire(lifecycle, mock_clock):
     """
     get_roster_context must surface both a recent departure and a recent hire
     so DepartmentPlanner prompts reflect actual roster state.
@@ -637,13 +647,13 @@ def test_get_roster_context_reflects_departure_and_hire(lifecycle):
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
                "knowledge_domains": ["redis-cache"], "documented_pct": 0.3, "day": 4}
     mgr._scheduled_departures = {4: [dep_cfg]}
-    mgr.process_departures(day=4, date_str="2026-01-04", state=state)
+    mgr.process_departures(day=4, date_str="2026-01-04", state=state, clock=mock_clock)
 
     hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
                 "expertise": ["Python"], "style": "methodical", "tenure": "new",
                 "day": 5}
     mgr._scheduled_hires = {5: [hire_cfg]}
-    mgr.process_hires(day=5, date_str="2026-01-05", state=state)
+    mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     context = mgr.get_roster_context()
 

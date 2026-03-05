@@ -6,6 +6,61 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.4] — 2026-03-05
+
+### Added
+
+- `sim_clock.py` — Actor-local simulation clock replacing all `random.randint`
+  timestamp generation across `flow.py` and `normal_day.py`. Each employee now
+  has an independent time cursor, guaranteeing no individual can have two
+  overlapping artifacts and allowing genuine parallel activity across the org.
+
+- `SimClock.advance_actor()` — Ambient work primitive. Advances a single actor's
+  cursor by `estimated_hrs` and returns a randomly sampled artifact timestamp
+  from within that work block. Used for ticket progress, Confluence pages, and
+  deep work sessions where no causal ordering exists between actors.
+
+- `SimClock.sync_and_tick()` — Causal work primitive. Synchronizes all
+  participating actors to the latest cursor among them (the thread cannot start
+  until the busiest person is free), then ticks forward by a random delta.
+  Used for incident response chains, escalations, and PR review threads.
+
+- `SimClock.tick_message()` — Per-message Slack cadence ticker. Wraps
+  `sync_and_tick` with cadence hints: `"incident"` (1–4 min), `"normal"`
+  (3–12 min), `"async"` (10–35 min). Replaces the flat random hour assignment
+  in `_parse_slack_messages()` so messages within a thread are always
+  chronologically ordered and realistically spaced.
+
+- `SimClock.tick_system()` — Independent cursor for automated bot alerts
+  (Datadog, PagerDuty, GitHub Actions). Advances separately from human actors
+  so bot messages are never gated by an individual's availability.
+
+- `SimClock.sync_to_system()` — Incident response helper. Pulls on-call and
+  incident lead cursors forward to the system clock when a P1 fires, ensuring
+  all human response artifacts are stamped after the triggering alert.
+
+- `SimClock.at()` — Scheduled meeting pin. Stamps an artifact at the declared
+  meeting time and advances all attendee cursors to the meeting end. Used for
+  standup (09:30), sprint planning, and retrospectives.
+
+- `SimClock.schedule_meeting()` — Randomized ceremony scheduler. Picks a
+  random slot within a defined window (e.g. sprint planning 09:30–11:00,
+  retro 14:00–16:00) and pins all attendees via `at()`.
+
+- `SimClock.sync_and_advance()` — Multi-actor ambient work primitive. Syncs
+  participants to the latest cursor then advances all by a shared duration.
+  Used for collaborative work blocks like pair programming or design sessions.
+
+### Fixed
+
+- Timestamps across Slack threads, JIRA comments, Confluence pages, bot alerts,
+  and external contact summaries were previously generated with independent
+  `random.randint(hour, ...)` calls, producing out-of-order and causally
+  inconsistent artifact timelines. All timestamp generation now routes through
+  `SimClock`, restoring correct forensic ordering throughout the corpus.
+
+---
+
 ## [v0.3.3] — 2026-03-05
 
 ### Changed

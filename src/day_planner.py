@@ -41,6 +41,12 @@ from plan_validator import PlanValidator
 
 logger = logging.getLogger("orgforge.planner")
 
+def _coerce_collaborators(raw) -> List[str]:
+    """Normalize LLM collaborator output — handles str, list, or None."""
+    if not raw:
+        return []
+    return raw if isinstance(raw, list) else [raw]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEPARTMENT PLANNER
@@ -111,7 +117,7 @@ class DepartmentPlanner:
             "activity_type": "string",
             "description": "string",
             "related_id": "string or null",
-            "collaborator": "string or null",
+            "collaborator": ["string"],
             "estimated_hrs": float
             }}
         ]
@@ -248,7 +254,7 @@ class DepartmentPlanner:
                     activity_type=a.get("activity_type", "ticket_progress"),
                     description=a.get("description", ""),
                     related_id=a.get("related_id"),
-                    collaborator=a.get("collaborator"),
+                    collaborator=_coerce_collaborators(a.get("collaborator")),
                     estimated_hrs=float(a.get("estimated_hrs", 2.0)),
                 )
                 for a in ep.get("agenda", [])
@@ -636,7 +642,8 @@ class DayPlannerOrchestrator:
         state,
         mem:            Memory,
         graph_dynamics: GraphDynamics,
-        lifecycle_context: str = "",
+        clock,
+        lifecycle_context: str = ""
     ) -> OrgDayPlan:
         """
         Full planning pass for one day.
@@ -644,9 +651,10 @@ class DayPlannerOrchestrator:
         """
         day  = state.day
         date = str(state.current_date.date())
+        system_time_iso = clock.now("system").isoformat() # This will be 09:00:00
 
         # ── Generate org theme (lightweight — replaces _generate_theme()) ─────
-        org_theme = self._generate_org_theme(state, mem)
+        org_theme = self._generate_org_theme(state, mem, clock)
 
         # ── Build cross-dept signals from recent SimEvents ────────────────────
         cross_signals_by_dept = self._extract_cross_signals(mem, day)
@@ -705,6 +713,7 @@ class DayPlannerOrchestrator:
         for r in self._validator.rejected(results):
             mem.log_event(SimEvent(
                 type="proposed_event_rejected",
+                timestamp=system_time_iso,
                 day=day, date=date,
                 actors=r.event.actors,
                 artifact_ids={},
@@ -722,6 +731,7 @@ class DayPlannerOrchestrator:
         for novel in self._validator.drain_novel_log():
             mem.log_event(SimEvent(
                 type="novel_event_proposed",
+                timestamp=system_time_iso,
                 day=day, date=date,
                 actors=novel.actors,
                 artifact_ids={},
@@ -749,11 +759,12 @@ class DayPlannerOrchestrator:
 
     # ─── Helpers ─────────────────────────────────────────────────────────────
 
-    def _generate_org_theme(self, state, mem: Memory) -> str:
+    def _generate_org_theme(self, state, mem: Memory, clock) -> str:
         """Lightweight replacement for _generate_theme() in flow.py."""
+        system_time_iso = clock.now("system").isoformat()
         ctx = mem.context_for_prompt(
             f"day {state.day} system health sprint incidents",
-            n=3, as_of_day=state.day
+            n=3, as_of_time=system_time_iso
         )
         agent = Agent(
             role="CEO",
@@ -836,4 +847,3 @@ class DayPlannerOrchestrator:
             e.facts for e in mem.get_event_log()
             if e.type == "day_summary" and e.day >= max(1, day - 7)
         ]
-

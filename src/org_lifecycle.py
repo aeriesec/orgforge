@@ -157,12 +157,12 @@ class OrgLifecycleManager:
     # ─── PUBLIC ───────────────────────────────────────────────────────────────
 
     def process_departures(
-        self, day: int, date_str: str, state
+        self, day: int, date_str: str, state, clock
     ) -> List[DepartureRecord]:
         departures: List[DepartureRecord] = []
 
         for dep_cfg in self._scheduled_departures.get(day, []):
-            record = self._execute_departure(dep_cfg, day, date_str, state, scheduled=True)
+            record = self._execute_departure(dep_cfg, day, date_str, state, scheduled=True, clock=clock)
             if record:
                 departures.append(record)
 
@@ -196,7 +196,7 @@ class OrgLifecycleManager:
                         # from personas so we don't hardcode anything here
                     }
                     record = self._execute_departure(
-                        attrition_cfg, day, date_str, state, scheduled=False
+                        attrition_cfg, day, date_str, state, scheduled=False, clock=clock
                     )
                     if record:
                         departures.append(record)
@@ -205,17 +205,17 @@ class OrgLifecycleManager:
         return departures
 
     def process_hires(
-        self, day: int, date_str: str, state
+        self, day: int, date_str: str, state, clock
     ) -> List[HireRecord]:
         hires: List[HireRecord] = []
         for hire_cfg in self._scheduled_hires.get(day, []):
-            record = self._execute_hire(hire_cfg, day, date_str, state)
+            record = self._execute_hire(hire_cfg, day, date_str, state, clock)
             if record:
                 hires.append(record)
         return hires
 
     def scan_for_knowledge_gaps(
-        self, text: str, triggered_by: str, day: int, date_str: str, state
+        self, text: str, triggered_by: str, day: int, date_str: str, state, timestamp: str
     ) -> List[KnowledgeGapEvent]:
         found: List[KnowledgeGapEvent] = []
         text_lower = text.lower()
@@ -235,7 +235,9 @@ class OrgLifecycleManager:
                 self._gap_events.append(gap_event)
                 found.append(gap_event)
                 self._mem.log_event(SimEvent(
-                    type="knowledge_gap_detected", day=day, date=date_str,
+                    type="knowledge_gap_detected", 
+                    timestamp=timestamp,
+                    day=day, date=date_str,
                     actors=[record.name], artifact_ids={"trigger": triggered_by},
                     facts={
                         "departed_employee":    record.name,
@@ -305,7 +307,7 @@ class OrgLifecycleManager:
     # ─── DEPARTURE ENGINE ─────────────────────────────────────────────────────
 
     def _execute_departure(
-        self, dep_cfg: dict, day: int, date_str: str, state, scheduled: bool
+        self, dep_cfg: dict, day: int, date_str: str, state, scheduled: bool, clock
     ) -> Optional[DepartureRecord]:
         name = dep_cfg["name"]
         G    = self._gd.G
@@ -339,20 +341,25 @@ class OrgLifecycleManager:
             centrality_at_departure=departing_centrality,
         )
 
+        departure_time = clock.schedule_meeting([name], min_hour=9, max_hour=9, duration_mins=15)
+        timestamp_iso = departure_time.isoformat()
+
         # Side-effects run in this exact order so each can still reference live graph:
         #   1. Incident handoff   — needs Dijkstra path through departing node
         #   2. JIRA reassignment  — reads ticket assignees from state
         #   3. Remove node        — graph mutation
         #   4. Centrality vacuum  — diff before/after centrality, apply stress
 
-        self._handoff_active_incidents(name, dept_lead, record, day, date_str, state)
-        self._reassign_jira_tickets(name, dept_lead, record, day, date_str, state)
+        self._handoff_active_incidents(name, dept_lead, record, day, date_str, state, timestamp_iso)
+        self._reassign_jira_tickets(name, dept_lead, record, day, date_str, state, timestamp_iso)
 
         G.remove_node(name)
         self._gd._centrality_dirty = True
         self._gd._stress.pop(name, None)
 
-        self._apply_centrality_vacuum(centrality_before, name, day, date_str)
+        
+
+        self._apply_centrality_vacuum(centrality_before, name, day, date_str, timestamp_iso)
 
         # Mutate org-level collections
         if dept in self._org_chart and name in self._org_chart[dept]:
@@ -372,9 +379,12 @@ class OrgLifecycleManager:
         }
 
         self._schedule_backfill(record, day)
+        
+        
 
         self._mem.log_event(SimEvent(
             type="employee_departed", day=day, date=date_str,
+            timestamp=departure_time.isoformat(),
             actors=[name], artifact_ids={},
             facts={
                 "name":                 name,
@@ -412,7 +422,7 @@ class OrgLifecycleManager:
 
     def _handoff_active_incidents(
         self, name: str, dept_lead: str, record: DepartureRecord,
-        day: int, date_str: str, state
+        day: int, date_str: str, state, timestamp_iso
     ) -> None:
         """
         For every active incident whose linked JIRA ticket is assigned to the
@@ -437,7 +447,9 @@ class OrgLifecycleManager:
             record.incident_handoffs.append(inc.ticket_id)
 
             self._mem.log_event(SimEvent(
-                type="escalation_chain", day=day, date=date_str,
+                type="escalation_chain", 
+                timestamp=timestamp_iso,
+                day=day, date=date_str,
                 actors=[name, new_owner], artifact_ids={"jira": inc.ticket_id},
                 facts={
                     "trigger":          "forced_handoff_on_departure",
@@ -464,7 +476,7 @@ class OrgLifecycleManager:
 
     def _reassign_jira_tickets(
         self, name: str, dept_lead: str, record: DepartureRecord,
-        day: int, date_str: str, state
+        day: int, date_str: str, state, timestamp_iso
     ) -> None:
         """
         Reassign all non-Done JIRA tickets owned by the departing engineer.
@@ -492,7 +504,9 @@ class OrgLifecycleManager:
             record.reassigned_tickets.append(ticket["id"])
 
             self._mem.log_event(SimEvent(
-                type="ticket_progress", day=day, date=date_str,
+                type="ticket_progress", 
+                timestamp=timestamp_iso,
+                day=day, date=date_str,
                 actors=[name, dept_lead], artifact_ids={"jira": ticket["id"]},
                 facts={
                     "ticket_id":    ticket["id"],
@@ -524,6 +538,7 @@ class OrgLifecycleManager:
         departed_name:     str,
         day:               int,
         date_str:          str,
+        clock,
     ) -> None:
         """
         After the departed node is removed, force a fresh centrality computation.
@@ -564,6 +579,7 @@ class OrgLifecycleManager:
 
         self._mem.log_event(SimEvent(
             type="knowledge_gap_detected",   # closest existing type for RAG eval
+            timestamp=clock,
             day=day, date=date_str,
             actors=[n for n, _, _ in vacuum_affected],
             artifact_ids={},
@@ -589,7 +605,7 @@ class OrgLifecycleManager:
     # ─── HIRE ENGINE ──────────────────────────────────────────────────────────
 
     def _execute_hire(
-        self, hire_cfg: dict, day: int, date_str: str, state
+        self, hire_cfg: dict, day: int, date_str: str, state, clock
     ) -> Optional[HireRecord]:
         name = hire_cfg["name"]
         dept = hire_cfg.get("dept", list(self._org_chart.keys())[0])
@@ -641,8 +657,15 @@ class OrgLifecycleManager:
             "dept": dept, "expertise": expertise,
         }
 
+        hire_time = clock.schedule_meeting([name], min_hour=9, max_hour=10, duration_mins=30)
+        # Ensure it doesn't roll back before 09:30
+        if hire_time.minute < 30 and hire_time.hour == 9:
+            hire_time = hire_time.replace(minute=random.randint(30, 59))
+
         self._mem.log_event(SimEvent(
-            type="employee_hired", day=day, date=date_str,
+            type="employee_hired", 
+            timestamp=hire_time.isoformat(),
+            day=day, date=date_str,
             actors=[name], artifact_ids={},
             facts={
                 "name": name, "dept": dept, "role": role,
