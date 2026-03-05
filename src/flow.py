@@ -586,7 +586,6 @@ class Flow(Flow[State]):
                 self.state, self._mem, self.graph_dynamics,
                 lifecycle_context=self._lifecycle.get_roster_context(),
             )
-            org_plan = self._day_planner.plan(self.state, self._mem, self.graph_dynamics)
             self.state.daily_theme  = org_plan.org_theme
             self.state.org_day_plan = org_plan
             self._print_day_header()
@@ -605,19 +604,14 @@ class Flow(Flow[State]):
                 self._handle_incident()
             else:
                 self._normal_day.handle(self.state.org_day_plan)
+                if random.random() < CONFIG["simulation"].get("adhoc_confluence_prob", 0.3):
+                    self._generate_adhoc_confluence_page()
 
             self._end_of_day()
             self.state.day += 1
             self.state.current_date += timedelta(days=1)
 
         self._print_final_report()
-
-    # ─── THEME ────────────────────────────────
-    def _generate_theme(self) -> str:
-        ctx = self._mem.context_for_prompt(f"day {self.state.day} system health sprint incidents", n=3, as_of_day=self.state.day)
-        planner = Agent(role="CEO", goal="Decide today's dominant theme.", backstory="You see patterns across the company.", llm=WORKER_MODEL)
-        task = Task(description=f"Day {self.state.day}. Health: {self.state.system_health}. Morale: {self.state.team_morale:.2f}.\nContext:\n{ctx}\nWrite ONE sentence for today's theme.", expected_output="One sentence.", agent=planner)
-        return str(Crew(agents=[planner], tasks=[task], verbose=False, llm=PLANNER_MODEL).kickoff()).strip()
 
     # ─── SPRINT PLANNING ──────────────────────
     def _handle_sprint_planning(self):
@@ -677,7 +671,7 @@ class Flow(Flow[State]):
             description=f"Write a Slack standup update for:\n{chr(10).join(profiles)}\n\nContext:\n{ctx}\nFormat EXACTLY: Name: [Message]",
             expected_output="A transcript of standup updates.", agent=standup_agent
         )
-        result = str(Crew(agents=[standup_agent], tasks=[task], verbose=False, llm=WORKER_MODEL).kickoff())
+        result = str(Crew(agents=[standup_agent], tasks=[task], verbose=False).kickoff())
         
         messages = []
         for line in result.split("\n"):
@@ -705,7 +699,7 @@ class Flow(Flow[State]):
         scrum_master = resolve_role("scrum_master")
         historian = Agent(role="Scrum Master", goal="Write retro.", backstory=persona_backstory(scrum_master, self._mem, graph_dynamics=self.graph_dynamics), llm=PLANNER_MODEL)
         task = Task(description=f"Write retro Confluence {conf_id} for Sprint #{self.state.sprint.sprint_number}.\nContext:\n{ctx}\nSections: What went well, What didn't, Action items.", expected_output="Markdown.", agent=historian)
-        content = str(Crew(agents=[historian], tasks=[task], verbose=False, llm=PLANNER_MODEL).kickoff())
+        content = str(Crew(agents=[historian], tasks=[task], verbose=False).kickoff())
         path = f"{BASE}/confluence/retros/{conf_id}.md"
         save_md(path, content)
         entry = {"id": conf_id, "title": f"Retro Sprint #{self.state.sprint.sprint_number}", "summary": "Sprint Retrospective", "path": path}
@@ -727,9 +721,9 @@ class Flow(Flow[State]):
         eng_peer      = next((n for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), []) if n != on_call), on_call)
 
 
-        rc_agent = Agent(role="Senior Engineer", goal="Diagnose root cause.", backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics), llm=WORKER_MODEL)
+        rc_agent = Agent(role="Senior Engineer", goal="Diagnose root cause.", backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics), llm=PLANNER_MODEL)
         rc_task  = Task(description=f"Theme: {self.state.daily_theme}\nWrite ONE specific technical root cause (max 20 words).", expected_output="One sentence.", agent=rc_agent)
-        root_cause = str(Crew(agents=[rc_agent], tasks=[rc_task], verbose=False, llm=PLANNER_MODEL).kickoff()).strip()
+        root_cause = str(Crew(agents=[rc_agent], tasks=[rc_task], verbose=False).kickoff()).strip()
 
         involves_gap = any(
             k.lower() in root_cause.lower()
@@ -841,8 +835,6 @@ class Flow(Flow[State]):
         eng_peer = next((n for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), []) if n != on_call), on_call)
 
         for inc in self.state.active_incidents:
-            inc.days_active += 1
-
             if inc.stage == "detected":
                 inc.stage = "investigating"
                 still_active.append(inc)
@@ -906,7 +898,7 @@ class Flow(Flow[State]):
             description=f"Write Confluence postmortem for {inc.ticket_id}.\nActual Root Cause: {inc.root_cause}\nDuration: {inc.days_active} days.\nFormat as Markdown.",
             expected_output="A full Markdown document.", agent=writer
         )
-        content      = str(Crew(agents=[writer], tasks=[task], verbose=False, llm=PLANNER_MODEL).kickoff())
+        content      = str(Crew(agents=[writer], tasks=[task], verbose=False).kickoff())
         full_content = f"# Postmortem: {inc.title}\n**ID:** {conf_id}\n**JIRA:** [{inc.ticket_id}]\n\n" + content
         path         = f"{BASE}/confluence/postmortems/{conf_id}.md"
         save_md(path, full_content)
@@ -955,7 +947,7 @@ class Flow(Flow[State]):
         
         writer = Agent(role="Corporate Writer", goal="Write documentation.", backstory=f"You are {author}.", llm=PLANNER_MODEL)
         task = Task(description=f"Write Confluence page titled '{title}'.\nContext:\n{ctx}\nFormat as Markdown.", expected_output="Markdown.", agent=writer)
-        content = str(Crew(agents=[writer], tasks=[task], verbose=False, llm=PLANNER_MODEL).kickoff())
+        content = str(Crew(agents=[writer], tasks=[task], verbose=False).kickoff())
 
         full_content = f"# {title}\n**ID:** {conf_id}  \n**Author:** {author}\n\n" + content + bill_gap_warning(title)
 
@@ -1238,7 +1230,7 @@ class Flow(Flow[State]):
             agent=agent,
         )
         summary_text = str(
-            Crew(agents=[agent], tasks=[task], verbose=False, llm=WORKER_MODEL).kickoff()
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         ).strip()
 
         # Write to the incidents Slack channel
