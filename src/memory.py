@@ -67,7 +67,7 @@ class SimEvent:
         )
 
     def to_dict(self) -> Dict:
-        return asdict(self)
+        return json.loads(json.dumps(asdict(self), default=str))
 
     @classmethod
     def from_dict(cls, d: Dict) -> "SimEvent":
@@ -126,15 +126,17 @@ class OllamaEmbedder(BaseEmbedder):
             return self._fallback(text)
         try:
             r = requests.post(
-                f"{self._host}/api/embeddings",
-                json={"model": self._model, "prompt": text},
+                f"{self._host}/api/embed",
+                json={"model": self._model, "input": text},
                 timeout=30,
             )
-            return r.json()["embedding"]
-        except Exception as e:
-            logger.error(f"[memory] Ollama embedding failed: {e}")
-            return self._fallback(text)
-
+            return r.json()["embeddings"][0]
+        except requests.HTTPError as e:
+            logger.warning(f"[memory] Ollama embedding HTTP error: {e.response.status_code}")
+            return []
+        except (KeyError, IndexError) as e:
+            logger.warning(f"[memory] Ollama embedding response malformed: {e}")
+            return []
 
 # ── CLOUD: OpenAI ──────────────────────────────
 class OpenAIEmbedder(BaseEmbedder):
@@ -449,7 +451,7 @@ class Memory:
         artifact_count = self._artifacts.estimated_document_count()
         oversample     = max(n * 3, min(artifact_count // 10, 200))
 
-        pipeline = [
+        pipeline: list[dict] = [
             {
                 "$vectorSearch": {
                     "queryVector":  self._embedder.embed(query),

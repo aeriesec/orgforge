@@ -1006,10 +1006,10 @@ class Flow(Flow[State]):
         open_incident_ids = [inc.ticket_id for inc in self.state.active_incidents]
 
         # Stress snapshot for today's active actors only — keeps the summary tight
-        stress_today = {
+        stress_today = dict({
             name: self.graph_dynamics._stress.get(name, 0)
             for name in unique_actors
-        }
+        })
 
         # ── Enriched day_summary SimEvent ────────────────────────────────────────
         self._mem.log_event(SimEvent(
@@ -1031,7 +1031,7 @@ class Flow(Flow[State]):
                 # ── New enrichment fields ──
                 "active_actors":        unique_actors,
                 "dominant_event":       dominant_event,
-                "event_type_counts":    event_counts,
+                "event_type_counts":    dict(self.state.daily_event_type_counts),
                 "departments_involved": departments_involved,
                 "open_incidents":       open_incident_ids,
                 "stress_snapshot":      stress_today,
