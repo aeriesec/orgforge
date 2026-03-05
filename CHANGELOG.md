@@ -12,6 +12,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Change embedding endpoint to call `/embed` instead of `/embeddings` and
   update the handling of the response.
+- Convert `event_counts` to a plain dict in flow.py
 
 ---
 

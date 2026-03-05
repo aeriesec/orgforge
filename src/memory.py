@@ -67,7 +67,7 @@ class SimEvent:
         )
 
     def to_dict(self) -> Dict:
-        return asdict(self)
+        return json.loads(json.dumps(asdict(self), default=str))
 
     @classmethod
     def from_dict(cls, d: Dict) -> "SimEvent":
