@@ -178,7 +178,7 @@ class SimClock:
         Example: schedule_meeting(leads, 9, 11) for Sprint Planning.
         """
         # Pick a random top-of-the-hour or half-hour slot in the window
-        hour = random.randint(min_hour, max_hour - 1)
+        hour = random.randint(min_hour, max(min_hour, max_hour - 1))
         minute = random.choice([0, 15, 30, 45])
         
         # Use the at() method we defined earlier to pin the actors

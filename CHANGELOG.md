@@ -6,6 +6,26 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.5] — 2026-03-05
+
+### Added
+
+- Tests for `sim_clock.py` — full coverage of all public methods including
+  business-hours enforcement, weekend rollover, and clock monotonicity.
+- Tests for `SimClock` integration across `flow.py` and `org_lifecycle.py` —
+  verifies artifact timestamps fall within actor work blocks, ceremony timestamps
+  land in scheduled windows, and departure/hire events carry valid ISO-8601 times.
+
+### Fixed
+
+- `_embed_and_count()` — added missing `timestamp` parameter forwarded to
+  `Memory.embed_artifact()`. Artifacts were previously embedded without a
+  timestamp, breaking temporal filtering in `context_for_prompt()`.
+- `SimClock.schedule_meeting()` — fixed `ValueError: empty range in randrange`
+  crash when `min_hour == max_hour` (e.g. departure events pinned to 09:xx).
+
+---
+
 ## [v0.3.4] — 2026-03-05
 
 ### Added
