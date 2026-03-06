@@ -6,6 +6,33 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.7] — 2026-03-05
+
+### Added
+
+- **Watercooler distraction system** (`normal_day.py`): Employees now have a
+  configurable probability (`simulation.watercooler_prob`, default `0.15`) of
+  being pulled into an off-topic Slack conversation during their workday. The
+  distraction is gated once per employee per day, targets a randomly selected
+  agenda item rather than always the first, and pulls in 1–2 colleagues weighted
+  by social graph edge strength. A context-switch penalty (`0.16–0.25h`) is
+  applied both to the agenda item's estimated hours and to the SimClock cursor,
+  so the time cost is reflected in downstream scheduling.
+- **`test_normal_day.py`**: First test suite for `NormalDayHandler`. Covers
+  dispatch routing, ticket progress, 1:1 handling, async questions, design
+  discussions, mentoring, SimClock cursor advancement, distraction gate
+  behaviour, graph dynamics integration, and utility functions (30 tests).
+
+### Fixed
+
+- Distraction index selection now uses `random.choice` over the full list of
+  non-deferred agenda item indices rather than always targeting the first item.
+- Context-switch penalty now calls `self._clock.advance_actor()` in addition to
+  mutating `item.estimated_hrs`, ensuring SimClock reflects the lost time rather
+  than only the plan model.
+
+---
+
 ## [v0.3.6] — 2026-03-06
 
 ### Fixed

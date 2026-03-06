@@ -200,4 +200,5 @@ KNOWN_EVENT_TYPES = {
     "normal_day_slack", "confluence_created", "day_summary",
     "employee_departed", "employee_hired", "knowledge_gap_detected",
     "onboarding_session", "farewell_message", "warmup_1on1",
+    "watercooler_chat",
 }

@@ -1,42 +1,3 @@
-"""
-normal_day.py
-=============
-Drop-in enrichment for OrgForge's _handle_normal_day().
-
-WHAT CHANGED AND WHY:
-  Before: one random Slack thread driven by a theme string. Everyone's day
-  looked the same. An incident day and a quiet day had the same texture
-  in the corpus — just different Slack content.
-
-  After: each engineer's actual agenda items from the OrgDayPlan drive
-  what happens. Ticket progress generates a JIRA status update + Slack
-  message. PR reviews generate a code review comment thread. A 1:1 generates
-  a DM. An async question generates a short cross-dept thread. Deep work
-  generates nothing visible — which is itself realistic.
-
-  The result is a corpus where you can look at any engineer's activity on
-  any day and see a coherent workday, not a random theme-driven conversation.
-
-HOW TO INTEGRATE:
-  1. Copy this file alongside flow.py
-  2. In flow.py, add the import:
-         from normal_day import NormalDayHandler
-  3. In Flow.__init__(), add:
-         self._normal_day = NormalDayHandler(
-             config=CONFIG,
-             mem=self._mem,
-             state=self.state,
-             graph_dynamics=self.graph_dynamics,
-             social_graph=self.social_graph,
-             git=self._git,
-             worker_llm=WORKER_MODEL,
-             planner_llm=PLANNER_MODEL,
-         )
-  4. Replace _handle_normal_day() call in daily_cycle() with:
-         self._normal_day.handle(self.state.org_day_plan)
-  5. Keep _generate_adhoc_confluence_page() in flow.py — it's called from here.
-"""
-
 from __future__ import annotations
 
 import json
@@ -124,23 +85,42 @@ class NormalDayHandler:
         Deferred items are logged as SimEvents so the record shows the interruption.
         """
         all_participants: List[str] = []
-
+    
         for dept, dept_plan in org_plan.dept_plans.items():
             for eng_plan in dept_plan.engineer_plans:
-
-                for item in eng_plan.agenda:
+                
+                # Per-engineer-per-day gate: evaluated once, fires at most once
+                watercooler_prob = self._config["simulation"].get("watercooler_prob", 0.15)
+                will_be_distracted = random.random() < watercooler_prob
+                distraction_fired = False
+                
+                # Pick a random non-deferred item to attach the distraction to
+                non_deferred_indices = [
+                    idx for idx, item in enumerate(eng_plan.agenda) if not item.deferred
+                ]
+                distraction_index = (
+                    random.choice(non_deferred_indices) if non_deferred_indices else None
+                )
+                
+                for idx, item in enumerate(eng_plan.agenda):
                     if item.deferred:
                         self._log_deferred_item(eng_plan.name, item, date_str)
                         continue
+                    
+                    if will_be_distracted and not distraction_fired and idx == distraction_index:
+                        self._trigger_watercooler_chat(eng_plan.name, date_str)
+                        penalty_hours = random.uniform(0.16, 0.25)
+                        item.estimated_hrs += penalty_hours
+                        self._clock.advance_actor(eng_plan.name, penalty_hours)
+                        distraction_fired = True
 
                     participants = self._dispatch(eng_plan, item, dept_plan, date_str)
                     all_participants.extend(participants)
 
-        # Boost social graph edges for everyone who interacted today
         if all_participants:
             unique = list(set(all_participants))
             self.graph_dynamics_record(unique)
-
+            
     def _dispatch(
         self,
         eng_plan:  EngineerDayPlan,
@@ -1051,6 +1031,89 @@ class NormalDayHandler:
             # OR pass a callback here. Simplest: keep the prob check in flow.py
             # and call both. See integration note at top of file.
             pass
+
+    def _trigger_watercooler_chat(self, target_actor: str, date_str: str) -> None:
+        """Injects non-work chatter, pulling the target actor away from their work."""
+        if target_actor not in self._graph:
+            return
+            
+        edges = self._graph[target_actor]
+        if not edges:
+            return
+            
+        # Pull 1-2 work friends to distract them
+        colleagues = random.choices(
+            list(edges.keys()),
+            weights=[edges[n]["weight"] for n in edges.keys()],
+            k=random.randint(1, 2),
+        )
+        participants = list(set([target_actor] + colleagues))
+        if len(participants) < 2:
+            return
+
+        # 1. The Distraction Time Sink
+        # This uses sim_clock to find the busiest person in this group, syncs 
+        # them together, and eats up 10-15 minutes of their day.
+        chat_duration_mins = random.randint(10, 15)
+        chat_duration_hours = chat_duration_mins / 60.0
+        thread_start, thread_end = self._clock.sync_and_advance(participants, hours=chat_duration_hours)
+        thread_start_iso = thread_start.isoformat()
+
+        # 2. LLM Prompting
+        topics = [
+            "weekend plans", "a trending TV show", "complaining about the weather", 
+            "trying to figure out lunch options", "sharing a pet photo"
+        ]
+        topic = random.choice(topics)
+        
+        profiles = [f"{n} ({dept_of_name(n, self._org_chart)}): {self._gd.stress_tone_hint(n)}" for n in participants]
+
+        agent = Agent(
+            role="Slack Observer",
+            goal="Write a casual, non-work Slack thread.",
+            backstory="You observe real humans taking a break from work.",
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Write a 3-5 message Slack conversation between:\n"
+                f"{chr(10).join(profiles)}\n\n"
+                f"Topic: {topic}\n"
+                f"This MUST be entirely unrelated to work, code, or Jira tickets. "
+                f"Format EXACTLY: Name: [Message]"
+            ),
+            expected_output="Slack conversation.",
+            agent=agent,
+        )
+        
+        result = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+        messages = self._parse_slack_messages(result, participants)
+
+        if messages:
+            current_msg_time = datetime.fromisoformat(thread_start_iso)
+            for msg in messages:
+                msg["ts"] = current_msg_time.isoformat()
+                current_msg_time += timedelta(minutes=random.randint(1, 3))
+
+            channel = "random" if len(participants) > 2 else f"dm_{sorted(participants)[0].lower()}_{sorted(participants)[1].lower()}"
+            path = f"{self._base}/slack/channels/{channel}/{date_str}_{target_actor}_distracted.json"
+            
+            self._save_slack(path, messages, channel)
+            self._gd.record_slack_interaction(participants)
+            
+            self._mem.log_event(SimEvent(
+                type="watercooler_chat",
+                timestamp=thread_start_iso,
+                day=self._state.day,
+                date=date_str,
+                actors=participants,
+                artifact_ids={"slack": path},
+                facts={"topic": topic, "message_count": len(messages)},
+                summary=f"{target_actor} got distracted chatting about {topic} with {len(participants)-1} others.",
+                tags=["watercooler", "slack", "distraction"],
+            ))
+            
+            logger.info(f"    [dim]☕ Distraction: {target_actor} pulled into chat about {topic}[/dim]")
 
     def _legacy_slack_chatter(self, date_str: str) -> None:
         """Original _handle_normal_day() behaviour — used as fallback."""

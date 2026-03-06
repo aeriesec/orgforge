@@ -29,5 +29,9 @@ def mock_config_and_db():
          patch("memory.MongoClient"), \
          patch("memory.build_embedder", return_value=mock_embedder), \
          patch("memory.Memory._init_vector_indexes"), \
-         patch("flow.build_llm"):
+         patch("flow.build_llm"), \
+         patch("normal_day.Agent"), \
+         patch("normal_day.Task"), \
+         patch("normal_day.Crew") as mock_crew_cls:
+        mock_crew_cls.return_value.kickoff.return_value = "Alice: Hello.\nBob: Hi there."
         yield
