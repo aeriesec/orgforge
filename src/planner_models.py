@@ -9,7 +9,7 @@ Import freely from flow.py, day_planner.py, or anywhere else.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,6 +107,29 @@ class LifecycleContext:
     active_gaps:       List[str]              # knowledge domain strings still unresolved
 
 @dataclass
+class SprintContext:
+    """
+    Deterministic ticket ownership snapshot built by TicketAssigner before
+    any LLM planning occurs.  Injected into every DepartmentPlanner prompt so
+    the LLM sees only its legal menu — it never needs to reason about ownership.
+
+    owned_tickets      — tickets already assigned to a specific engineer.
+                         LLM must NOT reassign these.
+    available_tickets  — unowned tickets the planner may assign freely within
+                         this department's capacity.
+    in_progress_ids    — subset of owned tickets already being actively worked
+                         (status == "In Progress").  Surfaced so the LLM knows
+                         what is mid-flight vs. newly started.
+    capacity_by_member — {name: available_hrs} pre-computed by TicketAssigner
+                         from GraphDynamics stress + on-call status.
+    """
+    owned_tickets:      Dict[str, str]   # {ticket_id: owner_name}
+    available_tickets:  List[str]        # ticket_ids with no owner yet
+    in_progress_ids:    List[str]        # owned + status == "In Progress"
+    capacity_by_member: Dict[str, float] # {name: hrs}
+
+
+@dataclass
 class ProposedEvent:
     """
     An event the LLM DayPlanner wants to fire today.
@@ -135,6 +158,7 @@ class DepartmentDayPlan:
     planner_reasoning: str                    # LLM chain-of-thought — for researchers
     day:               int
     date:              str
+    sprint_context:    Optional["SprintContext"] = None  # populated by TicketAssigner
 
 
 # ─────────────────────────────────────────────────────────────────────────────

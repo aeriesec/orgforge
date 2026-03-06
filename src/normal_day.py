@@ -15,6 +15,7 @@ from planner_models import (
     DepartmentDayPlan,
     EngineerDayPlan,
     OrgDayPlan,
+    ProposedEvent,
 )
 
 logger = logging.getLogger("orgforge.normalday")
@@ -38,7 +39,8 @@ class NormalDayHandler:
         git,
         worker_llm,
         planner_llm,
-        clock
+        clock,
+        persona_helper
     ):
         self._config         = config
         self._mem            = mem
@@ -53,24 +55,26 @@ class NormalDayHandler:
         self._company        = config["simulation"]["company_name"]
         self._all_names      = [n for dept in config["org_chart"].values() for n in dept]
         self._org_chart      = config["org_chart"]
-        self._clock = clock
+        self._clock          = clock
+        self._persona_helper  = persona_helper
 
     # ─── PUBLIC ENTRY POINT ───────────────────────────────────────────────────
 
     def handle(self, org_plan: Optional[OrgDayPlan]) -> None:
-        """
-        Main entry point — called from flow.py in place of _handle_normal_day().
-        Falls back gracefully if org_plan is None (e.g. during early days before
-        the planner is warm).
-        """
+        """Processes both planned agenda items and unplanned org collisions."""
         logger.info(f"  [bold blue]💬 Normal Day Activity[/bold blue]")
         date_str = str(self._state.current_date.date())
 
         if org_plan is None:
-            # Fallback: old behaviour
             self._legacy_slack_chatter(date_str)
-        else:
-            self._execute_agenda_items(org_plan, date_str)
+            return
+
+        # 1. Execute the planned daily work
+        self._execute_agenda_items(org_plan, date_str)
+
+        # 2. Execute the unplanned cross-dept collisions (Synergy or Friction)
+        for event in org_plan.collision_events:
+            self._handle_collision_event(event, date_str)
 
         # These fire regardless — they're ambient signals, not agenda-driven
         self._maybe_bot_alerts()
@@ -189,9 +193,15 @@ class NormalDayHandler:
         linked_prs = ticket.get("linked_prs", [])
         pr_context = f"Open PRs for this ticket: {', '.join(linked_prs)}" if linked_prs else "No PRs have been opened yet."
 
+        backstory = self._persona_helper(
+            assignee, 
+            mem=self._mem, 
+            graph_dynamics=self._gd
+        )
+
         agent = Agent(
             role="Software Engineer",
-            backstory=f"You are {assignee}, working on a JIRA ticket.",
+            backstory=backstory,
             goal="Make progress on the ticket and report status.",
             llm=self._worker
         )
@@ -850,6 +860,60 @@ class NormalDayHandler:
             cron_time_iso
         )
         return [name]
+    
+    def _handle_collision_event(self, event: ProposedEvent, date_str: str):
+        """Renders the unplanned interaction as a Slack thread."""
+        participants = event.actors
+        
+        # Determine the vibe from the coordinator's facts_hint
+        tension = event.facts_hint.get("tension_level", "medium")
+        
+        # Build profiles with live stress and persona backstories
+        profiles = []
+        for name in participants:
+            backstory = self._persona_helper(name, mem=self._mem, graph_dynamics=self._gd)
+            profiles.append(f"NAME: {name}\nCONTEXT: {backstory}")
+
+        # Use the Planner model for complex group dynamics
+        agent = Agent(
+            role="Org Interaction Simulator",
+            goal=f"Simulate a {tension}-tension interaction: {event.event_type}",
+            backstory="You write authentic corporate dialogue based on persona stress.",
+            llm=self._planner
+        )
+
+        task = Task(
+            description=(
+                f"TOPIC: {event.rationale}\n"
+                f"TENSION LEVEL: {tension}\n"
+                f"PARTICIPANTS:\n{chr(10).join(profiles)}\n\n"
+                f"Write a 5-8 message Slack thread. If tension is 'low', focus on "
+                f"synergy and mentorship. If 'high', focus on friction and blockers. "
+                f"STRICTLY follow each person's TYPING QUIRKS (caps, punctuation, etc)."
+            ),
+            expected_output="Slack transcript. Name: [Message] format.",
+            agent=agent
+        )
+
+        result = str(Crew(agents=[agent], tasks=[task]).kickoff())
+        messages = self._parse_slack_messages(result, participants)
+        
+        # Save to digital-hq or relevant channel
+        channel = "digital-hq"
+        path = f"{self._base}/slack/channels/{channel}/{date_str}_collision.json"
+        self._save_slack(path, messages, channel)
+        
+        # Log the simulation event for the memory store
+        self._mem.log_event(SimEvent(
+            type="org_collision",
+            timestamp=self._clock.now("system").isoformat(),
+            day=self._state.day, date=date_str,
+            actors=participants,
+            artifact_ids={"slack": path},
+            facts={"tension": tension, "type": event.event_type},
+            summary=f"Unplanned {tension} interaction: {event.rationale}",
+            tags=["collision", tension]
+        ))
 
     # ─── ARTIFACT GENERATORS ─────────────────────────────────────────────────
 
@@ -1155,13 +1219,19 @@ class NormalDayHandler:
             )
 
     def _maybe_adhoc_confluence(self) -> None:
-        if random.random() < self._config["simulation"].get("adhoc_confluence_prob", 0.3):
-            # Delegates back to flow.py's existing method via the state reference
-            # flow.py should call self._normal_day.handle() then check if it needs
-            # to also call self._generate_adhoc_confluence_page() separately,
-            # OR pass a callback here. Simplest: keep the prob check in flow.py
-            # and call both. See integration note at top of file.
-            pass
+        """Generates documentation that isn't tied to a specific incident or sprint goal."""
+        if random.random() >= self._config["simulation"].get("adhoc_confluence_prob", 0.3):
+            return
+
+        # Pick a random employee to be the author
+        author = random.choice(self._all_names)
+        
+        # Use our unified persona helper to get their voice/stress
+        backstory = self._persona_helper(author, mem=self._mem, graph_dynamics=self._gd)
+        
+        # Call the existing ad-hoc logic but pass the persona context
+        # This ensures Jax's ad-hoc docs are terse and Deepa's are methodical
+        self._state.generate_adhoc_confluence_page(author=author, backstory=backstory)
 
     def _trigger_watercooler_chat(self, target_actor: str, date_str: str) -> None:
         """Injects non-work chatter, pulling the target actor away from their work."""
