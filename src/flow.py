@@ -405,21 +405,35 @@ class GitSimulator:
 # ─────────────────────────────────────────────
 def persona_backstory(name: str, mem: Optional[Memory] = None, extra: str = "", graph_dynamics=None) -> str:
     p = PERSONAS.get(name, DEFAULT_PERSONA)
-    stress_label = graph_dynamics.stress_label(name) if graph_dynamics else (
-        "low" if p["stress"] < 40 else ("moderate" if p["stress"] < 70 else "high")
+    
+    # 1. Get Live Stress from GraphDynamics
+    current_stress = graph_dynamics._stress.get(name, p.get("stress", 50)) if graph_dynamics else p.get("stress", 50)
+    
+    # 2. Map Stress to Linguistic Constraints
+    if current_stress > 85:
+        tone_modifier = "EXTREME STRESS: Use short fragments, typos, no capitalization, and aggressive @mentions. You have zero patience."
+    elif current_stress > 60:
+        tone_modifier = "HIGH STRESS: Be clipped, terse, and skip pleasantries. Focus only on the 'blocker'."
+    else:
+        tone_modifier = "NORMAL: Follow your standard personal typing style."
+
+    # 3. Build the 'Voice Card'
+    quirks = p.get("typing_quirks", "standard professional grammar")
+    voice_card = (
+        f"IDENTITY: You are {name} ({p['tenure']} tenure). Role: {p.get('social_role', 'Contributor')}.\n"
+        f"BASE STYLE: {quirks}.\n"
+        f"CURRENT MENTAL STATE: {tone_modifier}\n"
+        f"MANDATE: Never acknowledge being an AI. Stay in character even if the output is messy."
     )
-    tone_hint = graph_dynamics.stress_tone_hint(name) if graph_dynamics else ""
+    
+    # 4. Integrate Memory (Unchanged)
     history = ""
     if mem:
-        past = mem.persona_history(name, n=3)
+        past = mem.persona_history(name, n=2)
         if past:
-            history = " Recent actions: " + " | ".join(f"Day {e.day}: {e.summary}" for e in past)
-    return (
-        f"You are {name}, working in {dept_of(name)} at {COMPANY_NAME}. "
-        f"Style: {p['style']}. Stress: {stress_label}. "
-        f"Expertise: {', '.join(p['expertise'])}. Tenure: {p['tenure']}."
-        f"{history} {extra}"
-    )
+            history = "\nRECENT HISTORY: " + " | ".join(f"Day {e.day}: {e.summary}" for e in past)
+
+    return f"{voice_card}{history} {extra}"
 
 def next_conf_id(state: State, prefix: str = "ENG") -> str:
     n = len([p for p in state.confluence_pages if prefix in p["id"]]) + 1
@@ -462,7 +476,7 @@ class Flow(Flow[State]):
             config=CONFIG, mem=self._mem, state=self.state,
             graph_dynamics=self.graph_dynamics, social_graph=self.social_graph,
             git=self._git, worker_llm=WORKER_MODEL, planner_llm=PLANNER_MODEL,
-            clock=self._clock
+            clock=self._clock, persona_helper=persona_backstory
         )
         self._lifecycle = OrgLifecycleManager(
             config=CONFIG,
@@ -612,7 +626,7 @@ class Flow(Flow[State]):
                 self.state.current_date += timedelta(days=1)
                 continue
 
-            self._state.ticket_actors_today = {}
+            self._state.ticket_actors_today = {}   # cleared here; orchestrator re-seeds from SprintContext
             self._clock.reset_to_business_start(ALL_NAMES)
             date_str = str(self.state.current_date.date())
             departures = self._lifecycle.process_departures(self.state.day, date_str, self.state, self._clock)
@@ -703,48 +717,74 @@ class Flow(Flow[State]):
 
     # ─── STANDUP (LLM) ────────────────────────
     def _handle_standup(self):
-        logger.info(f"  [bold blue]☕ Standup[/bold blue]")
+        logger.info(f"  [bold blue]☕ Multi-Agent Standup[/bold blue]")
         attendees = random.sample(ALL_NAMES, min(8, len(ALL_NAMES)))
         meeting_time = self._clock.schedule_meeting(attendees, min_hour=9, max_hour=10, duration_mins=15)
         meeting_time_iso = meeting_time.isoformat()
-        ctx = self._mem.context_for_prompt(
-            "current sprint active tickets and incidents", 
-            n=4, 
-            as_of_time=meeting_time_iso
-        )
-        
-        profiles = []
-        for name in attendees:
-            p = PERSONAS.get(name, DEFAULT_PERSONA)
-            past = self._mem.persona_history(name, n=1)
-            recent = f" Recently did: {past[0].summary}" if past else ""
-            profiles.append(f"- {name} ({dept_of(name)}, Expert in: {', '.join(p['expertise'])}).{recent}")
-
-        standup_agent = Agent(role="Tech Lead", goal="Simulate a realistic daily standup thread.", backstory="You observe the daily standup.", llm=WORKER_MODEL)
-        task = Task(
-            description=f"Write a Slack standup update for:\n{chr(10).join(profiles)}\n\nContext:\n{ctx}\nFormat EXACTLY: Name: [Message]",
-            expected_output="A transcript of standup updates.", agent=standup_agent
-        )
-        result = str(Crew(agents=[standup_agent], tasks=[task], verbose=False).kickoff())
         
         messages = []
-        for line in result.split("\n"):
-            if ":" in line:
-                name, text = line.split(":", 1)
-                name = name.strip()
-                if name in ALL_NAMES:
-                    messages.append({"user": name, "text": text.strip(), "ts": self.state.current_date.replace(hour=9, minute=30).isoformat()})
+        for name in attendees:
+            # 1. Fetch the persistent persona + live stress context
+            backstory = persona_backstory(name, mem=self._mem, graph_dynamics=self.graph_dynamics)
+            
+            # 2. Get specific context for this person's current work
+            p = PERSONAS.get(name, DEFAULT_PERSONA)
+            personal_ctx = self._mem.context_for_prompt(
+                f"{name} {p.get('expertise')} recent tasks", 
+                n=2, 
+                as_of_time=meeting_time_iso
+            )
 
-        if not messages: messages = [{"user": "System", "text": "Standup notes corrupted.", "ts": self.state.current_date.isoformat()}]
+            # 3. Create a dedicated Agent for THIS person
+            standup_agent = Agent(
+                role=f"{dept_of(name)} Team Member",
+                goal="Provide a realistic, character-accurate Slack standup update.",
+                backstory=backstory, # Carries typing quirks and stress
+                llm=WORKER_MODEL
+            )
+
+            task = Task(
+                description=(
+                    f"It's the morning standup. Write your Slack update (1-3 sentences).\n"
+                    f"CONTEXT: {personal_ctx}\n\n"
+                    f"RULES:\n"
+                    f"- Use your specific TYPING QUIRKS from your backstory.\n"
+                    f"- Mention what you did yesterday or what's blocking you.\n"
+                    f"- Be messy: use fragments or lower-case if that is your style.\n"
+                    f"Format: [Message only]"
+                ),
+                expected_output="A single Slack message in character.",
+                agent=standup_agent
+            )
+
+            # 4. Generate the individual response
+            response = str(Crew(agents=[standup_agent], tasks=[task], verbose=False).kickoff()).strip()
+            
+            messages.append({
+                "user": name,
+                "text": response,
+                "ts": meeting_time_iso
+            })
+
+        # 5. Save and Log (Standard Logic)
         date_str = str(self.state.current_date.date())
         slack_path = f"{BASE}/slack/channels/standup/{date_str}.json"
         save_json(slack_path, messages)
+        
         self.state.slack_threads.append({"date": date_str, "channel": "standup", "message_count": len(messages)})
-        self._mem.log_event(SimEvent(type="standup", timestamp=meeting_time_iso, day=self.state.day, date=date_str, actors=[m["user"] for m in messages], 
-                                     artifact_ids={"slack": slack_path}, facts={"attendee_count": len(messages)}, 
-                                     summary=f"Standup: {len(messages)} attendees shared updates.", tags=["standup"]))
+        self._mem.log_event(SimEvent(
+            type="standup", 
+            timestamp=meeting_time_iso, 
+            day=self.state.day, 
+            date=date_str, 
+            actors=attendees, 
+            artifact_ids={"slack": slack_path}, 
+            facts={"attendee_count": len(messages)}, 
+            summary=f"Standup: {len(messages)} unique voices shared updates.", 
+            tags=["standup"]
+        ))
 
-        self._record_daily_actor(*[m["user"] for m in messages])
+        self._record_daily_actor(*attendees)
         self._record_daily_event("standup")
 
     # ─── RETROSPECTIVE ────────────────────────
@@ -1045,24 +1085,54 @@ class Flow(Flow[State]):
         
         save_json(slack_path, messages)
 
-    def _generate_adhoc_confluence_page(self):
+    def _generate_adhoc_confluence_page(self, author: Optional[str] = None, backstory: Optional[str] = None):
+        """Generates a character-accurate ad-hoc Confluence page."""
         raw_topics = CONFIG.get("adhoc_confluence_topics", [["ENG", "Documentation"], ["HR", "Policy Update"]])
         rendered   = [(t[0], render_template(t[1])) for t in raw_topics]
         prefix, title = random.choice(rendered)
         conf_id = next_conf_id(self.state, prefix)
-        author  = random.choice(ALL_NAMES)
+
+        resolved_author: str = author if author is not None else random.choice(ALL_NAMES)
+        
+        # 1. Fallback for author/backstory if called outside of NormalDayHandler
+        if not author:
+            author = random.choice(ALL_NAMES)
+        if backstory is None:
+            backstory = persona_backstory(resolved_author, mem=self._mem, graph_dynamics=self.graph_dynamics)
+
         session_mins = random.randint(30, 90)
         session_hours = session_mins / 60.0
-        artifact_time, new_cursor = self._clock.advance_actor(author, hours=session_hours)
+        artifact_time, new_cursor = self._clock.advance_actor(resolved_author, hours=session_hours)
         artifact_time_iso = artifact_time.isoformat()
-        ctx     = self._mem.context_for_prompt(title, n=3, as_of_time=artifact_time_iso)
         
-        writer = Agent(role="Corporate Writer", goal="Write documentation.", backstory=f"You are {author}.", llm=PLANNER_MODEL)
-        task = Task(description=f"Write Confluence page titled '{title}'.\nContext:\n{ctx}\nFormat as Markdown.", expected_output="Markdown.", agent=writer)
+        # 2. Contextual retrieval to make the doc feel "connected"
+        ctx = self._mem.context_for_prompt(title, n=3, as_of_time=artifact_time_iso)
+        
+        writer = Agent(
+            role="Corporate Writer",
+            goal=f"Draft a {title} document.",
+            backstory=backstory, # Persistent persona + stress
+            llm=PLANNER_MODEL
+        )
+        
+        task = Task(
+            description=(
+                f"Write a Confluence page titled '{title}'.\n"
+                f"CONTEXT: {ctx}\n\n"
+                f"STRICT RULES:\n"
+                f"- Use your specific technical expertise and TYPING STYLE.\n"
+                f"- If you are stressed, the doc might be shorter or more blunt.\n"
+                f"- If you are methodical, use deep technical detail and lists.\n"
+                f"Format as Markdown."
+            ),
+            expected_output="A realistic Markdown document.",
+            agent=writer
+        )
+        
         content = str(Crew(agents=[writer], tasks=[task], verbose=False).kickoff())
-
         full_content = f"# {title}\n**ID:** {conf_id}  \n**Author:** {author}\n\n" + content + bill_gap_warning(title)
 
+        # 3. Lifecycle Check: Does this doc touch a 'departed' employee's domain?
         self._lifecycle.scan_for_knowledge_gaps(
             text=full_content,
             triggered_by=conf_id,
@@ -1072,16 +1142,31 @@ class Flow(Flow[State]):
             timestamp=artifact_time_iso
         )
         
+        # 4. Save and Embed (Standard Logic)
         path = f"{BASE}/confluence/general/{conf_id}.md"
         save_md(path, full_content)
         entry = {"id": conf_id, "title": title, "path": path}
         self.state.confluence_pages.append(entry)
-        self._embed_and_count(id=conf_id, type="confluence", title=title, content=full_content, day=self.state.day, date=str(self.state.current_date.date()),
-                              timestamp=artifact_time_iso)
-        self._mem.log_event(SimEvent(type="confluence_created", timestamp=artifact_time_iso,
-                                     day=self.state.day, date=str(self.state.current_date.date()), 
-                                     actors=[author], artifact_ids={"confluence": conf_id}, facts={"title": title}, summary=f"{author} created {conf_id}.", tags=["confluence"]))
-        logger.info(f"    [dim]📝 Generated Confluence Page: {conf_id} — {title}[/dim]")
+        
+        self._embed_and_count(
+            id=conf_id, type="confluence", title=title, content=full_content, 
+            day=self.state.day, date=str(self.state.current_date.date()),
+            timestamp=artifact_time_iso
+        )
+        
+        self._mem.log_event(SimEvent(
+            type="confluence_created", 
+            timestamp=artifact_time_iso,
+            day=self.state.day, 
+            date=str(self.state.current_date.date()), 
+            actors=[resolved_author], 
+            artifact_ids={"confluence": conf_id}, 
+            facts={"title": title, "adhoc": True}, 
+            summary=f"{author} created ad-hoc doc {conf_id}.", 
+            tags=["confluence", "adhoc"]
+        ))
+        
+        logger.info(f"    [dim]📝 Character-Accurate Doc: {conf_id} ({resolved_author})[/dim]")
 
     # ─── END OF DAY ───────────────────────────
     def _end_of_day(self):

@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch, call
 def mock_flow():
     """Fixture to initialize Flow with mocked LLMs and DB to avoid API calls."""
     with patch("flow.build_llm"), patch("flow.Memory"):
+        from flow import Flow, persona_backstory
+
         flow = Flow()
         # Initialize minimal state
         flow.state.day = 1
@@ -47,6 +49,8 @@ def test_incident_logic_variable_scope(mock_agent_class, mock_task_class, mock_c
     # Mock necessary components for incident creation
     mock_flow.graph_dynamics = MagicMock()
     mock_flow.graph_dynamics.build_escalation_chain.return_value = MagicMock(chain=[])
+    mock_flow.graph_dynamics._stress = MagicMock()
+    mock_flow.graph_dynamics._stress.get.return_value = 50
     
     # This test ensures the code actually runs without a NameError
     try:
@@ -341,6 +345,8 @@ def test_incident_sync_to_system_advances_on_call_cursor(
     mock_flow.graph_dynamics = MagicMock()
     mock_flow.graph_dynamics.build_escalation_chain.return_value = MagicMock(chain=[])
     mock_flow.graph_dynamics.relevant_external_contacts.return_value = []
+    mock_flow.graph_dynamics._stress = MagicMock()
+    mock_flow.graph_dynamics._stress.get.return_value = 40
 
     on_call = flow_module.resolve_role("on_call_engineer")
 

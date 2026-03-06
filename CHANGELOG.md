@@ -4,6 +4,24 @@ All notable changes to OrgForge will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+--
+
+## [v0.4.0] — 2026-03-06
+
+### Fixed
+
+- **Persona Type Safety (`flow.py`)**: Added explicit type guards in `_generate_adhoc_confluence_page` to ensure the `author` variable is resolved to a `str` before being passed to `persona_backstory`, resolving a Pylance `reportArgumentType` error.
+- **SimEvent Schema Integrity (`normal_day.py`)**: Updated `_handle_collision_event` to include the mandatory `artifact_ids` field, properly linking unplanned Slack interactions to their generated JSON paths in the event log.
+- **Test Suite Mocking (`tests/test_flow.py`)**: Corrected `TypeError` in incident logic tests where `MagicMock` objects were compared to integers; stress lookups in `graph_dynamics` now return valid numeric values during simulation tests.
+
+### Changed
+
+- **Linguistic Persistence Architecture (`flow.py`, `normal_day.py`)**: Refactored `NormalDayHandler` to accept a `persona_helper` dependency, enabling all synthetic artifacts (Jira, Slack, PRs) to pull from a unified, stress-reactive linguistic fingerprint.
+- **Multi-Agent Standup Simulation (`flow.py`)**: Replaced the single-agent "Tech Lead" standup with a multi-agent loop; each attendee now generates a unique update based on their specific typing quirks, technical expertise, and live stress level.
+- **"Messy" Org Coordination (`day_planner.py`, `normal_day.py`)**: Enhanced the `OrgCoordinator` to trigger unplanned "collisions"—ranging from high-synergy mentorship to high-friction accountability checks—based on the current tension and morale of department leads.
+- **Dynamic Persona Schema (`config.yaml`)**: Expanded persona definitions to include `typing_quirks` (e.g., lowercase-only, emoji-heavy), `social_role`, and `pet_peeves` to break the "cousin" effect and ensure diverse, human-like technical prose.
+- **Character-Accurate Ad-hoc Documentation (`flow.py`, `normal_day.py`)**: Integrated persona backstories into the ad-hoc Confluence generator, ensuring background documentation matches the specific voice and stress state of the authoring employee.
+
 ---
 
 ## [v0.3.9] — 2026-03-06

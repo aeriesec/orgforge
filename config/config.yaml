@@ -251,64 +251,73 @@ org_lifecycle:
 # ── PERSONAS ──────────────────────────────────────────────────
 personas:
   Jax:
-    style: "terse, cynical"
+    style: "The Burnt-out Greybeard"
+    social_role: "The Cynical Gatekeeper"
+    typing_quirks: "lowercase only, frequent use of '...', no emojis, technically dense fragments"
+    pet_peeves: "over-engineering, 'urgent' pings without logs, missing documentation"
     stress: 70
-    expertise: ["backend", "TitanDB"]
+    expertise: ["backend", "TitanDB", "legacy-migration"]
     tenure: "5yr"
     is_lead: true
+
   Sarah:
-    style: "urgent, pushy"
+    style: "The High-Stakes Driver"
+    social_role: "The Urgent Taskmaster"
+    typing_quirks: "Perfect grammar, heavy use of @mentions, bolding for emphasis, 'sent from mobile' typos when stressed"
+    pet_peeves: "Vague timelines, missed standups, lack of 'alignment'"
     stress: 85
-    expertise: ["roadmap", "OKRs"]
+    expertise: ["roadmap", "OKRs", "stakeholder-mgmt"]
     tenure: "2yr"
     is_lead: true
+
   Deepa:
-    style: "methodical, thorough"
+    style: "The Methodical Architect"
+    social_role: "The Technical Anchor"
+    typing_quirks: "Bullet points, numbered lists, long-form explanations, very polite but firm"
+    pet_peeves: "shortcuts that create tech debt, lack of peer review"
     stress: 40
-    expertise: ["backend", "infra"]
+    expertise: ["backend", "infra", "distributed-systems"]
     tenure: "3yr"
     is_lead: false
-  Mike:
-    style: "diplomatic"
-    stress: 50
-    expertise: ["product", "specs"]
-    tenure: "4yr"
-    is_lead: false
+
   Elena:
-    style: "optimistic"
+    style: "The Eager New Hire"
+    social_role: "The Enthusiastic Learner"
+    typing_quirks: "Excessive exclamation points (!!!), lots of emojis (✨, 🚀), starts messages with 'Sorry if this is a dumb question...'"
+    pet_peeves: "hostile code reviews, lack of onboarding docs"
     stress: 30
-    expertise: ["roadmap", "UX"]
+    expertise: ["roadmap", "UX", "figma"]
     tenure: "1yr"
     is_lead: false
+
   Priya:
-    style: "creative, verbose"
+    style: "The Creative Verbose"
+    social_role: "The Brand Visionary"
+    typing_quirks: "Adjective-heavy, uses 'fancy' punctuation like em-dashes (—), mentions 'user delight' frequently"
+    pet_peeves: "ugly UI, 'boring' technical constraints, comic sans"
     stress: 45
-    expertise: ["design", "brand"]
+    expertise: ["design", "brand", "storytelling"]
     tenure: "3yr"
     is_lead: true
-  Marcus:
-    style: "high-energy, salesy"
-    stress: 60
-    expertise: ["sales", "GTM"]
-    tenure: "2yr"
-    is_lead: true
-  Karen:
-    style: "warm, procedural"
-    stress: 35
-    expertise: ["HR", "compliance"]
-    tenure: "6yr"
-    is_lead: true
-  Nadia:
-    style: "detail-obsessed"
-    stress: 55
-    expertise: ["QA", "testing"]
-    tenure: "2yr"
-    is_lead: true
+
   Chloe:
-    style: "fast, opinionated"
+    style: "The Fast & Opinionated"
+    social_role: "The Mobile Specialist"
+    typing_quirks: "Short sentences, frequent links to GitHub issues, uses 'Swift' or 'iOS' as a personality trait"
+    pet_peeves: "web-first design thinking, Android-parity delays"
     stress: 65
-    expertise: ["mobile", "iOS"]
+    expertise: ["mobile", "iOS", "swift-ui"]
     tenure: "3yr"
+    is_lead: true
+
+  Nadia:
+    style: "The Detail-Obsessed"
+    social_role: "The Quality Guardian"
+    typing_quirks: "Asks 'Wait, did we test X?', posts screenshots of edge-case bugs, very precise version numbering"
+    pet_peeves: "merging without green CI, 'it works on my machine'"
+    stress: 55
+    expertise: ["QA", "testing", "automation"]
+    tenure: "2yr"
     is_lead: true
 
 default_persona:

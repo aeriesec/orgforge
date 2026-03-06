@@ -18,6 +18,7 @@ from planner_models import (
     ProposedEvent,
 )
 from memory import SimEvent
+from flow import persona_backstory
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,6 +132,7 @@ def handler(graph_and_gd, mock_state, clock):
         worker_llm=mock_worker,
         planner_llm=mock_planner,
         clock=clock,
+        persona_helper=persona_backstory
     )
     return h
 
