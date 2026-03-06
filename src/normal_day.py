@@ -120,7 +120,7 @@ class NormalDayHandler:
         if all_participants:
             unique = list(set(all_participants))
             self.graph_dynamics_record(unique)
-            
+
     def _dispatch(
         self,
         eng_plan:  EngineerDayPlan,
@@ -160,102 +160,153 @@ class NormalDayHandler:
     def _handle_ticket_progress(
         self,
         eng_plan: EngineerDayPlan,
-        item:     AgendaItem,
+        item: AgendaItem,
         date_str: str,
     ) -> List[str]:
-        """
-        Engineer makes progress on a ticket.
-        Generates: JIRA status comment + optional Slack message if blocked.
-        """
-        name      = eng_plan.name
-        ticket_id = item.related_id
-        ticket    = self._find_ticket(ticket_id)
-
-        if not ticket:
-            return [name]
+        """Simulates an engineer working on a specific JIRA ticket and potentially opening a PR."""
+        import json # Ensure json is available
         
-        artifact_time, new_cursor = self._clock.advance_actor(name, hours=item.estimated_hrs)
-        current_actor_time = artifact_time.isoformat()
+        assignee = eng_plan.name
+        ticket_id = item.related_id
+        if not ticket_id:
+            return []
+        
+        # Find the ticket in state
+        ticket = next((t for t in self._state.jira_tickets if t["id"] == ticket_id), None)
+        if not ticket:
+            return [eng_plan.name]
 
-        # Move ticket to In Progress if it's still To Do
-        if ticket.get("status") == "To Do":
-            ticket["status"] = "In Progress"
-            self._save_ticket(ticket)
+        current_actor_time, new_cursor = self._clock.advance_actor(assignee, hours=2.0)
+        current_actor_time_iso = current_actor_time.isoformat()
+        ctx = self._mem.context_for_prompt(f"{ticket_id} {ticket['title']}", n=3, as_of_time=current_actor_time_iso)
 
-        # Generate a realistic JIRA comment from this engineer
+        # 1. Format existing state for the LLM
+        existing_comments = "\n".join(
+            f"- {c['author']} ({c['date']}): {c['text']}" 
+            for c in ticket.get("comments", [])[-3:]
+        ) or "None."
 
-        ctx = self._mem.context_for_prompt(
-            f"{ticket['title']} {ticket_id}", n=2, as_of_time=current_actor_time
-        )
-        tone_hint = self._gd.stress_tone_hint(name)
+        linked_prs = ticket.get("linked_prs", [])
+        pr_context = f"Open PRs for this ticket: {', '.join(linked_prs)}" if linked_prs else "No PRs have been opened yet."
 
         agent = Agent(
             role="Software Engineer",
-            goal="Write a realistic JIRA ticket progress comment.",
-            backstory=(
-                f"You are {name}, working on [{ticket_id}]: {ticket['title']}. "
-                f"{tone_hint} Write like a real engineer — terse, specific, "
-                f"reference what you actually did today."
-            ),
-            llm=self._worker,
+            backstory=f"You are {assignee}, working on a JIRA ticket.",
+            goal="Make progress on the ticket and report status.",
+            llm=self._worker
         )
+
+        # 2. Force the LLM to output JSON and decide if the code is done
         task = Task(
             description=(
                 f"Write a JIRA comment for ticket [{ticket_id}]: {ticket['title']}.\n"
+                f"Your specific task today was: {item.description}\n"
+                f"Recent comments:\n{existing_comments}\n"
+                f"{pr_context}\n\n"
                 f"Context: {ctx}\n"
-                f"1-3 sentences. Mention what you did, any blockers, next step. "
-                f"Do not invent ticket IDs or people not mentioned above."
+                f"1. Write a 1-3 sentence JIRA comment about what you did today based on your task.\n"
+                f"2. Decide if the coding phase for this ticket is completely finished today. (If this is your first day on a complex ticket, it might be false).\n"
+                f"Respond ONLY with valid JSON matching this schema:\n"
+                f"{{\n"
+                f"  \"comment\": \"string\",\n"
+                f"  \"is_code_complete\": boolean\n"
+                f"}}"
             ),
-            expected_output="A short JIRA comment. Plain text.",
+            expected_output="Valid JSON only.",
             agent=agent,
         )
-        comment_text = str(
-            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
-        ).strip()
 
-        # Append comment to the ticket JSON
-        comment = {
-            "author":  name,
-            "date":    date_str,
-            "text":    comment_text,
-            "day":     self._state.day,
-        }
-        ticket["updated_at"] = current_actor_time
-        ticket.setdefault("comments", []).append(comment)
+        raw_result = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+        clean_json = raw_result.replace("```json", "").replace("```", "").strip()
+        
+        try:
+            parsed_data = json.loads(clean_json)
+            comment_text = parsed_data.get("comment", f"Worked on {ticket_id}.")
+            is_code_complete = parsed_data.get("is_code_complete", False)
+        except json.JSONDecodeError:
+            comment_text = clean_json # Fallback if LLM fails JSON
+            is_code_complete = False
+
+        BLOCKER_KEYWORDS = ("blocked", "blocker", "waiting on", "can't proceed", "stuck")
+        if any(kw in comment_text.lower() for kw in BLOCKER_KEYWORDS):
+            self._mem.log_event(SimEvent(
+                type="blocker_flagged",
+                timestamp=current_actor_time_iso,
+                day=self._state.day,
+                date=date_str,
+                actors=[assignee],
+                artifact_ids={"jira": ticket_id},
+                facts={"ticket_id": ticket_id, "comment": comment_text},
+                summary=f"{assignee} flagged a blocker on {ticket_id}.",
+                tags=["jira", "blocker"]
+            ))
+
+        # 3. Update the JIRA ticket
+        ticket.setdefault("comments", []).append({
+            "author": assignee,
+            "date": date_str,
+            "created": current_actor_time_iso,
+            "updated": current_actor_time_iso,
+            "text": f"\"{comment_text}\"",
+            "day": self._state.day
+        })
+        
+        # Ensure status is at least In Progress
+        if ticket["status"] == "To Do":
+            ticket["status"] = "In Progress"
+
+        # 4. Spawning the PR!
+        spawned_pr_id = None
+        if is_code_complete and not linked_prs:
+            # Code is done, generate the PR!
+            pr = self._git.create_pr(
+                author=assignee, 
+                ticket_id=ticket_id, 
+                title=f"[{ticket_id}] {ticket['title'][:50]}", 
+                timestamp=current_actor_time_iso
+            )
+            spawned_pr_id = pr["pr_id"]
+            ticket.setdefault("linked_prs", []).append(spawned_pr_id)
+            ticket["status"] = "In Review" # Advance the status
+
+        ticket["updated_at"] = current_actor_time_iso
+
+        # 5. Save and Embed
         self._save_ticket(ticket)
+        self._mem.embed_artifact(
+            id=f"{ticket_id}_comment_{len(ticket['comments'])}",
+            type="jira_comment",
+            title=f"Comment on {ticket_id}",
+            content=comment_text,
+            day=self._state.day, date=date_str,
+            metadata={"ticket_id": ticket_id, "author": assignee},
+            timestamp=current_actor_time_iso
+        )
 
-        # If the engineer mentions a blocker, generate a short Slack question
-        actors = [name]
-        blocker_keywords = ["blocked", "waiting", "need", "unclear", "can't", "cannot"]
-        if any(kw in comment_text.lower() for kw in blocker_keywords):
-            collaborator = next(iter(item.collaborator), None) or self._closest_colleague(name)
-            if collaborator and ticket_id:
-                actors = self._emit_blocker_slack(
-                    name, collaborator, ticket_id, ticket["title"],
-                    comment_text, date_str, current_actor_time
-                )
+        artifacts = {
+            "jira": ticket_id,
+            "jira_comment": f"{ticket_id}_comment_{len(ticket['comments'])}"
+        }
+        if spawned_pr_id:
+            artifacts["pr"] = spawned_pr_id
 
         self._mem.log_event(SimEvent(
             type="ticket_progress",
-            timestamp=current_actor_time,
-            day=self._state.day,
+            timestamp=current_actor_time_iso,
+            day=self._state.day, 
             date=date_str,
-            actors=actors,
-            artifact_ids={"jira": ticket_id} if ticket_id else {},
-            facts={
-                "ticket_id":    ticket_id,
-                "title":        ticket["title"],
-                "comment":      comment_text,
-                "new_status":   ticket["status"],
-                "has_blocker":  any(kw in comment_text.lower() for kw in blocker_keywords),
-            },
-            summary=f"{name} progressed [{ticket_id or 'unknown'}]: {ticket['title'][:50]}",
-            tags=["ticket_progress", "jira"],
+            actors=[assignee],
+            artifact_ids=artifacts,
+            facts={"ticket_id": ticket_id, "status": ticket["status"], "spawned_pr": spawned_pr_id},
+            summary=f"{assignee} worked on {ticket_id}. " + (f"Opened PR {spawned_pr_id}!" if spawned_pr_id else ""),
+            tags=["jira", "engineering"]
         ))
 
-        self._state.daily_artifacts_created += 1
-        logger.info(f"    [dim]📝 {name} → [{ticket_id}][/dim]")
-        return actors
+        generated_artifacts = [ticket_id]
+        if spawned_pr_id is not None:
+            generated_artifacts.append(spawned_pr_id)
+            
+        return generated_artifacts
 
     def _handle_pr_review(
         self,
@@ -306,6 +357,22 @@ class NormalDayHandler:
         review_text = str(
             Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         ).strip()
+
+        import os, json as _json
+        pr_path = f"{self._base}/git/prs/{pr.get('pr_id', pr_id)}.json"
+        os.makedirs(os.path.dirname(pr_path), exist_ok=True)
+        with open(pr_path, "w") as f:
+            _json.dump(pr, f, indent=2)
+
+        pr_comment = {
+            "author": reviewer,
+            "date": date_str,
+            "timestamp": current_actor_time,
+            "text": review_text
+        }
+        pr.setdefault("comments", []).append(pr_comment)
+
+
 
         # Emit as a GitHub bot message in #engineering
         self._emit_bot_message(
@@ -454,16 +521,16 @@ class NormalDayHandler:
         ticket_title = ticket["title"] if ticket else item.description
 
         # Pick the channel — same dept = dept channel, cross-dept = digital-hq
-        asker_dept = dept_of_name(asker, self._org_chart)
+        initial_participants = [asker]
         if collaborator:
-            collab_dept = dept_of_name(collaborator, self._org_chart)
-            channel = (
-                asker_dept.lower().replace(" ", "-")
-                if asker_dept == collab_dept
-                else "digital-hq"
-            )
+            initial_participants.append(collaborator)
+            
+        depts = {dept_of_name(p, self._org_chart) for p in initial_participants}
+        
+        if len(depts) > 1:
+            channel = "digital-hq"
         else:
-            channel = asker_dept.lower().replace(" ", "-")
+            channel = dept_of_name(asker, self._org_chart).lower().replace(" ", "-")
 
         # Pull in 1-2 more people from the channel naturally
         channel_members = self._channel_members(channel, asker)
@@ -618,11 +685,17 @@ class NormalDayHandler:
 
         messages = self._parse_slack_messages(result, participants, hour_range=(10, 15))
 
-        dept_channel = dept_of_name(initiator, self._org_chart).lower().replace(" ", "-")
+        depts = {dept_of_name(p, self._org_chart) for p in participants}
+        if len(depts) > 1:
+            dept_channel = "digital-hq"
+        else:
+            dept_channel = dept_of_name(initiator, self._org_chart).lower().replace(" ", "-")
+
         path = (
             f"{self._base}/slack/channels/{dept_channel}/"
             f"{date_str}_{initiator.lower()}_design.json"
         )
+
         if messages:
             current_msg_time = datetime.fromisoformat(meeting_time_iso)
 
@@ -638,8 +711,9 @@ class NormalDayHandler:
         # 30% chance a design discussion spawns a Confluence stub
         conf_id = None
         if random.random() < 0.30 and messages:
+            # pass the generated Slack messages into the doc generator
             conf_id = self._create_design_doc_stub(
-                initiator, participants, item.description, ctx, date_str
+                initiator, participants, item.description, ctx, date_str, messages
             )
 
         self._mem.log_event(SimEvent(
@@ -887,38 +961,58 @@ class NormalDayHandler:
         topic:        str,
         ctx:          str,
         date_str:     str,
+        slack_transcript: List[dict]  # NEW: We receive the transcript here
     ) -> Optional[str]:
-        """Creates a brief Confluence stub from a design discussion."""
+        """Creates a Confluence doc from a chat and spawns actionable JIRA tickets."""
+        import json # Ensure json is available for parsing
+
         conf_id = f"CONF-ENG-{len(self._state.confluence_pages) + 1:03d}"
 
         artifact_time, new_cursor = self._clock.advance_actor(author, hours=0.5)
         artifact_time_iso = artifact_time.isoformat()
 
-        safe_ctx = self._mem.context_for_prompt(
-            f"{topic} design discussion", 
-            n=3, 
-            as_of_time=artifact_time_iso
-        )
+        # Format the chat log so the LLM can read the actual conversation
+        chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
 
         agent = Agent(
-            role="Technical Writer",
-            goal="Write a Confluence design doc stub.",
-            backstory=f"You are {author}, capturing a design decision.",
-            llm=self._planner,
+            role="Technical Lead",
+            goal="Document technical decisions and extract actionable tickets.",
+            backstory=f"You are {author}. You just finished a Slack discussion and need to document it and assign follow-up work.",
+            llm=self._planner,  # The planner model is usually better at strict JSON
         )
+        
         task = Task(
             description=(
-                f"Write a brief Confluence design doc stub for: {topic}\n"
-                f"ID: {conf_id}. Authors: {', '.join(participants)}.\n"
-                f"Context: {ctx}\n"
-                f"Sections: Problem Statement, Options Considered, Decision, Next Steps.\n"
-                f"Keep it short — this is a working doc, not a final RFC."
+                f"You just had this Slack discussion about '{topic}':\n\n{chat_log}\n\n"
+                f"Background Context: {ctx}\n\n"
+                f"1. Write a brief Confluence design doc documenting the actual decisions made in the chat.\n"
+                f"2. Extract 1-3 concrete next steps from the chat and turn them into JIRA ticket definitions.\n"
+                f"Respond ONLY with valid JSON matching this exact schema:\n"
+                f"{{\n"
+                f"  \"markdown_doc\": \"string (the full markdown content, starting with the Problem Statement)\",\n"
+                f"  \"new_tickets\": [\n"
+                f"    {{ \"title\": \"string\", \"assignee\": \"string (must be one of: {', '.join(participants)})\", \"story_points\": int (1, 2, 3, 5, or 8) }}\n"
+                f"  ]\n"
+                f"}}"
             ),
-            expected_output="Markdown document.",
+            expected_output="Valid JSON only. No markdown fences.",
             agent=agent,
         )
-        content = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
-        full    = (
+        
+        raw_result = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+        clean_json = raw_result.replace("```json", "").replace("```", "").strip()
+        
+        try:
+            parsed_data = json.loads(clean_json)
+            content = parsed_data.get("markdown_doc", "Draft pending.")
+            new_tickets = parsed_data.get("new_tickets", [])
+        except json.JSONDecodeError as e:
+            logger.warning(f"[normal_day] JSON parse failed for design doc stub: {e}")
+            content = "Failed to parse JSON design doc from LLM."
+            new_tickets = []
+
+        # 1. Save the Confluence Document
+        full = (
             f"# Design: {topic}\n"
             f"**ID:** {conf_id}  \n"
             f"**Authors:** {', '.join(participants)}  \n"
@@ -928,10 +1022,9 @@ class NormalDayHandler:
         path = f"{self._base}/confluence/design/{conf_id}.md"
         self._save_md(path, full)
 
-        
-
         entry = {"id": conf_id, "title": f"Design: {topic[:50]}", "path": path}
         self._state.confluence_pages.append(entry)
+        
         self._mem.embed_artifact(
             id=conf_id, type="confluence",
             timestamp=artifact_time_iso,
@@ -941,18 +1034,53 @@ class NormalDayHandler:
         )
         self._state.daily_artifacts_created += 1
 
+        # 2. Spawn the JIRA Tickets into the Simulation State!
+        created_ticket_ids = []
+        for tk in new_tickets:
+            tid = f"ORG-{len(self._state.jira_tickets) + 100}"
+            assignee = tk.get("assignee")
+            
+            # Fallback if the LLM hallucinates a name not in the company
+            if assignee not in self._all_names:
+                assignee = author
+                
+            ticket = {
+                "id": tid,
+                "title": tk.get("title", "Generated Task"),
+                "status": "To Do",
+                "assignee": assignee,
+                "sprint": self._state.sprint.sprint_number if hasattr(self._state, 'sprint') else 1,
+                "story_points": tk.get("story_points", 2),
+                "linked_prs": [],
+                "created_at": artifact_time_iso,
+                "updated_at": artifact_time_iso
+            }
+            
+            self._state.jira_tickets.append(ticket)
+            self._save_ticket(ticket)
+            created_ticket_ids.append(tid)
+            
+            # Embed the new ticket so the DayPlanner can see it tomorrow
+            self._mem.embed_artifact(
+                id=tid, type="jira", title=ticket["title"], content=json.dumps(ticket), 
+                day=self._state.day, date=date_str, metadata={"assignee": assignee}, 
+                timestamp=artifact_time_iso
+            )
+            self._state.daily_artifacts_created += 1
+
+        # 3. Log the Event
         self._mem.log_event(SimEvent(
             type="confluence_created",
             timestamp=artifact_time_iso,
             day=self._state.day, date=date_str,
             actors=participants,
-            artifact_ids={"confluence": conf_id},
-            facts={"title": entry["title"], "type": "design_doc"},
-            summary=f"{author} created design doc {conf_id}: {topic[:50]}",
-            tags=["confluence", "design_doc"],
+            artifact_ids={"confluence": conf_id, "spawned_tickets": json.dumps(created_ticket_ids)},
+            facts={"title": entry["title"], "type": "design_doc", "spawned_tickets": created_ticket_ids},
+            summary=f"{author} created {conf_id} and spawned {len(created_ticket_ids)} tickets: {', '.join(created_ticket_ids)}",
+            tags=["confluence", "design_doc", "jira"],
         ))
 
-        logger.info(f"    [dim]📄 Design doc stub: {conf_id}[/dim]")
+        logger.info(f"    [dim]📄 Design doc stub: {conf_id} (Spawned {len(created_ticket_ids)} tickets)[/dim]")
         return conf_id
 
     # ─── LOGGING HELPERS ─────────────────────────────────────────────────────
