@@ -1,0 +1,760 @@
+diff --git a/config/config.yaml b/config/config.yaml
+index 54c9ff0..7fe3ee1 100644
+--- a/config/config.yaml
++++ b/config/config.yaml
+@@ -120,19 +120,24 @@ adhoc_confluence_topics:
+ genesis_docs:
+   technical:
+     count: 3
+-    id_prefix: "CONF-ENG"
++    id_prefix: "ENG"
+     prompt: >
+-      Write {count} separate Confluence pages about {project_name} and {legacy_system}.
+-      Reference these engineers: {engineers}.
+-      IDs: {ids}.
+-      Separate pages with '---PAGE BREAK---'.
++      Write a single Confluence page with ID {id} about {project_name}
++      and {legacy_system}. Authors: {authors}.
++      Existing pages you may reference: {related_pages}.
++      Do not invent any other CONF-* IDs.
++      Start directly with the  heading. Output only Markdown.
++
+   business:
+     count: 2
+-    id_prefix: "CONF-MKT"
++    id_prefix: "MKT"
+     prompt: >
+-      Write a {product_page} Campaign Brief (CONF-MKT-001) and a Sales OKR doc (CONF-MKT-002).
+-      Reference these team members: {sales_members}.
+-      Separate with '---PAGE BREAK---'.
++      Write a single Confluence page with ID {id} for {company_name}.
++      Topic: {product_page} campaign planning.
++      Authors: {authors}.
++      Existing pages you may reference: {related_pages}.
++      Do not invent any other CONF-* IDs.
++      Start directly with the  heading. Output only Markdown.
+ 
+ # ── SPRINT GOAL TEMPLATE ──────────────────────────────────────
+ sprint_goal_template: "Stabilize {legacy_system} and deliver sprint features"
+diff --git a/src/flow.py b/src/flow.py
+index d2e8596..f3c3416 100644
+--- a/src/flow.py
++++ b/src/flow.py
+@@ -21,6 +21,8 @@ from dataclasses import field
+ 
+ from day_planner import DayPlannerOrchestrator
+ from normal_day import NormalDayHandler
++from artifact_registry import ArtifactRegistry
++from confluence_writer import ConfluenceWriter
+ from pydantic import BaseModel, Field
+ from rich.console import Console
+ from rich.table import Table
+@@ -439,7 +441,10 @@ def next_conf_id(state: State, prefix: str = "ENG") -> str:
+     n = len([p for p in state.confluence_pages if prefix in p["id"]]) + 1
+     return f"CONF-{prefix}-{n:03d}"
+ 
+-def next_jira_id(state: State) -> str:
++def next_jira_id(state, registry=None) -> str:
++    if registry is not None:
++        return registry.next_jira_id()
++    # Fallback — should not be reached once registry is wired
+     return f"ORG-{len(state.jira_tickets) + 100}"
+ 
+ def bill_gap_warning(topic: str) -> str:
+@@ -472,12 +477,6 @@ class Flow(Flow[State]):
+         self._git = GitSimulator(self.state, self._mem, self.social_graph, WORKER_MODEL)
+         self._day_planner = DayPlannerOrchestrator(CONFIG, WORKER_MODEL, PLANNER_MODEL)
+         self._clock = SimClock(self.state)
+-        self._normal_day = NormalDayHandler(
+-            config=CONFIG, mem=self._mem, state=self.state,
+-            graph_dynamics=self.graph_dynamics, social_graph=self.social_graph,
+-            git=self._git, worker_llm=WORKER_MODEL, planner_llm=PLANNER_MODEL,
+-            clock=self._clock, persona_helper=persona_backstory
+-        )
+         self._lifecycle = OrgLifecycleManager(
+             config=CONFIG,
+             graph_dynamics=self.graph_dynamics,
+@@ -488,6 +487,27 @@ class Flow(Flow[State]):
+             leads=LEADS,
+             worker_llm=WORKER_MODEL,
+         )
++        self._registry = ArtifactRegistry(self._mem, base_export_dir=BASE)
++        self._confluence = ConfluenceWriter(
++            mem=self._mem,
++            registry=self._registry,
++            state=self.state,
++            config=CONFIG,
++            worker_llm=WORKER_MODEL,
++            planner_llm=PLANNER_MODEL,
++            clock=self._clock,
++            lifecycle=self._lifecycle,
++            persona_helper=persona_backstory,
++            graph_dynamics=self.graph_dynamics,
++            base_export_dir=BASE,
++        )
++        self._normal_day = NormalDayHandler(
++            config=CONFIG, mem=self._mem, state=self.state,
++            graph_dynamics=self.graph_dynamics, social_graph=self.social_graph,
++            git=self._git, worker_llm=WORKER_MODEL, planner_llm=PLANNER_MODEL,
++            clock=self._clock, persona_helper=persona_backstory,
++            confluence_writer=self._confluence,
++        )
+ 
+         stats = self._mem.stats()
+         logger.info(f"[dim]Memory: provider={stats['embed_provider']} model={stats['embed_model']} dims={stats['embed_dims']} MongoDB={'✓' if stats['mongodb_ok'] else '⚠'}[/dim]")
+@@ -538,83 +558,52 @@ class Flow(Flow[State]):
+             box=box.DOUBLE_EDGE,
+         ))
+ 
+-        # Build historian backstory from config — no hardcoded company lore
+         gap_summary = "; ".join(
+             f"{n} (ex-{e['role']}, left {e['left']}) owned {', '.join(e['knew_about'][:2])}"
+             for n, e in DEPARTED_EMPLOYEES.items()
+         )
+-        historian = Agent(
+-            role="Corporate Historian",
+-            goal="Write authentic internal technical and business documents.",
+-            backstory=(
+-                f"You work at {COMPANY_NAME}, a {INDUSTRY} company. "
+-                f"The legacy system '{LEGACY['name']}' ({LEGACY['description']}) is known to be unstable. "
+-                + (f"Departed employees with knowledge gaps: {gap_summary}. " if gap_summary else "")
+-                + "Write with real detail and insider knowledge."
+-            ),
+-            llm=PLANNER_MODEL,
+-        )
+ 
+-        # Resolve departments dynamically — fall back gracefully if dept doesn't exist
+         eng_dept   = next((d for d in ORG_CHART if "engineer" in d.lower() or "eng" in d.lower()), list(ORG_CHART.keys())[0])
+         sales_dept = next((d for d in ORG_CHART if "sales" in d.lower() or "market" in d.lower()), list(ORG_CHART.keys())[-1])
+         eng_members  = random.sample(ORG_CHART[eng_dept],   min(3, len(ORG_CHART[eng_dept])))
+         sale_members = random.sample(ORG_CHART[sales_dept], min(2, len(ORG_CHART[sales_dept])))
+ 
+-        # Pull genesis doc config and render templates
+         tech_cfg = CONFIG.get("genesis_docs", {}).get("technical", {})
+         biz_cfg  = CONFIG.get("genesis_docs", {}).get("business",  {})
+-        tech_count  = tech_cfg.get("count", 3)
+-        tech_prefix = tech_cfg.get("id_prefix", "CONF-ENG")
+-        tech_ids    = [f"{tech_prefix}-{str(i+1).zfill(3)}" for i in range(tech_count)]
+-
+-        tech_prompt = render_template(tech_cfg.get("prompt", (
+-            "Write {count} separate Confluence pages about {project_name} and {legacy_system}. "
+-            "Reference {engineers}. IDs: {ids}. Separate with '---PAGE BREAK---'."
+-        ))).replace("{count}", str(tech_count)).replace("{engineers}", str(eng_members)).replace("{ids}", ", ".join(tech_ids))
+-
+-        biz_prompt = render_template(biz_cfg.get("prompt", (
+-            "Write a {product_page} Campaign Brief (CONF-MKT-001) and a Sales OKR doc (CONF-MKT-002). "
+-            "Reference {sales_members}. Separate with '---PAGE BREAK---'."
+-        ))).replace("{sales_members}", str(sale_members))
+-
+-        tech_task = Task(description=tech_prompt, expected_output=f"{tech_count} full Markdown pages separated by '---PAGE BREAK---'.", agent=historian)
+-        biz_task  = Task(description=biz_prompt,  expected_output="Two full Markdown pages separated by '---PAGE BREAK---'.", agent=historian)
+-
+-        crew   = Crew(agents=[historian], tasks=[tech_task, biz_task], verbose=False)
+-        result = str(crew.kickoff())
+-
+-        from datetime import datetime, time
+-        genesis_time = datetime.combine(self.state.current_date.date(), time(8, 0)).isoformat()
+-
+-        for raw in result.split("---PAGE BREAK---"):
+-            ids = re.findall(r"CONF-[A-Z]+-\d+", raw)
+-            if not ids: continue
+-            doc_id = ids[0]
+-            title_match = re.search(r"#\s+(.+)", raw)
+-            title = title_match.group(1).strip() if title_match else f"Archive: {doc_id}"
+-            path = f"{BASE}/confluence/archives/{doc_id}.md"
+-            content = raw + bill_gap_warning(raw)
+-            save_md(path, content)
+-
+-            entry = {"id": doc_id, "title": title, "summary": title, "path": path}
+-            self.state.confluence_pages.append(entry)
+-            self._embed_and_count(
+-                id=doc_id, type="confluence", title=title, content=content,
+-                day=self.state.day, date=str(self.state.current_date.date()),
+-                metadata={"authors": str(eng_members)}, timestamp=genesis_time
+-            )
+ 
+-            
+-            self._mem.log_event(SimEvent(
+-                type="confluence_created", timestamp=genesis_time,
+-                day=self.state.day, date=str(self.state.current_date.date()),
+-                actors=eng_members, artifact_ids={"confluence": doc_id},
+-                facts={"title": title, "phase": "genesis"},
+-                summary=f"Archive page {doc_id} created: {title}", tags=["genesis", "confluence"],
+-            ))
++        # Technical pages — one LLM call per page, no PAGE BREAK parsing
++        self._confluence.write_genesis_batch(
++            prefix=tech_cfg.get("id_prefix", "CONF-ENG").replace("CONF-", ""),
++            count=tech_cfg.get("count", 3),
++            prompt_tpl=render_template(tech_cfg.get("prompt",
++                "Write a single Confluence page with ID {id} about {project_name} "
++                "and {legacy_system}. Authors: {authors}. "
++                "Existing related pages you may reference: {related_pages}. "
++                "Output only Markdown."
++            )),
++            authors=eng_members,
++            subdir="archives",
++        )
+ 
+-        logger.info(f"[green]✓ Genesis complete.[/green] Memory: {self._mem.stats()['artifact_count']} artifacts embedded.\n")
++        # Business pages
++        self._confluence.write_genesis_batch(
++            prefix=biz_cfg.get("id_prefix", "CONF-MKT").replace("CONF-", ""),
++            count=biz_cfg.get("count", 2),
++            prompt_tpl=render_template(biz_cfg.get("prompt",
++                "Write a single Confluence page with ID {id} for {company_name}. "
++                "Authors: {authors}. "
++                "Existing related pages you may reference: {related_pages}. "
++                "Output only Markdown."
++            )),
++            authors=sale_members,
++            extra_vars={"product_page": PRODUCT_PAGE},
++            subdir="archives",
++        )
++
++        logger.info(
++            f"[green]✓ Genesis complete.[/green] "
++            f"Memory: {self._mem.stats()['artifact_count']} artifacts embedded.\n"
++        )
+ 
+     # ─── DAILY LOOP ───────────────────────────
+     @listen(genesis_phase)
+@@ -681,7 +670,8 @@ class Flow(Flow[State]):
+         
+         new_tickets = []
+         for theme in random.sample(ticket_themes, min(n_tickets, len(ticket_themes))):
+-            tid = next_jira_id(self.state)
++            tid = self._registry.next_jira_id()
++            self._registry.register_jira(tid)
+             assignee = random.choice(ALL_NAMES)
+             pts = random.choice([1, 2, 3, 5, 8])
+             ticket = {
+@@ -818,7 +808,7 @@ class Flow(Flow[State]):
+ 
+     # ─── INCIDENT DETECTION ───────────────────
+     def _handle_incident(self):
+-        ticket_id     = next_jira_id(self.state)
++        ticket_id     = next_jira_id(self.state, self._registry)
+         on_call       = resolve_role("on_call_engineer")
+         incident_lead = resolve_role("incident_commander")
+         eng_peer      = next((n for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), []) if n != on_call), on_call)
+@@ -1034,35 +1024,19 @@ class Flow(Flow[State]):
+ 
+     def _write_postmortem(self, inc: ActiveIncident):
+         on_call  = resolve_role("postmortem_writer")
+-        eng_peer = next((n for n in ORG_CHART.get(CONFIG["roles"].get("postmortem_writer", ""), []) if n != on_call), on_call)
+-        conf_id  = next_conf_id(self.state, "ENG")
+-
+-        pm_duration_hours = random.randint(60, 180) / 60.0
+-        artifact_time, new_cursor = self._clock.advance_actor(on_call, hours=pm_duration_hours)
+-        artifact_time_iso = artifact_time.isoformat()
+-
+-        writer   = Agent(role="Senior Engineer", goal="Write a postmortem.", backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics), llm=PLANNER_MODEL)
+-        task = Task(
+-            description=f"Write Confluence postmortem for {inc.ticket_id}.\nActual Root Cause: {inc.root_cause}\nDuration: {inc.days_active} days.\nFormat as Markdown.",
+-            expected_output="A full Markdown document.", agent=writer
++        eng_peer = next(
++            (n for n in ORG_CHART.get(CONFIG["roles"].get("postmortem_writer", ""), [])
++             if n != on_call),
++            on_call
++        )
++        self._confluence.write_postmortem(
++            incident_id=inc.ticket_id,
++            incident_title=inc.title,
++            root_cause=inc.root_cause,
++            days_active=inc.days_active,
++            on_call=on_call,
++            eng_peer=eng_peer,
+         )
+-        content      = str(Crew(agents=[writer], tasks=[task], verbose=False).kickoff())
+-        full_content = f"# Postmortem: {inc.title}\n**ID:** {conf_id}\n**JIRA:** [{inc.ticket_id}]\n\n" + content
+-        path         = f"{BASE}/confluence/postmortems/{conf_id}.md"
+-        save_md(path, full_content)
+-        entry = {"id": conf_id, "title": f"Postmortem: {inc.ticket_id}", "path": path}
+-        self.state.confluence_pages.append(entry)
+-        self._embed_and_count(id=conf_id, type="confluence", title=entry["title"], content=full_content, day=self.state.day, date=str(self.state.current_date.date()),
+-                               timestamp=artifact_time_iso)
+-        self._mem.log_event(SimEvent(
+-            type="postmortem_created", 
+-            timestamp=artifact_time_iso,
+-            day=self.state.day, date=str(self.state.current_date.date()),
+-            actors=[on_call, eng_peer],
+-            artifact_ids={"confluence": conf_id, "jira": inc.ticket_id}, facts={"root_cause": inc.root_cause},
+-            summary=f"Postmortem {conf_id} written for {inc.ticket_id}.", tags=["postmortem"]
+-        ))
+-        logger.info(f"    [green]📄 Postmortem Generated:[/green] {conf_id}")
+ 
+     def _emit_bot_message(self, channel: str, bot_name: str, text: str, timestamp: str):
+         """Injects a contextual bot message into a specific Slack channel."""
+@@ -1085,88 +1059,12 @@ class Flow(Flow[State]):
+         
+         save_json(slack_path, messages)
+ 
+-    def _generate_adhoc_confluence_page(self, author: Optional[str] = None, backstory: Optional[str] = None):
+-        """Generates a character-accurate ad-hoc Confluence page."""
+-        raw_topics = CONFIG.get("adhoc_confluence_topics", [["ENG", "Documentation"], ["HR", "Policy Update"]])
+-        rendered   = [(t[0], render_template(t[1])) for t in raw_topics]
+-        prefix, title = random.choice(rendered)
+-        conf_id = next_conf_id(self.state, prefix)
+-
+-        resolved_author: str = author if author is not None else random.choice(ALL_NAMES)
+-        
+-        # 1. Fallback for author/backstory if called outside of NormalDayHandler
+-        if not author:
+-            author = random.choice(ALL_NAMES)
+-        if backstory is None:
+-            backstory = persona_backstory(resolved_author, mem=self._mem, graph_dynamics=self.graph_dynamics)
+-
+-        session_mins = random.randint(30, 90)
+-        session_hours = session_mins / 60.0
+-        artifact_time, new_cursor = self._clock.advance_actor(resolved_author, hours=session_hours)
+-        artifact_time_iso = artifact_time.isoformat()
+-        
+-        # 2. Contextual retrieval to make the doc feel "connected"
+-        ctx = self._mem.context_for_prompt(title, n=3, as_of_time=artifact_time_iso)
+-        
+-        writer = Agent(
+-            role="Corporate Writer",
+-            goal=f"Draft a {title} document.",
+-            backstory=backstory, # Persistent persona + stress
+-            llm=PLANNER_MODEL
+-        )
+-        
+-        task = Task(
+-            description=(
+-                f"Write a Confluence page titled '{title}'.\n"
+-                f"CONTEXT: {ctx}\n\n"
+-                f"STRICT RULES:\n"
+-                f"- Use your specific technical expertise and TYPING STYLE.\n"
+-                f"- If you are stressed, the doc might be shorter or more blunt.\n"
+-                f"- If you are methodical, use deep technical detail and lists.\n"
+-                f"Format as Markdown."
+-            ),
+-            expected_output="A realistic Markdown document.",
+-            agent=writer
+-        )
+-        
+-        content = str(Crew(agents=[writer], tasks=[task], verbose=False).kickoff())
+-        full_content = f"# {title}\n**ID:** {conf_id}  \n**Author:** {author}\n\n" + content + bill_gap_warning(title)
+-
+-        # 3. Lifecycle Check: Does this doc touch a 'departed' employee's domain?
+-        self._lifecycle.scan_for_knowledge_gaps(
+-            text=full_content,
+-            triggered_by=conf_id,
+-            day=self.state.day,
+-            date_str=str(self.state.current_date.date()),
+-            state=self.state,
+-            timestamp=artifact_time_iso
+-        )
+-        
+-        # 4. Save and Embed (Standard Logic)
+-        path = f"{BASE}/confluence/general/{conf_id}.md"
+-        save_md(path, full_content)
+-        entry = {"id": conf_id, "title": title, "path": path}
+-        self.state.confluence_pages.append(entry)
+-        
+-        self._embed_and_count(
+-            id=conf_id, type="confluence", title=title, content=full_content, 
+-            day=self.state.day, date=str(self.state.current_date.date()),
+-            timestamp=artifact_time_iso
+-        )
+-        
+-        self._mem.log_event(SimEvent(
+-            type="confluence_created", 
+-            timestamp=artifact_time_iso,
+-            day=self.state.day, 
+-            date=str(self.state.current_date.date()), 
+-            actors=[resolved_author], 
+-            artifact_ids={"confluence": conf_id}, 
+-            facts={"title": title, "adhoc": True}, 
+-            summary=f"{author} created ad-hoc doc {conf_id}.", 
+-            tags=["confluence", "adhoc"]
+-        ))
+-        
+-        logger.info(f"    [dim]📝 Character-Accurate Doc: {conf_id} ({resolved_author})[/dim]")
++    def _generate_adhoc_confluence_page(
++        self,
++        author: Optional[str] = None,
++        backstory: Optional[str] = None,
++    ):
++        self._confluence.write_adhoc_page(author=author, backstory=backstory)
+ 
+     # ─── END OF DAY ───────────────────────────
+     def _end_of_day(self):
+diff --git a/src/normal_day.py b/src/normal_day.py
+index 97624a5..e2edb69 100644
+--- a/src/normal_day.py
++++ b/src/normal_day.py
+@@ -40,7 +40,8 @@ class NormalDayHandler:
+         worker_llm,
+         planner_llm,
+         clock,
+-        persona_helper
++        persona_helper,
++        confluence_writer=None
+     ):
+         self._config         = config
+         self._mem            = mem
+@@ -56,7 +57,9 @@ class NormalDayHandler:
+         self._all_names      = [n for dept in config["org_chart"].values() for n in dept]
+         self._org_chart      = config["org_chart"]
+         self._clock          = clock
+-        self._persona_helper  = persona_helper
++        self._persona_helper = persona_helper
++        self._confluence     = confluence_writer
++        self._registry       = getattr(confluence_writer, "_registry", None)
+ 
+     # ─── PUBLIC ENTRY POINT ───────────────────────────────────────────────────
+ 
+@@ -182,45 +185,50 @@ class NormalDayHandler:
+ 
+         current_actor_time, new_cursor = self._clock.advance_actor(assignee, hours=2.0)
+         current_actor_time_iso = current_actor_time.isoformat()
+-        ctx = self._mem.context_for_prompt(f"{ticket_id} {ticket['title']}", n=3, as_of_time=current_actor_time_iso)
+-
+-        # 1. Format existing state for the LLM
+-        existing_comments = "\n".join(
+-            f"- {c['author']} ({c['date']}): {c['text']}" 
+-            for c in ticket.get("comments", [])[-3:]
+-        ) or "None."
+-
++        ctx = self._mem.context_for_prompt(
++            f"{ticket_id} {ticket['title']}", n=3, as_of_time=current_actor_time_iso
++        )
+         linked_prs = ticket.get("linked_prs", [])
+-        pr_context = f"Open PRs for this ticket: {', '.join(linked_prs)}" if linked_prs else "No PRs have been opened yet."
+ 
+-        backstory = self._persona_helper(
+-            assignee, 
+-            mem=self._mem, 
+-            graph_dynamics=self._gd
+-        )
++        # Build structured ticket context — title + full state in one object
++        if self._registry:
++            ticket_ctx = self._registry.ticket_summary(
++                ticket, self._state.day
++            ).for_prompt()
++        else:
++            # Graceful fallback if registry not wired yet
++            ticket_ctx = (
++                f"Ticket: [{ticket_id}] {ticket.get('title', '')}\n"
++                f"Status: {ticket.get('status', 'To Do')}\n"
++                f"Recent comments: " + (
++                    "\n".join(
++                        f"  - {c['author']} ({c['date']}): {c['text']}"
++                        for c in ticket.get("comments", [])[-3:]
++                    ) or "None."
++                )
++            )
++
++        backstory = self._persona_helper(assignee, mem=self._mem, graph_dynamics=self._gd)
+ 
+         agent = Agent(
+             role="Software Engineer",
+             backstory=backstory,
+             goal="Make progress on the ticket and report status.",
+-            llm=self._worker
++            llm=self._worker,
+         )
+-
+-        # 2. Force the LLM to output JSON and decide if the code is done
+         task = Task(
+             description=(
+-                f"Write a JIRA comment for ticket [{ticket_id}]: {ticket['title']}.\n"
+-                f"Your specific task today was: {item.description}\n"
+-                f"Recent comments:\n{existing_comments}\n"
+-                f"{pr_context}\n\n"
+-                f"Context: {ctx}\n"
+-                f"1. Write a 1-3 sentence JIRA comment about what you did today based on your task.\n"
+-                f"2. Decide if the coding phase for this ticket is completely finished today. (If this is your first day on a complex ticket, it might be false).\n"
+-                f"Respond ONLY with valid JSON matching this schema:\n"
+-                f"{{\n"
+-                f"  \"comment\": \"string\",\n"
+-                f"  \"is_code_complete\": boolean\n"
+-                f"}}"
++                f"{ticket_ctx}\n\n"
++                f"Your specific task today: {item.description}\n"
++                f"Memory context: {ctx}\n\n"
++                f"1. Write a 1-3 sentence JIRA comment about what you did today.\n"
++                f"2. Decide if the coding phase is completely finished today.\n"
++                f"   (If this is day 1 of a complex ticket, it's likely false.)\n"
++                f"Respond ONLY with valid JSON:\n"
++                f'{{\n'
++                f'  "comment": "string",\n'
++                f'  "is_code_complete": boolean\n'
++                f'}}'
+             ),
+             expected_output="Valid JSON only.",
+             agent=agent,
+@@ -1023,132 +1031,23 @@ class NormalDayHandler:
+ 
+     def _create_design_doc_stub(
+         self,
+-        author:       str,
+-        participants: List[str],
+-        topic:        str,
+-        ctx:          str,
+-        date_str:     str,
+-        slack_transcript: List[dict]  # NEW: We receive the transcript here
++        author:           str,
++        participants:     List[str],
++        topic:            str,
++        ctx:              str,              # kept for signature compat, not used
++        date_str:         str,
++        slack_transcript: List[dict],
+     ) -> Optional[str]:
+-        """Creates a Confluence doc from a chat and spawns actionable JIRA tickets."""
+-        import json # Ensure json is available for parsing
+-
+-        conf_id = f"CONF-ENG-{len(self._state.confluence_pages) + 1:03d}"
+-
+-        artifact_time, new_cursor = self._clock.advance_actor(author, hours=0.5)
+-        artifact_time_iso = artifact_time.isoformat()
+-
+-        # Format the chat log so the LLM can read the actual conversation
+-        chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
+-
+-        agent = Agent(
+-            role="Technical Lead",
+-            goal="Document technical decisions and extract actionable tickets.",
+-            backstory=f"You are {author}. You just finished a Slack discussion and need to document it and assign follow-up work.",
+-            llm=self._planner,  # The planner model is usually better at strict JSON
+-        )
+-        
+-        task = Task(
+-            description=(
+-                f"You just had this Slack discussion about '{topic}':\n\n{chat_log}\n\n"
+-                f"Background Context: {ctx}\n\n"
+-                f"1. Write a brief Confluence design doc documenting the actual decisions made in the chat.\n"
+-                f"2. Extract 1-3 concrete next steps from the chat and turn them into JIRA ticket definitions.\n"
+-                f"Respond ONLY with valid JSON matching this exact schema:\n"
+-                f"{{\n"
+-                f"  \"markdown_doc\": \"string (the full markdown content, starting with the Problem Statement)\",\n"
+-                f"  \"new_tickets\": [\n"
+-                f"    {{ \"title\": \"string\", \"assignee\": \"string (must be one of: {', '.join(participants)})\", \"story_points\": int (1, 2, 3, 5, or 8) }}\n"
+-                f"  ]\n"
+-                f"}}"
+-            ),
+-            expected_output="Valid JSON only. No markdown fences.",
+-            agent=agent,
+-        )
+-        
+-        raw_result = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+-        clean_json = raw_result.replace("```json", "").replace("```", "").strip()
+-        
+-        try:
+-            parsed_data = json.loads(clean_json)
+-            content = parsed_data.get("markdown_doc", "Draft pending.")
+-            new_tickets = parsed_data.get("new_tickets", [])
+-        except json.JSONDecodeError as e:
+-            logger.warning(f"[normal_day] JSON parse failed for design doc stub: {e}")
+-            content = "Failed to parse JSON design doc from LLM."
+-            new_tickets = []
+-
+-        # 1. Save the Confluence Document
+-        full = (
+-            f"# Design: {topic}\n"
+-            f"**ID:** {conf_id}  \n"
+-            f"**Authors:** {', '.join(participants)}  \n"
+-            f"**Date:** {date_str}\n\n"
+-            + content
+-        )
+-        path = f"{self._base}/confluence/design/{conf_id}.md"
+-        self._save_md(path, full)
+-
+-        entry = {"id": conf_id, "title": f"Design: {topic[:50]}", "path": path}
+-        self._state.confluence_pages.append(entry)
+-        
+-        self._mem.embed_artifact(
+-            id=conf_id, type="confluence",
+-            timestamp=artifact_time_iso,
+-            title=entry["title"], content=full,
+-            day=self._state.day, date=date_str,
+-            metadata={"authors": str(participants), "type": "design_doc"},
++        if self._confluence is None:
++            logger.warning("[normal_day] No ConfluenceWriter — skipping design doc.")
++            return None
++        return self._confluence.write_design_doc(
++            author=author,
++            participants=participants,
++            topic=topic,
++            slack_transcript=slack_transcript,
++            date_str=date_str,
+         )
+-        self._state.daily_artifacts_created += 1
+-
+-        # 2. Spawn the JIRA Tickets into the Simulation State!
+-        created_ticket_ids = []
+-        for tk in new_tickets:
+-            tid = f"ORG-{len(self._state.jira_tickets) + 100}"
+-            assignee = tk.get("assignee")
+-            
+-            # Fallback if the LLM hallucinates a name not in the company
+-            if assignee not in self._all_names:
+-                assignee = author
+-                
+-            ticket = {
+-                "id": tid,
+-                "title": tk.get("title", "Generated Task"),
+-                "status": "To Do",
+-                "assignee": assignee,
+-                "sprint": self._state.sprint.sprint_number if hasattr(self._state, 'sprint') else 1,
+-                "story_points": tk.get("story_points", 2),
+-                "linked_prs": [],
+-                "created_at": artifact_time_iso,
+-                "updated_at": artifact_time_iso
+-            }
+-            
+-            self._state.jira_tickets.append(ticket)
+-            self._save_ticket(ticket)
+-            created_ticket_ids.append(tid)
+-            
+-            # Embed the new ticket so the DayPlanner can see it tomorrow
+-            self._mem.embed_artifact(
+-                id=tid, type="jira", title=ticket["title"], content=json.dumps(ticket), 
+-                day=self._state.day, date=date_str, metadata={"assignee": assignee}, 
+-                timestamp=artifact_time_iso
+-            )
+-            self._state.daily_artifacts_created += 1
+-
+-        # 3. Log the Event
+-        self._mem.log_event(SimEvent(
+-            type="confluence_created",
+-            timestamp=artifact_time_iso,
+-            day=self._state.day, date=date_str,
+-            actors=participants,
+-            artifact_ids={"confluence": conf_id, "spawned_tickets": json.dumps(created_ticket_ids)},
+-            facts={"title": entry["title"], "type": "design_doc", "spawned_tickets": created_ticket_ids},
+-            summary=f"{author} created {conf_id} and spawned {len(created_ticket_ids)} tickets: {', '.join(created_ticket_ids)}",
+-            tags=["confluence", "design_doc", "jira"],
+-        ))
+-
+-        logger.info(f"    [dim]📄 Design doc stub: {conf_id} (Spawned {len(created_ticket_ids)} tickets)[/dim]")
+-        return conf_id
+ 
+     # ─── LOGGING HELPERS ─────────────────────────────────────────────────────
+ 
+@@ -1219,19 +1118,13 @@ class NormalDayHandler:
+             )
+ 
+     def _maybe_adhoc_confluence(self) -> None:
+-        """Generates documentation that isn't tied to a specific incident or sprint goal."""
+         if random.random() >= self._config["simulation"].get("adhoc_confluence_prob", 0.3):
+             return
+-
+-        # Pick a random employee to be the author
+-        author = random.choice(self._all_names)
+-        
+-        # Use our unified persona helper to get their voice/stress
++        if self._confluence is None:
++            return
++        author    = random.choice(self._all_names)
+         backstory = self._persona_helper(author, mem=self._mem, graph_dynamics=self._gd)
+-        
+-        # Call the existing ad-hoc logic but pass the persona context
+-        # This ensures Jax's ad-hoc docs are terse and Deepa's are methodical
+-        self._state.generate_adhoc_confluence_page(author=author, backstory=backstory)
++        self._confluence.write_adhoc_page(author=author, backstory=backstory)
+ 
+     def _trigger_watercooler_chat(self, target_actor: str, date_str: str) -> None:
+         """Injects non-work chatter, pulling the target actor away from their work."""
+diff --git a/src/ticket_assigner.py b/src/ticket_assigner.py
+index d99cf8f..eb2f9da 100644
+--- a/src/ticket_assigner.py
++++ b/src/ticket_assigner.py
+@@ -3,9 +3,7 @@ ticket_assigner.py
+ ==================
+ Deterministic ticket assignment for OrgForge.
+ 
+-Implements Options B + C from the architecture discussion:
+-
+-  Option C — Graph-weighted assignment
++  Graph-weighted assignment
+       Scores every (engineer, ticket) pair using:
+         • skill match against ticket title keywords
+         • inverse stress  (burnt-out engineers get lighter loads)
+@@ -14,7 +12,7 @@ Implements Options B + C from the architecture discussion:
+       Uses scipy linear_sum_assignment (Hungarian algorithm) for globally
+       optimal matching. Falls back to greedy round-robin if scipy is absent.
+ 
+-  Option B — Two-pass planning
++  Two-pass planning
+       Pass 1 (this module): builds a fully valid SprintContext with locked
+       assignments before any LLM call.
+       Pass 2 (DepartmentPlanner): receives SprintContext and only writes
+diff --git a/tests/test_flow.py b/tests/test_flow.py
+index 43d3f0f..c357235 100644
+--- a/tests/test_flow.py
++++ b/tests/test_flow.py
+@@ -368,12 +368,16 @@ def test_incident_sync_to_system_advances_on_call_cursor(
+         "after sync_to_system — sync had no effect"
+     )
+ 
+-
++@patch("confluence_writer.Crew")
+ @patch("flow.Crew")
+ @patch("flow.Task")
+ @patch("flow.Agent")
+ def test_postmortem_artifact_timestamp_within_actor_work_block(
+-    mock_agent_class, mock_task_class, mock_crew_class, mock_flow
++    mock_agent_class,
++    mock_task_class,
++    mock_crew_class,
++    mock_cw_crew,
++    mock_flow
+ ):
+     """
+     _write_postmortem uses advance_actor to compute the artifact timestamp.
+@@ -385,6 +389,7 @@ def test_postmortem_artifact_timestamp_within_actor_work_block(
+     mock_crew_instance = MagicMock()
+     mock_crew_instance.kickoff.return_value = "## Postmortem\n\nRoot cause: OOM."
+     mock_crew_class.return_value = mock_crew_instance
++    mock_cw_crew.return_value = mock_crew_instance
+ 
+     writer = flow_module.resolve_role("postmortem_writer")
+     mock_flow._clock.reset_to_business_start(flow_module.ALL_NAMES)
+@@ -404,7 +409,9 @@ def test_postmortem_artifact_timestamp_within_actor_work_block(
+     # Grab the postmortem_created SimEvent to inspect its timestamp
+     all_calls = mock_flow._mem.log_event.call_args_list
+     pm_evt = next(
+-        c.args[0] for c in all_calls if c.args[0].type == "postmortem_created"
++        c.args[0] for c in all_calls 
++        if c.args[0].type == "confluence_created" 
++        and "postmortem" in c.args[0].tags
+     )
+     stamped = datetime.fromisoformat(pm_evt.timestamp)
+ 
+diff --git a/tests/test_lifecycle.py b/tests/test_lifecycle.py
+index a8f49c0..1cc0f3b 100644
+--- a/tests/test_lifecycle.py
++++ b/tests/test_lifecycle.py
+@@ -19,6 +19,8 @@ def mock_flow():
+         flow = Flow()
+         flow.state.day = 5
+         flow.state.system_health = 80
++        flow._registry = MagicMock()
++        flow._confluence = MagicMock()
+         return flow
+     
+ @pytest.fixture
+diff --git a/tests/test_normal_day.py b/tests/test_normal_day.py
+index df14cc8..5d8af84 100644
+--- a/tests/test_normal_day.py
++++ b/tests/test_normal_day.py
+@@ -561,6 +561,17 @@ def test_design_discussion_confluence_stub_created_sometimes(handler, mock_state
+     eng_plan  = _simple_eng_plan("Alice", [item])
+     dept_plan = _simple_dept_plan([eng_plan])
+ 
++    mock_cw = MagicMock()
++    def fake_write_design(*args, **kwargs):
++        from memory import SimEvent
++        handler._mem.log_event(SimEvent(
++            type="confluence_created", day=1, date="", timestamp="", 
++            actors=[], artifact_ids={}, facts={}, summary=""
++        ))
++        return "CONF-ENG-123"
++    mock_cw.write_design_doc.side_effect = fake_write_design
++    handler._confluence = mock_cw
++
+     with patch.object(handler, "_save_slack"), \
+          patch.object(handler, "_save_md"), \
+          patch("normal_day.Crew") as mock_crew, \

@@ -368,12 +368,16 @@ def test_incident_sync_to_system_advances_on_call_cursor(
         "after sync_to_system — sync had no effect"
     )
 
-
+@patch("confluence_writer.Crew")
 @patch("flow.Crew")
 @patch("flow.Task")
 @patch("flow.Agent")
 def test_postmortem_artifact_timestamp_within_actor_work_block(
-    mock_agent_class, mock_task_class, mock_crew_class, mock_flow
+    mock_agent_class,
+    mock_task_class,
+    mock_crew_class,
+    mock_cw_crew,
+    mock_flow
 ):
     """
     _write_postmortem uses advance_actor to compute the artifact timestamp.
@@ -385,6 +389,7 @@ def test_postmortem_artifact_timestamp_within_actor_work_block(
     mock_crew_instance = MagicMock()
     mock_crew_instance.kickoff.return_value = "## Postmortem\n\nRoot cause: OOM."
     mock_crew_class.return_value = mock_crew_instance
+    mock_cw_crew.return_value = mock_crew_instance
 
     writer = flow_module.resolve_role("postmortem_writer")
     mock_flow._clock.reset_to_business_start(flow_module.ALL_NAMES)
@@ -404,7 +409,9 @@ def test_postmortem_artifact_timestamp_within_actor_work_block(
     # Grab the postmortem_created SimEvent to inspect its timestamp
     all_calls = mock_flow._mem.log_event.call_args_list
     pm_evt = next(
-        c.args[0] for c in all_calls if c.args[0].type == "postmortem_created"
+        c.args[0] for c in all_calls 
+        if c.args[0].type == "confluence_created" 
+        and "postmortem" in c.args[0].tags
     )
     stamped = datetime.fromisoformat(pm_evt.timestamp)
 

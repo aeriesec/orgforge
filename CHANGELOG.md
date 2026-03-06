@@ -6,6 +6,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 --
 
+## [v0.4.1] — 2026-03-06
+
+### Fixed
+
+- **Test Suite Mocking (`tests/test_flow.py`, `tests/test_normal_day.py`)**: Added `@patch("confluence_writer.Crew")` to `test_postmortem_artifact_timestamp_within_actor_work_block` to ensure the delegated writer is properly mocked. Fixed a `StopIteration` error in the postmortem test by asserting against the unified `confluence_created` event type containing a `postmortem` tag instead of the deprecated `postmortem_created` event. Mocked `ConfluenceWriter.write_design_doc` with a side effect in `test_design_discussion_confluence_stub_created_sometimes` to emit the expected simulation event during assertions.
+- **Fixture Initialization (`tests/test_lifecycle.py`)**: Appended `_registry = MagicMock()` and `_confluence = MagicMock()` to the `mock_flow` fixture to prevent `AttributeError` crashes during test setup.
+
+### Changed
+
+- **Unified Confluence Generation (`flow.py`, `normal_day.py`)**: Fully delegated the creation of genesis documents, postmortems, ad-hoc pages, and design doc stubs to the centralized `ConfluenceWriter`. Instantiated `ArtifactRegistry` and `ConfluenceWriter` in the `Flow` constructor and injected them into the `NormalDayHandler`.
+- **Deterministic ID Allocation (`flow.py`, `config.yaml`)**: Updated `next_jira_id`, `_handle_sprint_planning`, and `_handle_incident` to pull JIRA IDs directly from the `ArtifactRegistry`. Refactored the `genesis_docs` prompts in `config.yaml` to generate single pages with explicit IDs rather than relying on brittle `---PAGE BREAK---` splitting. Stripped the hardcoded `CONF-` from the `id_prefix` configurations for engineering and marketing.
+- **Structured Ticket Context (`normal_day.py`)**: Replaced the manual string formatting of JIRA ticket states in `_handle_jira_ticket_work` with `_registry.ticket_summary(ticket, self._state.day).for_prompt()`, ensuring the LLM receives complete, structured context. Added a graceful fallback if the registry isn't wired yet.
+- **Documentation Cleanup (`ticket_assigner.py`)**: Removed outdated architectural notes referencing "Options B + C" from the module docstring.
+
+---
+
 ## [v0.4.0] — 2026-03-06
 
 ### Fixed

@@ -3,9 +3,7 @@ ticket_assigner.py
 ==================
 Deterministic ticket assignment for OrgForge.
 
-Implements Options B + C from the architecture discussion:
-
-  Option C — Graph-weighted assignment
+  Graph-weighted assignment
       Scores every (engineer, ticket) pair using:
         • skill match against ticket title keywords
         • inverse stress  (burnt-out engineers get lighter loads)
@@ -14,7 +12,7 @@ Implements Options B + C from the architecture discussion:
       Uses scipy linear_sum_assignment (Hungarian algorithm) for globally
       optimal matching. Falls back to greedy round-robin if scipy is absent.
 
-  Option B — Two-pass planning
+  Two-pass planning
       Pass 1 (this module): builds a fully valid SprintContext with locked
       assignments before any LLM call.
       Pass 2 (DepartmentPlanner): receives SprintContext and only writes
