@@ -6,6 +6,20 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.6] — 2026-03-06
+
+### Fixed
+
+- Resolved `UnboundLocalError` for `random` in `normal_day.py` — removed redundant
+  `import random` statements inside `_handle_design_discussion`, `_handle_1on1`,
+  `_handle_qa_question`, and `_handle_blocked_engineer`. Python's function-scoping
+  rules caused the conditional inner imports to shadow the top-level import,
+  leaving `random` unbound at call sites earlier in the same function body.
+- Updated `config/config.yaml` cloud model references to use the `bedrock/` prefix
+  so model selection routes correctly to AWS Bedrock at runtime.
+
+---
+
 ## [v0.3.5] — 2026-03-05
 
 ### Added

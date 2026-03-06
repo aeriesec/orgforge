@@ -44,9 +44,9 @@ model_presets:
   cloud:
     provider: "bedrock"
     # Claude 3.5 Sonnet on Bedrock — best for long-form corporate doc generation
-    planner: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    planner: "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
     # Llama 3.1 8B on Bedrock — fast, cheap for high-volume worker calls
-    worker: "meta.llama3-1-8b-instruct-v1:0"
+    worker: "bedrock/us.meta.llama3-1-8b-instruct-v1:0"
     aws_region: "us-east-1"
     embed_provider: "openai"
     embed_model: "text-embedding-3-large"
@@ -59,7 +59,7 @@ simulation:
   domain: "apexathletics.io"
   output_dir: "./export"
   db_name: "orgforge"
-  max_days: 2
+  max_days: 22
   start_date: "2026-03-02"
 
   adhoc_confluence_prob: 0.3
