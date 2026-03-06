@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Dict, Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from dataclasses import field
 
 from day_planner import DayPlannerOrchestrator
 from normal_day import NormalDayHandler
@@ -280,6 +281,7 @@ class State(BaseModel):
     daily_event_type_counts: Dict[str, int] = {}
     departed_employees: Dict[str, Dict] = {}   # name → {left, role, knew_about, documented_pct}
     new_hires: Dict[str, Dict] = {}   # name → {joined, role, dept, expertise}
+    ticket_actors_today: Dict[str, List[str]] = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────
@@ -610,6 +612,7 @@ class Flow(Flow[State]):
                 self.state.current_date += timedelta(days=1)
                 continue
 
+            self._state.ticket_actors_today = {}
             self._clock.reset_to_business_start(ALL_NAMES)
             date_str = str(self.state.current_date.date())
             departures = self._lifecycle.process_departures(self.state.day, date_str, self.state, self._clock)
@@ -617,7 +620,7 @@ class Flow(Flow[State]):
 
             if departures or hires:
                 # Patch the day planner's validator to reflect the new roster
-                patch_validator_for_lifecycle(self._day_planner.validator, self._lifecycle)
+                patch_validator_for_lifecycle(self._day_planner._validator, self._lifecycle)
 
             org_plan = self._day_planner.plan(
                 self.state, self._mem, self.graph_dynamics,

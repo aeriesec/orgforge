@@ -88,9 +88,6 @@ class DepartmentPlanner:
 
     {lifecycle_context}
 
-    KNOWN EVENT TYPES YOU CAN PROPOSE:
-    {known_types}
-
     You may also propose NEW event types if the situation genuinely calls for it.
     If you propose a novel event, set "is_novel": true and specify "artifact_hint"
     as one of: "slack", "jira", "confluence", or "email".
@@ -99,10 +96,7 @@ class DepartmentPlanner:
     1. Write a department theme for today (one sentence, specific to {dept}).
     2. For each team member, write a 2-4 item agenda (what they plan to work on).
        CRITICAL RULES:
-       - ROLE ENFORCEMENT: If {dept} is a non-engineering department (like HR, Sales, Marketing), your team members CANNOT 
-         write code, design system architecture, or review PRs. Their agenda MUST reflect their actual business functions (e.g., recruitment, 
-         policy updates, sales calls), even if the ORG THEME is highly technical.
-       - TICKET ALLOCATION: Do not assign multiple people to the same ticket ID for "ticket_progress". Only the explicit assignee should make progress.
+       - NON-ENGINEERING TEAMS: Agenda items must reflect actual business functions only (recruitment, sales calls, policy — not code or PRs).
        - EVENT REDUNDANCY: Do not schedule redundant "design_discussion" or "async_question" events for the same topic across multiple people. 
          One initiator is enough.
     3. Propose 1-3 events that should fire today, ordered by priority (1=must, 3=optional).
@@ -140,8 +134,7 @@ class DepartmentPlanner:
         "is_novel": false,
         "artifact_hint": "string or null"
         }}
-    ],
-    "planner_reasoning": "string"
+    ]
     }}
     """
 
@@ -250,22 +243,40 @@ class DepartmentPlanner:
             return self._fallback_plan(org_theme, day, date, cross_signals)
 
         # ── Engineer plans ────────────────────────────────────────────────────
+        # Tracks which ticket IDs have already been claimed for ticket_progress
+        # this planning pass. Prevents the LLM assigning the same ticket to
+        # multiple engineers despite the prompt instruction to the contrary.
+        claimed_tickets: set = set()
+
         eng_plans: List[EngineerDayPlan] = []
         for ep in data.get("engineer_plans", []):
             name = ep.get("name", "")
             if name not in self.members:
                 continue   # LLM invented a name — skip silently
 
-            agenda = [
-                AgendaItem(
-                    activity_type=a.get("activity_type", "ticket_progress"),
+            agenda = []
+            for a in ep.get("agenda", []):
+                activity_type = a.get("activity_type", "ticket_progress")
+                related_id    = a.get("related_id")
+
+                # Strip duplicate ticket_progress items — only the first engineer
+                # to claim a ticket ID in this plan gets to work on it.
+                if activity_type == "ticket_progress" and related_id:
+                    if related_id in claimed_tickets:
+                        logger.warning(
+                            f"[planner] {self.dept}: stripped duplicate "
+                            f"ticket_progress for {related_id} from {name}'s agenda."
+                        )
+                        continue
+                    claimed_tickets.add(related_id)
+
+                agenda.append(AgendaItem(
+                    activity_type=activity_type,
                     description=a.get("description", ""),
-                    related_id=a.get("related_id"),
+                    related_id=related_id,
                     collaborator=_coerce_collaborators(a.get("collaborator")),
                     estimated_hrs=float(a.get("estimated_hrs", 2.0)),
-                )
-                for a in ep.get("agenda", [])
-            ]
+                ))
 
             # Fallback agenda if LLM returned nothing useful
             if not agenda:
@@ -455,20 +466,6 @@ class OrgCoordinator:
 
     ORG STATE: health={health}, morale={morale_label}
 
-    A collision event is something like:
-    - Sales heard about an incident and needs a stability update from Engineering
-    - A customer escalation lands in Sales that Engineering needs to know about
-    - HR notices two burnt-out engineers and schedules a sync with the Eng lead
-    - A feature request from Sales creates a new JIRA ticket in Engineering's backlog
-
-    CRITICAL RULES:
-    1. STRICT ROLES: Non-engineering roles (Sales, HR) can ask for updates, escalate customer issues, 
-       or check on employee well-being, but they CANNOT solve technical problems, write code, or propose system architecture.
-    2. ACTOR MATCHING: The 'actors' array MUST contain real names selected from the specific department 
-       lists provided above. Do not invent names.
-    3. BE CONSERVATIVE: LLMs often want to force connections. Only propose a collision if it is highly organic and essential. 
-       If nothing truly connects today, you MUST respond with {{"collision": null}}.
-
     Respond ONLY with valid JSON:
     {{
     "collision": {{
@@ -478,8 +475,7 @@ class OrgCoordinator:
         "facts_hint": {{}},
         "priority": 1,
         "artifact_hint": "string"
-    }},
-    "reasoning": "string"
+    }}
     }}
     """
 

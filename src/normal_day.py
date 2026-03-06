@@ -302,6 +302,9 @@ class NormalDayHandler:
             tags=["jira", "engineering"]
         ))
 
+        bucket = self._state.ticket_actors_today.setdefault(ticket_id, set())
+        bucket.add(assignee)
+
         generated_artifacts = [ticket_id]
         if spawned_pr_id is not None:
             generated_artifacts.append(spawned_pr_id)

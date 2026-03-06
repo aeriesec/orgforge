@@ -11,6 +11,8 @@ Checks every ProposedEvent against:
   3. State plausibility — health/morale thresholds make the event sensible
   4. Cooldown windows   — same event type can't fire too frequently
   5. Novel event triage — unknown event types are logged, not silently dropped
+  6. Ticket dedup       — same ticket can't receive progress from multiple actors
+                          on the same day (reads state.ticket_actors_today)
 """
 
 from __future__ import annotations
@@ -100,6 +102,10 @@ class PlanValidator:
         recent_incident_count = sum(
             e.get("incidents_opened", 0) for e in recent_events
         )
+        # Live per-ticket actor tracking for today — read from state, not summaries.
+        # state.ticket_actors_today is populated by flow.py as ticket_progress
+        # events execute, and reset to {} at the top of each daily_cycle().
+        ticket_actors_today = self._ticket_actors_today(state)
 
         results: List[ValidationResult] = []
         for event in proposed:
@@ -108,6 +114,7 @@ class PlanValidator:
                 state,
                 recent_event_types,
                 recent_incident_count,
+                ticket_actors_today,
             )
             if not result.approved and result.was_novel:
                 self._novel_log.append(event)
@@ -137,10 +144,11 @@ class PlanValidator:
 
     def _validate_one(
         self,
-        event:                ProposedEvent,
+        event:                 ProposedEvent,
         state,
-        recent_event_types:   Dict[str, int],   # {event_type: days_since_last}
+        recent_event_types:    Dict[str, int],   # {event_type: days_since_last}
         recent_incident_count: int,
+        ticket_actors_today:   Dict[str, set],   # {ticket_id: {actors who touched it today}}
     ) -> ValidationResult:
 
         # ── 1. Actor integrity ────────────────────────────────────────────────
@@ -151,7 +159,7 @@ class PlanValidator:
                 rejection_reason=f"Unknown actors: {unknown_actors}. "
                                  f"LLM invented names not in org_chart.",
             )
-        
+
         # ── 1b. Departed-actor guard ──────────────────────────────────────────
         # patch_validator_for_lifecycle() keeps _valid_actors pruned,
         # but this explicit check gives a clearer rejection message.
@@ -229,6 +237,24 @@ class PlanValidator:
                 ),
             )
 
+        # ── 6. Ticket dedup ───────────────────────────────────────────────────
+        # Prevents multiple agents independently logging progress on the same
+        # ticket on the same day. ticket_id is sourced from facts_hint, not
+        # related_id (which lives on AgendaItem, not ProposedEvent).
+        if event.event_type == "ticket_progress":
+            ticket_id = event.facts_hint.get("ticket_id")
+            if ticket_id:
+                actors_on_ticket = ticket_actors_today.get(ticket_id, set())
+                overlap = [a for a in event.actors if a in actors_on_ticket]
+                if overlap:
+                    return ValidationResult(
+                        approved=False, event=event,
+                        rejection_reason=(
+                            f"Duplicate ticket work: {overlap} already logged "
+                            f"progress on {ticket_id} today."
+                        ),
+                    )
+
         # ── All checks passed ─────────────────────────────────────────────────
         return ValidationResult(approved=True, event=event)
 
@@ -250,3 +276,13 @@ class PlanValidator:
                 if etype not in days_since:
                     days_since[etype] = i + 1
         return days_since
+
+    def _ticket_actors_today(self, state) -> Dict[str, set]:
+        """
+        Returns the live {ticket_id: {actor, ...}} map for today.
+        Reads from state.ticket_actors_today, which flow.py owns:
+          - Reset to {} at the top of each daily_cycle()
+          - Updated after each ticket_progress event fires
+        Defaults to {} safely if state doesn't have the attribute yet.
+        """
+        return getattr(state, "ticket_actors_today", {})

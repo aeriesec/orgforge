@@ -6,6 +6,33 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.9] — 2026-03-06
+
+### Fixed
+
+- **Duplicate ticket work (`day_planner.py`)**: `_parse_plan()` now maintains a
+  `claimed_tickets` set across all engineer plans in a single planning pass.
+  Any `ticket_progress` agenda item referencing a ticket ID already claimed by
+  another engineer is stripped before execution, preventing multiple agents from
+  independently logging progress on the same ticket on the same day. Violations
+  are logged as warnings.
+- **`_validator` attribute error (`flow.py`)**: `daily_cycle` was referencing
+  `self._day_planner.validator` instead of `self._day_planner._validator`,
+  causing an `AttributeError` on day 11 when `patch_validator_for_lifecycle`
+  was first invoked.
+
+### Changed
+
+- **Ticket dedup safety net (`plan_validator.py`, `normal_day.py`)**: Added a
+  secondary `ticket_actors_today` guard on `state` that tracks which actors have
+  executed `ticket_progress` against a given ticket ID within the current day.
+  The validator checks this before approving `ProposedEvent` entries via
+  `facts_hint["ticket_id"]`, and `_handle_ticket_progress` registers the actor
+  on success. Resets to `{}` at the top of each `daily_cycle()`. Acts as a
+  catch-all for paths that bypass `_parse_plan`.
+
+---
+
 ## [v0.3.8] — 2026-03-06
 
 ### Added
