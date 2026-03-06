@@ -323,17 +323,24 @@ def save_eml(path: str, from_name: str, to_names: List[str], subject: str, body:
 # 4. GIT SIMULATOR (NetworkX Aware)
 # ─────────────────────────────────────────────
 class GitSimulator:
-    def __init__(self, state: State, mem: Memory, social_graph: nx.Graph):
+    def __init__(self, state: State, mem: Memory, social_graph: nx.Graph, worker_llm):
         self._state = state
         self._mem = mem
         self._graph = social_graph
+        self._worker_llm = worker_llm
 
-    def create_pr(self, author: str, ticket_id: str, title: str,timestamp: str, reviewers: Optional[List[str]] = None) -> Dict:
+    def create_pr(self, author: str, ticket_id: str, title: str, timestamp: str, reviewers: Optional[List[str]] = None) -> Dict:
         pr_id = f"PR-{len(self._state.pr_registry) + 100}"
         
         if not reviewers:
             edges = self._graph[author]
-            eng_colleagues = {n: edges[n]['weight'] for n in edges if "Engineering" in self._graph.nodes[n]['dept'] and n != author}
+            
+            eng_colleagues = {
+                n: edges[n].get('weight', 1.0) 
+                for n in edges 
+                if "engineer" in self._graph.nodes[n].get('dept', '').lower() and n != author
+            }
+            
             if eng_colleagues:
                 sorted_eng = sorted(eng_colleagues.items(), key=lambda x: x[1], reverse=True)
                 reviewers = [sorted_eng[0][0]]
@@ -344,12 +351,29 @@ class GitSimulator:
                 fallback   = next((n for n in ORG_CHART[eng_dept] if n != author), ORG_CHART[eng_dept][0])
                 reviewers = [fallback]
 
+        try:
+            ctx = self._mem.context_for_prompt(title, n=2, as_of_time=timestamp)
+            agent = Agent(role="Software Engineer", goal="Write a PR description.", backstory=f"You are {author}.", llm=self._worker_llm)
+            task = Task(
+                description=(
+                    f"Write a GitHub Pull Request description for ticket [{ticket_id}]: {title}.\n"
+                    f"Context: {ctx}\n"
+                    f"Include a short 'What Changed' and 'Why' section. Keep it under 100 words. Format as Markdown."
+                ),
+                expected_output="Markdown PR body.", agent=agent
+            )
+            description = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+        except Exception as e:
+            description = f"Auto-generated PR for [{ticket_id}]: {title}"
+
         pr = {
             "pr_id": pr_id, "ticket_id": ticket_id, "title": title,
+            "description": description,
             "author": author, "author_email": email_of(author),
             "reviewers": reviewers, "status": "open", "comments": [],
             "created_at": timestamp,
         }
+        
         path = f"{BASE}/git/prs/{pr_id}.json"
         save_json(path, pr)
         self._state.pr_registry.append({"pr_id": pr_id, "ticket_id": ticket_id, "author": author, "status": "open"})
@@ -429,7 +453,7 @@ class Flow(Flow[State]):
         self._mem = Memory()
         self.graph_dynamics = GraphDynamics(build_social_graph(), CONFIG)
         self.social_graph   = self.graph_dynamics.G
-        self._git = GitSimulator(self.state, self._mem, self.social_graph)
+        self._git = GitSimulator(self.state, self._mem, self.social_graph, WORKER_MODEL)
         self._day_planner = DayPlannerOrchestrator(CONFIG, WORKER_MODEL, PLANNER_MODEL)
         self._clock = SimClock(self.state)
         self._normal_day = NormalDayHandler(
@@ -903,6 +927,18 @@ class Flow(Flow[State]):
                 inc.stage = "fix_in_progress"
                 pr = self._git.create_pr(author=on_call, ticket_id=inc.ticket_id, title=f"[{inc.ticket_id}] Fix: {inc.root_cause[:60]}",
                                           timestamp=cron_time_iso)
+
+                for t in self.state.jira_tickets:
+                    if t["id"] == inc.ticket_id:
+                        if pr["pr_id"] not in t.get("linked_prs", []):
+                            t.setdefault("linked_prs", []).append(pr["pr_id"])
+                        
+                        # Update the timestamp to match the PR creation time!
+                        t["updated_at"] = cron_time_iso 
+                        
+                        save_json(f"{BASE}/jira/{inc.ticket_id}.json", t) # Update the JSON on disk
+                        break
+
                 self._emit_bot_message(
                     "engineering",
                     "GitHub",

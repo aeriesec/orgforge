@@ -98,6 +98,13 @@ class DepartmentPlanner:
     YOUR TASK:
     1. Write a department theme for today (one sentence, specific to {dept}).
     2. For each team member, write a 2-4 item agenda (what they plan to work on).
+       CRITICAL RULES:
+       - ROLE ENFORCEMENT: If {dept} is a non-engineering department (like HR, Sales, Marketing), your team members CANNOT 
+         write code, design system architecture, or review PRs. Their agenda MUST reflect their actual business functions (e.g., recruitment, 
+         policy updates, sales calls), even if the ORG THEME is highly technical.
+       - TICKET ALLOCATION: Do not assign multiple people to the same ticket ID for "ticket_progress". Only the explicit assignee should make progress.
+       - EVENT REDUNDANCY: Do not schedule redundant "design_discussion" or "async_question" events for the same topic across multiple people. 
+         One initiator is enough.
     3. Propose 1-3 events that should fire today, ordered by priority (1=must, 3=optional).
     4. Note your reasoning briefly.
 
@@ -114,7 +121,7 @@ class DepartmentPlanner:
         "focus_note": "string (one sentence about their headspace today)",
         "agenda": [
             {{
-            "activity_type": "string",
+            "activity_type": "Must be exactly one of: ticket_progress, pr_review, 1on1, async_question, design_discussion, mentoring, deep_work",
             "description": "string",
             "related_id": "string or null",
             "collaborator": ["string"],
@@ -453,10 +460,14 @@ class OrgCoordinator:
     - A customer escalation lands in Sales that Engineering needs to know about
     - HR notices two burnt-out engineers and schedules a sync with the Eng lead
     - A feature request from Sales creates a new JIRA ticket in Engineering's backlog
-    - Leadership calls a sync because health has been low for 3+ days
 
-    Only propose a collision if it's genuinely motivated by the plans above.
-    If nothing natural connects today, respond with {{"collision": null}}.
+    CRITICAL RULES:
+    1. STRICT ROLES: Non-engineering roles (Sales, HR) can ask for updates, escalate customer issues, 
+       or check on employee well-being, but they CANNOT solve technical problems, write code, or propose system architecture.
+    2. ACTOR MATCHING: The 'actors' array MUST contain real names selected from the specific department 
+       lists provided above. Do not invent names.
+    3. BE CONSERVATIVE: LLMs often want to force connections. Only propose a collision if it is highly organic and essential. 
+       If nothing truly connects today, you MUST respond with {{"collision": null}}.
 
     Respond ONLY with valid JSON:
     {{
@@ -579,8 +590,11 @@ class OrgCoordinator:
             if dept == eng_key:
                 continue
             events_str = ", ".join(e.event_type for e in plan.proposed_events[:2])
+            # Extract the names of the people in this department
+            names = ", ".join(ep.name for ep in plan.engineer_plans)
+            
             lines.append(
-                f"  {dept}: theme='{plan.theme}' "
+                f"  {dept} (Members: {names}): theme='{plan.theme}' "
                 f"events=[{events_str}]"
             )
         return "\n".join(lines) if lines else "  (no other departments)"

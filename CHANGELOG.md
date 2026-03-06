@@ -6,6 +6,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.3.8] — 2026-03-06
+
+### Added
+
+- **Automated PR generation from ticket completion** (`normal_day.py`, `flow.py`): When an engineer's LLM output indicates `is_code_complete: true`, `_handle_ticket_progress` now automatically calls `GitSimulator.create_pr`, attaches the resulting PR ID to the ticket, and advances its status to "In Review". The ticket JSON on disk is updated atomically at the same timestamp.
+- **LLM-authored PR descriptions** (`flow.py`): `GitSimulator` now accepts a `worker_llm` parameter and uses a CrewAI agent to write a contextual Markdown PR body ("What Changed" / "Why") using memory context, falling back to a plain auto-generated string on failure.
+- **JIRA ticket spawning from design discussions** (`normal_day.py`): `_create_design_doc_stub` now receives the live Slack transcript and prompts the planner LLM for structured JSON containing both the Confluence markdown and 1–3 concrete follow-up `new_tickets`. Each ticket is saved to state, written to disk, and embedded in memory so the `DayPlanner` can schedule it the next day.
+- **Blocker detection and memory logging** (`normal_day.py`): `_handle_ticket_progress` scans the LLM comment for blocker keywords and, when found, logs a `blocker_flagged` `SimEvent` with the relevant ticket and actor.
+
+### Changed
+
+- **`_handle_ticket_progress` now outputs structured JSON** (`normal_day.py`): The engineer agent is prompted to return `{"comment": "...", "is_code_complete": boolean}` rather than plain text, enabling downstream PR automation. Falls back gracefully on parse failure.
+- **`DepartmentPlanner` prompt hardened** (`day_planner.py`): Added critical rules for role enforcement (non-engineering staff cannot perform engineering tasks), ticket allocation (only the explicit assignee progresses a ticket), and event deduplication (one initiator per `design_discussion` / `async_question`). The `activity_type` field is now constrained to an explicit enum.
+- **`OrgCoordinator` collision prompt tightened** (`day_planner.py`): Replaced the loose "only if genuinely motivated" language with numbered rules enforcing strict role separation, real-name actor matching, and a conservative default of `{"collision": null}`. Department summaries now include member name lists to reduce hallucinated actors.
+- **Cross-department channel routing unified** (`normal_day.py`): Both `_handle_async_question` and `_handle_design_discussion` now derive the target channel from the full participant set — routing to `#digital-hq` whenever participants span multiple departments, rather than always defaulting to the initiator's department channel.
+- **`GitSimulator` reviewer lookup made case-insensitive** (`flow.py`): Department membership check now uses `.lower()` string matching and `.get()` with a default weight, preventing `KeyError` crashes when node attributes are missing.
+
+### Fixed
+
+- Incident-flow PR creation now links the new PR ID back to the originating JIRA ticket and persists the updated ticket JSON to disk (`flow.py`).
+- PR review comments are now written back to the PR's JSON file on disk before the bot message is emitted (`normal_day.py`).
+
+---
+
 ## [v0.3.7] — 2026-03-05
 
 ### Added
