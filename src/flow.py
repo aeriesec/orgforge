@@ -1037,7 +1037,8 @@ class Flow(Flow[State]):
         save_md(path, full_content)
         entry = {"id": conf_id, "title": title, "path": path}
         self.state.confluence_pages.append(entry)
-        self._embed_and_count(id=conf_id, type="confluence", title=title, content=full_content, day=self.state.day, date=str(self.state.current_date.date()))
+        self._embed_and_count(id=conf_id, type="confluence", title=title, content=full_content, day=self.state.day, date=str(self.state.current_date.date()),
+                              timestamp=artifact_time_iso)
         self._mem.log_event(SimEvent(type="confluence_created", timestamp=artifact_time_iso,
                                      day=self.state.day, date=str(self.state.current_date.date()), 
                                      actors=[author], artifact_ids={"confluence": conf_id}, facts={"title": title}, summary=f"{author} created {conf_id}.", tags=["confluence"]))
