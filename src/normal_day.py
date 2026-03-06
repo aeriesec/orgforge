@@ -43,6 +43,7 @@ import json
 import logging
 import random
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
 
 from crewai import Agent, Task, Crew
 
@@ -423,8 +424,6 @@ class NormalDayHandler:
         if not messages:
             return [name, collaborator]
         
-        from datetime import datetime, timedelta
-        import random
 
         current_msg_time = datetime.fromisoformat(meeting_time_iso)
 
@@ -536,9 +535,6 @@ class NormalDayHandler:
         messages = self._parse_slack_messages(result, all_actors, hour_range=(10, 16))
         if not messages:
             return all_actors
-        
-        from datetime import datetime, timedelta
-        import random
 
         current_msg_time = datetime.fromisoformat(meeting_time_iso)
 
@@ -648,9 +644,6 @@ class NormalDayHandler:
             f"{date_str}_{initiator.lower()}_design.json"
         )
         if messages:
-            from datetime import datetime, timedelta
-            import random
-
             current_msg_time = datetime.fromisoformat(meeting_time_iso)
 
             for msg in messages:
@@ -839,8 +832,7 @@ class NormalDayHandler:
         )
 
         if messages:
-            from datetime import datetime, timedelta
-            import random
+            
 
             current_msg_time = datetime.fromisoformat(timestamp)
 
