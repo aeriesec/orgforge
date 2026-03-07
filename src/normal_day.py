@@ -40,7 +40,8 @@ class NormalDayHandler:
         worker_llm,
         planner_llm,
         clock,
-        persona_helper
+        persona_helper,
+        confluence_writer=None
     ):
         self._config         = config
         self._mem            = mem
@@ -56,7 +57,9 @@ class NormalDayHandler:
         self._all_names      = [n for dept in config["org_chart"].values() for n in dept]
         self._org_chart      = config["org_chart"]
         self._clock          = clock
-        self._persona_helper  = persona_helper
+        self._persona_helper = persona_helper
+        self._confluence     = confluence_writer
+        self._registry       = getattr(confluence_writer, "_registry", None)
 
     # ─── PUBLIC ENTRY POINT ───────────────────────────────────────────────────
 
@@ -182,45 +185,50 @@ class NormalDayHandler:
 
         current_actor_time, new_cursor = self._clock.advance_actor(assignee, hours=2.0)
         current_actor_time_iso = current_actor_time.isoformat()
-        ctx = self._mem.context_for_prompt(f"{ticket_id} {ticket['title']}", n=3, as_of_time=current_actor_time_iso)
-
-        # 1. Format existing state for the LLM
-        existing_comments = "\n".join(
-            f"- {c['author']} ({c['date']}): {c['text']}" 
-            for c in ticket.get("comments", [])[-3:]
-        ) or "None."
-
-        linked_prs = ticket.get("linked_prs", [])
-        pr_context = f"Open PRs for this ticket: {', '.join(linked_prs)}" if linked_prs else "No PRs have been opened yet."
-
-        backstory = self._persona_helper(
-            assignee, 
-            mem=self._mem, 
-            graph_dynamics=self._gd
+        ctx = self._mem.context_for_prompt(
+            f"{ticket_id} {ticket['title']}", n=3, as_of_time=current_actor_time_iso
         )
+        linked_prs = ticket.get("linked_prs", [])
+
+        # Build structured ticket context — title + full state in one object
+        if self._registry:
+            ticket_ctx = self._registry.ticket_summary(
+                ticket, self._state.day
+            ).for_prompt()
+        else:
+            # Graceful fallback if registry not wired yet
+            ticket_ctx = (
+                f"Ticket: [{ticket_id}] {ticket.get('title', '')}\n"
+                f"Status: {ticket.get('status', 'To Do')}\n"
+                f"Recent comments: " + (
+                    "\n".join(
+                        f"  - {c['author']} ({c['date']}): {c['text']}"
+                        for c in ticket.get("comments", [])[-3:]
+                    ) or "None."
+                )
+            )
+
+        backstory = self._persona_helper(assignee, mem=self._mem, graph_dynamics=self._gd)
 
         agent = Agent(
             role="Software Engineer",
             backstory=backstory,
             goal="Make progress on the ticket and report status.",
-            llm=self._worker
+            llm=self._worker,
         )
-
-        # 2. Force the LLM to output JSON and decide if the code is done
         task = Task(
             description=(
-                f"Write a JIRA comment for ticket [{ticket_id}]: {ticket['title']}.\n"
-                f"Your specific task today was: {item.description}\n"
-                f"Recent comments:\n{existing_comments}\n"
-                f"{pr_context}\n\n"
-                f"Context: {ctx}\n"
-                f"1. Write a 1-3 sentence JIRA comment about what you did today based on your task.\n"
-                f"2. Decide if the coding phase for this ticket is completely finished today. (If this is your first day on a complex ticket, it might be false).\n"
-                f"Respond ONLY with valid JSON matching this schema:\n"
-                f"{{\n"
-                f"  \"comment\": \"string\",\n"
-                f"  \"is_code_complete\": boolean\n"
-                f"}}"
+                f"{ticket_ctx}\n\n"
+                f"Your specific task today: {item.description}\n"
+                f"Memory context: {ctx}\n\n"
+                f"1. Write a 1-3 sentence JIRA comment about what you did today.\n"
+                f"2. Decide if the coding phase is completely finished today.\n"
+                f"   (If this is day 1 of a complex ticket, it's likely false.)\n"
+                f"Respond ONLY with valid JSON:\n"
+                f'{{\n'
+                f'  "comment": "string",\n'
+                f'  "is_code_complete": boolean\n'
+                f'}}'
             ),
             expected_output="Valid JSON only.",
             agent=agent,
@@ -1023,132 +1031,23 @@ class NormalDayHandler:
 
     def _create_design_doc_stub(
         self,
-        author:       str,
-        participants: List[str],
-        topic:        str,
-        ctx:          str,
-        date_str:     str,
-        slack_transcript: List[dict]  # NEW: We receive the transcript here
+        author:           str,
+        participants:     List[str],
+        topic:            str,
+        ctx:              str,              # kept for signature compat, not used
+        date_str:         str,
+        slack_transcript: List[dict],
     ) -> Optional[str]:
-        """Creates a Confluence doc from a chat and spawns actionable JIRA tickets."""
-        import json # Ensure json is available for parsing
-
-        conf_id = f"CONF-ENG-{len(self._state.confluence_pages) + 1:03d}"
-
-        artifact_time, new_cursor = self._clock.advance_actor(author, hours=0.5)
-        artifact_time_iso = artifact_time.isoformat()
-
-        # Format the chat log so the LLM can read the actual conversation
-        chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
-
-        agent = Agent(
-            role="Technical Lead",
-            goal="Document technical decisions and extract actionable tickets.",
-            backstory=f"You are {author}. You just finished a Slack discussion and need to document it and assign follow-up work.",
-            llm=self._planner,  # The planner model is usually better at strict JSON
+        if self._confluence is None:
+            logger.warning("[normal_day] No ConfluenceWriter — skipping design doc.")
+            return None
+        return self._confluence.write_design_doc(
+            author=author,
+            participants=participants,
+            topic=topic,
+            slack_transcript=slack_transcript,
+            date_str=date_str,
         )
-        
-        task = Task(
-            description=(
-                f"You just had this Slack discussion about '{topic}':\n\n{chat_log}\n\n"
-                f"Background Context: {ctx}\n\n"
-                f"1. Write a brief Confluence design doc documenting the actual decisions made in the chat.\n"
-                f"2. Extract 1-3 concrete next steps from the chat and turn them into JIRA ticket definitions.\n"
-                f"Respond ONLY with valid JSON matching this exact schema:\n"
-                f"{{\n"
-                f"  \"markdown_doc\": \"string (the full markdown content, starting with the Problem Statement)\",\n"
-                f"  \"new_tickets\": [\n"
-                f"    {{ \"title\": \"string\", \"assignee\": \"string (must be one of: {', '.join(participants)})\", \"story_points\": int (1, 2, 3, 5, or 8) }}\n"
-                f"  ]\n"
-                f"}}"
-            ),
-            expected_output="Valid JSON only. No markdown fences.",
-            agent=agent,
-        )
-        
-        raw_result = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
-        clean_json = raw_result.replace("```json", "").replace("```", "").strip()
-        
-        try:
-            parsed_data = json.loads(clean_json)
-            content = parsed_data.get("markdown_doc", "Draft pending.")
-            new_tickets = parsed_data.get("new_tickets", [])
-        except json.JSONDecodeError as e:
-            logger.warning(f"[normal_day] JSON parse failed for design doc stub: {e}")
-            content = "Failed to parse JSON design doc from LLM."
-            new_tickets = []
-
-        # 1. Save the Confluence Document
-        full = (
-            f"# Design: {topic}\n"
-            f"**ID:** {conf_id}  \n"
-            f"**Authors:** {', '.join(participants)}  \n"
-            f"**Date:** {date_str}\n\n"
-            + content
-        )
-        path = f"{self._base}/confluence/design/{conf_id}.md"
-        self._save_md(path, full)
-
-        entry = {"id": conf_id, "title": f"Design: {topic[:50]}", "path": path}
-        self._state.confluence_pages.append(entry)
-        
-        self._mem.embed_artifact(
-            id=conf_id, type="confluence",
-            timestamp=artifact_time_iso,
-            title=entry["title"], content=full,
-            day=self._state.day, date=date_str,
-            metadata={"authors": str(participants), "type": "design_doc"},
-        )
-        self._state.daily_artifacts_created += 1
-
-        # 2. Spawn the JIRA Tickets into the Simulation State!
-        created_ticket_ids = []
-        for tk in new_tickets:
-            tid = f"ORG-{len(self._state.jira_tickets) + 100}"
-            assignee = tk.get("assignee")
-            
-            # Fallback if the LLM hallucinates a name not in the company
-            if assignee not in self._all_names:
-                assignee = author
-                
-            ticket = {
-                "id": tid,
-                "title": tk.get("title", "Generated Task"),
-                "status": "To Do",
-                "assignee": assignee,
-                "sprint": self._state.sprint.sprint_number if hasattr(self._state, 'sprint') else 1,
-                "story_points": tk.get("story_points", 2),
-                "linked_prs": [],
-                "created_at": artifact_time_iso,
-                "updated_at": artifact_time_iso
-            }
-            
-            self._state.jira_tickets.append(ticket)
-            self._save_ticket(ticket)
-            created_ticket_ids.append(tid)
-            
-            # Embed the new ticket so the DayPlanner can see it tomorrow
-            self._mem.embed_artifact(
-                id=tid, type="jira", title=ticket["title"], content=json.dumps(ticket), 
-                day=self._state.day, date=date_str, metadata={"assignee": assignee}, 
-                timestamp=artifact_time_iso
-            )
-            self._state.daily_artifacts_created += 1
-
-        # 3. Log the Event
-        self._mem.log_event(SimEvent(
-            type="confluence_created",
-            timestamp=artifact_time_iso,
-            day=self._state.day, date=date_str,
-            actors=participants,
-            artifact_ids={"confluence": conf_id, "spawned_tickets": json.dumps(created_ticket_ids)},
-            facts={"title": entry["title"], "type": "design_doc", "spawned_tickets": created_ticket_ids},
-            summary=f"{author} created {conf_id} and spawned {len(created_ticket_ids)} tickets: {', '.join(created_ticket_ids)}",
-            tags=["confluence", "design_doc", "jira"],
-        ))
-
-        logger.info(f"    [dim]📄 Design doc stub: {conf_id} (Spawned {len(created_ticket_ids)} tickets)[/dim]")
-        return conf_id
 
     # ─── LOGGING HELPERS ─────────────────────────────────────────────────────
 
@@ -1219,19 +1118,13 @@ class NormalDayHandler:
             )
 
     def _maybe_adhoc_confluence(self) -> None:
-        """Generates documentation that isn't tied to a specific incident or sprint goal."""
         if random.random() >= self._config["simulation"].get("adhoc_confluence_prob", 0.3):
             return
-
-        # Pick a random employee to be the author
-        author = random.choice(self._all_names)
-        
-        # Use our unified persona helper to get their voice/stress
+        if self._confluence is None:
+            return
+        author    = random.choice(self._all_names)
         backstory = self._persona_helper(author, mem=self._mem, graph_dynamics=self._gd)
-        
-        # Call the existing ad-hoc logic but pass the persona context
-        # This ensures Jax's ad-hoc docs are terse and Deepa's are methodical
-        self._state.generate_adhoc_confluence_page(author=author, backstory=backstory)
+        self._confluence.write_adhoc_page(author=author, backstory=backstory)
 
     def _trigger_watercooler_chat(self, target_actor: str, date_str: str) -> None:
         """Injects non-work chatter, pulling the target actor away from their work."""

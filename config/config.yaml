@@ -120,19 +120,24 @@ adhoc_confluence_topics:
 genesis_docs:
   technical:
     count: 3
-    id_prefix: "CONF-ENG"
+    id_prefix: "ENG"
     prompt: >
-      Write {count} separate Confluence pages about {project_name} and {legacy_system}.
-      Reference these engineers: {engineers}.
-      IDs: {ids}.
-      Separate pages with '---PAGE BREAK---'.
+      Write a single Confluence page with ID {id} about {project_name}
+      and {legacy_system}. Authors: {authors}.
+      Existing pages you may reference: {related_pages}.
+      Do not invent any other CONF-* IDs.
+      Start directly with the  heading. Output only Markdown.
+
   business:
     count: 2
-    id_prefix: "CONF-MKT"
+    id_prefix: "MKT"
     prompt: >
-      Write a {product_page} Campaign Brief (CONF-MKT-001) and a Sales OKR doc (CONF-MKT-002).
-      Reference these team members: {sales_members}.
-      Separate with '---PAGE BREAK---'.
+      Write a single Confluence page with ID {id} for {company_name}.
+      Topic: {product_page} campaign planning.
+      Authors: {authors}.
+      Existing pages you may reference: {related_pages}.
+      Do not invent any other CONF-* IDs.
+      Start directly with the  heading. Output only Markdown.
 
 # ── SPRINT GOAL TEMPLATE ──────────────────────────────────────
 sprint_goal_template: "Stabilize {legacy_system} and deliver sprint features"

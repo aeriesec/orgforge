@@ -19,6 +19,8 @@ def mock_flow():
         flow = Flow()
         flow.state.day = 5
         flow.state.system_health = 80
+        flow._registry = MagicMock()
+        flow._confluence = MagicMock()
         return flow
     
 @pytest.fixture

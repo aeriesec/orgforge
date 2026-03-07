@@ -561,6 +561,17 @@ def test_design_discussion_confluence_stub_created_sometimes(handler, mock_state
     eng_plan  = _simple_eng_plan("Alice", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
+    mock_cw = MagicMock()
+    def fake_write_design(*args, **kwargs):
+        from memory import SimEvent
+        handler._mem.log_event(SimEvent(
+            type="confluence_created", day=1, date="", timestamp="", 
+            actors=[], artifact_ids={}, facts={}, summary=""
+        ))
+        return "CONF-ENG-123"
+    mock_cw.write_design_doc.side_effect = fake_write_design
+    handler._confluence = mock_cw
+
     with patch.object(handler, "_save_slack"), \
          patch.object(handler, "_save_md"), \
          patch("normal_day.Crew") as mock_crew, \
