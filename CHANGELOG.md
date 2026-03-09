@@ -6,52 +6,6 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [v0.5.0] — 2026-03-07
-
-### Added
-
-- **Persona-Driven Confluence Topic Generation (`confluence_writer.py`)**: Replaced the static `adhoc_confluence_topics` YAML list with a fast LLM call (`WORKER_MODEL`) that invents a page title grounded in the author's `expertise` array, current stress level, today's `daily_theme`, and a RAG context pull from memory. Topics are now industry-aware — changing `industry` in `config.yaml` automatically changes what gets documented without any other configuration.
-
-- **Active-Actor Author Selection (`confluence_writer.py`, `flow.py`)**: Ad-hoc Confluence pages are now authored by someone from `state.daily_active_actors` rather than a random org member. Ensures every page is written by a person provably working that day, making the authorship eval-safe.
-
-- **Publish Ledger (`flow.py`, `confluence_writer.py`)**: Added `confluence_published_today: Dict[str, str]` to `State`. After `_finalise_page()` registers a root page, its lowercased title and first author are written into the ledger. Only root pages enter the ledger — child chunks do not. The ledger resets each morning in the daily counter reset block, preventing cross-day contamination. Used by the topic agent to exclude already-covered topics (same-day dedup) and by `find_confluence_experts()` for causal ordering enforcement.
-
-- **LLM-Generated Sprint Tickets (`flow.py`)**: Replaced the static `sprint_ticket_themes` YAML list with a `WORKER_MODEL` call that generates ticket titles from the attending engineers' combined `expertise` tags and the legacy system context. Falls back to four hardcoded sensible defaults on JSON parse failure so planning never crashes.
-
-- **`Memory.find_confluence_experts()` (`memory.py`)**: New method that runs a vector similarity search over the Confluence artifact collection to return subject-matter experts for a given topic. Reuses already-stored page embeddings — no new embed calls are made for stored pages, only one embed call for the query string. Applies a `score_threshold` (default 0.75) and an `as_of_time` timestamp cutoff for sub-day causal ordering precision. Returns `[{title, author, score, day}]`.
-
-- **`Memory.recall()` now returns `metadata` and `timestamp` (`memory.py`)**: Added both fields to the `$project` stage so callers receive author information and timestamps in a single round-trip rather than requiring a second query.
-
-- **Expertise-Weighted Participant Routing (`normal_day.py`)**: Added `_expertise_matched_participants()` helper that augments a seed participant list in two passes: (1) semantic expert injection via `find_confluence_experts()` with causal ordering enforced by `as_of_time`, (2) persona expertise-tag fallback weighted by social-graph proximity for engineers with no Confluence history. People with zero expertise overlap are never added. Applied to both `_handle_async_question()` and `_handle_design_discussion()`, replacing the previous random channel-member sampling and ad-hoc keyword scan respectively.
-
-- **Semantic `doc_hint` in Slack Threads (`normal_day.py`)**: `_handle_async_question()` now builds a `doc_hint` from `find_confluence_experts()` and injects it into the Slack prompt so participants can reference existing documentation naturally. Covers cross-day pages, not just same-day ones.
-
-- **Two-Step Clock Pattern for Participant Assembly (`normal_day.py`)**: `_handle_async_question()` and `_handle_design_discussion()` now use a provisional `sync_and_advance` on seed participants to obtain a `meeting_time_iso` timestamp before expert injection, then a second `sync_and_advance(hours=0)` to pull any injected experts forward to the same meeting time without double-advancing the seeds.
-
-### Changed
-
-- **`_maybe_adhoc_confluence()` (`normal_day.py`)**: Removed the `random.choice(self._all_names)` author selection and the manual `backstory` construction. Both are now handled entirely inside `ConfluenceWriter.write_adhoc_page()`. Call site reduced to `self._confluence.write_adhoc_page()` with no arguments.
-
-- **`_generate_adhoc_confluence_page()` (`flow.py`)**: Now resolves the author from `state.daily_active_actors` before delegating to `ConfluenceWriter`, making the intent explicit at the call site while still allowing explicit `author=` overrides from other callers.
-
-- **`_handle_design_discussion()` participant assembly (`normal_day.py`)**: Replaced the single-pass expertise keyword scan (which stopped at the first match) with a call to `_expertise_matched_participants()`, giving consistent scoring, graph-proximity weighting, and Confluence author injection across all Slack thread types.
-
-- **`_handle_async_question()` facts dict (`normal_day.py`)**: `responders` in the logged `SimEvent` facts is now derived as `[a for a in all_actors if a != asker]` since the old `responders` variable was removed when participant assembly was replaced.
-
-### Removed
-
-- **`adhoc_confluence_topics` (`config.yaml`)**: Deleted. Topics are now generated at runtime by the LLM from persona expertise.
-
-- **`sprint_ticket_themes` (`config.yaml`)**: Deleted. Ticket titles are now generated at runtime by the LLM from attendee expertise and legacy system context.
-
---
-
-I notice there are **AWS credentials exposed in `.env.example`** in this patch. I'll flag that in the changelog entry. Now let me write the high-level changelog section.
-
-Here's the new changelog section for `CHANGELOG.md`:
-
----
-
 ## [v0.5.0] — 2026-03-09
 
 ### Added
