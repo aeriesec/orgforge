@@ -40,6 +40,7 @@ from planner_models import (
 )
 from plan_validator import PlanValidator
 from ticket_assigner import TicketAssigner
+from config_loader import PERSONAS, DEFAULT_PERSONA
 
 logger = logging.getLogger("orgforge.planner")
 
@@ -73,6 +74,7 @@ class DepartmentPlanner:
     Today is Day {day} ({date}).
 
     ORG THEME: {org_theme}
+    SPRINT THEME: {sprint_theme}
     SYSTEM HEALTH: {system_health}/100
     TEAM MORALE: {morale_label}
 
@@ -99,6 +101,20 @@ class DepartmentPlanner:
     {cross_signals}
 
     {lifecycle_context}
+
+    ACTIVE INCIDENTS (do not duplicate work already captured):
+    {open_chains_str}
+
+    ## NARRATIVE CONSTRAINTS (CRITICAL):
+    - {company} is an ESTABLISHED company, not a new startup.
+    - Day {day} is merely the first day we are observing them, NOT the day the company was founded.
+    - They have years of existing code, legacy systems, and established processes.
+    - DO NOT write plans about "Day 1 kickoffs", "establishing foundational knowledge", or "defining core contracts from scratch".
+    - DO write plans about maintaining systems, paying down tech debt, iterating on existing features, or routine corporate work.
+
+    You may also propose NEW event types if the situation genuinely calls for it.
+    If you propose a novel event, set "is_novel": true and specify "artifact_hint"
+    as one of: "slack", "jira", "confluence", or "email".
 
     You may also propose NEW event types if the situation genuinely calls for it.
     If you propose a novel event, set "is_novel": true and specify "artifact_hint"
@@ -217,9 +233,43 @@ class DepartmentPlanner:
             capacity_section = "\n".join(cap_lines)
         else:
             # Non-engineering depts or fallback — use the old open_tickets path
-            owned_section    = self._open_tickets(state)
+            owned_section = self._open_tickets(state, mem)
             avail_section    = "  (see owned tickets above)"
             capacity_section = "  (standard 6h per engineer)"
+
+        open_chains = []
+        for inc in state.active_incidents:
+            if getattr(inc, "causal_chain", None):
+                open_chains.append(
+                    f"- {inc.ticket_id} ({inc.stage}): \"{inc.root_cause[:80]}\"\n"
+                    f"  Artifacts so far: {inc.causal_chain.snapshot()}\n"
+                    f"  On-call: {inc.on_call}. Day {inc.days_active} active."
+                )
+
+        lead_name    = self.config.get("leads", {}).get(self.dept, "")
+        lead_persona = PERSONAS.get(lead_name, DEFAULT_PERSONA)
+        lead_stress  = state.persona_stress.get(lead_name, 30)
+        lead_style   = lead_persona.get("style", "pragmatic and direct")
+        lead_expertise = ", ".join(lead_persona.get("expertise", []))
+        on_call_name = self.config.get("on_call_engineer", "")
+
+        lead_context = (
+            f"You are {lead_name}, lead of {self.dept} at "
+            f"{self.config['simulation']['company_name']}. "
+            f"Your current stress is {lead_stress}/100"
+            + (" — you are on-call today." if lead_name == on_call_name else ".") +
+            f" Your style: {lead_style}. "
+            f"Your expertise: {lead_expertise}. "
+            f"You plan your team's day from lived experience, not abstraction. "
+            f"You know who is struggling, what is mid-flight, and what can wait."
+        )
+
+        agent = Agent(
+            role=f"{lead_name}, {self.dept} Lead",
+            goal=f"Plan your team's day honestly, given your stress, their capacity, and what is actually on fire.",
+            backstory=lead_context,
+            llm=self._llm,
+        )
 
         prompt = self._PLAN_PROMPT.format(
             dept=self.dept,
@@ -237,6 +287,8 @@ class DepartmentPlanner:
             cross_signals=cross_str,
             known_types=known_str,
             lifecycle_context=lifecycle_context,
+            sprint_theme=sprint_context.sprint_theme if sprint_context else "",
+            open_chains_str=open_chains
         )
 
         agent = Agent(
@@ -387,11 +439,11 @@ class DepartmentPlanner:
             lines.append(f"  - {name}: stress={stress}/100. {tone}")
         return "\n".join(lines)
 
-    def _open_tickets(self, state) -> str:
-        tickets = [
-            t for t in state.jira_tickets
-            if t.get("assignee") in self.members and t.get("status") != "Done"
-        ]
+    def _open_tickets(self, state, mem: Memory) -> str:
+        tickets = list(mem._jira.find({
+            "assignee": {"$in": self.members},
+            "status":   {"$ne": "Done"},
+        }))
         if not tickets:
             return "  (no open tickets assigned to this team)"
         return "\n".join(
@@ -512,17 +564,22 @@ class OrgCoordinator:
 
     ORG STATE: health={health}, morale={morale_label}
 
+    NARRATIVE RULE: {company} is an established, mature company. Do not treat Day {day} as the founding day of the startup.
+
     COLLISION ARCHETYPES:
-    - "The Accountability Check": Stressed PM (Sarah) pings Engineering for an ETA.
-    - "The Scope Creep": Sales (Marcus) asks Engineering for a "quick favor" mid-incident.
-    - "The Wellness Friction": HR (Karen) tries to hold a meeting while Eng is firefighting.
-    - "The Knowledge Gap": Someone realizes a departed employee owned a service.
+    - "The Accountability Check": A stressed PM pings Engineering lead for an ETA.
+    - "The Scope Creep": A Sales member asks an Engineer for a "quick favor" mid-incident.
+    - "The Wellness Friction": HR lead tries to hold a meeting while Eng is firefighting.
+    - "The Knowledge Gap": Someone realizes a departed employee owned a critical service.
+
+    ACTOR RULE: "actors" must contain individual first names only, taken directly from
+    the Members lists in DEPT PLANS above. Never use department names as actors.
 
     Respond ONLY with valid JSON:
     {{
     "collision": {{
         "event_type": "string",
-        "actors": ["string"],
+        "actors": ["FirstName", "FirstName"],
         "rationale": "string (why these specific people are clashing today)",
         "facts_hint": {{ "tension_level": "high/medium/low" }},
         "priority": 1,
@@ -543,15 +600,15 @@ class OrgCoordinator:
         date: str,
         org_theme: str
     ) -> OrgDayPlan:
-        # Build a richer summary of other plans that includes lead stress
+        # Build a richer summary of other plans that includes lead stress and member names
         other_plans_str = ""
         for dept, plan in dept_plans.items():
-            # Get the lead for this dept to check their current stress
             lead_name = self._config.get("leads", {}).get(dept)
             stress = state.persona_stress.get(lead_name, 50) if lead_name else 50
-            
+            members = self._config.get("org_chart", {}).get(dept, [])
             other_plans_str += (
                 f"- {dept}: Theme='{plan.theme}'. Lead={lead_name} (Stress: {stress}/100). "
+                f"Members: {members}. "
                 f"Events planned: {[e.event_type for e in plan.proposed_events[:2]]}\n"
             )
 
@@ -564,15 +621,6 @@ class OrgCoordinator:
             health=state.system_health,
             morale_label=morale_label
         )
-
-        prompt = self._COORD_PROMPT.format(
-            company=self._config["simulation"]["company_name"],
-            day=day,
-            other_plans_with_stress=other_plans_str,
-            health=state.system_health,
-            morale_label=morale_label
-        )
-
         agent = Agent(
             role="Org Conflict Coordinator",
             goal="Identify realistic friction points between departments.",
@@ -592,7 +640,13 @@ class OrgCoordinator:
         reasoning = ""
 
         try:
-            data = json.loads(clean)
+            raw_data = json.loads(clean)
+            if isinstance(raw_data, list):
+                data = raw_data[0] if len(raw_data) > 0 else {}
+            elif isinstance(raw_data, dict):
+                data = raw_data
+            else:
+                data = {}
             reasoning = data.get("reasoning", "")
             col = data.get("collision")
             if col:
@@ -715,11 +769,11 @@ class DayPlannerOrchestrator:
         # Build SprintContext for every dept before any LLM call so the LLM
         # only ever sees the tickets it is legally allowed to plan against.
         if self._ticket_assigner is None:
-            self._ticket_assigner = TicketAssigner(self._config, graph_dynamics)
+            self._ticket_assigner = TicketAssigner(self._config, graph_dynamics, mem)
 
         sprint_contexts: Dict[str, SprintContext] = {}
         for dept, members in self._config["org_chart"].items():
-            sprint_contexts[dept] = self._ticket_assigner.build(state, members)
+            sprint_contexts[dept] = self._ticket_assigner.build(state, members, dept_name=dept)
 
         # Seed ticket_actors_today from the locked assignments so the validator
         # has a populated map from the very start of the day.
@@ -837,16 +891,31 @@ class DayPlannerOrchestrator:
     # ─── Helpers ─────────────────────────────────────────────────────────────
 
     def _generate_org_theme(self, state, mem: Memory, clock) -> str:
-        """Lightweight replacement for _generate_theme() in flow.py."""
         system_time_iso = clock.now("system").isoformat()
         ctx = mem.context_for_prompt(
             f"day {state.day} system health sprint incidents",
             n=3, as_of_time=system_time_iso
         )
+
+        # ── Resolve CEO persona ────────────────────────────────────────────
+        from flow import PERSONAS, DEFAULT_PERSONA
+
+        ceo_name    = self._config.get("roles", {}).get("ceo", "")
+        ceo_persona = PERSONAS.get(ceo_name, DEFAULT_PERSONA)
+        ceo_stress  = state.persona_stress.get(ceo_name, 30)
+        ceo_style   = ceo_persona.get("style", "strategic and decisive")
+
         agent = Agent(
-            role="CEO",
-            goal="Decide today's dominant org theme.",
-            backstory="You see patterns across the whole company.",
+            role=f"{ceo_name}, CEO" if ceo_name else "CEO",
+            goal="Decide today's dominant org theme based on what you know about your company right now.",
+            backstory=(
+                f"You are {ceo_name}, CEO of "
+                f"{self._config['simulation']['company_name']}. "
+                f"Your current stress is {ceo_stress}/100. "
+                f"Your style: {ceo_style}. "
+                f"You set the tone for the whole org each morning based on "
+                f"what kept you up last night and what needs to change today."
+            ),
             llm=self._worker_llm,
         )
         task = Task(
@@ -919,8 +988,5 @@ class DayPlannerOrchestrator:
             ep.stress_level = graph_dynamics._stress.get(ep.name, 30)
 
     def _recent_day_summaries(self, mem: Memory, day: int) -> List[dict]:
-        """Last 7 day_summary facts dicts for the validator."""
-        return [
-            e.facts for e in mem.get_event_log()
-            if e.type == "day_summary" and e.day >= max(1, day - 7)
-        ]
+        """Last 7 day_summary facts dicts for the validator. Queries MongoDB."""
+        return mem.get_recent_day_summaries(current_day=day, window=7)

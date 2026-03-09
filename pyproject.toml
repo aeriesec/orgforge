@@ -17,4 +17,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-
+filterwarnings = [
+    "ignore:deprecated:DeprecationWarning:crewai.crew",
+]

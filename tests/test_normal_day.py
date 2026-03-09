@@ -17,7 +17,7 @@ from planner_models import (
     OrgDayPlan,
     ProposedEvent,
 )
-from memory import SimEvent
+from memory import Memory, SimEvent
 from flow import persona_backstory
 
 
@@ -111,12 +111,12 @@ def clock(mock_state):
 
 
 @pytest.fixture
-def handler(graph_and_gd, mock_state, clock):
+def handler(graph_and_gd, mock_state, clock, make_test_memory):
     """NormalDayHandler with mocked LLM, mem, and git but real graph/clock."""
     G, gd = graph_and_gd
 
-    mock_mem = MagicMock()
-    mock_mem.context_for_prompt.return_value = "some context"
+    mock_mem = make_test_memory
+    mock_mem.context_for_prompt = MagicMock(return_value="some context")
 
     mock_git = MagicMock()
     mock_worker = MagicMock()
@@ -248,7 +248,7 @@ def test_ticket_progress_moves_todo_to_in_progress(handler, mock_state, tmp_path
     A ticket in 'To Do' status must be set to 'In Progress' when progressed.
     """
     ticket = _make_ticket("ORG-101", "Fix retry logic", status="To Do", assignee="Alice")
-    mock_state.jira_tickets = [ticket]
+    handler._mem.upsert_ticket(ticket)
 
     item = AgendaItem(
         activity_type="ticket_progress",
@@ -264,7 +264,7 @@ def test_ticket_progress_moves_todo_to_in_progress(handler, mock_state, tmp_path
         mock_crew.return_value.kickoff.return_value = "Made progress on retry logic."
         handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
 
-    assert ticket["status"] == "In Progress"
+    assert handler._mem.get_ticket("ORG-101")["status"] == "In Progress"
 
 
 def test_ticket_progress_emits_simevent(handler, mock_state):
@@ -273,7 +273,7 @@ def test_ticket_progress_emits_simevent(handler, mock_state):
     with the correct ticket_id in facts.
     """
     ticket = _make_ticket("ORG-102", "Write unit tests", status="To Do", assignee="Bob")
-    mock_state.jira_tickets = [ticket]
+    handler._mem.upsert_ticket(ticket)
 
     item = AgendaItem(
         activity_type="ticket_progress",
@@ -302,7 +302,7 @@ def test_ticket_progress_no_op_for_missing_ticket(handler, mock_state):
     When the ticket_id does not exist in state.jira_tickets, the handler
     must return gracefully without emitting a SimEvent or crashing.
     """
-    mock_state.jira_tickets = []
+    # No ticket seeded — get_ticket("ORG-GHOST") returns None from mongomock
 
     item = AgendaItem(
         activity_type="ticket_progress",
@@ -329,7 +329,7 @@ def test_ticket_progress_blocker_emits_blocker_flagged(handler, mock_state):
     blocker_flagged SimEvent must also be emitted.
     """
     ticket = _make_ticket("ORG-103", "Investigate timeout", status="In Progress", assignee="Carol")
-    mock_state.jira_tickets = [ticket]
+    handler._mem.upsert_ticket(ticket)
 
     item = AgendaItem(
         activity_type="ticket_progress",
@@ -342,7 +342,7 @@ def test_ticket_progress_blocker_emits_blocker_flagged(handler, mock_state):
     dept_plan = _simple_dept_plan([eng_plan])
 
     with patch.object(handler, "_save_ticket"), \
-         patch.object(handler, "_save_slack"), \
+         patch.object(handler, "_save_slack", return_value=("", "")), \
          patch("normal_day.Crew") as mock_crew:
         # First call: ticket comment (contains "blocked"); second call: blocker Slack
         mock_crew.return_value.kickoff.side_effect = [
@@ -373,7 +373,7 @@ def test_one_on_one_emits_simevent_with_both_actors(handler, mock_state):
     eng_plan  = _simple_eng_plan("Bob", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = (
             "Bob: Hey, quick question about the sprint.\nAlice: Sure, what's up?"
@@ -406,7 +406,7 @@ def test_one_on_one_boosts_graph_edge(handler, graph_and_gd):
     eng_plan  = _simple_eng_plan("Bob", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = (
             "Bob: Wanted to chat about priorities.\nAlice: Let's do it."
@@ -450,7 +450,7 @@ def test_async_question_emits_simevent(handler, mock_state):
     include the asker and channel.
     """
     ticket = _make_ticket("ORG-104", "Cache invalidation bug", assignee="Carol")
-    mock_state.jira_tickets = [ticket]
+    handler._mem.upsert_ticket(ticket)
 
     item = AgendaItem(
         activity_type="async_question",
@@ -462,7 +462,7 @@ def test_async_question_emits_simevent(handler, mock_state):
     eng_plan  = _simple_eng_plan("Carol", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = (
             "Carol: Anyone know why the cache isn't invalidating?\n"
@@ -494,7 +494,7 @@ def test_async_question_cross_dept_uses_digital_hq(handler, mock_state):
     eng_plan  = _simple_eng_plan("Carol", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = (
             "Carol: Dave, can you clarify the quota?\nDave: Sure, let me pull it up."
@@ -527,7 +527,7 @@ def test_design_discussion_emits_simevent(handler, mock_state):
     eng_plan  = _simple_eng_plan("Alice", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch.object(handler, "_save_md"), \
          patch("normal_day.Crew") as mock_crew, \
          patch("random.random", return_value=0.99):   # suppress Confluence stub
@@ -563,7 +563,7 @@ def test_design_discussion_confluence_stub_created_sometimes(handler, mock_state
 
     mock_cw = MagicMock()
     def fake_write_design(*args, **kwargs):
-        from memory import SimEvent
+        from memory import Memory, SimEvent
         handler._mem.log_event(SimEvent(
             type="confluence_created", day=1, date="", timestamp="", 
             actors=[], artifact_ids={}, facts={}, summary=""
@@ -572,7 +572,7 @@ def test_design_discussion_confluence_stub_created_sometimes(handler, mock_state
     mock_cw.write_design_doc.side_effect = fake_write_design
     handler._confluence = mock_cw
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch.object(handler, "_save_md"), \
          patch("normal_day.Crew") as mock_crew, \
          patch("random.random", return_value=0.10):   # trigger Confluence path
@@ -609,7 +609,7 @@ def test_mentoring_double_boosts_graph_edge(handler, graph_and_gd):
     eng_plan  = _simple_eng_plan("Alice", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = (
             "Alice: Let's talk about async/await.\nCarol: I've been struggling with it."
@@ -634,7 +634,7 @@ def test_mentoring_emits_simevent(handler, mock_state):
     eng_plan  = _simple_eng_plan("Alice", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = (
             "Alice: How are you finding the new ticket workload?\n"
@@ -735,7 +735,7 @@ def test_one_on_one_syncs_both_cursors(handler, clock, mock_state):
     eng_plan  = _simple_eng_plan("Bob", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = (
             "Bob: Quick sync on the sprint.\nAlice: Sure, go ahead."
@@ -847,7 +847,7 @@ def test_execute_agenda_items_calls_graph_dynamics_record(handler, mock_state):
     dept_plan = _simple_dept_plan([eng_plan])
     org_plan  = _simple_org_plan({"Engineering": dept_plan})
 
-    with patch.object(handler, "_save_slack"), \
+    with patch.object(handler, "_save_slack", return_value=("", "")), \
          patch.object(handler, "graph_dynamics_record") as mock_gdr, \
          patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = (

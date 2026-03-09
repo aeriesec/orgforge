@@ -49,9 +49,9 @@ _CONF_REF_RE = re.compile(r"\bCONF-[A-Z]+-\d+\b")
 
 # ── Chunking defaults ─────────────────────────────────────────────────────────
 # Cohere Embed v4 supports 128K tokens, but focused pages improve retrieval
-# precision. ~3 000 chars ≈ ~750 tokens — well inside any embedder's window.
-DEFAULT_CHUNK_CHARS   = 3_000
-DEFAULT_CHUNK_OVERLAP = 200
+# precision. ~9 000 chars ≈ ~750 tokens — well inside any embedder's window.
+DEFAULT_CHUNK_CHARS   = 12_000
+DEFAULT_CHUNK_OVERLAP = 400
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ class TicketSummary:
     story_points:  Optional[int]
     days_active:   int
     comment_count: int
-    last_comments: List[Dict]    # last 3 comments, normalised to author/date/text
+    last_comments: List[Dict]
     linked_prs:    List[str]
     was_blocked:   bool
     sprint:        Optional[int]
@@ -156,7 +156,7 @@ class ArtifactRegistry:
     reuse IDs from a previous simulation run.
     """
 
-    def __init__(self, mem: "Memory", base_export_dir: str = "./export"):
+    def __init__(self, mem: Memory, base_export_dir: str = "./export"):
         self._mem  = mem
         self._base = base_export_dir
 
@@ -172,25 +172,21 @@ class ArtifactRegistry:
     def _seed_from_mongo(self) -> None:
         """Populate both caches from MongoDB on startup."""
         try:
-            for doc in self._mem._artifacts.find(
-                {"type": "confluence"}, {"_id": 1, "title": 1}
-            ):
+            # Seed Confluence (from artifacts collection)
+            for doc in self._mem._artifacts.find({"type": "confluence"}, {"_id": 1, "title": 1}):
                 self._confluence[doc["_id"]] = doc.get("title", "")
 
-            for doc in self._mem._artifacts.find(
-                {"type": "jira"}, {"_id": 1}
-            ):
-                jid    = doc["_id"]
+            # Seed JIRA (from new dedicated tickets collection)
+            for doc in self._mem._jira.find({}, {"id": 1}):
+                jid = doc["id"]
                 suffix = jid.replace("ORG-", "")
                 if suffix.isdigit():
                     self._jira[jid] = int(suffix)
 
-            logger.info(
-                f"[registry] Seeded {len(self._confluence)} Confluence + "
-                f"{len(self._jira)} JIRA IDs from MongoDB."
-            )
+            logger.info(f"[registry] Seeded {len(self._confluence)} CONF + {len(self._jira)} JIRA IDs.")
         except Exception as e:
-            logger.warning(f"[registry] Could not seed from MongoDB: {e}")
+            logger.warning(f"[registry] Seeding failed: {e}")
+
 
     # ─────────────────────────────────────────────
     # SHARED ALLOCATOR CORE
@@ -260,8 +256,7 @@ class ArtifactRegistry:
         self.register_confluence(conf_id, title)
 
     def confluence_exists(self, conf_id: str) -> bool:
-        val = self._confluence.get(conf_id)
-        return val is not None and val != "__reserved__"
+        return conf_id in self._confluence
 
     def all_confluence_ids(self) -> List[str]:
         return [k for k, v in self._confluence.items() if v != "__reserved__"]
@@ -375,18 +370,19 @@ class ArtifactRegistry:
 
     def related_context(self, topic: str, n: int = 5) -> str:
         """
-        Return a bullet list of existing confirmed Confluence page IDs +
-        titles for injection into LLM prompts as the allowed reference set.
-
-        Returns "None yet." if no pages have been confirmed yet.
+        Return a bullet list of existing Confluence page IDs + titles.
+        Exposes '__reserved__' IDs so the LLM knows what is coming up in the batch.
         """
-        candidates = [
-            (id_, title)
-            for id_, title in self._confluence.items()
-            if title not in ("__reserved__", "")
-        ]
+        candidates = []
+        for id_, title in self._confluence.items():
+            if title == "__reserved__":
+                candidates.append((id_, "[Planned / Coming Soon]"))
+            elif title != "":
+                candidates.append((id_, title))
+                
         if not candidates:
             return "None yet."
+            
         return "\n".join(
             f"- {id_}: {title}" for id_, title in candidates[-n:]
         )
@@ -562,5 +558,5 @@ class ArtifactRegistry:
 
     @staticmethod
     def _extract_first_heading(text: str) -> Optional[str]:
-        m = re.search(r"^#{1,3}\s+(.+)", text, re.MULTILINE)
+        m = re.search(r"^#{2,3}\s+(.+)", text, re.MULTILINE)
         return m.group(1).strip() if m else None

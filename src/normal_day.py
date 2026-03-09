@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import random
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
-from crewai import Agent, Task, Crew
+from crewai import Agent, Process, Task, Crew
 
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
@@ -41,7 +42,8 @@ class NormalDayHandler:
         planner_llm,
         clock,
         persona_helper,
-        confluence_writer=None
+        confluence_writer=None,
+        vader=None,
     ):
         self._config         = config
         self._mem            = mem
@@ -60,17 +62,14 @@ class NormalDayHandler:
         self._persona_helper = persona_helper
         self._confluence     = confluence_writer
         self._registry       = getattr(confluence_writer, "_registry", None)
+        self._vader          = vader
 
     # ─── PUBLIC ENTRY POINT ───────────────────────────────────────────────────
 
-    def handle(self, org_plan: Optional[OrgDayPlan]) -> None:
+    def handle(self, org_plan: OrgDayPlan) -> None:
         """Processes both planned agenda items and unplanned org collisions."""
         logger.info(f"  [bold blue]💬 Normal Day Activity[/bold blue]")
         date_str = str(self._state.current_date.date())
-
-        if org_plan is None:
-            self._legacy_slack_chatter(date_str)
-            return
 
         # 1. Execute the planned daily work
         self._execute_agenda_items(org_plan, date_str)
@@ -178,8 +177,7 @@ class NormalDayHandler:
         if not ticket_id:
             return []
         
-        # Find the ticket in state
-        ticket = next((t for t in self._state.jira_tickets if t["id"] == ticket_id), None)
+        ticket = self._mem.get_ticket(ticket_id)
         if not ticket:
             return [eng_plan.name]
 
@@ -288,11 +286,14 @@ class NormalDayHandler:
             ticket["status"] = "In Review" # Advance the status
 
         ticket["updated_at"] = current_actor_time_iso
+        comment_id = f"{ticket_id}_comment_{len(ticket['comments'])}"
 
-        # 5. Save and Embed
+        # 5. Save and Embed — upsert first so status is persisted even if
+        # _save_ticket is patched out in tests
+        self._mem.upsert_ticket(ticket)
         self._save_ticket(ticket)
         self._mem.embed_artifact(
-            id=f"{ticket_id}_comment_{len(ticket['comments'])}",
+            id=comment_id,
             type="jira_comment",
             title=f"Comment on {ticket_id}",
             content=comment_text,
@@ -301,12 +302,23 @@ class NormalDayHandler:
             timestamp=current_actor_time_iso
         )
 
+        active_inc = next((i for i in self._state.active_incidents if i.ticket_id == ticket_id), None)
+        
+        if active_inc and getattr(active_inc, "causal_chain", None):
+            active_inc.causal_chain.append(comment_id)
+            if spawned_pr_id:
+                active_inc.causal_chain.append(spawned_pr_id)
+
         artifacts = {
             "jira": ticket_id,
-            "jira_comment": f"{ticket_id}_comment_{len(ticket['comments'])}"
+            "jira_comment": comment_id
         }
         if spawned_pr_id:
             artifacts["pr"] = spawned_pr_id
+
+        facts = {"ticket_id": ticket_id, "status": ticket["status"], "spawned_pr": spawned_pr_id}
+        if active_inc and getattr(active_inc, "causal_chain", None):
+            facts["causal_chain"] = active_inc.causal_chain.snapshot()
 
         self._mem.log_event(SimEvent(
             type="ticket_progress",
@@ -315,13 +327,16 @@ class NormalDayHandler:
             date=date_str,
             actors=[assignee],
             artifact_ids=artifacts,
-            facts={"ticket_id": ticket_id, "status": ticket["status"], "spawned_pr": spawned_pr_id},
+            facts=facts,
             summary=f"{assignee} worked on {ticket_id}. " + (f"Opened PR {spawned_pr_id}!" if spawned_pr_id else ""),
             tags=["jira", "engineering"]
         ))
 
         bucket = self._state.ticket_actors_today.setdefault(ticket_id, set())
         bucket.add(assignee)
+
+        if self._vader:
+            self._score_and_apply_sentiment(comment_text, [assignee], self._vader)
 
         generated_artifacts = [ticket_id]
         if spawned_pr_id is not None:
@@ -353,15 +368,14 @@ class NormalDayHandler:
         current_actor_time = artifact_time.isoformat()
 
         ctx      = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
+        backstory = self._persona_helper(reviewer, mem=self._mem, graph_dynamics=self._gd, 
+                                         extra=f"You are {reviewer}, reviewing {author}'s PR: {pr_title}.")
 
         # Generate review comment
         agent = Agent(
             role="Code Reviewer",
             goal="Write a realistic PR review comment.",
-            backstory=(
-                f"You are {reviewer}, reviewing {author}'s PR: {pr_title}. "
-                f"{self._gd.stress_tone_hint(reviewer)}"
-            ),
+            backstory=backstory,
             llm=self._worker,
         )
         task = Task(
@@ -379,21 +393,17 @@ class NormalDayHandler:
             Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         ).strip()
 
-        import os, json as _json
+        pr_comment = {"author": reviewer, "date": date_str,
+              "timestamp": current_actor_time, "text": review_text}
+        pr.setdefault("comments", []).append(pr_comment)
+        
+        # Write back the mutated PR (comment appended) to both stores
         pr_path = f"{self._base}/git/prs/{pr.get('pr_id', pr_id)}.json"
+        import os, json as _json
         os.makedirs(os.path.dirname(pr_path), exist_ok=True)
         with open(pr_path, "w") as f:
             _json.dump(pr, f, indent=2)
-
-        pr_comment = {
-            "author": reviewer,
-            "date": date_str,
-            "timestamp": current_actor_time,
-            "text": review_text
-        }
-        pr.setdefault("comments", []).append(pr_comment)
-
-
+        self._mem.upsert_pr(pr)   
 
         # Emit as a GitHub bot message in #engineering
         self._emit_bot_message(
@@ -432,6 +442,17 @@ class NormalDayHandler:
             tags=["pr_review", "engineering"],
         ))
 
+        active_inc = next(
+            (i for i in self._state.active_incidents
+            if i.ticket_id == pr.get("linked_ticket")),
+            None
+        )
+        if active_inc and getattr(active_inc, "causal_chain", None):
+            active_inc.causal_chain.append(pr.get("pr_id", pr_id or ""))
+
+        if self._vader:
+            self._score_and_apply_sentiment(review_text, [reviewer], self._vader)
+
         logger.info(f"    [dim]🔍 {reviewer} reviewed {pr.get('pr_id', 'PR')}[/dim]")
         return actors
 
@@ -457,42 +478,93 @@ class NormalDayHandler:
         )
         meeting_time_iso = meeting_start.isoformat()
 
-        stress_a = self._gd.stress_tone_hint(name)
-        stress_b = self._gd.stress_tone_hint(collaborator)
-        ctx      = self._mem.context_for_prompt(
+        ctx = self._mem.context_for_prompt(
             f"1on1 {name} {collaborator} workload", n=2, as_of_time=meeting_time_iso
         )
 
-        agent = Agent(
-            role="Workplace Conversation Writer",
-            goal="Write a realistic 1:1 DM exchange.",
-            backstory="You write authentic, unscripted workplace conversations.",
-            llm=self._worker,
-        )
-        task = Task(
-            description=(
-                f"Write a 3-5 message DM between {name} and {collaborator}.\n"
-                f"{name}: {stress_a}\n"
-                f"{collaborator}: {stress_b}\n"
-                f"Context: {ctx}\n"
-                f"Topics might include: workload, current sprint, a decision that "
-                f"needs to be made, or something personal-professional (lunch, PTO).\n"
-                f"Format EXACTLY: Name: [Message]"
-            ),
-            expected_output="DM transcript. Name: [Message] format.",
-            agent=agent,
-        )
+        def _voice_card(name: str) -> str:
+            p = self._config.get("personas", {}).get(name, {})
+            stress = self._gd._stress.get(name, 30)
+            quirks = p.get("typing_quirks", "standard professional grammar")
+            tenure = p.get("tenure", "mid")
+            mood = (
+                "drained, short replies" if stress > 80 else
+                "a bit distracted" if stress > 60 else
+                "relaxed and present"
+            )
+            return (
+                f"{name} | Tenure: {tenure}\n"
+                f"  Typing style: {quirks}\n"
+                f"  Current mood: {mood}"
+            )
+
+        voice_cards = f"{_voice_card(name)}\n\n{_voice_card(collaborator)}"
+
+        agents, tasks, prev_task = [], [], None
+        for i, speaker in enumerate([name, collaborator]):
+            p = self._config.get("personas", {}).get(speaker, {})
+            backstory = self._persona_helper(speaker, mem=self._mem, graph_dynamics=self._gd)
+            agent = Agent(
+                role=f"{speaker} — {p.get('role', 'Engineer')}",
+                goal=f"Have a natural 1:1 DM conversation as {speaker}.",
+                backstory=backstory,
+                llm=self._worker,
+            )
+            other = collaborator if i == 0 else name
+            desc = (
+                f"You are {speaker}. You are in a private Slack DM with {other}.\n\n"
+                f"Both of you:\n{voice_cards}\n\n"
+                f"Context: {ctx}\n\n"
+                f"{'Open the conversation' if i == 0 else 'Reply naturally'}. "
+                f"Topics might include workload, sprint decisions, or something "
+                f"personal-professional. Use your typing quirks. 1-2 sentences. "
+                f"Format: {speaker}: [message]"
+            )
+            task = Task(
+                description=desc,
+                expected_output=f"One message from {speaker} in format: {speaker}: [message]",
+                agent=agent,
+                context=[prev_task] if prev_task else [],
+            )
+            agents.append(agent)
+            tasks.append(task)
+            prev_task = task
+
+        # Add 1-2 follow-up turns so the DM feels like a real back-and-forth
+        for round_i in range(random.randint(1, 2)):
+            for i, speaker in enumerate([name, collaborator]):
+                p = self._config.get("personas", {}).get(speaker, {})
+                backstory = self._persona_helper(speaker, mem=self._mem, graph_dynamics=self._gd)
+                agent = Agent(
+                    role=f"{speaker} — {p.get('role', 'Engineer')}",
+                    goal=f"Continue the DM naturally as {speaker}.",
+                    backstory=backstory,
+                    llm=self._worker,
+                )
+                task = Task(
+                    description=(
+                        f"You are {speaker}. Continue the DM conversation. "
+                        f"React to what was just said. Stay in character. "
+                        f"Format: {speaker}: [message]"
+                    ),
+                    expected_output=f"One message from {speaker} in format: {speaker}: [message]",
+                    agent=agent,
+                    context=[prev_task] if prev_task else [],
+                )
+                agents.append(agent)
+                tasks.append(task)
+                prev_task = task
+
         result = str(
-            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            Crew(agents=agents, tasks=tasks, process=Process.sequential, verbose=False).kickoff()
         )
 
         messages = self._parse_slack_messages(
-            result, [name, collaborator], hour_range=(9, 11)
+            result, [name, collaborator]
         )
         if not messages:
             return [name, collaborator]
         
-
         current_msg_time = datetime.fromisoformat(meeting_time_iso)
 
         for msg in messages:
@@ -504,8 +576,7 @@ class NormalDayHandler:
 
         p1, p2    = sorted([name, collaborator])
         channel   = f"dm_{p1.lower()}_{p2.lower()}"
-        path      = f"{self._base}/slack/channels/{channel}/{date_str}_1on1.json"
-        self._save_slack(path, messages, channel)
+        slack_path, thread_id = self._save_slack(messages, channel, interaction_type="1on1")
 
         self._mem.log_event(SimEvent(
             type="1on1",
@@ -513,11 +584,15 @@ class NormalDayHandler:
             day=self._state.day,
             date=date_str,
             actors=[name, collaborator],
-            artifact_ids={"slack": path},
+            artifact_ids={"slack_path": slack_path, "slack_thread": thread_id},
             facts={"participants": [name, collaborator], "message_count": len(messages)},
             summary=f"1:1 between {name} and {collaborator}.",
             tags=["1on1", "slack"],
         ))
+
+        if self._vader and messages:
+            full_text = " ".join(m["text"] for m in messages)
+            self._score_and_apply_sentiment(full_text, [name, collaborator], self._vader)
 
         self._gd.record_slack_interaction([name, collaborator])
         logger.info(f"    [dim]👥 1:1 {name} ↔ {collaborator}[/dim]")
@@ -533,7 +608,7 @@ class NormalDayHandler:
         """
         Engineer asks a question in a channel.
         Generates: Slack thread with 2-4 replies from colleagues.
-        The question is grounded in the engineer's current ticket or blocker.
+        Each participant speaks from their own persona via a dedicated Agent.
         """
         asker        = eng_plan.name
         collaborator = next(iter(item.collaborator), None) or self._closest_colleague(asker)
@@ -545,76 +620,160 @@ class NormalDayHandler:
         initial_participants = [asker]
         if collaborator:
             initial_participants.append(collaborator)
-            
+
         depts = {dept_of_name(p, self._org_chart) for p in initial_participants}
-        
         if len(depts) > 1:
             channel = "digital-hq"
         else:
             channel = dept_of_name(asker, self._org_chart).lower().replace(" ", "-")
 
-        # Pull in 1-2 more people from the channel naturally
-        channel_members = self._channel_members(channel, asker)
-        responders = [collaborator] if collaborator else []
-        extras = [n for n in channel_members if n != asker and n not in responders]
-        responders.extend(random.sample(extras, min(1, len(extras))))
-        all_actors = list({asker} | set(responders))
-
-        chat_duration_mins = random.randint(5, 20)
+        chat_duration_mins  = random.randint(5, 45)
         chat_duration_hours = chat_duration_mins / 60.0
-
-        meeting_start, meeting_end = self._clock.sync_and_advance(
-            all_actors, 
+        provisional_start, _ = self._clock.sync_and_advance(
+            initial_participants,
             hours=chat_duration_hours
         )
-        meeting_time_iso = meeting_start.isoformat()
+        meeting_time_iso = provisional_start.isoformat()
+
+        seed = [collaborator] if collaborator else []
+        all_actors = self._expertise_matched_participants(
+            topic=ticket_title,
+            seed_participants=[asker] + seed,
+            as_of_time=meeting_time_iso,
+            max_extras=1,
+        )
+
+        meeting_start, _ = self._clock.sync_and_advance(all_actors, hours=0)
+        meeting_time_iso  = meeting_start.isoformat()
 
         ctx = self._mem.context_for_prompt(ticket_title, n=2, as_of_time=meeting_time_iso)
 
-        agent = Agent(
-            role="Slack Thread Writer",
-            goal="Write a realistic async question thread.",
-            backstory="You write authentic Slack conversations in engineering teams.",
-            llm=self._worker,
+        relevant_experts = self._mem.find_confluence_experts(
+            topic=ticket_title,
+            score_threshold=0.75,
+            n=3,
+            as_of_time=meeting_time_iso,
         )
-        profiles = "\n".join(
-            f"  - {n} ({dept_of_name(n, self._org_chart)}): "
-            f"{self._gd.stress_tone_hint(n)}"
-            for n in all_actors
-        )
-        task = Task(
-            description=(
-                f"{asker} has a question related to: {ticket_title}\n"
-                f"Participants:\n{profiles}\n"
-                f"Context: {ctx}\n\n"
-                f"Write a 3-5 message Slack thread. {asker} asks first, "
-                f"others respond with genuine help, follow-up questions, or "
-                f"'I don't know but try X'. Keep it realistic — not everyone "
-                f"knows the answer immediately.\n"
-                f"Format EXACTLY: Name: [Message]"
-            ),
-            expected_output="Slack thread. Name: [Message] format.",
-            agent=agent,
-        )
-        result = str(
-            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        doc_hint = (
+            f"Note: the following internal documentation exists and may be "
+            f"referenced naturally in this conversation:\n"
+            + "\n".join(
+                f"  - '{e['title']}' (written by {e['author']}, day {e['day']})"
+                for e in relevant_experts
+            )
+            if relevant_experts else ""
         )
 
-        messages = self._parse_slack_messages(result, all_actors, hour_range=(10, 16))
+        # ── Build per-person voice cards ─────────────────────────────────────────
+        personas = self._config.get("personas", {})
+
+        def _voice_card(name: str) -> str:
+            p      = personas.get(name, {})
+            stress = self._gd._stress.get(name, 30)
+            quirks = p.get("typing_quirks", "standard professional grammar")
+            expertise = p.get("expertise", [])
+            tenure    = p.get("tenure", "mid")
+
+            if stress > 80:
+                mood = "visibly stressed, terse replies, wants to resolve this fast"
+            elif stress > 60:
+                mood = "somewhat distracted but trying to help"
+            else:
+                mood = "engaged and happy to dig in"
+
+            expertise_str = ", ".join(str(e) for e in expertise[:3]) if expertise else "general engineering"
+            return (
+                f"{name} | Tenure: {tenure} | Dept: {dept_of_name(name, self._org_chart)}\n"
+                f"  Typing style: {quirks}\n"
+                f"  Expertise: {expertise_str}\n"
+                f"  Current mood: {mood}"
+            )
+
+        voice_cards = "\n\n".join(_voice_card(n) for n in all_actors)
+
+        # ── One Agent per participant — sequential crew ───────────────────────────
+        agents    = []
+        tasks     = []
+        prev_task = None
+
+        for i, name in enumerate(all_actors):
+            p         = personas.get(name, {})
+            backstory = self._persona_helper(name, mem=self._mem, graph_dynamics=self._gd)
+
+            agent = Agent(
+                role=f"{name} — {p.get('tenure', 'Engineer')}",
+                goal=f"Respond authentically as {name} in a Slack Q&A thread.",
+                backstory=backstory,
+                llm=self._worker,
+            )
+
+            if i == 0:
+                # Asker opens the thread
+                desc = (
+                    f"You are {name}. You have a question related to your work on: {ticket_title}\n\n"
+                    f"Participants in this thread:\n{voice_cards}\n\n"
+                    f"Relevant context: {ctx}\n"
+                    f"{doc_hint}\n\n"
+                    f"Post your opening question exactly as {name} would — use your typing quirks, "
+                    f"reflect your current mood, and be specific about what you're stuck on. "
+                    f"1-3 sentences. Format: {name}: [message]"
+                )
+            else:
+                # Responders reply to what came before
+                desc = (
+                    f"You are {name}. A colleague just asked a question in Slack about: {ticket_title}\n\n"
+                    f"Participants:\n{voice_cards}\n\n"
+                    f"Relevant context: {ctx}\n"
+                    f"{doc_hint}\n\n"
+                    f"Reply naturally as {name} would — use your typing quirks, reflect your mood. "
+                    f"You may have the answer, ask a clarifying question, say you don't know but "
+                    f"suggest someone else, or reference internal docs if relevant. "
+                    f"1-3 sentences. Format: {name}: [message]"
+                )
+
+            task = Task(
+                description=desc,
+                expected_output=f"One Slack message from {name} in format: {name}: [message]",
+                agent=agent,
+                context=[prev_task] if prev_task else [],
+            )
+
+            agents.append(agent)
+            tasks.append(task)
+            prev_task = task
+
+        result = str(
+            Crew(agents=agents, tasks=tasks, process=Process.sequential, verbose=False).kickoff()
+        )
+
+        messages = self._parse_slack_messages(result, all_actors)
         if not messages:
             return all_actors
 
         current_msg_time = datetime.fromisoformat(meeting_time_iso)
-
         for msg in messages:
-            # Stamp the message with our exact, mathematically safe time
             msg["ts"] = current_msg_time.isoformat()
-            
-            # Add 1 to 4 random minutes so the reply looks like a human typing
             current_msg_time += timedelta(minutes=random.randint(1, 4))
 
-        path = f"{self._base}/slack/channels/{channel}/{date_str}_{asker.lower()}_q.json"
-        self._save_slack(path, messages, channel)
+        slack_path, thread_id = self._save_slack(messages, channel, interaction_type="async_question")
+
+        active_inc = None
+        if ticket_id:
+            active_inc = next(
+                (i for i in self._state.active_incidents if i.ticket_id == ticket_id), None
+            )
+            if active_inc and getattr(active_inc, "causal_chain", None):
+                active_inc.causal_chain.append(thread_id)
+
+        facts = {
+            "asker":         asker,
+            "channel":       channel,
+            "topic":         ticket_title,
+            "responders":    [a for a in all_actors if a != asker],
+            "message_count": len(messages),
+        }
+        if active_inc and getattr(active_inc, "causal_chain", None):
+            facts["causal_chain"] = active_inc.causal_chain.snapshot()
 
         self._mem.log_event(SimEvent(
             type="async_question",
@@ -622,17 +781,15 @@ class NormalDayHandler:
             day=self._state.day,
             date=date_str,
             actors=all_actors,
-            artifact_ids={"slack": path, "jira": ticket_id or ""},
-            facts={
-                "asker":     asker,
-                "channel":   channel,
-                "topic":     ticket_title,
-                "responders": responders,
-                "message_count": len(messages),
-            },
+            artifact_ids={"slack": slack_path, "slack_thread": thread_id, "jira": ticket_id or ""},
+            facts=facts,
             summary=f"{asker} asked a question in #{channel} about {ticket_title[:50]}.",
             tags=["async_question", "slack"],
         ))
+
+        if self._vader and messages:
+            full_text = " ".join(m["text"] for m in messages)
+            self._score_and_apply_sentiment(full_text, all_actors, self._vader)
 
         self._gd.record_slack_interaction(all_actors)
         logger.info(f"    [dim]❓ {asker} → #{channel} ({len(messages)} msgs)[/dim]")
@@ -655,67 +812,108 @@ class NormalDayHandler:
         )
         participants = list({initiator} | set(collaborators))
 
-        # Pull one more person with relevant expertise if available
-        if len(participants) < 3:
-            topic_lower = item.description.lower()
-            for name in self._all_names:
-                if name in participants:
-                    continue
-                p = self._config.get("personas", {}).get(name, {})
-                expertise = [e.lower() for e in p.get("expertise", [])]
-                if any(kw in topic_lower for kw in expertise):
-                    participants.append(name)
-                    break
-
-        chat_duration_mins = random.randint(5, 45)
+        chat_duration_mins  = random.randint(5, 45)
         chat_duration_hours = chat_duration_mins / 60.0
+        provisional_start, _ = self._clock.sync_and_advance(
+            participants,
+            hours=chat_duration_hours
+        )
+        meeting_time_iso = provisional_start.isoformat()
+
+        # Augment with expertise-matched participants.  The helper injects:
+        #   - the author of any published-today Confluence page on this topic
+        #   - up to 1 extra person with overlapping expertise and graph proximity.
+        # This replaces the previous ad-hoc topic keyword scan.
+        participants = self._expertise_matched_participants(
+            topic=item.description,
+            seed_participants=participants,
+            as_of_time=meeting_time_iso,
+            max_extras=1,
+        )
 
         meeting_start, meeting_end = self._clock.sync_and_advance(
-            participants, 
-            hours=chat_duration_hours
+            participants,
+            hours=0,
         )
         meeting_time_iso = meeting_start.isoformat()
 
         ctx = self._mem.context_for_prompt(item.description, n=3, as_of_time=meeting_time_iso)
 
-        agent = Agent(
-            role="Engineering Team",
-            goal="Write a realistic design discussion Slack thread.",
-            backstory="You write authentic technical discussions between engineers.",
-            llm=self._planner,
-        )
-        profiles = "\n".join(
-            f"  - {n}: {self._gd.stress_tone_hint(n)}" for n in participants
-        )
-        task = Task(
-            description=(
-                f"Write a 5-8 message Slack design discussion about: {item.description}\n"
-                f"Participants:\n{profiles}\n"
-                f"Context: {ctx}\n\n"
-                f"This should feel like engineers working through a real technical "
-                f"decision — trade-offs, constraints, 'what about X' questions. "
-                f"Someone should land on a tentative conclusion or next step.\n"
-                f"Format EXACTLY: Name: [Message]"
-            ),
-            expected_output="Slack thread. Name: [Message] format.",
-            agent=agent,
-        )
-        result = str(
-            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        def _voice_card(name: str) -> str:
+            p = self._config.get("personas", {}).get(name, {})
+            stress = self._gd._stress.get(name, 30)
+            quirks = p.get("typing_quirks", "standard professional grammar")
+            expertise = ", ".join(p.get("expertise", [])[:3])
+            social_role = p.get("social_role", "Contributor")
+            mood = (
+                "terse, wants to decide fast and move on" if stress > 80 else
+                "engaged but watching the clock" if stress > 60 else
+                "thinking carefully, happy to explore trade-offs"
+            )
+            return (
+                f"{name} | Role: {social_role} | Expertise: {expertise}\n"
+                f"  Typing style: {quirks}\n"
+                f"  Current mood: {mood}"
+            )
+
+        voice_cards = "\n\n".join(_voice_card(p) for p in participants)
+
+        agents, tasks, prev_task = [], [], None
+        # Initiator opens, then round-robin through participants for 5-8 turns total
+        turn_speakers = [initiator] + (
+            [participants[i % len(participants)] for i in range(1, random.randint(5, 8))]
         )
 
-        messages = self._parse_slack_messages(result, participants, hour_range=(10, 15))
+        for i, speaker in enumerate(turn_speakers):
+            p = self._config.get("personas", {}).get(speaker, {})
+            backstory = self._persona_helper(speaker, mem=self._mem, graph_dynamics=self._gd)
+            agent = Agent(
+                role=f"{speaker} — {p.get('social_role', 'Engineer')}",
+                goal=f"Contribute authentically to a technical design discussion as {speaker}.",
+                backstory=backstory,
+                llm=self._planner,
+            )
+            if i == 0:
+                desc = (
+                    f"You are {speaker}, opening a Slack design discussion.\n\n"
+                    f"Topic: {item.description}\n\n"
+                    f"Participants:\n{voice_cards}\n\n"
+                    f"Context: {ctx}\n\n"
+                    f"Frame the problem or decision that needs to be made. "
+                    f"Be specific — name constraints, risks, or the trade-off you're wrestling with. "
+                    f"Use your typing quirks. 2-3 sentences max. Format: {speaker}: [message]"
+                )
+            else:
+                others = [p for p in participants if p != speaker]
+                desc = (
+                    f"You are {speaker}. Respond to the design thread about: {item.description}.\n\n"
+                    f"Participants:\n{voice_cards}\n\n"
+                    f"React as an engineer actually working through this — raise a trade-off, "
+                    f"ask 'what about X', push back, or propose a concrete next step. "
+                    f"Don't just agree. Stay in character. "
+                    f"Format: {speaker}: [message]"
+                )
+            task = Task(
+                description=desc,
+                expected_output=f"One message from {speaker} in format: {speaker}: [message]",
+                agent=agent,
+                context=[prev_task] if prev_task else [],
+            )
+            agents.append(agent)
+            tasks.append(task)
+            prev_task = task
+
+        result = str(
+            Crew(agents=agents, tasks=tasks, process=Process.sequential, verbose=False).kickoff()
+        )
+
+        messages = self._parse_slack_messages(result, participants)
 
         depts = {dept_of_name(p, self._org_chart) for p in participants}
         if len(depts) > 1:
             dept_channel = "digital-hq"
         else:
             dept_channel = dept_of_name(initiator, self._org_chart).lower().replace(" ", "-")
-
-        path = (
-            f"{self._base}/slack/channels/{dept_channel}/"
-            f"{date_str}_{initiator.lower()}_design.json"
-        )
 
         if messages:
             current_msg_time = datetime.fromisoformat(meeting_time_iso)
@@ -727,7 +925,7 @@ class NormalDayHandler:
                 # Add 1 to 4 random minutes so the reply looks like a human typing
                 current_msg_time += timedelta(minutes=random.randint(1, 8))
 
-            self._save_slack(path, messages, dept_channel)
+        slack_path, thread_id = self._save_slack(messages, dept_channel, interaction_type="design")
 
         # 30% chance a design discussion spawns a Confluence stub
         conf_id = None
@@ -743,7 +941,7 @@ class NormalDayHandler:
             day=self._state.day,
             date=date_str,
             actors=participants,
-            artifact_ids={"slack": path, "confluence": conf_id or ""},
+            artifact_ids={"slack_path": slack_path, "slack_thread": thread_id, "confluence": conf_id or ""},
             facts={
                 "topic":         item.description,
                 "participants":  participants,
@@ -793,40 +991,96 @@ class NormalDayHandler:
             f"mentoring {mentee} learning growth", n=2, as_of_time=meeting_time_iso
         )
 
-        agent = Agent(
-            role="Workplace Mentor",
-            goal="Write a realistic mentoring DM exchange.",
-            backstory=(
-                f"You are {mentor}, an experienced engineer helping {mentee} grow. "
-                f"{self._gd.stress_tone_hint(mentor)}"
-            ),
-            llm=self._worker,
+        def _voice_card(name: str) -> str:
+            p = self._config.get("personas", {}).get(name, {})
+            stress = self._gd._stress.get(name, 30)
+            quirks = p.get("typing_quirks", "standard professional grammar")
+            tenure = p.get("tenure", "mid")
+            expertise = ", ".join(p.get("expertise", [])[:3])
+            mood = (
+                "drained, keeping answers short" if stress > 80 else
+                "patient but distracted" if stress > 60 else
+                "engaged and generous with their time"
+            )
+            return (
+                f"{name} | Tenure: {tenure} | Expertise: {expertise}\n"
+                f"  Typing style: {quirks}\n"
+                f"  Current mood: {mood}"
+            )
+
+        voice_cards = (
+            f"MENTOR:\n{_voice_card(mentor)}\n\n"
+            f"MENTEE:\n{_voice_card(mentee)}"
         )
-        task = Task(
-            description=(
-                f"Write a 4-6 message DM between mentor {mentor} and mentee {mentee}.\n"
-                f"Context: {ctx}\n"
-                f"Topics: career growth, a technical concept {mentee} is learning, "
-                f"feedback on recent work, or advice on handling a situation.\n"
-                f"Format EXACTLY: Name: [Message]"
-            ),
-            expected_output="DM transcript. Name: [Message] format.",
-            agent=agent,
-        )
+
+        agents, tasks, prev_task = [], [], None
+        n_turns = self._turn_count([mentor, mentee], (3, 6))
+        speakers = [mentor, mentee, mentor, mentee, mentor, mentee]
+        for i, speaker in enumerate(speakers[:n_turns]):
+            p = self._config.get("personas", {}).get(speaker, {})
+            backstory = self._persona_helper(speaker, mem=self._mem, graph_dynamics=self._gd)
+            is_mentor = speaker == mentor
+            agent = Agent(
+                role=f"{speaker} — {'Mentor' if is_mentor else 'Mentee'}",
+                goal=(
+                    f"Guide {mentee} thoughtfully as an experienced engineer."
+                    if is_mentor else
+                    f"Ask genuine questions and absorb guidance as someone still learning."
+                ),
+                backstory=backstory,
+                llm=self._worker,
+            )
+            if i == 0:
+                desc = (
+                    f"You are {mentor}, opening a mentoring DM with {mentee}.\n\n"
+                    f"{voice_cards}\n\n"
+                    f"Context: {ctx}\n\n"
+                    f"Start the session — check in, then move toward a topic: career growth, "
+                    f"a technical concept, recent work feedback, or navigating a situation. "
+                    f"Use your typing quirks. 1-2 sentences. Format: {mentor}: [message]"
+                )
+            elif is_mentor:
+                desc = (
+                    f"You are {mentor}. Respond to {mentee}'s message. "
+                    f"Be specific — reference real context where you can. "
+                    f"Guide, don't lecture. Format: {mentor}: [message]"
+                )
+            else:
+                desc = (
+                    f"You are {mentee}. Respond to {mentor}'s guidance. "
+                    f"Ask a follow-up, show you're thinking it through, or push back gently "
+                    f"if something doesn't make sense. Format: {mentee}: [message]"
+                )
+            task = Task(
+                description=desc,
+                expected_output=f"One message from {speaker} in format: {speaker}: [message]",
+                agent=agent,
+                context=[prev_task] if prev_task else [],
+            )
+            agents.append(agent)
+            tasks.append(task)
+            prev_task = task
+
         result = str(
-            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            Crew(agents=agents, tasks=tasks, process=Process.sequential, verbose=False).kickoff()
         )
 
         messages = self._parse_slack_messages(
-            result, [mentor, mentee], hour_range=(14, 17)
+            result, [mentor, mentee]
         )
         if not messages:
             return [mentor, mentee]
+        
+        current_msg_time = datetime.fromisoformat(meeting_time_iso)
+
+        for msg in messages:
+            # Overwrites the dummy timestamp from the parser
+            msg["ts"] = current_msg_time.isoformat()
+            current_msg_time += timedelta(minutes=random.randint(1, 8))
 
         p1, p2  = sorted([mentor, mentee])
         channel = f"dm_{p1.lower()}_{p2.lower()}"
-        path    = f"{self._base}/slack/channels/{channel}/{date_str}_mentoring.json"
-        self._save_slack(path, messages, channel)
+        slack_path, thread_id = self._save_slack(messages, channel, interaction_type="mentoring")
 
         # Mentoring is a strong relationship signal
         self._gd.record_slack_interaction([mentor, mentee])
@@ -838,7 +1092,7 @@ class NormalDayHandler:
             day=self._state.day,
             date=date_str,
             actors=[mentor, mentee],
-            artifact_ids={"slack": path},
+            artifact_ids={"slack_path": slack_path, "slack_thread": thread_id},
             facts={"mentor": mentor, "mentee": mentee, "message_count": len(messages)},
             summary=f"{mentor} mentored {mentee}.",
             tags=["mentoring", "slack"],
@@ -908,8 +1162,7 @@ class NormalDayHandler:
         
         # Save to digital-hq or relevant channel
         channel = "digital-hq"
-        path = f"{self._base}/slack/channels/{channel}/{date_str}_collision.json"
-        self._save_slack(path, messages, channel)
+        slack_path, thread_id = self._save_slack(messages, channel)
         
         # Log the simulation event for the memory store
         self._mem.log_event(SimEvent(
@@ -917,7 +1170,7 @@ class NormalDayHandler:
             timestamp=self._clock.now("system").isoformat(),
             day=self._state.day, date=date_str,
             actors=participants,
-            artifact_ids={"slack": path},
+            artifact_ids={"slack_path": slack_path, "slack_thread": thread_id},
             facts={"tension": tension, "type": event.event_type},
             summary=f"Unplanned {tension} interaction: {event.rationale}",
             tags=["collision", tension]
@@ -957,12 +1210,10 @@ class NormalDayHandler:
         )
         result  = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
         messages = self._parse_slack_messages(
-            result, [asker, collaborator], hour_range=(10, 15)
+            result, [asker, collaborator]
         )
 
         if messages:
-            
-
             current_msg_time = datetime.fromisoformat(timestamp)
 
             for msg in messages:
@@ -972,12 +1223,16 @@ class NormalDayHandler:
                 # Add 1 to 4 random minutes so the reply looks like a human typing
                 current_msg_time += timedelta(minutes=random.randint(1, 4))
 
-            path = (
-                f"{self._base}/slack/channels/{channel}/"
-                f"{date_str}_{asker.lower()}_blocked.json"
-            )
-            self._save_slack(path, messages, channel)
+            slack_path, thread_id = self._save_slack(messages, channel, interaction_type="blocker")
             self._gd.record_slack_interaction([asker, collaborator])
+
+            active_inc = next((i for i in self._state.active_incidents if i.ticket_id == ticket_id), None)
+            if active_inc and getattr(active_inc, "causal_chain", None):
+                active_inc.causal_chain.append(thread_id)
+                
+            facts = {"blocker_reason": blocker_text}
+            if active_inc and getattr(active_inc, "causal_chain", None):
+                facts["causal_chain"] = active_inc.causal_chain.snapshot()
 
             self._mem.log_event(SimEvent(
                 type="blocker_flagged",
@@ -985,8 +1240,8 @@ class NormalDayHandler:
                 date=date_str,
                 timestamp=timestamp,
                 actors=[asker, collaborator],
-                artifact_ids={"jira": ticket_id},
-                facts={"blocker_reason": blocker_text},
+                artifact_ids={"slack_path": slack_path, "slack_thread": thread_id},
+                facts=facts,
                 summary=f"{asker} is blocked on {ticket_id}, pinged {collaborator}.",
                 tags=["slack", "blocker"]
             ))
@@ -1025,7 +1280,7 @@ class NormalDayHandler:
             "engineering", "GitHub",
             f"💬 {author} replied to {reviewer}'s review on {pr_id}: "
             f"\"{reply[:100]}\"",
-            timestamp
+            timestamp=timestamp
         )
         return [author, reviewer]
 
@@ -1122,150 +1377,184 @@ class NormalDayHandler:
             return
         if self._confluence is None:
             return
-        author    = random.choice(self._all_names)
-        backstory = self._persona_helper(author, mem=self._mem, graph_dynamics=self._gd)
-        self._confluence.write_adhoc_page(author=author, backstory=backstory)
+        # Author and topic are both resolved inside ConfluenceWriter.write_adhoc_page()
+        # using daily_active_actors and persona expertise — do not pick randomly here.
+        # daily_theme is passed so the topic agent can skew toward operational docs
+        # on incident days and strategic docs on calm ones.
+        self._confluence.write_adhoc_page()
 
     def _trigger_watercooler_chat(self, target_actor: str, date_str: str) -> None:
         """Injects non-work chatter, pulling the target actor away from their work."""
         if target_actor not in self._graph:
             return
-            
+
         edges = self._graph[target_actor]
         if not edges:
             return
-            
-        # Pull 1-2 work friends to distract them
+
+        # Pull 1-2 work friends weighted by relationship strength
         colleagues = random.choices(
             list(edges.keys()),
             weights=[edges[n]["weight"] for n in edges.keys()],
             k=random.randint(1, 2),
         )
-        participants = list(set([target_actor] + colleagues))
+        participants = list(dict.fromkeys([target_actor] + colleagues))
         if len(participants) < 2:
             return
 
-        # 1. The Distraction Time Sink
-        # This uses sim_clock to find the busiest person in this group, syncs 
-        # them together, and eats up 10-15 minutes of their day.
         chat_duration_mins = random.randint(10, 15)
-        chat_duration_hours = chat_duration_mins / 60.0
-        thread_start, thread_end = self._clock.sync_and_advance(participants, hours=chat_duration_hours)
+        thread_start, thread_end = self._clock.sync_and_advance(
+            participants, hours=chat_duration_mins / 60.0
+        )
         thread_start_iso = thread_start.isoformat()
 
-        # 2. LLM Prompting
-        topics = [
-            "weekend plans", "a trending TV show", "complaining about the weather", 
-            "trying to figure out lunch options", "sharing a pet photo"
-        ]
-        topic = random.choice(topics)
-        
-        profiles = [f"{n} ({dept_of_name(n, self._org_chart)}): {self._gd.stress_tone_hint(n)}" for n in participants]
+        # Build topic from participant context
+        personas = self._config.get("personas", {})
+        participant_interests = []
+        for name in participants:
+            p = personas.get(name, {})
+            interests = p.get("interests", [])
+            if interests:
+                participant_interests.extend(interests[:2])
 
-        agent = Agent(
-            role="Slack Observer",
-            goal="Write a casual, non-work Slack thread.",
-            backstory="You observe real humans taking a break from work.",
+        edge_weight = edges.get(colleagues[0], {}).get("weight", 0.5) if colleagues else 0.5
+        stress_avg = sum(self._gd._stress.get(n, 30) for n in participants) / len(participants)
+        hour = thread_start.hour
+
+        interests_str = ", ".join(set(participant_interests)) if participant_interests else "general life topics"
+
+        topic_agent = Agent(
+            role="Social Dynamics Observer",
+            goal="Pick a realistic watercooler topic for this specific group.",
+            backstory="You understand how real coworkers talk based on who they are.",
             llm=self._worker,
         )
-        task = Task(
+        topic_task = Task(
             description=(
-                f"Write a 3-5 message Slack conversation between:\n"
-                f"{chr(10).join(profiles)}\n\n"
-                f"Topic: {topic}\n"
-                f"This MUST be entirely unrelated to work, code, or Jira tickets. "
-                f"Format EXACTLY: Name: [Message]"
+                f"Two or more coworkers are taking a break from work at {hour}:00.\n"
+                f"Their shared interests include: {interests_str}\n"
+                f"Average stress level: {stress_avg:.0f}/100\n"
+                f"Relationship closeness (0-20 scale): {edge_weight:.1f}\n\n"
+                f"Pick ONE specific, natural watercooler topic for this group. "
+                f"High stress → venting or escapism. Low stress → genuine enthusiasm. "
+                f"Close colleagues → specific shared references. Acquaintances → generic small talk. "
+                f"Pre-lunch hour → food. Friday → weekend. "
+                f"Output only the topic as a short phrase. No explanation."
             ),
-            expected_output="Slack conversation.",
-            agent=agent,
+            expected_output="A short topic phrase, e.g. 'the finale of The Bear' or 'complaining about the new coffee machine'.",
+            agent=topic_agent,
         )
-        
-        result = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+        topic = str(Crew(agents=[topic_agent], tasks=[topic_task], verbose=False).kickoff()).strip()
+
+        # ── Build rich per-person voice cards from personas ───────────────────
+        personas = self._config.get("personas", {})
+
+        def _voice_card(name: str) -> str:
+            p = personas.get(name, {})
+            stress = self._gd._stress.get(name, 30)
+            quirks = p.get("typing_quirks", "standard professional grammar")
+            interests = p.get("interests", p.get("expertise", []))  # fall back to expertise if no interests
+            tenure = p.get("tenure", "mid")
+            social_role = p.get("social_role", "Contributor")
+
+            if stress > 80:
+                mood = "visibly drained, short replies, clearly wants this to be over quickly"
+            elif stress > 60:
+                mood = "a bit distracted, somewhat engaged but mind is elsewhere"
+            else:
+                mood = "relaxed and happy to take a break"
+
+            interests_str = ", ".join(str(i) for i in interests[:3]) if interests else "general topics"
+            return (
+                f"{name} | Tenure: {tenure} | Role: {social_role}\n"
+                f"  Typing style: {quirks}\n"
+                f"  Personal interests: {interests_str}\n"
+                f"  Current mood: {mood}"
+            )
+
+        voice_cards = "\n\n".join(_voice_card(n) for n in participants)
+
+        # ── One agent per participant — each speaks in their own voice ────────
+        agents = []
+        tasks = []
+        prev_task = None
+
+        for i, name in enumerate(participants):
+            p = personas.get(name, {})
+            backstory = self._persona_helper(name, mem=self._mem, graph_dynamics=self._gd)
+
+            agent = Agent(
+                role=f"{name} — {p.get('social_role', 'Team Member')}",
+                goal=f"Chat naturally as {name} would in a casual Slack conversation.",
+                backstory=backstory,
+                llm=self._worker,
+            )
+
+            if i == 0:
+                # Initiator — starts the thread
+                desc = (
+                    f"You are {name}. You just opened a Slack message to your colleagues "
+                    f"about: {topic}.\n\n"
+                    f"Participants in this chat:\n{voice_cards}\n\n"
+                    f"Write your opening message exactly as {name} would — use your typing "
+                    f"quirks, reflect your mood, and make it feel spontaneous. "
+                    f"1-2 sentences max. Format: {name}: [message]"
+                )
+            else:
+                # Responders — react to what came before
+                desc = (
+                    f"You are {name}. You just received a Slack message from your colleague "
+                    f"about: {topic}.\n\n"
+                    f"Participants:\n{voice_cards}\n\n"
+                    f"Reply naturally as {name} would. Use your typing quirks and reflect "
+                    f"your current mood. Keep it casual and non-work. "
+                    f"1-2 sentences. Format: {name}: [message]"
+                )
+
+            task = Task(
+                description=desc,
+                expected_output=f"One Slack message from {name} in format: {name}: [message]",
+                agent=agent,
+                context=[prev_task] if prev_task else [],
+            )
+
+            agents.append(agent)
+            tasks.append(task)
+            prev_task = task
+
+        result = str(
+            Crew(agents=agents, tasks=tasks, process=Process.sequential, verbose=False).kickoff()
+        )
+
         messages = self._parse_slack_messages(result, participants)
 
         if messages:
-            current_msg_time = datetime.fromisoformat(thread_start_iso)
-            for msg in messages:
-                msg["ts"] = current_msg_time.isoformat()
-                current_msg_time += timedelta(minutes=random.randint(1, 3))
+            channel = (
+                "random" if len(participants) > 2
+                else f"dm_{sorted(participants)[0].lower()}_{sorted(participants)[1].lower()}"
+            )
 
-            channel = "random" if len(participants) > 2 else f"dm_{sorted(participants)[0].lower()}_{sorted(participants)[1].lower()}"
-            path = f"{self._base}/slack/channels/{channel}/{date_str}_{target_actor}_distracted.json"
-            
-            self._save_slack(path, messages, channel)
+            slack_path, thread_id = self._mem.log_slack_messages(
+                channel=channel,
+                messages=messages,
+                export_dir=Path(self._base),
+            )
+
             self._gd.record_slack_interaction(participants)
-            
+
             self._mem.log_event(SimEvent(
                 type="watercooler_chat",
                 timestamp=thread_start_iso,
                 day=self._state.day,
                 date=date_str,
                 actors=participants,
-                artifact_ids={"slack": path},
+                artifact_ids={"slack_thread": thread_id, "slack_path":   slack_path},
                 facts={"topic": topic, "message_count": len(messages)},
                 summary=f"{target_actor} got distracted chatting about {topic} with {len(participants)-1} others.",
                 tags=["watercooler", "slack", "distraction"],
             ))
-            
+
             logger.info(f"    [dim]☕ Distraction: {target_actor} pulled into chat about {topic}[/dim]")
-
-    def _legacy_slack_chatter(self, date_str: str) -> None:
-        """Original _handle_normal_day() behaviour — used as fallback."""
-        seed_person = random.choice(self._all_names)
-        edges       = self._graph[seed_person]
-        colleagues  = random.choices(
-            list(edges.keys()),
-            weights=[edges[n]["weight"] for n in edges.keys()],
-            k=random.randint(2, 4),
-        )
-        participants = list(set([seed_person] + colleagues))
-        # 1. Randomize the duration between 5 and 30 minutes
-        #    (Convert to hours because sync_and_advance expects hours)
-        chat_duration_mins = random.randint(5, 30)
-        chat_duration_hours = chat_duration_mins / 60.0
-
-        thread_start, thread_end = self._clock.sync_and_advance(participants, hours=chat_duration_hours)
-        thread_start_iso = thread_start.isoformat()
-
-        # 2. Mathematically restrict the context to the exact moment the chat begins
-        ctx = self._mem.context_for_prompt(
-            self._state.daily_theme, 
-            n=2, 
-            as_of_time=thread_start_iso 
-        )
-
-        profiles = [f"{n} ({dept_of_name(n, self._org_chart)})" for n in participants]
-
-        agent = Agent(
-            role="Slack Observer",
-            goal="Write casual Slack thread.",
-            backstory="You observe real humans chatting.",
-            llm=self._worker,
-        )
-        task = Task(
-            description=(
-                f"Write a 4-6 message Slack conversation between:\n"
-                f"{chr(10).join(profiles)}\n\n"
-                f"Theme: {self._state.daily_theme}\nContext: {ctx}\n"
-                f"Format EXACTLY: Name: [Message]"
-            ),
-            expected_output="Slack conversation.",
-            agent=agent,
-        )
-        result   = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
-        messages = self._parse_slack_messages(result, participants)
-
-        if messages:
-            depts    = {dept_of_name(p, self._org_chart) for p in participants}
-            channel  = (
-                f"dm_{sorted(participants)[0].lower()}_{sorted(participants)[1].lower()}"
-                if len(participants) == 2
-                else (list(depts)[0].lower().replace(" ", "-") if len(depts) == 1
-                      else "digital-hq")
-            )
-            path = f"{self._base}/slack/channels/{channel}/{date_str}_{seed_person}.json"
-            self._save_slack(path, messages, channel)
-            self._gd.record_slack_interaction(participants)
 
     # ─── LOW-LEVEL UTILITIES ──────────────────────────────────────────────────
 
@@ -1273,35 +1562,67 @@ class NormalDayHandler:
         self,
         raw:         str,
         valid_names: List[str],
-        hour_range:  Tuple[int, int] = (9, 17),
+        cadence:     str = "normal", # Use the cadence ranges from sim_clock
     ) -> List[dict]:
         messages = []
+        
+        # 1. Sync all participants to the exact same starting point
+        # This guarantees the conversation starts AFTER whatever they were just doing
+        current_time = self._clock.sync_and_tick(valid_names, min_mins=0, max_mins=2)
+
         for line in raw.split("\n"):
             if ":" not in line:
                 continue
             name, text = line.split(":", 1)
             name = name.strip()
+            
             if name in valid_names:
+                # 2. Advance the clock forward safely using sim_clock
+                # This ensures the next message is always chronologically after this one
+                current_time = self._clock.tick_message(valid_names, cadence=cadence)
+                
                 messages.append({
                     "user": name,
                     "text": text.strip(),
-                    "ts":   self._state.current_date.replace(
-                        hour=random.randint(*hour_range),
-                        minute=random.randint(0, 59),
-                    ).isoformat(),
+                    "ts":   current_time.isoformat(),
                 })
         return messages
 
-    def _save_slack(self, path: str, messages: List[dict], channel: str) -> None:
-        import os
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(messages, f, indent=2)
-        self._state.slack_threads.append({
-            "date":          str(self._state.current_date.date()),
-            "channel":       channel,
-            "message_count": len(messages),
-        })
+    def _save_slack(self, messages: List[dict], channel: str, interaction_type: str = "general") -> Tuple[str, str]:
+        """Write Slack messages to disk + MongoDB. Returns export path."""
+        date_str = str(self._state.current_date.date())
+        # Ensure every message has the date field log_slack_messages needs
+        for m in messages:
+            m.setdefault("date", date_str)
+            
+        slack_path, thread_id = self._mem.log_slack_messages(    # handles disk + MongoDB + path
+            channel=channel,
+            messages=messages,
+            export_dir=Path(self._base)
+        )
+
+        if messages:
+            # Concatenate the full conversation so the RAG context preserves the flow
+            full_transcript = "\n".join(f"{m['user']}: {m['text']}" for m in messages)
+            start_timestamp = messages[0].get("ts", self._clock.now("system").isoformat())
+            
+            self._mem.embed_artifact(
+                id=thread_id,
+                type="slack_thread",
+                title=f"{interaction_type.replace('_', ' ').title()} in #{channel}",
+                content=full_transcript,
+                day=self._state.day,
+                date=date_str,
+                timestamp=start_timestamp,
+                metadata={
+                    "channel": channel,
+                    "interaction_type": interaction_type,
+                    "participants": list({m["user"] for m in messages}),
+                    "message_count": len(messages)
+                }
+            )
+
+        return slack_path, thread_id
 
     def _save_md(self, path: str, content: str) -> None:
         import os
@@ -1316,54 +1637,40 @@ class NormalDayHandler:
         with open(path, "w") as f:
             _json.dump(ticket, f, indent=2)
 
-    def _emit_bot_message(self, channel: str, bot_name: str, text: str, timestamp: str) -> None:
-        import os
-        date_str   = str(self._state.current_date.date())
-        slack_path = f"{self._base}/slack/channels/{channel}/{date_str}_bots.json"
-        messages   = []
-        if os.path.exists(slack_path):
-            with open(slack_path) as f:
-                messages = json.load(f)
-        messages.append({
+        self._mem.upsert_ticket(ticket)
+
+    def _emit_bot_message(
+        self, channel: str, bot_name: str, text: str, timestamp: str
+    ) -> None:
+        """Unified 4-arg signature matching flow.py._emit_bot_message."""
+        date_str = str(self._state.current_date.date())
+        msg = {
             "user":   bot_name,
             "email":  f"{bot_name.lower()}@bot.{self._domain}",
             "text":   text,
-            "ts":     self._state.current_date.replace(
-                hour=random.randint(8, 17),
-                minute=random.randint(0, 59),
-            ).isoformat(),
+            "ts":     timestamp,
+            "date":   date_str,
             "is_bot": True,
-        })
-        os.makedirs(os.path.dirname(slack_path), exist_ok=True)
-        with open(slack_path, "w") as f:
-            json.dump(messages, f, indent=2)
+        }
+        self._mem.log_slack_messages(
+            channel=channel,
+            messages=[msg],
+            export_dir=Path(self._base),
+        )
 
     def _find_ticket(self, ticket_id: Optional[str]) -> Optional[dict]:
-        if not ticket_id:
-            return None
-        return next(
-            (t for t in self._state.jira_tickets if t["id"] == ticket_id), None
-        )
+        if not ticket_id: return None
+        return self._mem.get_ticket(ticket_id)
 
     def _find_pr(self, pr_id: Optional[str]) -> Optional[dict]:
         if not pr_id:
             return None
-        import os
-        path = f"{self._base}/git/prs/{pr_id}.json"
-        if os.path.exists(path):
-            with open(path) as f:
-                return json.load(f)
-        return None
+        return self._mem._prs.find_one({"pr_id": pr_id})
 
     def _find_reviewable_pr(self, reviewer: str) -> Optional[dict]:
         """Find an open PR where this person is listed as a reviewer."""
-        import os, glob
-        for path in glob.glob(f"{self._base}/git/prs/PR-*.json"):
-            with open(path) as f:
-                pr = json.load(f)
-            if pr.get("status") == "open" and reviewer in pr.get("reviewers", []):
-                return pr
-        return None
+        prs = self._mem.get_reviewable_prs_for(reviewer)
+        return random.choice(prs) if prs else None
 
     def _closest_colleague(self, name: str) -> Optional[str]:
         """Returns the highest-weight neighbour in the social graph."""
@@ -1413,6 +1720,107 @@ class NormalDayHandler:
     def graph_dynamics_record(self, participants: List[str]) -> None:
         self._gd.record_slack_interaction(participants)
 
+    def _expertise_matched_participants(
+        self,
+        topic: str,
+        seed_participants: List[str],
+        as_of_time: Optional[str] = None,
+        max_extras: int = 2,
+    ) -> List[str]:
+        """
+        Given a topic string and a seed participant list, return an augmented
+        list that pulls in people whose persona expertise overlaps the topic.
+
+        Priority order:
+          1. Anyone in seed_participants stays.
+          2. Authors of semantically similar Confluence pages already in MongoDB
+             are injected as subject-matter experts.  This uses vector similarity
+             via Memory.find_confluence_experts() -- no new embed calls are made
+             for stored pages, only one embed call for the topic query string.
+             Causal ordering is enforced by the as_of_time cutoff so a page
+             being written right now cannot be referenced before it is saved.
+          3. Up to max_extras additional people whose persona expertise tags
+             appear in the topic string, weighted by social-graph proximity to
+             the seed so the conversation stays socially plausible.
+
+        People with zero expertise overlap are never added -- primary eval guard
+        against off-domain participants joining technical threads.
+        """
+        topic_lower = topic.lower()
+        participants: List[str] = list(seed_participants)
+
+        # 1. Semantic expert injection via MongoDB vector search.
+        #    find_confluence_experts() reuses already-stored embeddings, so the
+        #    only new embed call is for the topic query string itself.
+        #    as_of_time enforces causal ordering at sub-day precision.
+        experts = self._mem.find_confluence_experts(
+            topic=topic,
+            score_threshold=0.75,
+            n=5,
+            as_of_time=as_of_time,
+        )
+        for e in experts:
+            author = e.get("author")
+            if author and author in self._all_names and author not in participants:
+                participants.append(author)
+
+        # 2. Expertise-tag fallback for engineers with no Confluence history yet
+        #    (new hires, or topics that haven't been documented before).
+        if len(participants) >= len(seed_participants) + max_extras:
+            return participants
+
+        candidates: List[tuple] = []
+        for name in self._all_names:
+            if name in participants:
+                continue
+            persona = self._config.get("personas", {}).get(name, {})
+            expertise = [e.lower() for e in persona.get("expertise", [])]
+            hits = sum(1 for tag in expertise if tag in topic_lower)
+            if hits == 0:
+                continue
+            graph_weight = max(
+                (
+                    self._graph[name][p].get("weight", 0.0)
+                    for p in seed_participants
+                    if self._graph.has_edge(name, p)
+                ),
+                default=0.0,
+            )
+            candidates.append((name, hits + graph_weight))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        for name, _ in candidates[:max_extras]:
+            if name not in participants:
+                participants.append(name)
+
+        return participants
+    
+    def _score_and_apply_sentiment(
+        self,
+        text: str,
+        actors: List[str],
+        vader,
+    ) -> float:
+        """Score text sentiment and apply stress nudge to involved actors."""
+        compound = vader.polarity_scores(text)["compound"]
+        self._gd.apply_sentiment_stress(actors, compound)
+        return compound
+    
+    def _turn_count(self, participants: List[str], default_range: tuple) -> int:
+        """
+        Returns a turn count inversely scaled to average participant stress.
+        High stress → shorter exchange. Low stress → fuller conversation.
+        """
+        avg_stress = sum(
+            self._gd._stress.get(n, 30) for n in participants
+        ) / len(participants)
+
+        if avg_stress > 80:
+            return default_range[0]                          # floor — terse, get-it-done
+        elif avg_stress > 60:
+            return random.randint(*default_range[:2])        # low end of range
+        else:
+            return random.randint(*default_range)            # full range
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILITY — dept lookup without importing flow globals

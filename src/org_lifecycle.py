@@ -130,6 +130,7 @@ class OrgLifecycleManager:
         all_names:      List[str],               # mutable — mutated in place
         leads:          Dict[str, str],
         worker_llm=None,
+        base_export_dir: str = "",
     ):
         self._cfg       = config.get("org_lifecycle", {})
         self._gd        = graph_dynamics
@@ -139,6 +140,7 @@ class OrgLifecycleManager:
         self._all_names = all_names
         self._leads     = leads
         self._llm       = worker_llm
+        self._base      = base_export_dir 
 
         self._departed:   List[DepartureRecord]   = []
         self._hired:      List[HireRecord]        = []
@@ -431,7 +433,7 @@ class OrgLifecycleManager:
         Falls back to dept_lead if no path exists.
         """
         for inc in state.active_incidents:
-            jira = next((t for t in state.jira_tickets if t.get("id") == inc.ticket_id), None)
+            jira = self._mem.get_ticket(inc.ticket_id)
             if not jira or jira.get("assignee") != name:
                 continue
 
@@ -444,6 +446,7 @@ class OrgLifecycleManager:
 
             # Deterministic mutation — engine owns this, not the LLM
             jira["assignee"] = new_owner
+            self._mem.upsert_ticket(jira)   # persist — get_ticket reads from MongoDB
             record.incident_handoffs.append(inc.ticket_id)
 
             self._mem.log_event(SimEvent(
@@ -486,7 +489,11 @@ class OrgLifecycleManager:
           "In Progress"  with no linked PR → reset to "To Do" (new owner starts fresh)
           "In Progress"  with linked PR    → keep status; PR review/merge closes it
         """
-        for ticket in state.jira_tickets:
+        open_tickets = list(self._mem._jira.find({
+            "assignee": name,
+            "status":   {"$ne": "Done"},
+        }))
+        for ticket in open_tickets:
             if ticket.get("assignee") != name or ticket.get("status") == "Done":
                 continue
             # Skip tickets that were already handed off via incident handoff above
@@ -495,11 +502,17 @@ class OrgLifecycleManager:
                 record.reassigned_tickets.append(ticket["id"])
                 continue
 
-            old_status      = ticket["status"]
+            old_status = ticket["status"]
             ticket["assignee"] = dept_lead
-
             if old_status == "In Progress" and not ticket.get("linked_prs"):
                 ticket["status"] = "To Do"
+            self._mem.upsert_ticket(ticket)
+            if self._base:
+                import json as _json
+                serialisable = {k: v for k, v in ticket.items() if k != "_id"}
+                path = f"{self._base}/jira/{ticket['id']}.json"
+                with open(path, 'w') as f:
+                    _json.dump(serialisable, f, indent=2)
 
             record.reassigned_tickets.append(ticket["id"])
 

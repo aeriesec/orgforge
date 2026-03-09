@@ -15,13 +15,15 @@ Usage:
     mem = Memory()
 """
 
+from datetime import datetime, timezone
 import os
 import json
 import hashlib
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Any
+import time
+from typing import List, Dict, Optional, Any, Tuple
 
 from pymongo import MongoClient
 from pymongo.operations import SearchIndexModel
@@ -43,6 +45,33 @@ EMBED_MODEL    = os.environ.get("EMBED_MODEL",  "mxbai-embed-large")
 EMBED_DIMS     = int(os.environ.get("EMBED_DIMS", "1024"))
 
 # ─────────────────────────────────────────────
+# TOKEN USAGE TRACKING  (debug mode only)
+# Set DEBUG_TOKEN_TRACKING=true in environment
+# or pass debug_tokens=True to Memory.__init__
+# ─────────────────────────────────────────────
+
+DEBUG_TOKEN_TRACKING = (
+    os.environ.get("DEBUG_TOKEN_TRACKING", "false").lower() == "true"
+)
+
+_SKIP_EMBED_TYPES = {
+    "jira_ticket_created",
+    "jira_ticket_updated",
+    "confluence_page_created",
+    "slack_thread_created",
+    "slack_message_sent",
+    "pr_opened",
+    "pr_merged",
+    "email_sent",
+    "ticket_progress",
+    "novel_event_proposed",
+    "plan_rejected",
+    "end_of_day",
+    "agenda_item_deferred",
+    "proposed_event_rejected"
+}
+
+# ─────────────────────────────────────────────
 # SIM EVENT
 # ─────────────────────────────────────────────
 @dataclass
@@ -52,7 +81,7 @@ class SimEvent:
     date: str
     timestamp: str
     actors: List[str]
-    artifact_ids: Dict[str, str]
+    artifact_ids: Dict[str, Any]
     facts: Dict[str, Any]
     summary: str
     tags: List[str] = field(default_factory=list)
@@ -94,7 +123,7 @@ class BaseEmbedder(ABC):
         self.dims = dims
 
     @abstractmethod
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str, input_type: str = "search_document") -> List[float]:
         """Return a float vector of length self.dims."""
         ...
 
@@ -123,17 +152,20 @@ class OllamaEmbedder(BaseEmbedder):
             logger.warning(f"[memory] ⚠️  Cannot connect to Ollama at {self._host}. Using fallback hashing.")
             return False
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str, input_type: str = "search_document") -> List[float]:
         if not self._ok:
             return self._fallback(text)
         try:
             r = requests.post(
                 f"{self._host}/api/embed",
                 json={"model": self._model, "input": text},
-                timeout=30,
+                timeout=120,
             )
+
+            self._prompt_embed_tokens       = r.json()['prompt_eval_count']
+            
             return r.json()["embeddings"][0]
-        except requests.HTTPError as e:
+        except (requests.HTTPError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             logger.warning(f"[memory] Ollama embedding HTTP error: {e.response.status_code}")
             return []
         except (KeyError, IndexError) as e:
@@ -180,19 +212,25 @@ class OpenAIEmbedder(BaseEmbedder):
 # ── CLOUD: AWS Bedrock ─────────────────────────
 class BedrockEmbedder(BaseEmbedder):
     """
-    Generates embeddings via AWS Bedrock Titan Embeddings G1 (1536 dims).
+    Generates embeddings via AWS Bedrock Embeddings.
     Requires: boto3, AWS credentials (IAM role, env vars, or ~/.aws/credentials).
     """
 
-    TITAN_MODEL = "amazon.titan-embed-text-v1"
-    TITAN_DIMS  = 1536
+    EMBED_MODEL = "cohere.embed-v4:0"
+    EMBED_DIMS  = 1024
 
-    def __init__(self, region: str = "us-east-1", dims: int = TITAN_DIMS):
+    def __init__(self, region: str = "us-east-1", dims: int = EMBED_DIMS):
         super().__init__(dims)
         self._region = region
         try:
             import boto3, json as _json
-            self._client = boto3.client("bedrock-runtime", region_name=region)
+            from botocore.config import Config
+            self._client = boto3.client(service_name="bedrock-runtime", region_name=region, config=Config(
+                read_timeout=60,
+                connect_timeout=10,
+                max_pool_connections=50,
+                retries={"max_attempts": 2}
+            ))
             self._json   = _json
             self._ok     = True
             logger.info(f"[memory] Bedrock embedder ready (Titan G1, {dims} dims, region={region})")
@@ -203,22 +241,36 @@ class BedrockEmbedder(BaseEmbedder):
             logger.error(f"[memory] ⚠️  Bedrock init failed: {e}")
             self._ok = False
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str, input_type: str = "search_document") -> List[float]:
         if not self._ok:
             return self._fallback(text)
-        try:
-            body = self._json.dumps({"inputText": text[:8000]})
-            resp = self._client.invoke_model(
-                modelId=self.TITAN_MODEL,
-                body=body,
-                contentType="application/json",
-                accept="application/json",
-            )
-            result = self._json.loads(resp["body"].read())
-            return result["embedding"]
-        except Exception as e:
-            logger.error(f"[memory] Bedrock embedding failed: {e}")
-            return self._fallback(text)
+        
+        for attempt in range(3):
+            try:
+                body = self._json.dumps({"texts": [text], "input_type": input_type, "embedding_types": ["float"], "output_dimension": 1024})
+                resp = self._client.invoke_model(
+                    modelId=self.EMBED_MODEL,
+                    body=body,
+                    contentType="application/json",
+                    accept="application/json",
+                )
+
+                raw_body                    = resp["body"].read()
+                resp["body"].close()
+
+                result                      = self._json.loads(raw_body)
+                vector                      = result["embeddings"]["float"][0]
+                headers                     = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+                self._prompt_embed_tokens   = int(headers.get("x-amzn-bedrock-input-token-count", 0))
+                return vector
+            except self._client.exceptions.ThrottlingException:
+                wait = 6.2 * (attempt + 1)   # backoff: 6.2, 12.4, 18.6
+                logger.warning(f"[embed] throttled, waiting {wait}s")
+                time.sleep(wait)
+            except Exception as e:
+                logger.error(f"[memory] Bedrock embedding failed: {e}")
+                return self._fallback(text)
+        return self._fallback(text)
 
 
 # ─────────────────────────────────────────────
@@ -252,18 +304,64 @@ def build_embedder(
 # MEMORY (MongoDB)
 # ─────────────────────────────────────────────
 class Memory:
-    def __init__(self, mongo_uri: str = MONGO_URI):
+    def __init__(
+        self,
+        mongo_uri:    str         = MONGO_URI,
+        debug_tokens: bool        = False,
+        mongo_client              = None,   # inject mongomock.MongoClient() in tests
+    ):
         self._embedder = build_embedder()
-        self._client = MongoClient(mongo_uri)
+        # Accept an injected client (e.g. mongomock) so tests never touch a
+        # real MongoDB instance.  Production code passes nothing and gets the
+        # real MongoClient as before.
+        self._client = mongo_client or MongoClient(mongo_uri)
         self._db = self._client[DB_NAME]
         
         self._artifacts = self._db["artifacts"]
         self._events = self._db["events"]
+        self._debug_tokens = debug_tokens or DEBUG_TOKEN_TRACKING
+        self._token_usage  = self._db["token_usage"] if self._debug_tokens else None
+        self._artifacts = self._db["artifacts"]
+        self._events = self._db["events"]
+        self._jira = self._db["jira_tickets"]
+        self._prs = self._db["pull_requests"]
+        self._checkpoints = self._db["checkpoints"]
+        self._slack = self._db["slack_messages"]
+
+        self._jira.create_index([("id", 1)], unique=True)
+        self._jira.create_index([("assignee", 1), ("status", 1)])
+        self._prs.create_index([("pr_id", 1)], unique=True)
+        self._prs.create_index([("reviewers", 1), ("status", 1)])
+        self._slack.create_index([("channel", 1), ("ts", 1)])
+
+        self._current_day: int = 0
         
         # In-memory ordered log for strict sequential access
         self._event_log: List[SimEvent] = []
         
         self._init_vector_indexes()
+
+    def _embed(self, text: str, input_type: str = "search_document", caller: str = "unknown", doc_id: str = "", doc_type: str = "") -> list:
+        """
+        Single internal embed call. All methods route through here so token
+        logging is guaranteed regardless of which path triggers the embed.
+        """
+        vector = self._embedder.embed(text, input_type=input_type)
+        self.log_token_usage(
+            caller          = caller,
+            call_type       = "embed",
+            model           = EMBED_MODEL,
+            day             = getattr(self, "_current_day", 0),
+            timestamp       = datetime.now(timezone.utc).isoformat(),
+            total_tokens    = getattr(self._embedder, "_prompt_embed_tokens", 0),
+            prompt_tokens   = getattr(self._embedder, "_prompt_embed_tokens", 0),
+            extra        = {
+                "doc_id":   doc_id,
+                "doc_type": doc_type,
+                "text_len": len(text),
+            }
+        )
+        return vector
 
     def _init_vector_indexes(self):
         """Creates the Atlas Vector Search indexes if they don't exist."""
@@ -273,7 +371,8 @@ class Memory:
                     "type": "vector",
                     "path": "embedding",
                     "numDimensions": EMBED_DIMS,
-                    "similarity": "cosine"
+                    "similarity": "dotProduct",
+                    "quantization": "scalar"
                 },
                 {
                     "type": "filter",
@@ -316,8 +415,8 @@ class Memory:
 
     def embed_artifact(self, id: str, type: str, title: str, content: str, day: int, date: str, timestamp: str, metadata: Optional[Dict] = None):
         """Upsert artifact into MongoDB with vector embedding."""
-        embed_text = f"{title}\n\n{content[:2000]}"
-        vector = self._embedder.embed(embed_text)
+        embed_text = f"{title}\n\n{content}"
+        vector = self._embed(embed_text, input_type="search_document", caller="embed_artifact", doc_id=id, doc_type=type)
 
         doc = {
             "_id": id,
@@ -337,8 +436,13 @@ class Memory:
         """Insert SimEvent into MongoDB."""
         self._event_log.append(event)
         event_id = f"EVT-{event.day}-{event.type}-{len(self._event_log)}"
-        
-        vector = self._embedder.embed(event.to_embed_text())
+
+        if event.type not in _SKIP_EMBED_TYPES:
+            logger.info(f"[embed] starting embed for {event_id} & {event.type}")
+            vector = self._embed(event.to_embed_text(), input_type="search_document", caller="log_event", doc_id=event_id, doc_type=event.type)
+        else:
+            logger.debug(f"[embed] skipping embed for {event_id} (artifact-backed)")
+            vector = None
         
         doc = event.to_dict()
         doc["_id"] = event_id
@@ -348,16 +452,69 @@ class Memory:
 
     # ─── READ ─────────────────────────────────
 
-    def recall(self, query: str, n: int = 5, type_filter: Optional[str] = None, day_range: Optional[tuple] = None) -> List[Dict]:
-        """Hybrid vector + metadata search over artifacts."""
-        query_vec = self._embedder.embed(query)
+    @staticmethod
+    def _to_iso(as_of_time: Optional[Any]) -> Optional[str]:
+        """
+        Normalise as_of_time to an ISO 8601 string for MongoDB comparisons.
+        Accepts datetime objects (from SimClock) or pre-formatted ISO strings
+        (legacy callers that already called .isoformat()).  Returns None
+        unchanged so optional semantics are preserved throughout.
+        """
+        if as_of_time is None:
+            return None
+        if isinstance(as_of_time, str):
+            return as_of_time
+        return as_of_time.isoformat()
+
+    from typing import Optional, List, Dict, Any
+
+    def recall(
+        self,
+        query:       str,
+        n:           int            = 5,
+        type_filter: Optional[str]  = None,
+        day_range:   Optional[tuple]= None,
+        since:       Optional[Any]  = None,
+        as_of_time:  Optional[Any]  = None,
+    ) -> List[Dict]:
+        """
+        Hybrid vector + metadata search over artifacts.
+
+        since (datetime | str | None, SimClock-sourced):
+            Hard causal floor — only artifacts whose timestamp is >= this
+            value are eligible. 
+
+        as_of_time (datetime | str | None, SimClock-sourced):
+            Hard causal ceiling — only artifacts whose timestamp is <= this
+            value are eligible.  Enforced inside the $vectorSearch pre-filter
+            so the ANN candidate set is already bounded before scoring; no
+            post-retrieval pruning is needed or performed.
+
+            Both `since` and `as_of_time` accept a datetime (``clock.now(actor)``) 
+            or a pre-formatted ISO string — both are normalised internally via _to_iso().
+        """
+
+        logger.info(f"[embed] starting embed for query: {query[:50]}")
+        query_vec = self._embed(query, input_type="search_query", caller="recall", doc_id=query[:50], doc_type="query")
         
         # Build the exact-match pre-filter for MongoDB Vector Search
-        filter_doc = {}
+        filter_doc: Dict[str, Any] = {}
         if type_filter:
             filter_doc["type"] = {"$eq": type_filter}
         if day_range:
             filter_doc["day"] = {"$gte": day_range[0], "$lte": day_range[1]}
+            
+        # Handle time-based floor and ceiling
+        iso_floor = self._to_iso(since)
+        iso_ceiling = self._to_iso(as_of_time)
+        
+        if iso_floor is not None or iso_ceiling is not None:
+            timestamp_filter = {}
+            if iso_floor is not None:
+                timestamp_filter["$gte"] = iso_floor
+            if iso_ceiling is not None:
+                timestamp_filter["$lte"] = iso_ceiling
+            filter_doc["timestamp"] = timestamp_filter
 
         pipeline = [
             {
@@ -365,17 +522,17 @@ class Memory:
                     "index": "vector_index",
                     "path": "embedding",
                     "queryVector": query_vec,
-                    "numCandidates": max(n * 10, 100), # MongoDB requirement for optimal ANN search
+                    "numCandidates": max(n * 10, 100),  # MongoDB ANN requirement
                     "limit": n,
                 }
             }
         ]
         
-        # Add filter if it exists
         if filter_doc:
             pipeline[0]["$vectorSearch"]["filter"] = filter_doc
 
-        # Project output to calculate score and remove raw vector array
+        # Project output — include metadata so callers can read author,
+        # parent_id, etc. without a second round-trip. Raw embedding excluded.
         pipeline.append({
             "$project": {
                 "id": "$_id",
@@ -383,6 +540,8 @@ class Memory:
                 "type": 1,
                 "day": 1,
                 "date": 1,
+                "timestamp": 1,
+                "metadata": 1,
                 "score": {"$meta": "vectorSearchScore"}
             }
         })
@@ -394,39 +553,104 @@ class Memory:
             logger.error(f"[memory] recall failed: {e}")
             return []
 
+    def find_confluence_experts(
+        self,
+        topic:           str,
+        score_threshold: float     = 0.75,
+        n:               int       = 5,
+        as_of_time:      Optional[Any] = None,
+    ) -> List[Dict[str, str]]:
+        """
+        Vector search over Confluence artifacts to find subject-matter experts
+        for a given topic.  Returns a list of {title, author, score, day} dicts
+        ordered by descending relevance score.
+
+        This is the semantic alternative to keyword matching in
+        NormalDayHandler._expertise_matched_participants().  Because every
+        Confluence page is embedded at write-time via embed_artifact(), this
+        call reuses existing vectors — no new embed calls are made for the
+        stored pages, only one embed call is made for the topic query string.
+
+        score_threshold filters out weak matches so only genuinely relevant
+        authors are injected into conversations.  0.75 is a reasonable default
+        for dotProduct similarity with 1024-dim vectors; tune down to ~0.65 for
+        shorter topics that produce noisier embeddings.
+
+        Args:
+            topic:           The subject of the Slack thread or design discussion.
+            score_threshold: Minimum similarity score to be considered an expert.
+            n:               Max number of candidate pages to consider.
+            as_of_time:      datetime or ISO string — only pages written before
+                             this moment are eligible.  Passed directly into
+                             recall() so the cutoff is enforced in the MongoDB
+                             $vectorSearch pre-filter, not post-retrieval.
+                             Normalised via _to_iso() inside recall().
+
+        Returns:
+            List of dicts with keys: title, author, score, day.
+            Empty list if no pages exceed the threshold.
+        """
+        # as_of_time is pushed into the $vectorSearch pre-filter inside
+        # recall() — the ANN candidate pool is already time-bounded, so no
+        # manual post-retrieval timestamp check is required here.
+        results = self.recall(
+            query=topic,
+            n=n,
+            type_filter="confluence",
+            as_of_time=as_of_time,
+        )
+
+        experts: List[Dict[str, str]] = []
+        for r in results:
+            if r.get("score", 0) < score_threshold:
+                continue
+            author = r.get("metadata", {}).get("author")
+            if author:
+                experts.append({
+                    "title":  r.get("title", ""),
+                    "author": author,
+                    "score":  round(r.get("score", 0), 4),
+                    "day":    r.get("day", 0),
+                })
+
+        return experts
+
     def recall_events(
         self,
-        query: str,
-        n: int = 3,
-        as_of_time: Optional[str] = None
+        query:      str,
+        n:          int          = 3,
+        as_of_time: Optional[Any] = None,
     ) -> List[SimEvent]:
         """
         Returns the n most relevant SimEvents for the query.
-        If as_of_day is provided, restricts to events on or before that day.
-        """
-        query_filter = {}
-        
-        # Apply the strict chronological cutoff
-        if as_of_time is not None:
-            query_filter["timestamp"] = {"$lte": as_of_time}
 
-        # Query MongoDB events collection directly
+        as_of_time (datetime | str | None, SimClock-sourced):
+            Hard causal ceiling — only events whose timestamp is ≤ this value
+            are eligible.  Accepts a datetime or pre-formatted ISO string;
+            normalised via _to_iso() internally.
+        """
+        query_filter: Dict[str, Any] = {}
+        
+        iso = self._to_iso(as_of_time)
+        if iso is not None:
+            query_filter["timestamp"] = {"$lte": iso}
+
         results = (
             self._events
             .find(query_filter)
-            .sort("timestamp", -1)  # Sort descending so the most recent events come first
+            .sort("timestamp", -1)
             .limit(n * 3)
         )
 
         _MONGO_FIELDS = {"_id", "embedding"}
         events = [
-            SimEvent(**{k: v for k, v in e.items() if k not in _MONGO_FIELDS}) 
+            SimEvent(**{k: v for k, v in e.items() if k not in _MONGO_FIELDS})
             for e in results
         ]
-        
-        # Note: If you have vector embeddings on SimEvents, you would re-rank them 
-        # by the `query` text here. Otherwise, this just returns the n most recent 
-        # events that occurred before the actor's current cursor.
+
+        # Note: If you have vector embeddings on SimEvents, you would re-rank
+        # them by the `query` text here. Otherwise, this returns the n most
+        # recent events before the actor's current cursor.
         return events[:n]
 
     # ─── HELPERS ──────────────────────────────
@@ -443,51 +667,43 @@ class Memory:
 
     def context_for_prompt(
         self,
-        query: str,
-        n: int = 4,
-        as_of_time: Optional[str] = None,
+        query:      str,
+        n:          int          = 4,
+        as_of_time: Optional[Any] = None,
+        since: Optional[Any] = None,
     ) -> str:
         """
-        Semantic search over embedded artifacts and events.
-        If as_of_day is provided, restricts results to artifacts created
-        on or before that day — simulating what was knowable at that point.
+        RAG context block for LLM prompts — embeds ``query``, retrieves the
+        most semantically similar artifacts and events, and formats them into
+        a text block that can be injected directly into a system or user prompt.
+
+        as_of_time (datetime | str | None, SimClock-sourced):
+            Hard causal ceiling applied to *both* the artifact search and the
+            event search.  Any artifact or event with a timestamp after this
+            value is invisible to the LLM.
+
+            Accepts a datetime (``clock.now(actor)``) or a pre-formatted ISO
+            string — both are normalised internally via _to_iso(), so callers
+            that already hold an ISO string do not need to change.
         """
         lines = []
 
-        # ── Artifact search (temporal filter applied here) ────────────────
-        artifact_count = self._artifacts.estimated_document_count()
+        # ── Artifact retrieval ─────────────────────────────────────────────
+        # as_of_time is pushed into the MongoDB $vectorSearch pre-filter inside
+        # recall(), so the ANN candidate pool is already time-bounded.
+        # We oversample (n * 3) to give the vector scorer enough candidates
+        # before the timestamp filter shrinks the eligible set.
+        artifact_count = self._artifacts.count_documents({})
         oversample     = max(n * 3, min(artifact_count // 10, 200))
 
-        pipeline: list[dict] = [
-            {
-                "$vectorSearch": {
-                    "queryVector":  self._embedder.embed(query),
-                    "path":         "embedding",
-                    "numCandidates": oversample,
-                    "limit":        n,
-                    "index":        "vector_index",
-                }
-            }
-        ]
-
-        if as_of_time is not None:
-            pipeline[0]["$vectorSearch"]["filter"] = {
-                "timestamp": {"$lte": as_of_time}
-            }
-
-        pipeline.append({
-            "$project": {
-                "content": 1,
-                "title":   1,
-                "day":     1,
-                "type":    1,
-                "id":      1,
-                "timestamp": 1,
-                "score":   {"$meta": "vectorSearchScore"},
-            }
-        })
-
-        artifacts = list(self._artifacts.aggregate(pipeline))
+        artifacts = self.recall(
+            query=query,
+            n=oversample,
+            as_of_time=as_of_time,
+            since=since
+        )
+        # Trim to the top-n by vector score after the pre-filter is applied
+        artifacts = sorted(artifacts, key=lambda a: a.get("score", 0), reverse=True)[:n]
 
         if artifacts:
             lines.append("=== RELEVANT ARTIFACTS ===")
@@ -499,8 +715,10 @@ class Memory:
                     f"relevance {a.get('score', 0):.3f})"
                 )
 
-        # ── Event search (temporal filter applied here too) ───────────────
-        events = self.recall_events(query, n=3, as_of_time=as_of_time) # <-- Updated parameter
+        # ── Event retrieval ────────────────────────────────────────────────
+        # recall_events() applies the same as_of_time ceiling against the
+        # events collection — same datetime type, same contract.
+        events = self.recall_events(query, n=3, as_of_time=as_of_time)
 
         if events:
             lines.append("=== RELEVANT EVENTS ===")
@@ -537,8 +755,13 @@ class Memory:
         """Drop and recreate collections. Optionally wipe export directory."""
         self._artifacts.drop()
         self._events.drop()
+        self._jira.drop()
+        self._prs.drop()
+        self._slack.drop()
         self._event_log = []
         self._init_vector_indexes()
+        self._artifacts.count_documents({})
+        self._events.count_documents({})
         logger.info("[memory] 🗑️  Collections reset.")
 
         if export_dir:
@@ -561,3 +784,164 @@ class Memory:
             ))
             root_logger.addHandler(new_handler)
             logger.info(f"[memory] 🗑️  Export directory cleared: {export_path}")
+
+    def log_token_usage(
+        self,
+        caller: str,           # e.g. "write_adhoc_page", "_handle_async_question"
+        call_type: str,        # "llm" | "embed"
+        model: str,            # full model string, e.g. "bedrock/claude-sonnet-4-6"
+        day: int,
+        timestamp: str,
+        prompt_tokens: int     = 0,
+        completion_tokens: int = 0,
+        total_tokens: int      = 0,
+        extra: Optional[Dict]  = None,   # any caller-specific metadata
+    ) -> None:
+        """
+        Log a single LLM or embed call's token usage to MongoDB.
+        No-op when debug_tokens is False so production runs are unaffected.
+        """
+        if not self._debug_tokens or self._token_usage is None:
+            return
+
+        doc = {
+            "day":               day,
+            "timestamp":         timestamp,
+            "call_type":         call_type,        # "llm" or "embed"
+            "caller":            caller,
+            "model":             model,
+            "prompt_tokens":     prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens":      total_tokens,
+            **(extra or {}),
+        }
+        try:
+            self._token_usage.insert_one(doc)
+        except Exception as e:
+            logger.warning(f"[memory] token_usage insert failed: {e}")
+
+    def token_usage_summary(self) -> Dict:
+        """
+        Aggregate token usage by call_type and caller.
+        Returns a dict suitable for logging at end of simulation.
+        Only meaningful when debug_tokens=True.
+        """
+        if not self._debug_tokens or self._token_usage is None:
+            return {"debug_tokens": False}
+
+        pipeline = [
+            {
+                "$group": {
+                    "_id":               {"call_type": "$call_type", "caller": "$caller", "model": "$model"},
+                    "total_tokens":      {"$sum": "$total_tokens"},
+                    "prompt_tokens":     {"$sum": "$prompt_tokens"},
+                    "completion_tokens": {"$sum": "$completion_tokens"},
+                    "call_count":        {"$sum": 1},
+                }
+            },
+            {"$sort": {"total_tokens": -1}},
+        ]
+
+        rows = list(self._token_usage.aggregate(pipeline))
+        grand_total = sum(r["total_tokens"] for r in rows)
+
+        return {
+            "debug_tokens":  True,
+            "grand_total":   grand_total,
+            "by_caller":     rows,
+        }
+    
+    def has_genesis_artifacts(self) -> bool:
+        """
+        Returns True if Genesis artifacts already exist.
+        This prevents re-running expensive LLM Genesis calls.
+        """
+        # We check the events collection for any 'genesis' tag
+        return self._events.count_documents({"tags": "genesis"}) > 0
+
+    def save_checkpoint(self, day: int, state_vars: Dict, stress: Dict, cursors: Dict):
+        """Saves daily volatile state to MongoDB."""
+        self._checkpoints.update_one(
+            {"day": day}, 
+            {"$set": {
+                "day": day,
+                "state": state_vars, 
+                "stress": stress,
+                "cursors": cursors,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }}, 
+            upsert=True
+        )
+
+    def load_latest_checkpoint(self) -> Optional[Dict]:
+        """Finds the most recent successful end-of-day snapshot."""
+        return self._db["checkpoints"].find_one(sort=[("day", -1)])
+    
+    def upsert_ticket(self, ticket: Dict):
+        self._jira.update_one({"id": ticket["id"]}, {"$set": ticket}, upsert=True)
+
+    def get_ticket(self, ticket_id: str) -> Optional[Dict]:
+        # Exclude _id so callers never receive a non-serialisable ObjectId
+        return self._jira.find_one({"id": ticket_id}, {"_id": 0})
+
+    def get_open_tickets_for_dept(self, members: List[str], dept_name: str = "") -> List[Dict]:
+        query: Dict[str, Any] = {"status": {"$ne": "Done"}}
+        if dept_name:
+            query["dept"] = dept_name
+        else:
+            # fallback for incident tickets which route by assignee
+            query["assignee"] = {"$in": members}
+        return list(self._jira.find(query, {"_id": 0}))
+
+    def upsert_pr(self, pr: Dict):
+        self._prs.update_one({"pr_id": pr["pr_id"]}, {"$set": pr}, upsert=True)
+
+    def get_reviewable_prs_for(self, name: str) -> List[Dict]:
+        return list(self._prs.find({"reviewers": name, "status": "open"}))
+    
+    def log_slack_messages(self, channel: str, messages: List[Dict], export_dir: Path) -> Tuple[str, str]:
+        """Batch saves Slack messages to JSON files and MongoDB."""
+        if not messages: return ("", "")
+        
+        date_str  = messages[0].get("date")
+        thread_id = f"slack_{channel}_{messages[0].get('ts', datetime.now(timezone.utc).isoformat())}"
+
+        for m in messages:
+            m["thread_id"] = thread_id
+
+        channel_dir = export_dir / "slack" / "channels" / channel
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        file_path = channel_dir / f"{date_str}.json"
+
+        # Load-Append-Save Pattern
+        history = []
+        if file_path.exists():
+            with open(file_path, "r") as f:
+                try: history = json.load(f)
+                except json.JSONDecodeError: pass
+        
+        history.extend(messages)
+        with open(file_path, "w") as f:
+            json.dump(history, f, indent=2)
+
+        # MongoDB batch sync
+        db_docs = [{**m, "channel": channel, "file_path": str(file_path)} for m in messages]
+        self._slack.insert_many(db_docs)
+        return (str(file_path), thread_id)
+
+    def get_slack_history(self, channel: str, limit: int = 10) -> List[Dict]:
+        """Retrieve recent messages for a channel."""
+        return list(self._slack.find({"channel": channel}).sort("ts", -1).limit(limit))
+    
+    def get_recent_day_summaries(self, current_day: int, window: int = 7) -> List[dict]:
+        """
+        Returns facts dicts from day_summary events in the last `window` days.
+        Used by PlanValidator for cooldown tracking.
+        Queries MongoDB directly — does not touch the in-memory _event_log.
+        """
+        cutoff = max(1, current_day - window)
+        docs = self._events.find(
+            {"type": "day_summary", "day": {"$gte": cutoff}},
+            {"facts": 1, "_id": 0}
+        ).sort("day", 1)
+        return [d["facts"] for d in docs if "facts" in d]

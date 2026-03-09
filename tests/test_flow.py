@@ -16,6 +16,7 @@ def mock_flow():
         # Initialize minimal state
         flow.state.day = 1
         flow.state.system_health = 100
+        flow._mem.log_slack_messages.return_value = ("", "")
         return flow
 
 ### --- Bug Catching Tests ---
@@ -49,6 +50,7 @@ def test_incident_logic_variable_scope(mock_agent_class, mock_task_class, mock_c
     # Mock necessary components for incident creation
     mock_flow.graph_dynamics = MagicMock()
     mock_flow.graph_dynamics.build_escalation_chain.return_value = MagicMock(chain=[])
+    mock_flow.graph_dynamics.escalation_narrative.return_value = ""
     mock_flow.graph_dynamics._stress = MagicMock()
     mock_flow.graph_dynamics._stress.get.return_value = 50
     
@@ -79,16 +81,12 @@ def test_memory_context_retrieval(mock_flow):
 
     # Wire up the instance so context_for_prompt has something to work with
     mem._embedder.embed = MagicMock(return_value=[0.1] * 1024)
-    mem._artifacts.estimated_document_count = MagicMock(return_value=10)
+    mem._artifacts.count_documents = MagicMock(return_value=10)
     mem._artifacts.aggregate = MagicMock(return_value=[])
     mem.recall_events = MagicMock(return_value=[
         SimEvent(type="test", day=1, date="2026-01-01", actors=[], artifact_ids={}, facts={}, summary="Test Event", timestamp="2026-03-05T13:33:51.027Z")
     ])
 
-    mock_flow._mem.recall_events.return_value = [
-        SimEvent(type="test", day=1, date="2026-01-01", actors=[], artifact_ids={}, facts={}, summary="Test Event", timestamp="2026-03-05T13:33:51.027Z")
-    ]
-    
     context = mem.context_for_prompt("server crash")
     assert "RELEVANT EVENTS" in context
 
@@ -140,7 +138,7 @@ def test_temporal_memory_isolation(mock_flow):
     
     mem = Memory()  # Safe: mocked by autouse fixture
     mem._embedder.embed = MagicMock(return_value=[0.1] * 1024)
-    mem._artifacts.estimated_document_count = MagicMock(return_value=10)
+    mem._artifacts.count_documents = MagicMock(return_value=10)
     mem._artifacts.aggregate = MagicMock(return_value=[])
     # recall_events chains .find().sort().limit() — mock the full cursor chain
     mock_cursor = MagicMock()
@@ -344,6 +342,7 @@ def test_incident_sync_to_system_advances_on_call_cursor(
 
     mock_flow.graph_dynamics = MagicMock()
     mock_flow.graph_dynamics.build_escalation_chain.return_value = MagicMock(chain=[])
+    mock_flow.graph_dynamics.escalation_narrative.return_value = ""
     mock_flow.graph_dynamics.relevant_external_contacts.return_value = []
     mock_flow.graph_dynamics._stress = MagicMock()
     mock_flow.graph_dynamics._stress.get.return_value = 40

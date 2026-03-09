@@ -242,7 +242,7 @@ class PlanValidator:
         # ticket on the same day. ticket_id is sourced from facts_hint, not
         # related_id (which lives on AgendaItem, not ProposedEvent).
         if event.event_type == "ticket_progress":
-            ticket_id = event.facts_hint.get("ticket_id")
+            ticket_id = (event.facts_hint or {}).get("ticket_id")
             if ticket_id:
                 actors_on_ticket = ticket_actors_today.get(ticket_id, set())
                 overlap = [a for a in event.actors if a in actors_on_ticket]

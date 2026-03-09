@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from flow import Flow, ActiveIncident
-from memory import SimEvent
+from memory import Memory, SimEvent
 from org_lifecycle import OrgLifecycleManager, patch_validator_for_lifecycle
 
 from datetime import datetime
@@ -13,9 +13,9 @@ from sim_clock import SimClock
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture
-def mock_flow():
-    """Flow instance with mocked LLMs and DB, extended with lifecycle manager."""
-    with patch("flow.build_llm"), patch("flow.Memory"):
+def mock_flow(make_test_memory):
+    """Flow instance with mocked LLMs and a mongomock-backed Memory."""
+    with patch("flow.build_llm"), patch("flow.Memory", return_value=make_test_memory):
         flow = Flow()
         flow.state.day = 5
         flow.state.system_health = 80
@@ -90,14 +90,15 @@ def test_departure_reassigns_open_tickets(lifecycle, mock_clock):
     """
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    state.jira_tickets = [
+    for ticket in [
         {"id": "ORG-101", "title": "Fix retry logic", "status": "In Progress",
          "assignee": "Bob", "linked_prs": []},
         {"id": "ORG-102", "title": "Write docs",      "status": "To Do",
          "assignee": "Bob", "linked_prs": []},
         {"id": "ORG-103", "title": "Already done",    "status": "Done",
          "assignee": "Bob", "linked_prs": []},
-    ]
+    ]:
+        mgr._mem.upsert_ticket(ticket)
     state.active_incidents = []
 
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
@@ -105,9 +106,9 @@ def test_departure_reassigns_open_tickets(lifecycle, mock_clock):
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
-    t101 = next(t for t in state.jira_tickets if t["id"] == "ORG-101")
-    t102 = next(t for t in state.jira_tickets if t["id"] == "ORG-102")
-    t103 = next(t for t in state.jira_tickets if t["id"] == "ORG-103")
+    t101 = mgr._mem.get_ticket("ORG-101")
+    t102 = mgr._mem.get_ticket("ORG-102")
+    t103 = mgr._mem.get_ticket("ORG-103")
 
     # In Progress with no PR → reset to To Do, reassigned to lead
     assert t101["assignee"] == "Alice"
@@ -128,10 +129,10 @@ def test_departure_preserves_in_progress_ticket_with_pr(lifecycle, mock_clock):
     """
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    state.jira_tickets = [
+    mgr._mem.upsert_ticket(
         {"id": "ORG-200", "title": "Hot fix", "status": "In Progress",
-         "assignee": "Bob", "linked_prs": ["PR-101"]},
-    ]
+         "assignee": "Bob", "linked_prs": ["PR-101"]}
+    )
     state.active_incidents = []
 
     dep_cfg = {"name": "Bob", "reason": "layoff", "role": "Engineer",
@@ -139,7 +140,7 @@ def test_departure_preserves_in_progress_ticket_with_pr(lifecycle, mock_clock):
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
-    t200 = next(t for t in state.jira_tickets if t["id"] == "ORG-200")
+    t200 = mgr._mem.get_ticket("ORG-200")
     assert t200["assignee"] == "Alice"
     assert t200["status"]   == "In Progress"   # status preserved
 
@@ -155,10 +156,10 @@ def test_departure_hands_off_active_incident(lifecycle, mock_clock):
     """
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    state.jira_tickets = [
+    mgr._mem.upsert_ticket(
         {"id": "ORG-300", "title": "DB outage", "status": "In Progress",
-         "assignee": "Bob", "linked_prs": []},
-    ]
+         "assignee": "Bob", "linked_prs": []}
+    )
     state.active_incidents = [
         ActiveIncident(ticket_id="ORG-300", title="DB outage",
                        day_started=4, stage="investigating", root_cause="OOM"),
@@ -169,7 +170,7 @@ def test_departure_hands_off_active_incident(lifecycle, mock_clock):
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
-    t300 = next(t for t in state.jira_tickets if t["id"] == "ORG-300")
+    t300 = mgr._mem.get_ticket("ORG-300")
     # Bob is gone — ticket must now belong to someone still in the graph
     assert t300["assignee"] != "Bob"
     assert t300["assignee"] in all_names or t300["assignee"] == "Alice"
@@ -182,10 +183,10 @@ def test_handoff_emits_escalation_chain_simevent(lifecycle, mock_clock):
     """
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    state.jira_tickets = [
+    mgr._mem.upsert_ticket(
         {"id": "ORG-301", "title": "API down", "status": "In Progress",
-         "assignee": "Carol", "linked_prs": []},
-    ]
+         "assignee": "Carol", "linked_prs": []}
+    )
     state.active_incidents = [
         ActiveIncident(ticket_id="ORG-301", title="API down",
                        day_started=4, stage="detected", root_cause="timeout"),
@@ -225,7 +226,6 @@ def test_centrality_vacuum_stresses_neighbours(lifecycle, mock_clock):
     from graph_dynamics import GraphDynamics
 
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     ring_nodes = ["Alice", "Bob", "Carol", "Dave", "Eve"]
@@ -280,7 +280,6 @@ def test_centrality_vacuum_stress_capped_at_20(lifecycle, mock_clock):
     of how extreme the centrality shift is.
     """
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     # Force a very high multiplier to stress-test the cap
@@ -307,7 +306,6 @@ def test_centrality_vacuum_stress_capped_at_20(lifecycle, mock_clock):
 def test_departed_node_removed_from_graph(lifecycle, mock_clock):
     """The departing engineer's node must not exist in the graph after departure."""
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     assert gd.G.has_node("Bob")
@@ -325,7 +323,6 @@ def test_departed_node_removed_from_graph(lifecycle, mock_clock):
 def test_departed_node_stress_entry_removed(lifecycle, mock_clock):
     """The departing engineer's stress entry must be cleaned up from GraphDynamics."""
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     gd._stress["Bob"] = 55
@@ -341,7 +338,6 @@ def test_departed_node_stress_entry_removed(lifecycle, mock_clock):
 def test_departure_emits_employee_departed_simevent(lifecycle, mock_clock):
     """A departure must emit exactly one employee_departed SimEvent."""
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     dep_cfg = {"name": "Bob", "reason": "layoff", "role": "Engineer",
@@ -363,7 +359,6 @@ def test_departure_emits_employee_departed_simevent(lifecycle, mock_clock):
 def test_departure_record_stored_on_state(lifecycle, mock_clock):
     """state.departed_employees must be populated after a departure."""
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Senior Engineer",
@@ -386,7 +381,6 @@ def test_knowledge_gap_scan_detects_domain_hit(lifecycle, mock_clock):
     the incident root cause mentions a departed employee's known domain.
     """
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     # First, register a departure with known domains
@@ -426,7 +420,6 @@ def test_knowledge_gap_scan_deduplicates(lifecycle, mock_clock):
     how many times the text is scanned.
     """
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
@@ -451,7 +444,6 @@ def test_knowledge_gap_scan_deduplicates(lifecycle, mock_clock):
 def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):
     """Unrelated text must not trigger any knowledge gap events."""
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
@@ -587,7 +579,6 @@ def test_patch_validator_removes_departed_actor(lifecycle, mock_clock):
     from plan_validator import PlanValidator
 
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     validator = PlanValidator(
@@ -644,7 +635,6 @@ def test_get_roster_context_reflects_departure_and_hire(lifecycle, mock_clock):
     so DepartmentPlanner prompts reflect actual roster state.
     """
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
@@ -691,7 +681,6 @@ def test_departure_simevent_timestamp_is_early_morning(lifecycle):
     min_hour==max_hour range produces a valid, not an erroring, result.
     """
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     sim_date = datetime(2026, 1, 5, 0, 0, 0)
@@ -731,7 +720,6 @@ def test_departure_degenerate_hour_range_does_not_raise(lifecycle):
     gap analysis.
     """
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     clock = _make_real_clock(datetime(2026, 1, 5, 0, 0, 0))
@@ -763,7 +751,6 @@ def test_departure_and_hire_same_day_timestamps_are_in_business_hours(lifecycle)
     rather than asserting a cross-event ordering that doesn't exist.
     """
     mgr, gd, org_chart, all_names, state = lifecycle
-    state.jira_tickets     = []
     state.active_incidents = []
 
     sim_date = datetime(2026, 1, 5, 0, 0, 0)
@@ -801,7 +788,7 @@ def test_departure_and_hire_same_day_timestamps_are_in_business_hours(lifecycle)
 # 10. HIRE CLOCK — timestamp correctness
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_hire_simevent_timestamp_not_before_0930(lifecycle):
+def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
     """
     _execute_hire post-corrects the hire timestamp to be ≥ 09:30 when
     schedule_meeting returns a minute < 30 at 09:xx.
@@ -833,7 +820,7 @@ def test_hire_simevent_timestamp_not_before_0930(lifecycle):
         gd = GraphDynamics(G, config)
         mgr = OrgLifecycleManager(
             config=config, graph_dynamics=gd,
-            mem=MagicMock(), org_chart=config["org_chart"],
+            mem=make_test_memory, org_chart=config["org_chart"],
             personas=config["personas"], all_names=list(all_names),
             leads=config["leads"],
         )
@@ -849,6 +836,7 @@ def test_hire_simevent_timestamp_not_before_0930(lifecycle):
                     "expertise": ["Python"], "style": "methodical", "tenure": "new",
                     "day": 5}
         mgr._scheduled_hires = {5: [hire_cfg]}
+        make_test_memory.log_event.reset_mock()
         mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=clock)
 
         hire_events = [
@@ -927,7 +915,6 @@ def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
         gd._stress[n] = 25
 
     state = MagicMock()
-    state.jira_tickets     = []
     state.active_incidents = []
 
     sim_date = datetime(2026, 1, 5, 0, 0, 0)

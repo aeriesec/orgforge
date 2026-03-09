@@ -20,7 +20,7 @@ import networkx as nx
 DEFAULT_CFG = {
     # Propagation
     "stress_bleed_rate":       0.25,   # fraction of key-player excess that bleeds
-    "burnout_threshold":       65,     # stress score that triggers propagation
+    "burnout_threshold":       72,     # stress score that triggers propagation
     "incident_stress_hit":     20,     # raw stress added per P1 involvement
     "stress_daily_recovery":   3,      # flat recovery applied to everyone EOD
     "key_player_multiplier":   2.0,    # top-N% by betweenness = key players
@@ -282,6 +282,28 @@ class GraphDynamics:
             if system_health <= threshold:
                 triggered.append(contact)
         return triggered
+    
+    def apply_sentiment_stress(self, actors: List[str], vader_compound: float) -> None:
+        """
+        Nudge stress based on the compound sentiment of generated content.
+        vader_compound is in [-1.0, 1.0]. We only act on clearly negative content
+        (compound < -0.2) to avoid noise from neutral prose.
+        
+        Stress delta is small by design — sentiment is a chronic signal, not an
+        acute one like an incident. Max nudge is +5 per artifact.
+        """
+        if vader_compound > 0.3:
+            # Positive content slightly accelerates recovery
+            bonus = 1
+            for name in actors:
+                if name in self._stress:
+                    self._stress[name] = max(0, self._stress[name] - bonus)
+        if vader_compound < -0.2:
+            hit = int(round(((-vader_compound - 0.2) / 0.8) * 5))
+            hit = max(1, min(hit, 5))
+            for name in actors:
+                if name in self._stress:
+                    self._stress[name] = min(100, self._stress[name] + hit)
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
