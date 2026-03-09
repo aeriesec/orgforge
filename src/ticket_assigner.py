@@ -35,6 +35,7 @@ import logging
 from typing import Dict, List, Optional
 
 from graph_dynamics import GraphDynamics
+from memory import Memory
 from planner_models import SprintContext
 
 logger = logging.getLogger("orgforge.ticket_assigner")
@@ -69,13 +70,14 @@ class TicketAssigner:
     graph_dynamics : live GraphDynamics instance (owns stress + betweenness)
     """
 
-    def __init__(self, config: dict, graph_dynamics: GraphDynamics):
+    def __init__(self, config: dict, graph_dynamics: GraphDynamics, mem: Memory):
         self._config = config
         self._gd = graph_dynamics
+        self._mem = mem
 
     # ── Public ────────────────────────────────────────────────────────────────
 
-    def build(self, state, dept_members: List[str]) -> SprintContext:
+    def build(self, state, dept_members: List[str], dept_name: str = "") -> SprintContext:
         """
         Main entry point.  Call once per department, before DepartmentPlanner.plan().
 
@@ -88,19 +90,14 @@ class TicketAssigner:
         capacity = self._compute_capacity(dept_members, state)
 
         # Tickets assigned to this department but not yet done
-        open_tickets = [
-            t for t in state.jira_tickets
-            if t.get("assignee") in dept_members
-            and t.get("status") != "Done"
-        ]
+        open_tickets = self._mem.get_open_tickets_for_dept(dept_members, dept_name=dept_name)
 
         # Tickets in the sprint with no assignee yet (newly created this sprint)
-        unassigned = [
-            t for t in state.jira_tickets
-            if t.get("assignee") is None
-            and t.get("sprint") == state.sprint.sprint_number
-            and t.get("status") != "Done"
-        ]
+        unassigned = list(self._mem._jira.find({
+            "assignee": None,
+            "dept": dept_name,
+            "status": {"$ne": "Done"}
+        }))
 
         # Already-owned tickets stay owned — we only re-assign unassigned ones
         owned: Dict[str, str] = {
@@ -112,12 +109,11 @@ class TicketAssigner:
         if unassigned and dept_members:
             new_assignments = self._assign(unassigned, dept_members, capacity, state)
             owned.update(new_assignments)
-            # Write assignments back onto the state tickets so GitSimulator
-            # and the JIRA export see the correct owner immediately.
-            tid_map = {t["id"]: t for t in state.jira_tickets}
             for tid, owner in new_assignments.items():
-                if tid in tid_map:
-                    tid_map[tid]["assignee"] = owner
+                ticket = self._mem.get_ticket(tid)
+                if ticket:
+                    ticket["assignee"] = owner
+                    self._mem.upsert_ticket(ticket)
 
         in_progress = [
             t["id"] for t in open_tickets if t.get("status") == "In Progress"
@@ -305,7 +301,7 @@ class TicketAssigner:
         Also checks jira_tickets assignee history for continuity.
         """
         history: Dict[str, set] = {}
-        for ticket in state.jira_tickets:
+        for ticket in self._mem._jira.find({"assignee": {"$exists": True}}, {"id": 1, "assignee": 1}):
             assignee = ticket.get("assignee")
             if assignee:
                 history.setdefault(assignee, set()).add(ticket["id"])

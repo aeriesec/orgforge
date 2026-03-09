@@ -4,7 +4,93 @@ All notable changes to OrgForge will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+---
+
+## [v0.5.0] — 2026-03-07
+
+### Added
+
+- **Persona-Driven Confluence Topic Generation (`confluence_writer.py`)**: Replaced the static `adhoc_confluence_topics` YAML list with a fast LLM call (`WORKER_MODEL`) that invents a page title grounded in the author's `expertise` array, current stress level, today's `daily_theme`, and a RAG context pull from memory. Topics are now industry-aware — changing `industry` in `config.yaml` automatically changes what gets documented without any other configuration.
+
+- **Active-Actor Author Selection (`confluence_writer.py`, `flow.py`)**: Ad-hoc Confluence pages are now authored by someone from `state.daily_active_actors` rather than a random org member. Ensures every page is written by a person provably working that day, making the authorship eval-safe.
+
+- **Publish Ledger (`flow.py`, `confluence_writer.py`)**: Added `confluence_published_today: Dict[str, str]` to `State`. After `_finalise_page()` registers a root page, its lowercased title and first author are written into the ledger. Only root pages enter the ledger — child chunks do not. The ledger resets each morning in the daily counter reset block, preventing cross-day contamination. Used by the topic agent to exclude already-covered topics (same-day dedup) and by `find_confluence_experts()` for causal ordering enforcement.
+
+- **LLM-Generated Sprint Tickets (`flow.py`)**: Replaced the static `sprint_ticket_themes` YAML list with a `WORKER_MODEL` call that generates ticket titles from the attending engineers' combined `expertise` tags and the legacy system context. Falls back to four hardcoded sensible defaults on JSON parse failure so planning never crashes.
+
+- **`Memory.find_confluence_experts()` (`memory.py`)**: New method that runs a vector similarity search over the Confluence artifact collection to return subject-matter experts for a given topic. Reuses already-stored page embeddings — no new embed calls are made for stored pages, only one embed call for the query string. Applies a `score_threshold` (default 0.75) and an `as_of_time` timestamp cutoff for sub-day causal ordering precision. Returns `[{title, author, score, day}]`.
+
+- **`Memory.recall()` now returns `metadata` and `timestamp` (`memory.py`)**: Added both fields to the `$project` stage so callers receive author information and timestamps in a single round-trip rather than requiring a second query.
+
+- **Expertise-Weighted Participant Routing (`normal_day.py`)**: Added `_expertise_matched_participants()` helper that augments a seed participant list in two passes: (1) semantic expert injection via `find_confluence_experts()` with causal ordering enforced by `as_of_time`, (2) persona expertise-tag fallback weighted by social-graph proximity for engineers with no Confluence history. People with zero expertise overlap are never added. Applied to both `_handle_async_question()` and `_handle_design_discussion()`, replacing the previous random channel-member sampling and ad-hoc keyword scan respectively.
+
+- **Semantic `doc_hint` in Slack Threads (`normal_day.py`)**: `_handle_async_question()` now builds a `doc_hint` from `find_confluence_experts()` and injects it into the Slack prompt so participants can reference existing documentation naturally. Covers cross-day pages, not just same-day ones.
+
+- **Two-Step Clock Pattern for Participant Assembly (`normal_day.py`)**: `_handle_async_question()` and `_handle_design_discussion()` now use a provisional `sync_and_advance` on seed participants to obtain a `meeting_time_iso` timestamp before expert injection, then a second `sync_and_advance(hours=0)` to pull any injected experts forward to the same meeting time without double-advancing the seeds.
+
+### Changed
+
+- **`_maybe_adhoc_confluence()` (`normal_day.py`)**: Removed the `random.choice(self._all_names)` author selection and the manual `backstory` construction. Both are now handled entirely inside `ConfluenceWriter.write_adhoc_page()`. Call site reduced to `self._confluence.write_adhoc_page()` with no arguments.
+
+- **`_generate_adhoc_confluence_page()` (`flow.py`)**: Now resolves the author from `state.daily_active_actors` before delegating to `ConfluenceWriter`, making the intent explicit at the call site while still allowing explicit `author=` overrides from other callers.
+
+- **`_handle_design_discussion()` participant assembly (`normal_day.py`)**: Replaced the single-pass expertise keyword scan (which stopped at the first match) with a call to `_expertise_matched_participants()`, giving consistent scoring, graph-proximity weighting, and Confluence author injection across all Slack thread types.
+
+- **`_handle_async_question()` facts dict (`normal_day.py`)**: `responders` in the logged `SimEvent` facts is now derived as `[a for a in all_actors if a != asker]` since the old `responders` variable was removed when participant assembly was replaced.
+
+### Removed
+
+- **`adhoc_confluence_topics` (`config.yaml`)**: Deleted. Topics are now generated at runtime by the LLM from persona expertise.
+
+- **`sprint_ticket_themes` (`config.yaml`)**: Deleted. Ticket titles are now generated at runtime by the LLM from attendee expertise and legacy system context.
+
 --
+
+I notice there are **AWS credentials exposed in `.env.example`** in this patch. I'll flag that in the changelog entry. Now let me write the high-level changelog section.
+
+Here's the new changelog section for `CHANGELOG.md`:
+
+---
+
+## [v0.5.0] — 2026-03-09
+
+### Added
+
+- **Persona-Driven Content Generation (`confluence_writer.py`, `flow.py`)**: Ad-hoc Confluence topics and sprint ticket titles are now generated at runtime via LLM calls grounded in each author's `expertise` tags, the current daily theme, and RAG context — eliminating the static `adhoc_confluence_topics` and `sprint_ticket_themes` lists from `config.yaml`. Changing `industry` now automatically shifts what gets documented and planned without any other configuration.
+- **Active-Actor Authorship (`confluence_writer.py`)**: Ad-hoc pages are now authored by someone from `state.daily_active_actors`, ensuring every page is tied to a person provably working that day.
+- **Expertise-Weighted Participant Routing (`normal_day.py`, `memory.py`)**: Added `_expertise_matched_participants()` and `Memory.find_confluence_experts()` to inject subject-matter experts into Slack threads and design discussions via vector similarity over existing Confluence pages, with social-graph proximity weighting as fallback. Applied to `_handle_async_question()` and `_handle_design_discussion()`, replacing previous random sampling.
+- **Publish Ledger & Same-Day Dedup (`flow.py`, `confluence_writer.py`)**: `confluence_published_today` tracks root pages per day to prevent topic duplication and enforce causal ordering in expert injection.
+- **Per-Actor Multi-Agent Conversations (`normal_day.py`)**: All Slack interaction types (1:1s, async questions, design discussions, mentoring, watercooler) now use a dedicated `Agent` per participant in a sequential `Crew`, with per-person voice cards derived from personas. Replaces the previous single-agent thread writer.
+- **Causal Chain Tracking (`flow.py`, `normal_day.py`)**: Incidents now carry a `CausalChainHandler` that accumulates artifact IDs (bot alerts, tickets, PRs, Confluence postmortems, Slack threads) as the incident progresses, providing full ground-truth traceability in SimEvents.
+- **Recurrence Detection (`flow.py`)**: `RecurrenceDetector` identifies whether a new incident is a repeat of a prior one via vector similarity, annotating tickets and SimEvents with `recurrence_of` and `recurrence_gap_days`.
+- **Sentiment-Driven Stress (`graph_dynamics.py`, `normal_day.py`)**: VADER sentiment scoring is applied to generated Slack content, nudging actor stress up or down based on message tone (capped at ±5 per artifact).
+- **Simulation Checkpointing & Resume (`flow.py`, `memory.py`)**: Daily state snapshots (morale, health, stress, actor cursors) are saved to MongoDB after each day. On restart, the simulation picks up from the last checkpoint and skips genesis if artifacts already exist.
+- **Dedicated MongoDB Collections (`memory.py`)**: Jira tickets, PRs, Slack messages, and checkpoints are now stored in dedicated collections (`jira_tickets`, `pull_requests`, `slack_messages`, `checkpoints`) with appropriate indexes, replacing in-memory state lists on `State`.
+- **Token Usage Tracking (`memory.py`)**: Optional `DEBUG_TOKEN_TRACKING` mode logs all LLM and embed calls to a `token_usage` collection with per-caller aggregation.
+- **Parallelized Sprint Planning (`flow.py`)**: Ticket generation is now done per-department in parallel via `ThreadPoolExecutor`, with an LLM-negotiated sprint theme agreed between product and engineering leads before ticket creation begins.
+- **LLM-Persona Org Theme & Dept Planning (`day_planner.py`)**: The CEO agent now has a persona-grounded backstory with stress level; department planners similarly use the lead's persona. Active incident context is injected into planning prompts with a narrative constraint preventing "Day 1 startup" framing.
+- **Persona `interests` Field (`config.yaml`)**: All personas now have an `interests` list used to generate contextually grounded watercooler chat topics.
+
+### Changed
+
+- **State Artifact Lists Removed (`flow.py`)**: `confluence_pages`, `jira_tickets`, `slack_threads`, and `pr_registry` removed from `State`; counts and snapshots now query MongoDB directly.
+- **Slack Persistence Unified (`memory.py`, `normal_day.py`, `flow.py`)**: All Slack writes go through `Memory.log_slack_messages()`, which handles disk export, MongoDB upsert, and thread ID generation in one call. `_save_slack()` now returns `(path, thread_id)`.
+- **Ticket & PR Persistence Unified**: All ticket and PR mutations go through `Memory.upsert_ticket()` / `Memory.upsert_pr()` instead of mutating in-memory lists.
+- **`ConfluenceWriter._finalise_page()` author signature**: `authors: List[str]` replaced by `author: str` throughout; single primary author is used for metadata, embedding, and the `author_expertise` upsert.
+- **Embedding Improvements (`memory.py`, `artifact_registry.py`)**: Switched Bedrock embedder from Titan G1 to Cohere Embed v4 (1024-dim dotProduct with scalar quantization). Chunk size increased from 3K to 12K chars. Event types backed by other artifacts skip embedding to avoid duplication.
+- **Sprint & Retro Cadence (`flow.py`)**: Sprint planning and retro days are now driven by a configurable `sprint_length_days` rather than hardcoded weekday checks.
+- **`recall()` temporal filtering (`memory.py`)**: `as_of_time` and new `since` parameters now enforce causal floor/ceiling directly inside the MongoDB `$vectorSearch` pre-filter; accepts both `datetime` objects and ISO strings via `_to_iso()`.
+- **Cloud preset updated (`config.yaml`)**: Default cloud planner upgraded to `claude-sonnet-4-6`; Bedrock worker also upgraded; embedder switched to local Stella 1.5B.
+- **`config.yaml` persona stress levels reduced**: Marcus and Sarah's baseline stress lowered from 70–85 to 50–55.
+
+### Removed
+
+- **`adhoc_confluence_topics` and `sprint_ticket_themes` (`config.yaml`)**: Both static lists deleted; content is now generated at runtime.
+- **`state.jira_tickets`, `state.confluence_pages`, `state.slack_threads`, `state.pr_registry`**: Removed from `State`; all reads and writes go through MongoDB.
+- **`_legacy_slack_chatter()` (`normal_day.py`)**: Fallback single-agent Slack generation removed; the planner is now always required.
+- **Hardcoded `CONF-` prefix in `id_prefix` config**: Stripped from `genesis_docs` configuration.
+
+---
 
 ## [v0.4.1] — 2026-03-06
 

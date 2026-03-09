@@ -43,6 +43,7 @@ import logging
 import random
 import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+import time
 
 from crewai import Agent, Task, Crew
 from memory import Memory, SimEvent
@@ -100,9 +101,10 @@ class ConfluenceWriter:
         prefix:     str,
         count:      int,
         prompt_tpl: str,
-        authors:    List[str],
+        author:     str,
         extra_vars: Optional[Dict[str, str]] = None,
         subdir:     str = "archives",
+        tags:       Optional[List[str]] = None
     ) -> List[str]:
         """
         Generate *count* independent genesis Confluence pages for a given prefix.
@@ -117,8 +119,8 @@ class ConfluenceWriter:
             count:       Number of pages to generate.
             prompt_tpl:  Single-page prompt template. Available placeholders:
                            {id}, {company}, {industry}, {legacy_system},
-                           {project_name}, {authors}, {related_pages}
-            authors:     List of persona names to reference as authors.
+                           {project_name}, {author}, {related_pages}
+            author:      Author of the page.
             extra_vars:  Any additional {placeholder} → value substitutions.
             subdir:      Export subdirectory under confluence/.
 
@@ -126,60 +128,70 @@ class ConfluenceWriter:
             List of registered conf_ids in generation order.
         """
         # 1. Allocate all IDs before any LLM call
-        ids = [self._registry.next_id(prefix) for _ in range(count)]
-        logger.info(f"[confluence] Genesis batch allocated: {ids}")
-
         genesis_time = self._clock.now("system").isoformat()
+        queue = [self._registry.next_id(prefix) for _ in range(count)]
         registered_ids: List[str] = []
+        processed: set = set()
 
-        for conf_id in ids:
-            # 2. Build related-pages context from pages registered so far
-            related = self._registry.related_context(topic=conf_id, n=5)
+        while queue:
+            conf_id = queue.pop(0)
+            if conf_id in processed:
+                continue
+            processed.add(conf_id)
 
-            # 3. Render prompt — one page, all constraints explicit
+            related = ", ".join(registered_ids) if registered_ids else "None yet."
+
             vars_ = {
-                "id":           conf_id,
-                "company":      self._company,
-                "industry":     self._industry,
+                "id":            conf_id,
+                "company":       self._company,
+                "industry":      self._industry,
                 "legacy_system": self._legacy.get("name", ""),
-                "project_name": self._legacy.get("project_name", ""),
-                "authors":      ", ".join(authors),
-                "related_pages": related or "None yet.",
+                "project_name":  self._legacy.get("project_name", ""),
+                "author":        author,
+                "related_pages": related,
                 **(extra_vars or {}),
             }
             prompt = self._render(prompt_tpl, vars_)
+            prompt += (
+                f"\n\nThis page's ID is {conf_id}. "
+                f"You may reference other CONF-* pages naturally. "
+                f"Any page you reference will be written — so only reference pages "
+                f"that genuinely should exist in this knowledge base."
+            )
 
-            # 4. Single-page LLM call
             historian = Agent(
-                role="Corporate Historian",
-                goal="Write one authentic internal Confluence page.",
-                backstory=(
-                    f"You work at {self._company}, a {self._industry} company. "
-                    f"The legacy system '{self._legacy.get('name', '')}' is known to be unstable. "
-                    f"Write with real insider detail."
-                ),
-                llm=self._planner,
+            role="Corporate Historian",
+            goal="Write one authentic internal Confluence page.",
+            backstory=(
+                f"You work at {self._company}, a {self._industry} company. "
+                f"The legacy system '{self._legacy.get('name', '')}' is known to be unstable. "
+                f"Write with real insider detail."
+            ),
+            llm=self._planner,
             )
             task = Task(
                 description=prompt,
                 expected_output=(
                     f"A single Markdown Confluence page with ID {conf_id}. "
-                    f"No separators. No preamble. Start directly with the # heading."
+                    f"No separators. No preamble. "
+                    f"Do not include a main # title or a metadata block at the top. "
+                    f"Start directly with the first paragraph or ## section."
                 ),
                 agent=historian,
             )
             raw = str(Crew(agents=[historian], tasks=[task], verbose=False).kickoff()).strip()
 
-            # 5. Register, validate, chunk, save, embed
+            resolved_tags = tags or ["genesis", "confluence"]
+
             conf_ids = self._finalise_page(
                 raw_content=raw,
                 conf_id=conf_id,
                 title=self._extract_title(raw, conf_id),
-                authors=authors,
+                author=author,
                 date_str=str(self._state.current_date.date()),
                 timestamp=genesis_time,
                 subdir=subdir,
-                tags=["genesis", "confluence"],
+                tags=resolved_tags,
                 facts={"phase": "genesis"},
             )
             registered_ids.extend(conf_ids)
@@ -241,7 +253,7 @@ class ConfluenceWriter:
             raw_content=raw,
             conf_id=conf_id,
             title=f"Postmortem: {incident_title}",
-            authors=[on_call, eng_peer],
+            author=on_call,
             date_str=date_str,
             timestamp=timestamp,
             subdir="postmortems",
@@ -277,9 +289,8 @@ class ConfluenceWriter:
         agent = Agent(
             role="Technical Lead",
             goal="Document technical decisions and extract actionable tickets.",
-            backstory=(
-                f"You are {author} at {self._company}. You just finished a Slack "
-                f"discussion and need to document decisions and assign follow-up work."
+            backstory = self._persona(author, mem=self._mem, graph_dynamics=self._gd,
+                extra=f"You just finished a Slack discussion and need to document decisions and assign follow-up work."
             ),
             llm=self._planner,
         )
@@ -292,10 +303,10 @@ class ConfluenceWriter:
                 f"Also extract 1-3 concrete next steps as JIRA ticket definitions.\n"
                 f"Respond ONLY with valid JSON matching this exact schema:\n"
                 f"{{\n"
-                f"  \"markdown_doc\": \"string (full Markdown, starting with ## Problem Statement)\",\n"
+                f"  \"markdown_doc\": \"string (full Markdown, no main # title, start directly with ## Problem Statement)\",\n"
                 f"  \"new_tickets\": [\n"
                 f"    {{\"title\": \"string\", "
-                f"\"assignee\": \"string (must be one of: {', '.join(participants)})\", "
+                f"\"assignee\": \"string (must be exactly: {author})\", "
                 f"\"story_points\": 1|2|3|5|8}}\n"
                 f"  ]\n"
                 f"}}"
@@ -319,7 +330,7 @@ class ConfluenceWriter:
             raw_content=content,
             conf_id=conf_id,
             title=f"Design: {topic[:50]}",
-            authors=participants,
+            author=author,
             date_str=date_str,
             timestamp=timestamp,
             subdir="design",
@@ -369,23 +380,110 @@ class ConfluenceWriter:
         """
         Generate a character-accurate ad-hoc Confluence page.
 
-        Mirrors the original _generate_adhoc_confluence_page() in flow.py but
-        with Python-allocated IDs, reference injection, and chunking.
+        Topic and ID prefix are derived from the author's persona expertise via
+        a fast LLM call — no hardcoded topic lists required. The author is drawn
+        from state.daily_active_actors so every page is organically tied to
+        someone who was actually working today.
+
+        Falls back to a random org member only if no active actors exist yet.
         """
-        raw_topics = self._config.get(
-            "adhoc_confluence_topics",
-            [["ENG", "Documentation"], ["HR", "Policy Update"]],
+        # ── 1. Pick an author from today's active workers ─────────────────────
+        active_today: List[str] = list(
+            dict.fromkeys(getattr(self._state, "daily_active_actors", []))
         )
-        rendered = [(t[0], self._render_template(t[1])) for t in raw_topics]
-        prefix, title = random.choice(rendered)
+        resolved_author: str = author or (
+            random.choice(active_today) if active_today
+            else random.choice(self._all_names)
+        )
 
-        conf_id = self._registry.next_id(prefix)
-        resolved_author = author or random.choice(self._all_names)
+        # ── 2. Determine prefix from author's department ──────────────────────
+        dept = next(
+            (d for d, members in self._org_chart.items() if resolved_author in members),
+            "ENG",
+        )
+        # Map department names to short Confluence ID prefixes
+        _PREFIX_MAP = {
+            "Engineering_Backend":  "ENG",
+            "Engineering_Mobile":   "ENG",
+            "Product":              "PROD",
+            "Design":               "DESIGN",
+            "Sales_Marketing":      "MKT",
+            "HR_Ops":               "HR",
+            "QA_Support":           "QA",
+        }
+        prefix = _PREFIX_MAP.get(dept, dept[:3].upper())
 
-        if backstory is None:
-            backstory = self._persona(
-                resolved_author, mem=self._mem, graph_dynamics=self._gd
-            )
+        daily_theme: str = getattr(self._state, "daily_theme", "")
+
+        doc_history = list(self._mem._events.find(
+            {"type": "confluence_created"},
+            {"facts.title": 1, "actors": 1}
+        ).sort("timestamp", -1).limit(20))
+
+        history_str = "\n".join([
+            f"  - {e['facts'].get('title')} (by {e['actors'][0]})" 
+            for e in doc_history
+        ]) if doc_history else "No documentation exists yet."
+
+        persona = self._config.get("personas", {}).get(resolved_author, {})
+        expertise_list = persona.get("expertise", ["general tasks"])
+        expertise_str  = ", ".join(expertise_list)
+
+        seed_query = f"{resolved_author} {expertise_str} {daily_theme}"
+        topic_ctx = self._mem.context_for_prompt(
+            seed_query, n=3, as_of_time=self._clock.now(resolved_author).isoformat()
+        )
+
+        # Recent memory context — same RAG call used later for the writing agent,
+        # run early so the topic is grounded in what's actually in the sim.
+        seed_query = f"{resolved_author} {expertise_str} {daily_theme}"
+        topic_ctx = self._mem.context_for_prompt(
+            seed_query, n=3, as_of_time=self._clock.now(resolved_author).isoformat()
+        )
+
+        topic_agent = Agent(
+            role="Content Planner",
+            goal="Identify a unique documentation gap based on your expertise and org history.",
+            backstory=self._persona(
+                resolved_author, 
+                mem=self._mem, 
+                graph_dynamics=self._gd,
+                extra=(
+                    f"You are {resolved_author} from the {dept} department. "
+                    f"Your expertise includes: {expertise_str}. "
+                    f"You are deciding what to document today to provide the most value to the team."
+                )
+            ),
+            llm=self._worker,
+        )
+
+        topic_task = Task(
+            description=(
+                f"Today's Org Theme: {daily_theme}\n"
+                f"Recent Activity Context: {topic_ctx}\n\n"
+                f"EXISTING DOCUMENTATION (Do NOT duplicate or overlap significantly):\n"
+                f"{history_str}\n\n"
+                f"TASK:\n"
+                f"Based on your expertise ({expertise_str}), propose ONE specific Confluence page title "
+                f"you would plausibly write TODAY. \n\n"
+                f"Rules:\n"
+                f"- Find a technical 'gap'. If 'Auth' is already documented, look for a sub-topic "
+                f"like 'Auth Error Handling' or 'Rotating JWT Keys'.\n"
+                f"- Be specific and realistic based on the current Org Theme.\n"
+                f"- Return ONLY the page title string. No explanation. No quotes."
+            ),
+            expected_output="A single page title string. Nothing else.",
+            agent=topic_agent,
+        )
+
+        title = str(
+            Crew(agents=[topic_agent], tasks=[topic_task], verbose=False).kickoff()
+        ).strip().strip('"').strip("'")
+
+        # Sanity-trim in case the LLM adds extra prose
+        title = title.splitlines()[0][:120]
+
+        conf_id = self._registry.next_id(prefix)       
 
         session_hours = random.randint(30, 90) / 60.0
         artifact_time, _ = self._clock.advance_actor(resolved_author, hours=session_hours)
@@ -398,7 +496,15 @@ class ConfluenceWriter:
         writer_agent = Agent(
             role="Corporate Writer",
             goal=f"Draft a {title} Confluence page.",
-            backstory=backstory,
+            backstory=self._persona(
+                resolved_author, 
+                mem=self._mem, 
+                graph_dynamics=self._gd,
+                extra=(
+                    f"You are {resolved_author} from the {dept} department. "
+                    f"Your expertise includes: {expertise_str}. "
+                )
+            ),
             llm=self._planner,
         )
         task = Task(
@@ -410,7 +516,8 @@ class ConfluenceWriter:
                 f"- Use your specific technical expertise and typing style.\n"
                 f"- If stressed, the doc may be shorter or more blunt.\n"
                 f"- Do not invent any CONF-* IDs not listed above.\n"
-                f"- Start directly with the # heading. Format as Markdown."
+                f"- Format as Markdown. Do not write a main # title or metadata block (like Author/Date) at the top.\n"
+                f"- Start directly with the first paragraph or ## section."
             ),
             expected_output=f"A single Markdown Confluence page with ID {conf_id}.",
             agent=writer_agent,
@@ -432,7 +539,7 @@ class ConfluenceWriter:
             raw_content=raw,
             conf_id=conf_id,
             title=title,
-            authors=[resolved_author],
+            author=resolved_author,
             date_str=date_str,
             timestamp=timestamp,
             subdir="general",
@@ -449,7 +556,7 @@ class ConfluenceWriter:
         raw_content:        str,
         conf_id:            str,
         title:              str,
-        authors:            List[str],
+        author:             str,
         date_str:           str,
         timestamp:          str,
         subdir:             str,
@@ -476,7 +583,7 @@ class ConfluenceWriter:
             content=clean_content,
             prefix=self._id_prefix_from_id(conf_id),
             state=self._state,
-            author=authors[0] if authors else "",
+            author=author,
             date_str=date_str,
         )
 
@@ -484,16 +591,24 @@ class ConfluenceWriter:
         for page in pages:
             # _registry.chunk_into_pages already registered IDs —
             # catch the rare race where an ID was registered externally
+            logger.info(f"[finalise] embedding page.id={page.id} parent={page.parent_id or 'ROOT'} content_len={len(page.content)}")
             try:
                 # strip broken refs one more time after chunking added headers
                 final_content = self._registry.strip_broken_references(page.content)
-            except Exception:
+            except Exception as e:
+                logger.info(f"[finalise] Caught exception {e}")
                 final_content = page.content
 
             self._save_md(page.path, final_content)
 
-            entry = {"id": page.id, "title": page.title, "path": page.path}
-            self._state.confluence_pages.append(entry)
+            meta = {
+                "author":   author,
+                "parent_id": page.parent_id or "",
+                "is_chunk":  page.parent_id is not None,
+                "tags": tags or [],
+            }
+            if tags and "genesis" in tags:
+                meta["phase"] = "genesis"
 
             self._mem.embed_artifact(
                 id=page.id,
@@ -503,30 +618,54 @@ class ConfluenceWriter:
                 day=self._state.day,
                 date=date_str,
                 timestamp=timestamp,
-                metadata={
-                    "authors":   str(authors),
-                    "parent_id": page.parent_id or "",
-                    "is_chunk":  page.parent_id is not None,
-                },
+                metadata=meta
             )
+
+            if page.parent_id is None and author:
+                # Upsert into a dedicated expertise collection
+                self._mem._db["author_expertise"].update_one(
+                    {"author": author},
+                    {"$addToSet": {"topics": page.title.lower().strip()}},
+                    upsert=True
+                )
+
             self._state.daily_artifacts_created += 1
 
+            logger.debug(f"[finalise] pre-facts page.id={page.id}")
             page_facts = dict(facts)
+            
             page_facts.update({
                 "parent_id": page.parent_id or "",
                 "is_chunk":  page.parent_id is not None,
+                "title": page.title,
+                "author": author
             })
 
+            logger.info(f"[finalise] page facts {page_facts}")
+            logger.debug(f"[finalise] pre-artifact-ids page.id={page.id}")
             artifact_ids = {"confluence": page.id}
             if extra_artifact_ids:
                 artifact_ids.update(extra_artifact_ids)
 
+            logger.debug(f"[finalise] pre-log-event page.id={page.id}")
+            logger.debug(
+                f"[finalise] SimEvent fields — "
+                f"type=confluence_created "
+                f"timestamp={timestamp} "
+                f"day={self._state.day} "
+                f"date={date_str} "
+                f"actors={[author]} "
+                f"artifact_ids={artifact_ids} "
+                f"facts={page_facts} "
+                f"summary={'Child' if page.parent_id else 'Page'} {page.id} created: {page.title} "
+                f"tags={tags}"
+            )
             self._mem.log_event(SimEvent(
                 type="confluence_created",
                 timestamp=timestamp,
                 day=self._state.day,
                 date=date_str,
-                actors=authors,
+                actors=[author],
                 artifact_ids=artifact_ids,
                 facts=page_facts,
                 summary=(
@@ -534,6 +673,9 @@ class ConfluenceWriter:
                 ),
                 tags=tags,
             ))
+            logger.debug(f"[finalise] post-log-event page.id={page.id}")
+
+            logger.info(f"[confluence] _finalise_page complete: {page.id}")
 
             created_ids.append(page.id)
 
@@ -554,7 +696,8 @@ class ConfluenceWriter:
         """Create JIRA tickets from a list of LLM-extracted action items."""
         created_ids: List[str] = []
         for tk in new_tickets:
-            tid = f"ORG-{len(self._state.jira_tickets) + 100}"
+            tid = self._registry.next_jira_id()
+            self._registry.register_jira(tid)
             assignee = tk.get("assignee", fallback_author)
             if assignee not in self._all_names:
                 assignee = fallback_author
@@ -570,7 +713,7 @@ class ConfluenceWriter:
                 "created_at":   timestamp,
                 "updated_at":   timestamp,
             }
-            self._state.jira_tickets.append(ticket)
+            self._mem.upsert_ticket(ticket)  
             self._save_json(f"{self._base}/jira/{tid}.json", ticket)
             self._mem.embed_artifact(
                 id=tid, type="jira", title=ticket["title"],

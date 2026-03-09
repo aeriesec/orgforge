@@ -127,6 +127,7 @@ class SprintContext:
     available_tickets:  List[str]        # ticket_ids with no owner yet
     in_progress_ids:    List[str]        # owned + status == "In Progress"
     capacity_by_member: Dict[str, float] # {name: hrs}
+    sprint_theme:       str = ""
 
 
 @dataclass

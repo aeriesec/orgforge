@@ -4,11 +4,11 @@
 ![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)
 [![Run Tests](https://github.com/aeriesec/orgforge/actions/workflows/tests.yml/badge.svg)](https://github.com/aeriesec/orgforge/actions/workflows/tests.yml)
 
-**Synthetic corporate dataset generator for AI agent evaluation.**
+### A deterministic corporate simulator for generating ground-truth ecosystems and evaluating enterprise AI agents
 
 OrgForge simulates weeks of realistic enterprise activity — Confluence pages, JIRA tickets, Slack threads, Git PRs, emails, and server logs — grounded in an event-driven state machine so LLMs can't hallucinate facts out of sequence.
 
-The org isn't static. Engineers leave mid-sprint. Tickets get orphaned. Knowledge gaps surface in real time. New hires start cold and warm up through simulated collaboration. Stress propagates through a live social graph. Every artifact reflects the actual state of the org at the moment it was written.
+The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, forcing deterministic incident handoffs and ticket reassignments. Knowledge gaps surface when under-documented systems break. New hires build their internal network through simulated collaboration. Stress propagates through a live, weighted social graph. Every artifact reflects the exact state of the org at the moment it was written.
 
 ---
 
@@ -16,9 +16,52 @@ The org isn't static. Engineers leave mid-sprint. Tickets get orphaned. Knowledg
 
 When building AI agents that reason over institutional knowledge, you need a realistic corpus to test against. The only widely-used corporate dataset is the Enron email corpus — 25 years old, legally sensitive, and covering one company in crisis.
 
-OrgForge generates that corpus from scratch, parameterized to any company, industry, or org structure. Everything is grounded in a SimEvent log: LLMs write prose, but the facts — who was on-call, which ticket was open, when the incident resolved, who just left the team — are always controlled by the state machine.
+OrgForge generates that corpus from scratch, parameterized to any company, industry, or org structure. LLMs write the prose, but the facts — who was on-call, which ticket was open, when the incident resolved, who just left the team — are strictly controlled by the state machine.
 
-The larger goal is proving that institutional knowledge capture is a solvable problem. OrgForge is the open-source testbed building toward that.
+**The central design bet:** grounding LLM output in a deterministic event log makes the dataset actually useful for evaluating retrieval systems. You have ground truth about what happened, when, who was involved, and what the org's state was — so you can measure whether an agent surfaces the right context, not just plausible-sounding context.
+
+---
+
+## What the Output Looks Like
+
+Here's what a slice of a real simulation produces. An incident fires on Day 8:
+
+**`slack/channels/engineering-incidents.json`** — the alert arrives first, timestamped to the millisecond the on-call pager fired:
+
+```json
+{
+  "ts": "2026-03-10T14:23:07",
+  "user": "pagerduty-bot",
+  "text": "🔴 P1 ALERT: TitanDB latency spike — connection pool exhaustion under load. On-call: Jax."
+}
+```
+
+**`jira/IT-108.json`** — opened seconds later, facts pulled from the same SimEvent:
+
+```json
+{
+  "id": "IT-108",
+  "type": "incident",
+  "priority": "P1",
+  "title": "TitanDB: latency spike",
+  "root_cause": "connection pool exhaustion under load",
+  "assignee": "Jax",
+  "reporter": "system",
+  "opened": "2026-03-10T14:23:19"
+}
+```
+
+**`confluence/postmortems/IT-108.md`** — written the next day, linking the same root cause and PR:
+
+> _This incident was triggered by connection pool exhaustion under sustained load, first surfaced in IT-108. The fix landed in PR #47 (merged by Sarah). A prior knowledge gap in TitanDB connection management — stemming from Jordan's departure on Day 12 — contributed to the delayed diagnosis._
+
+The postmortem references the same root cause as the ticket. The sales email that week mentions platform instability. The sprint retro records the velocity hit. None of this is coincidence — it all traces back to one SimEvent that every downstream artifact reads from.
+
+---
+
+## Why Does This Exist?
+
+The only widely-used corporate dataset is the Enron email corpus — 25 years old, legally sensitive, and covering one company in crisis. OrgForge generates a modern corpus from scratch, parameterized to any company, industry, or org structure. LLMs write the prose; the facts are controlled by the state machine.
 
 ---
 
@@ -44,19 +87,33 @@ A default 22-day simulation produces:
 | `simulation_snapshot.json` | Full state: incidents, morale curve, system health, relationship graph, departed employees, new hires, knowledge gap events |
 | `simulation.log`           | Complete chronological system and debug logs for the entire run                                                             |
 
-Every artifact references real SimEvent facts. The incident email thread cites the same root cause as the JIRA ticket. The postmortem links the correct PR. The sales email mentions platform instability on weeks that actually had incidents. When an engineer departs, their tickets are reassigned and their knowledge gaps surface in subsequent incidents — not as static config, but as events the simulation discovers.
-
 ---
 
 ## Architecture & Mechanics
 
-OrgForge is not an LLM wrapper. It uses a strict event-driven state machine (CrewAI Flow), a vector database (MongoDB Atlas Local), and a dynamic social graph (NetworkX) to prevent hallucinations and maintain temporal consistency.
+OrgForge is not an LLM wrapper. Four interlocking systems enforce correctness.
 
 👉 **[Read the full Architecture Deep-Dive here.](ARCHITECTURE.md)**
 
 ---
 
+## The Departure Cascade
+
+The most complex behaviour in the simulation. When an engineer departs mid-sprint, the following fires in order before that day's planning runs:
+
+1. **Incident handoff** — active incidents assigned to the departing engineer are rerouted via Dijkstra escalation routing (while the node is still in the graph) to the next available person in the chain.
+2. **Ticket reassignment** — orphaned JIRA tickets go to the dept lead. `In Progress` tickets without a linked PR reset to `To Do` so the new owner starts fresh; tickets with a PR keep their status so the review/merge flow closes them naturally.
+3. **Graph recompute** — betweenness centrality is recalculated on the smaller graph. Engineers absorbing the departed node's bridging load receive a proportional stress hit.
+4. **Knowledge gap propagation** — if the departed engineer owned undocumented domains (configured via `documented_pct`), those gaps are registered in the SimEvent log and surface in subsequent incidents as contributing factors.
+5. **`employee_departed` SimEvent** — emitted with edge snapshot, centrality at departure, reassigned tickets, and incident handoffs. Full ground truth for retrieval evaluation.
+
+So when Jordan leaves on Day 12, the postmortem on Day 9's incident doesn't mention her. But the postmortem on Day 15 might: _"A prior knowledge gap in auth-service, stemming from a recent departure, contributed to the delayed diagnosis."_ That sentence is grounded in a real SimEvent, not LLM inference.
+
+---
+
 ## Quickstart
+
+`flow.py` is the main simulation entry point. `config/config.yaml` is the single source of truth for org structure, personas, incident triggers, and quality presets.
 
 ### Setup Options
 
@@ -103,7 +160,7 @@ docker compose up mongodb orgforge
 
 ### Option 3 — Cloud Preset (AWS Bedrock + OpenAI)
 
-Best output quality. Uses Claude 3.5 Sonnet for document generation, Llama 3.1 8B on Bedrock for high-volume worker calls, and OpenAI `text-embedding-3-large` for embeddings.
+Best output quality. Uses Claude Sonnet for document generation, Llama 3.1 8B on Bedrock for high-volume worker calls, and OpenAI `text-embedding-3-large` for embeddings.
 
 Set `quality_preset: "cloud"` in `config.yaml`, then:
 
@@ -162,49 +219,18 @@ For `Llama 3.3 70B` entirely locally, use a `g5.2xlarge` or `g5.12xlarge` with t
 quality_preset: "local_cpu" # local_cpu | local_gpu | cloud
 ```
 
-| Preset      | Planner                     | Worker                 | Embeddings             | Best For                        |
-| ----------- | --------------------------- | ---------------------- | ---------------------- | ------------------------------- |
-| `local_cpu` | Qwen 2.5 7B q4              | Qwen 2.5 1.5B          | mxbai-embed-large      | Laptops, parameter iteration    |
-| `local_gpu` | Llama 3.3 70B               | Llama 3.1 8B           | mxbai-embed-large      | Local GPU, high quality offline |
-| `cloud`     | Claude 3.5 Sonnet (Bedrock) | Llama 3.1 8B (Bedrock) | text-embedding-3-large | Production dataset generation   |
+| Preset      | Planner                     | Worker                | Embeddings             | Best For                 |
+| ----------- | --------------------------- | --------------------- | ---------------------- | ------------------------ |
+| `local_cpu` | qwen2.5:7b-instruct-q4_K_M  | qwen2.5:1.5b-instruct | mxbai-embed-large      | Local dev, no GPU        |
+| `local_gpu` | llama3.3:70b-instruct-q4_KM | llama3.1:8b-instruct  | mxbai-embed-large      | High-fidelity local runs |
+| `cloud`     | Claude Sonnet (Bedrock)     | llama3.1:8b (Bedrock) | text-embedding-3-large | Best output quality      |
 
-### Simulating a Different Company
+### Key Config Fields
 
-```yaml
-simulation:
-  company_name: "Meridian Capital"
-  industry: "financial technology"
-  domain: "meridiancapital.com"
-
-legacy_system:
-  name: "RiskEngine"
-  project_name: "Project Mercury"
-  description: "legacy risk calculation service"
-
-incident_triggers:
-  - "breach"
-  - "compliance"
-  - "timeout"
-
-org_chart:
-  Engineering: ["Sam", "Lena", "Omar", "Chris"]
-  Risk: ["Felix", "Ingrid", "Tom"]
-  Sales: ["Marcus", "Blake", "Tasha"]
-  HR_Ops: ["Karen", "Dave"]
-
-leads:
-  Engineering: "Sam"
-  Risk: "Felix"
-  Sales: "Marcus"
-  HR_Ops: "Karen"
-```
-
-### Key Config Sections
-
-| Section                   | What It Controls                                                                |
+| Field                     | Purpose                                                                         |
 | ------------------------- | ------------------------------------------------------------------------------- |
-| `quality_preset`          | Which model profile is active                                                   |
-| `simulation`              | Company name, domain, run duration, event probabilities                         |
+| `company_name`            | Injected into all generated prose                                               |
+| `simulation_days`         | Length of the simulation (default: 22)                                          |
 | `legacy_system`           | The unstable system referenced in incidents, tickets, and docs                  |
 | `incident_triggers`       | Keywords in the daily theme that trigger a P1 incident                          |
 | `sprint_ticket_themes`    | Pool of ticket titles drawn during sprint planning                              |
@@ -246,17 +272,7 @@ org_lifecycle:
   random_attrition_daily_prob: 0.005
 ```
 
-**What happens on departure:**
-
-- Active incidents assigned to the departing engineer are handed off via Dijkstra escalation routing — while the node is still in the graph — to the next available person in the chain
-- Orphaned JIRA tickets are reassigned to the dept lead; `"In Progress"` tickets without a linked PR are reset to `"To Do"` so the new owner starts fresh; tickets with a PR keep their status so the review/merge flow closes them naturally
-- Betweenness centrality is recomputed on the smaller graph; nodes that absorb the departing engineer's bridging load receive a proportional stress hit (capped at 20 points)
-- An `employee_departed` SimEvent is emitted with edge snapshot, centrality at departure, reassigned tickets, and incident handoffs — full ground truth for retrieval evaluation
-
-**What happens on hire:**
-
-- New engineer enters the graph with cold-start edges at `edge_weight_floor` to cross-dept nodes and `2× floor` to same-dept peers — both below the `warmup_threshold` so the day planner naturally proposes `warmup_1on1` and `onboarding_session` events until real collaboration warms the edges
-- An `employee_hired` SimEvent is emitted; the hire appears in `simulation_snapshot.json` with their final warm-edge count
+On hire, the new engineer enters the graph with cold-start edges below the `warmup_threshold`, so the day planner naturally proposes `warmup_1on1` and `onboarding_session` events until real collaboration warms the edges.
 
 ---
 

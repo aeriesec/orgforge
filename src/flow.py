@@ -11,7 +11,6 @@ import json
 import random
 import re
 from pathlib import Path
-import yaml
 import networkx as nx
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Optional
@@ -20,9 +19,10 @@ from email.mime.multipart import MIMEMultipart
 from dataclasses import field
 
 from day_planner import DayPlannerOrchestrator
-from normal_day import NormalDayHandler
+from normal_day import NormalDayHandler, dept_of_name
 from artifact_registry import ArtifactRegistry
 from confluence_writer import ConfluenceWriter
+from token_tracker import orgforge_token_listener
 from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.table import Table
@@ -31,7 +31,7 @@ from rich.logging import RichHandler
 from rich import box
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-from crewai import Agent, Task, Crew
+from crewai import Agent, Process, Task, Crew
 from crewai.flow.flow import Flow, listen, start
 from langchain_ollama import OllamaLLM
 
@@ -43,65 +43,37 @@ from org_lifecycle import (
          patch_validator_for_lifecycle,
          recompute_escalation_after_departure,
      )
+from causal_chain_handler import (
+    CausalChainHandler,
+    ARTIFACT_KEY_JIRA,
+    ARTIFACT_KEY_SLACK_THREAD,
+    RecurrenceDetector,
+)
 
 os.makedirs("./export", exist_ok=True)
 
-SRC_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SRC_DIR.parent
-
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
-EXPORT_DIR = PROJECT_ROOT / "export"
-
-EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+# ── Import all config constants from the neutral config_loader module.
+# This breaks the circular import:  flow → day_planner → flow (was broken).
+from config_loader import (
+    SRC_DIR, PROJECT_ROOT, CONFIG_PATH, EXPORT_DIR,
+    CONFIG, COMPANY_NAME, COMPANY_DOMAIN, INDUSTRY, BASE,
+    ORG_CHART, LEADS, PERSONAS, DEFAULT_PERSONA, LEGACY, PRODUCT_PAGE,
+    DEPARTED_EMPLOYEES, ALL_NAMES, LIVE_ORG_CHART, LIVE_PERSONAS,
+    _PRESET_NAME, _PRESET, _PROVIDER,
+)
 
 logging.basicConfig(
     level=logging.INFO,
+    force=True,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        # Writes all logs to a permanent file
         logging.FileHandler(EXPORT_DIR / "simulation.log", mode='a'),
         RichHandler(rich_tracebacks=True, show_time=False, show_path=False)
     ]
 )
 
 logger = logging.getLogger("orgforge.flow")
-
-# ─────────────────────────────────────────────
-# 1. LOAD CONFIG
-# ─────────────────────────────────────────────
-with open(CONFIG_PATH, "r") as f:
-    CONFIG = yaml.safe_load(f)
-
-COMPANY_NAME    = CONFIG["simulation"]["company_name"]
-COMPANY_DOMAIN  = CONFIG["simulation"]["domain"]
-INDUSTRY        = CONFIG["simulation"].get("industry", "technology")
-BASE            = CONFIG["simulation"].get("output_dir", str(EXPORT_DIR))
-ORG_CHART       = CONFIG["org_chart"]
-LEADS           = CONFIG["leads"]
-PERSONAS        = CONFIG["personas"]
-DEFAULT_PERSONA = CONFIG["default_persona"]
-LEGACY          = CONFIG["legacy_system"]
-PRODUCT_PAGE    = CONFIG.get("product_page", "Product Launch")
-
-DEPARTED_EMPLOYEES: Dict[str, Dict] = {
-    gap["name"]: {
-        "left":           gap["left"],
-        "role":           gap["role"],
-        "knew_about":     gap["knew_about"],
-        "documented_pct": gap["documented_pct"],
-    }
-    for gap in CONFIG.get("knowledge_gaps", [])
-}
-
-ALL_NAMES = [name for dept in ORG_CHART.values() for name in dept]
-LIVE_ORG_CHART  = {dept: list(members) for dept, members in ORG_CHART.items()}
-LIVE_PERSONAS   = {k: dict(v) for k, v in PERSONAS.items()}
-
-# ── Active preset ─────────────────────────────
-_PRESET_NAME = CONFIG.get("quality_preset", "local_cpu")
-_PRESET      = CONFIG["model_presets"][_PRESET_NAME]
-_PROVIDER    = _PRESET.get("provider", "ollama")
 
 def _bare_model(model_str: str) -> str:
     return model_str.strip()
@@ -126,7 +98,6 @@ def build_llm(model_key: str):
             llm = LLM(
                 model=model,
                 region_name=region,
-                max_tokens=4096,
                 temperature=0.7,
             )
             logger.info(f"[config] {model_key} → Bedrock/{model} (region={region})")
@@ -148,7 +119,7 @@ def build_llm(model_key: str):
     base_url = env_base_url if env_base_url else config_base_url
     
     logger.info(f"[config] {model_key} → Ollama/{model} ({base_url})")
-    return OllamaLLM(model=model, base_url=base_url, timeout=1200)
+    return OllamaLLM(model=model, base_url=base_url)
 
 PLANNER_MODEL = build_llm("planner")
 WORKER_MODEL  = build_llm("worker")
@@ -246,12 +217,29 @@ class ActiveIncident(BaseModel):
     involves_gap_knowledge: bool = False
     pr_id: Optional[str] = None
     root_cause: str = ""
+    causal_chain: Any = None 
+    recurrence_of: Optional[str] = None
 
 class SprintState(BaseModel):
     sprint_number: int = 1
     start_day: int = 1
     tickets_in_sprint: List[str] = []
     velocity: int = 0
+    sprint_theme: str = ""
+
+    def start_date(self, sim_start_date: datetime, sprint_length: int) -> datetime:
+        """
+        Derive sprint start date by counting only business days forward
+        from sim start — mirrors how state.day advances in the main loop.
+        """
+        target_day = (self.sprint_number - 1) * sprint_length + 1
+        current    = sim_start_date
+        biz_day    = 1
+        while biz_day < target_day:
+            current += timedelta(days=1)
+            if current.weekday() < 5:
+                biz_day += 1
+        return current
 
 class State(BaseModel):
     day: int = 1
@@ -261,10 +249,6 @@ class State(BaseModel):
     team_morale: float = Field(default_factory=lambda: CONFIG["morale"]["initial"])
     morale_history: List[float] = []
     is_researching: bool = False
-    confluence_pages: List[Dict] = []
-    jira_tickets: List[Dict] = []
-    slack_threads: List[Dict] = []
-    pr_registry: List[Dict] = []
     active_incidents: List[ActiveIncident] = []
     resolved_incidents: List[str] = []
     sprint: SprintState = Field(default_factory=SprintState)
@@ -283,8 +267,7 @@ class State(BaseModel):
     daily_event_type_counts: Dict[str, int] = {}
     departed_employees: Dict[str, Dict] = {}   # name → {left, role, knew_about, documented_pct}
     new_hires: Dict[str, Dict] = {}   # name → {joined, role, dept, expertise}
-    ticket_actors_today: Dict[str, List[str]] = field(default_factory=dict)
-
+    ticket_actors_today: Dict[str, List[str]] = Field(default_factory=dict)
 
 # ─────────────────────────────────────────────
 # 3. FILE I/O
@@ -334,7 +317,7 @@ class GitSimulator:
         self._worker_llm = worker_llm
 
     def create_pr(self, author: str, ticket_id: str, title: str, timestamp: str, reviewers: Optional[List[str]] = None) -> Dict:
-        pr_id = f"PR-{len(self._state.pr_registry) + 100}"
+        pr_id = f"PR-{self._mem._prs.count_documents({}) + 100}"
         
         if not reviewers:
             edges = self._graph[author]
@@ -380,7 +363,7 @@ class GitSimulator:
         
         path = f"{BASE}/git/prs/{pr_id}.json"
         save_json(path, pr)
-        self._state.pr_registry.append({"pr_id": pr_id, "ticket_id": ticket_id, "author": author, "status": "open"})
+        self._mem.upsert_pr(pr)
         self._mem.embed_artifact(
             id=pr_id, type="pr", title=title, content=json.dumps(pr),
             day=self._state.day, date=str(self._state.current_date.date()),
@@ -391,16 +374,15 @@ class GitSimulator:
         return pr
 
     def merge_pr(self, pr_id: str):
-        for pr in self._state.pr_registry:
-            if pr["pr_id"] == pr_id:
-                pr["status"] = "merged"
-                path = f"{BASE}/git/prs/{pr_id}.json"
-                if os.path.exists(path):
-                    with open(path) as f:
-                        data = json.load(f)
-                    data["status"] = "merged"
-                    save_json(path, data)
-                break
+        self._mem._prs.update_one(
+            {"pr_id": pr_id}, {"$set": {"status": "merged"}}
+        )
+        path = f"{BASE}/git/prs/{pr_id}.json"
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+            data["status"] = "merged"
+            save_json(path, data)
 
 # ─────────────────────────────────────────────
 # 5. HELPERS
@@ -437,15 +419,10 @@ def persona_backstory(name: str, mem: Optional[Memory] = None, extra: str = "", 
 
     return f"{voice_card}{history} {extra}"
 
-def next_conf_id(state: State, prefix: str = "ENG") -> str:
-    n = len([p for p in state.confluence_pages if prefix in p["id"]]) + 1
-    return f"CONF-{prefix}-{n:03d}"
-
 def next_jira_id(state, registry=None) -> str:
     if registry is not None:
         return registry.next_jira_id()
-    # Fallback — should not be reached once registry is wired
-    return f"ORG-{len(state.jira_tickets) + 100}"
+    raise RuntimeError("next_jira_id()")
 
 def bill_gap_warning(topic: str) -> str:
     """Scans all departed employees (not just Bill) for knowledge gap warnings."""
@@ -486,6 +463,7 @@ class Flow(Flow[State]):
             all_names=ALL_NAMES,
             leads=LEADS,
             worker_llm=WORKER_MODEL,
+            base_export_dir=BASE,
         )
         self._registry = ArtifactRegistry(self._mem, base_export_dir=BASE)
         self._confluence = ConfluenceWriter(
@@ -498,8 +476,7 @@ class Flow(Flow[State]):
             clock=self._clock,
             lifecycle=self._lifecycle,
             persona_helper=persona_backstory,
-            graph_dynamics=self.graph_dynamics,
-            base_export_dir=BASE,
+            graph_dynamics=self.graph_dynamics
         )
         self._normal_day = NormalDayHandler(
             config=CONFIG, mem=self._mem, state=self.state,
@@ -507,16 +484,21 @@ class Flow(Flow[State]):
             git=self._git, worker_llm=WORKER_MODEL, planner_llm=PLANNER_MODEL,
             clock=self._clock, persona_helper=persona_backstory,
             confluence_writer=self._confluence,
+            vader=vader,
         )
+        self._recurrence_detector = RecurrenceDetector(self._mem)
+        orgforge_token_listener.attach(self._mem)
 
         stats = self._mem.stats()
         logger.info(f"[dim]Memory: provider={stats['embed_provider']} model={stats['embed_model']} dims={stats['embed_dims']} MongoDB={'✓' if stats['mongodb_ok'] else '⚠'}[/dim]")
 
     def _is_sprint_planning_day(self) -> bool:
-        return self.state.current_date.weekday() == 0 and self.state.day % 10 == 1
+        sprint_length = CONFIG["simulation"].get("sprint_length_days", 10)
+        return self.state.day % sprint_length == 1
 
     def _is_retro_day(self) -> bool:
-        return self.state.current_date.weekday() == 4 and self.state.day % 10 == 9
+        sprint_length = CONFIG["simulation"].get("sprint_length_days", 10)
+        return self.state.day % sprint_length == (sprint_length - 1)
 
     def _is_standup_day(self) -> bool:
         return self.state.current_date.weekday() in (0, 2, 4)
@@ -552,6 +534,11 @@ class Flow(Flow[State]):
     # ─── GENESIS ─────────────────────────────
     @start()
     def genesis_phase(self):
+        if self._mem.has_genesis_artifacts():
+            logger.info("[bold green]⏩ Genesis Guard: Corporate history exists. Skipping LLM generation.[/bold green]")
+            # The Registry seeds itself from Mongo in __init__, so IDs are already synced.
+            return
+        
         logger.info(Panel.fit(
             f"[bold cyan]{COMPANY_NAME.upper()} — ORGFORGE SIMULATION[/bold cyan]\n"
             f"[dim]Preset: {_PRESET_NAME} | Provider: {_PROVIDER} | Seeding corporate archives...[/dim]",
@@ -565,8 +552,8 @@ class Flow(Flow[State]):
 
         eng_dept   = next((d for d in ORG_CHART if "engineer" in d.lower() or "eng" in d.lower()), list(ORG_CHART.keys())[0])
         sales_dept = next((d for d in ORG_CHART if "sales" in d.lower() or "market" in d.lower()), list(ORG_CHART.keys())[-1])
-        eng_members  = random.sample(ORG_CHART[eng_dept],   min(3, len(ORG_CHART[eng_dept])))
-        sale_members = random.sample(ORG_CHART[sales_dept], min(2, len(ORG_CHART[sales_dept])))
+        eng_member  = random.choice(ORG_CHART[eng_dept])
+        sale_member = random.choice(ORG_CHART[sales_dept])
 
         tech_cfg = CONFIG.get("genesis_docs", {}).get("technical", {})
         biz_cfg  = CONFIG.get("genesis_docs", {}).get("business",  {})
@@ -575,13 +562,14 @@ class Flow(Flow[State]):
         self._confluence.write_genesis_batch(
             prefix=tech_cfg.get("id_prefix", "CONF-ENG").replace("CONF-", ""),
             count=tech_cfg.get("count", 3),
-            prompt_tpl=render_template(tech_cfg.get("prompt",
-                "Write a single Confluence page with ID {id} about {project_name} "
-                "and {legacy_system}. Authors: {authors}. "
+            prompt_tpl=(
+                "You are {author}. Write a single Confluence page with ID {id} about {project_name} "
+                "and {legacy_system}. "
                 "Existing related pages you may reference: {related_pages}. "
-                "Output only Markdown."
-            )),
-            authors=eng_members,
+                "Output only Markdown. Do not include an author block, contributor list, "
+                "or metadata section in your output."
+            ),
+            author=eng_member,
             subdir="archives",
         )
 
@@ -589,15 +577,17 @@ class Flow(Flow[State]):
         self._confluence.write_genesis_batch(
             prefix=biz_cfg.get("id_prefix", "CONF-MKT").replace("CONF-", ""),
             count=biz_cfg.get("count", 2),
-            prompt_tpl=render_template(biz_cfg.get("prompt",
-                "Write a single Confluence page with ID {id} for {company_name}. "
-                "Authors: {authors}. "
+            prompt_tpl=(
+                "You are {author}. Write a single Confluence page with ID {id} for {company} "
+                "about {product_page} campaign planning and go-to-market strategy. "
                 "Existing related pages you may reference: {related_pages}. "
-                "Output only Markdown."
-            )),
-            authors=sale_members,
+                "Output only Markdown. Do not include an author block, contributor list, "
+                "or metadata section in your output."
+            ),
+            author=sale_member,
             extra_vars={"product_page": PRODUCT_PAGE},
             subdir="archives",
+            tags=["genesis"]
         )
 
         logger.info(
@@ -608,6 +598,20 @@ class Flow(Flow[State]):
     # ─── DAILY LOOP ───────────────────────────
     @listen(genesis_phase)
     def daily_cycle(self):
+        latest = self._mem.load_latest_checkpoint()
+        if latest:
+            logger.info(f"[bold cyan]♻️ Resuming simulation from Day {latest['day']}...[/bold cyan]")
+            self.state.day = latest['day'] + 1
+            self.state.team_morale = latest['state_vars']['morale']
+            self.state.system_health = latest['state_vars']['health']
+            
+            # Restore the 'Live' state of the secondary systems
+            self.graph_dynamics._stress = latest['stress']
+            self.state.actor_cursors = latest['cursors']
+            
+            # Re-sync current_date string back to a datetime object
+            self.state.current_date = datetime.strptime(latest['state_vars']['date'], "%Y-%m-%d")
+
         while self.state.day <= self.state.max_days:
             dow = self.state.current_date.weekday()
             if dow >= 5:
@@ -630,6 +634,12 @@ class Flow(Flow[State]):
                 lifecycle_context=self._lifecycle.get_roster_context(),
                 clock=self._clock
             )
+            if org_plan is None:
+                logger.error(f"[flow] Day {self.state.day}: DayPlanner returned None — skipping normal day")
+                continue  # or raise, depending on how strict you want to be
+            self.state.org_day_plan = org_plan
+
+            self._mem._current_day = self.state.day
             self.state.daily_theme  = org_plan.org_theme
             self.state.org_day_plan = org_plan
             self._print_day_header()
@@ -651,6 +661,17 @@ class Flow(Flow[State]):
                 if random.random() < CONFIG["simulation"].get("adhoc_confluence_prob", 0.3):
                     self._generate_adhoc_confluence_page()
 
+            self._mem.save_checkpoint(
+                day=self.state.day,
+                state_vars={
+                    "morale": self.state.team_morale,
+                    "health": self.state.system_health,
+                    "date": str(self.state.current_date.date())
+                },
+                stress=self.graph_dynamics._stress,
+                cursors=self.state.actor_cursors
+            )
+
             self._end_of_day()
             self.state.day += 1
             self.state.current_date += timedelta(days=1)
@@ -659,118 +680,277 @@ class Flow(Flow[State]):
 
     # ─── SPRINT PLANNING ──────────────────────
     def _handle_sprint_planning(self):
-        logger.info(f"  [bold blue]📋 Sprint #{self.state.sprint.sprint_number} Planning[/bold blue]")
-        attendees = list(set(list(LEADS.values()) + random.sample(ALL_NAMES, 3)))
-        raw_themes = CONFIG.get("sprint_ticket_themes", ["Refactor legacy system", "Add retry logic", "Fix errors", "QA regression"])
-        ticket_themes = [render_template(t) for t in raw_themes]
-        n_tickets = CONFIG["simulation"].get("sprint_tickets_per_planning", 4)
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        sprint_num = self.state.sprint.sprint_number
+        logger.info(f"  [bold blue]📋 Sprint #{sprint_num} Planning (LLM-driven)[/bold blue]")
+
+        active = list(dict.fromkeys(getattr(self.state, "daily_active_actors", [])))
+        leads = list(LEADS.values())
+        if len(active) >= 4:
+            attendees = list(dict.fromkeys(leads + random.sample(active, min(3, len(active)))))
+        else:
+            attendees = list(dict.fromkeys(leads + random.sample(ALL_NAMES, min(3, len(ALL_NAMES)))))
         meeting_time = self._clock.schedule_meeting(attendees, min_hour=9, max_hour=11)
         timestamp_str = meeting_time.isoformat()
-        
-        new_tickets = []
-        for theme in random.sample(ticket_themes, min(n_tickets, len(ticket_themes))):
-            tid = self._registry.next_jira_id()
-            self._registry.register_jira(tid)
-            assignee = random.choice(ALL_NAMES)
-            pts = random.choice([1, 2, 3, 5, 8])
-            ticket = {
-                "id": tid, "title": theme, "status": "To Do", "assignee": assignee,
-                "sprint": self.state.sprint.sprint_number, "story_points": pts, "linked_prs": [],
-                "created_at": timestamp_str,
-                "updated_at": timestamp_str
-            }
-            self.state.jira_tickets.append(ticket)
-            self.state.sprint.tickets_in_sprint.append(tid)
-            new_tickets.append(ticket)
-            save_json(f"{BASE}/jira/{tid}.json", ticket)
-            self._embed_and_count(id=tid, type="jira", title=theme, content=json.dumps(ticket), day=self.state.day, 
-                                  date=str(self.state.current_date.date()), metadata={"assignee": assignee}, timestamp=timestamp_str)
+        date_str = str(self.state.current_date.date())
 
-        sprint_facts = {
-            "sprint_number": self.state.sprint.sprint_number,
-            "tickets": [{"id": t["id"], "title": t["title"], "assignee": t["assignee"], "points": t["story_points"]} for t in new_tickets],
-            "total_points": sum(t["story_points"] for t in new_tickets),
-            "sprint_goal": render_template(CONFIG.get("sprint_goal_template", "Stabilize {legacy_system} and deliver sprint features")),
-        }
+        # ── Step 1: LLM generates sprint theme (one call, cheap) ──────────────
+        ctx = self._mem.context_for_prompt(
+            f"sprint {sprint_num} system health incidents velocity backlog",
+            n=4, as_of_time=timestamp_str
+        )
+
+        product_dept = next((d for d in LEADS if "product" in d.lower()), None)
+        product_lead = LEADS.get(product_dept, LEADS[next(iter(LEADS))])
+
+        product_agent = Agent(
+             role="Product Manager",
+            goal="Propose a sprint theme grounded in business priorities.",
+            backstory=persona_backstory(product_lead, self._mem, graph_dynamics=self.graph_dynamics),
+            llm=PLANNER_MODEL,
+        )
+        product_task = Task(
+            description=(
+                f"It's Sprint #{sprint_num} planning at {COMPANY_NAME}.\n"
+                f"System health: {self.state.system_health}/100. Morale: {self.state.team_morale:.2f}.\n"
+                f"Recent context:\n{ctx}\n\n"
+                f"Propose a sprint theme as a single sentence grounded in customer needs, "
+                f"roadmap priorities, or recent sales signals. Be specific to {INDUSTRY}. "
+                f"Output only the theme sentence."
+            ),
+            expected_output="One sentence sprint theme proposal.",
+            agent=product_agent,
+        )
+
+        eng_dept = next((d for d in LEADS if "eng" in d.lower()), None)
+        eng_lead = LEADS.get(eng_dept, LEADS[next(iter(LEADS))])
+
+        eng_agent = Agent(
+            role="Engineering Lead",
+            goal="Ratify or amend the sprint theme based on technical reality.",
+            backstory=persona_backstory(eng_lead, self._mem, graph_dynamics=self.graph_dynamics),
+            llm=PLANNER_MODEL,
+        )
+        eng_task = Task(
+            description=(
+                f"The Product Manager proposed this sprint theme: {{proposed_theme}}\n"
+                f"System health: {self.state.system_health}/100. Morale: {self.state.team_morale:.2f}.\n"
+                f"Either accept it as-is or amend it to reflect technical constraints. "
+                f"Output only the final one-sentence theme."
+            ),
+            expected_output="One sentence final sprint theme.",
+            agent=eng_agent,
+            context=[product_task],
+        )
+
+        sprint_theme = str(
+            Crew(agents=[product_agent, eng_agent], tasks=[product_task, eng_task], verbose=False).kickoff()
+        ).strip()
+        logger.info(f"    [cyan]🎯 Sprint theme:[/cyan] {sprint_theme}")
+
+        self.state.sprint.sprint_theme = sprint_theme
+
+        # ── Step 2: Per-dept ticket generation in parallel ─────────────────────
+        n_per_dept = CONFIG["simulation"].get("sprint_tickets_per_planning", 4)
+        all_new_tickets: list = []
+        lock = threading.Lock()
+
+        def _generate_dept_tickets(dept: str, members: list) -> list:
+            dept_ctx = self._mem.context_for_prompt(
+                f"{dept} {sprint_theme} backlog tasks", n=2, as_of_time=timestamp_str
+            )
+            lead_name = LEADS.get(dept, members[0])
+            agent = Agent(
+                role=f"{dept} Lead",
+                goal=f"Create realistic sprint tickets for the {dept} team.",
+                backstory=persona_backstory(lead_name, self._mem, graph_dynamics=self.graph_dynamics),
+                llm=WORKER_MODEL,
+            )
+            member_list = ", ".join(members)
+            task = Task(
+                description=(
+                    f"Sprint #{sprint_num} theme: \"{sprint_theme}\"\n"
+                    f"Department: {dept}\n"
+                    f"Team members: {member_list}\n"
+                    f"Recent dept context:\n{dept_ctx}\n\n"
+                    f"Create exactly {n_per_dept} Jira tickets for this sprint that align with the sprint theme.\n"
+                    f"Each ticket must:\n"
+                    f"  - Be concrete and specific (not 'improve performance' but 'reduce /search endpoint p99 from 800ms to 300ms')\n"
+                    f"  - Be realistic work for a {dept} team at {COMPANY_NAME} ({INDUSTRY})\n"
+                    f"  - Reference real systems, endpoints, or workflows from the context where possible\n"
+                    f"  - Have story points (1, 2, 3, 5, or 8) based on complexity\n\n"
+                    f"Respond ONLY with a JSON array:\n"
+                    f"[\n"
+                    f'  {{"title": "string", "story_points": int, "description": "string (2 sentences)"}},\n'
+                    f"  ...\n"
+                    f"]\n"
+                    f"No preamble. No markdown fences. Raw JSON only."
+                ),
+                expected_output=f"JSON array of {n_per_dept} ticket objects.",
+                agent=agent,
+            )
+            raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+
+            # Parse — strip accidental fences
+            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("` \n")
+            try:
+                proposals = json.loads(raw)
+                if not isinstance(proposals, list):
+                    raise ValueError("Not a list")
+            except Exception as e:
+                logger.warning(f"[sprint] {dept} ticket parse failed: {e}. Raw: {raw[:200]}")
+                # Graceful fallback: one generic ticket so the sprint isn't empty
+                proposals = [{"title": f"{sprint_theme} — {dept} work", "story_points": 2, "description": ""}]
+
+            dept_tickets = []
+            with lock:
+                for proposal in proposals[:n_per_dept]:
+                    tid = self._registry.next_jira_id()
+                    self._registry.register_jira(tid)
+                    ticket = {
+                        "id": tid,
+                        "title": proposal.get("title", f"{sprint_theme} — {dept}"),
+                        "description": proposal.get("description", ""),
+                        "status": "To Do",
+                        "assignee": None,           # TicketAssigner owns this next morning
+                        "dept": dept,
+                        "sprint": sprint_num,
+                        "sprint_theme": sprint_theme,
+                        "story_points": proposal.get("story_points", 2),
+                        "linked_prs": [],
+                        "created_at": timestamp_str,
+                        "updated_at": timestamp_str,
+                    }
+                    self._mem.upsert_ticket(ticket)
+                    save_json(f"{BASE}/jira/{tid}.json", ticket)
+                    self.state.sprint.tickets_in_sprint.append(tid)
+                    dept_tickets.append(ticket)
+                    self._embed_and_count(
+                        id=tid, type="jira",
+                        title=ticket["title"],
+                        content=json.dumps(ticket),
+                        day=self.state.day,
+                        date=date_str,
+                        metadata={"dept": dept, "sprint_theme": sprint_theme},
+                        timestamp=timestamp_str,
+                    )
+            return dept_tickets
+
+        depts = [(dept, members) for dept, members in LIVE_ORG_CHART.items()]
+        with ThreadPoolExecutor(max_workers=len(depts)) as pool:
+            futures = {pool.submit(_generate_dept_tickets, dept, members): dept for dept, members in depts}
+            for future in as_completed(futures):
+                dept = futures[future]
+                try:
+                    tickets = future.result()
+                    all_new_tickets.extend(tickets)
+                    logger.info(f"    [green]✓ {dept}:[/green] {[t['id'] for t in tickets]}")
+                except Exception as e:
+                    logger.error(f"    [red]✗ {dept} ticket gen failed:[/red] {e}")
+
+        for ticket in all_new_tickets:
+            self._mem.log_event(SimEvent(
+                type="jira_ticket_created",
+                day=self.state.day,
+                date=date_str,
+                timestamp=timestamp_str,
+                actors=[LEADS.get(ticket["dept"], attendees[0])],
+                artifact_ids={"jira": ticket["id"]},
+                facts={
+                    "sprint_number": sprint_num,
+                    "sprint_theme": sprint_theme,
+                    "title": ticket["title"],
+                    "points": ticket["story_points"],
+                    "dept": ticket["dept"],
+                    "status": "To Do",
+                },
+                summary=f"[{ticket['id']}] {ticket['title']} ({ticket['dept']})",
+                tags=["jira", "sprint_backlog", ticket["dept"].lower()],
+            ))
 
         self._mem.log_event(SimEvent(
-            type="sprint_planned", day=self.state.day, date=str(self.state.current_date.date()), timestamp=timestamp_str,
-            actors=attendees, artifact_ids={"jira_tickets": json.dumps([t["id"] for t in new_tickets])},
-            facts=sprint_facts, summary=f"Sprint #{sprint_facts['sprint_number']} planned.", tags=["sprint", "planning"],
+            type="sprint_planned",
+            day=self.state.day, date=date_str, timestamp=timestamp_str,
+            actors=attendees,
+            artifact_ids={"jira_tickets": [t["id"] for t in all_new_tickets]},
+            facts={
+                "sprint_number": sprint_num,
+                "sprint_theme": sprint_theme,
+                "tickets": [{"id": t["id"], "title": t["title"], "dept": t["dept"], "points": t["story_points"]} for t in all_new_tickets],
+                "total_points": sum(t["story_points"] for t in all_new_tickets),
+                "depts": list({t["dept"] for t in all_new_tickets}),
+            },
+            summary=f"Sprint #{sprint_num} planned: \"{sprint_theme}\" — {len(all_new_tickets)} tickets across {len(LIVE_ORG_CHART)} depts.",
+            tags=["sprint", "planning"],
         ))
 
         self._record_daily_actor(*attendees)
         self._record_daily_event("sprint_planned")
+        logger.info(f"    [bold green]✓ Sprint #{sprint_num} — {len(all_new_tickets)} tickets. Theme: {sprint_theme}[/bold green]")
 
-        logger.info(f"    [green]✓[/green] {[t['id'] for t in new_tickets]}")
-
-    # ─── STANDUP (LLM) ────────────────────────
     def _handle_standup(self):
         logger.info(f"  [bold blue]☕ Multi-Agent Standup[/bold blue]")
-        attendees = random.sample(ALL_NAMES, min(8, len(ALL_NAMES)))
+        
+        # Deriving all_names from the config provided in your files
+        all_names = [n for dept in CONFIG["org_chart"].values() for n in dept]
+        attendees = random.sample(all_names, min(8, len(all_names)))
+        
         meeting_time = self._clock.schedule_meeting(attendees, min_hour=9, max_hour=10, duration_mins=15)
         meeting_time_iso = meeting_time.isoformat()
-        
+        date_str = str(self.state.current_date.date())
+
         messages = []
         for name in attendees:
-            # 1. Fetch the persistent persona + live stress context
+            # Referencing your persona and RAG methods
             backstory = persona_backstory(name, mem=self._mem, graph_dynamics=self.graph_dynamics)
+            persona_cfg = CONFIG.get("personas", {}).get(name, {})
             
-            # 2. Get specific context for this person's current work
-            p = PERSONAS.get(name, DEFAULT_PERSONA)
             personal_ctx = self._mem.context_for_prompt(
-                f"{name} {p.get('expertise')} recent tasks", 
-                n=2, 
-                as_of_time=meeting_time_iso
+                f"{name} {persona_cfg.get('expertise')} recent tasks", 
+                n=2, as_of_time=meeting_time_iso
             )
 
-            # 3. Create a dedicated Agent for THIS person
             standup_agent = Agent(
-                role=f"{dept_of(name)} Team Member",
+                role=f"{dept_of_name(name, CONFIG['org_chart'])} Team Member", # Using utility
                 goal="Provide a realistic, character-accurate Slack standup update.",
-                backstory=backstory, # Carries typing quirks and stress
-                llm=WORKER_MODEL
+                backstory=backstory,
+                llm=WORKER_MODEL # Using your flow.py class attribute
             )
 
             task = Task(
                 description=(
                     f"It's the morning standup. Write your Slack update (1-3 sentences).\n"
                     f"CONTEXT: {personal_ctx}\n\n"
-                    f"RULES:\n"
-                    f"- Use your specific TYPING QUIRKS from your backstory.\n"
-                    f"- Mention what you did yesterday or what's blocking you.\n"
-                    f"- Be messy: use fragments or lower-case if that is your style.\n"
-                    f"Format: [Message only]"
+                    f"RULES: Use your typing quirks. Format: [Message only]"
                 ),
                 expected_output="A single Slack message in character.",
                 agent=standup_agent
             )
 
-            # 4. Generate the individual response
             response = str(Crew(agents=[standup_agent], tasks=[task], verbose=False).kickoff()).strip()
             
             messages.append({
                 "user": name,
                 "text": response,
-                "ts": meeting_time_iso
+                "ts": meeting_time_iso,
+                "thread_ts": meeting_time_iso,
+                "day": self.state.day,
+                "date": date_str
             })
 
-        # 5. Save and Log (Standard Logic)
-        date_str = str(self.state.current_date.date())
-        slack_path = f"{BASE}/slack/channels/standup/{date_str}.json"
-        save_json(slack_path, messages)
+        slack_path, thread_id = self._mem.log_slack_messages("standup", messages, export_dir=EXPORT_DIR)
         
-        self.state.slack_threads.append({"date": date_str, "channel": "standup", "message_count": len(messages)})
         self._mem.log_event(SimEvent(
             type="standup", 
             timestamp=meeting_time_iso, 
             day=self.state.day, 
             date=date_str, 
             actors=attendees, 
-            artifact_ids={"slack": slack_path}, 
+            artifact_ids={"slack_path": slack_path, "slack_thread": thread_id}, 
             facts={"attendee_count": len(messages)}, 
-            summary=f"Standup: {len(messages)} unique voices shared updates.", 
+            summary=f"Standup: {len(messages)} voices shared updates.", 
             tags=["standup"]
         ))
 
@@ -780,89 +960,357 @@ class Flow(Flow[State]):
     # ─── RETROSPECTIVE ────────────────────────
     def _handle_retrospective(self):
         logger.info(f"  [bold blue]🔄 Retro — Sprint #{self.state.sprint.sprint_number}[/bold blue]")
-        conf_id = next_conf_id(self.state, "RETRO")
 
-        attendees = ALL_NAMES
-        meeting_time = self._clock.schedule_meeting(attendees, min_hour=14, max_hour=16, duration_mins=60)
+        sprint_num  = self.state.sprint.sprint_number
+        date_str    = str(self.state.current_date.date())
+        conf_id     = self._registry.next_id("RETRO")
+        self._registry.register_confluence(conf_id, f"Retro Sprint #{sprint_num}")
+
+        # ── Attendees: engineering + product only ────────────────────────────────
+        sprint_depts = {"engineering", "product"}
+        attendees = [
+            n for n in ALL_NAMES
+            if dept_of_name(n, ORG_CHART).lower() in sprint_depts
+        ]
+
+        meeting_time     = self._clock.schedule_meeting(attendees, min_hour=14, max_hour=16, duration_mins=60)
         meeting_time_iso = meeting_time.isoformat()
-        ctx = self._mem.context_for_prompt(f"sprint {self.state.sprint.sprint_number} incidents velocity", n=4, as_of_time=meeting_time_iso)
-        scrum_master = resolve_role("scrum_master")
-        historian = Agent(role="Scrum Master", goal="Write retro.", backstory=persona_backstory(scrum_master, self._mem, graph_dynamics=self.graph_dynamics), llm=PLANNER_MODEL)
-        task = Task(description=f"Write retro Confluence {conf_id} for Sprint #{self.state.sprint.sprint_number}.\nContext:\n{ctx}\nSections: What went well, What didn't, Action items.", expected_output="Markdown.", agent=historian)
-        content = str(Crew(agents=[historian], tasks=[task], verbose=False).kickoff())
+
+        # ── Sprint-bounded context only ──────────────────────────────────────────
+        sprint_length  = CONFIG["simulation"].get("sprint_length_days", 10)
+        sprint_start_iso = self.state.sprint.start_date(
+            self.state.current_date - timedelta(days=self.state.day - self.state.sprint.start_day),
+            sprint_length
+        ).isoformat()
+        ctx = self._mem.context_for_prompt(
+            f"sprint {sprint_num} incidents velocity blockers morale",
+            n=6,
+            since=sprint_start_iso,
+            as_of_time=meeting_time_iso,
+        )
+
+        # ── Participants ─────────────────────────────────────────────────────────
+        scrum_master  = resolve_role("scrum_master")
+        eng_dept      = next((d for d in LEADS if "engineering" in d.lower()), None)
+        eng_lead      = LEADS.get(eng_dept)
+        product_dept  = next((d for d in LEADS if "product" in d.lower()), None)
+        product_lead  = LEADS.get(product_dept)
+
+        sprint_leads  = [p for p in [scrum_master, eng_lead, product_lead] if p]
+
+        # ── Per-voice agents ─────────────────────────────────────────────────────
+        agents    = []
+        tasks     = []
+        prev_task = None
+
+        role_prompts = {
+            eng_lead: (
+                "Engineering Lead",
+                f"Reflect on Sprint #{sprint_num} from an engineering perspective. "
+                f"Cover: velocity, incidents, technical debt surfaced, and any process "
+                f"friction the team hit. Be specific — reference actual events where "
+                f"possible. 3-5 bullet points."
+            ),
+            product_lead: (
+                "Product Manager",
+                f"Reflect on Sprint #{sprint_num} from a product perspective. "
+                f"Cover: whether sprint goals were met, any scope changes mid-sprint, "
+                f"and customer or stakeholder signals that should shape the next sprint. "
+                f"3-5 bullet points."
+            ),
+            scrum_master: (
+                "Scrum Master",
+                f"You have heard from engineering and product. Now synthesize their input "
+                f"into a Confluence retrospective document ({conf_id}) for Sprint #{sprint_num}.\n\n"
+                f"Sections:\n"
+                f"## What Went Well\n"
+                f"## What Didn't\n"
+                f"## Action Items (owner + due sprint)\n\n"
+                f"System health: {self.state.system_health}/100. "
+                f"Team morale: {self.state.team_morale:.2f}.\n"
+                f"Ground action items in the problems raised — no generic platitudes."
+            ),
+        }
+
+        for name in sprint_leads:
+            role_label, desc = role_prompts.get(name, ("Team Member", "Share your sprint reflections."))
+
+            agent = Agent(
+                role=role_label,
+                goal=f"Contribute authentically to the Sprint #{sprint_num} retrospective.",
+                backstory=persona_backstory(name, self._mem, graph_dynamics=self.graph_dynamics),
+                llm=PLANNER_MODEL,
+            )
+            task = Task(
+                description=f"Context from this sprint:\n{ctx}\n\n{desc}",
+                expected_output="Markdown contribution to the retrospective.",
+                agent=agent,
+                context=[prev_task] if prev_task else [],
+            )
+
+            agents.append(agent)
+            tasks.append(task)
+            prev_task = task
+
+        content = str(
+            Crew(agents=agents, tasks=tasks, process=Process.sequential, verbose=False).kickoff()
+        )
+
+        # ── Persist ──────────────────────────────────────────────────────────────
         path = f"{BASE}/confluence/retros/{conf_id}.md"
         save_md(path, content)
-        entry = {"id": conf_id, "title": f"Retro Sprint #{self.state.sprint.sprint_number}", "summary": "Sprint Retrospective", "path": path}
-        self.state.confluence_pages.append(entry)
-        self._embed_and_count(id=conf_id, type="confluence", title=entry["title"], content=content, day=self.state.day, date=str(self.state.current_date.date()),
-                              timestamp=meeting_time_iso)
-        self._mem.log_event(SimEvent(type="retrospective", timestamp=meeting_time_iso, day=self.state.day, date=str(self.state.current_date.date()), 
-                            actors=list(LEADS.values()), artifact_ids={"confluence": conf_id}, facts={"sprint_number": self.state.sprint.sprint_number}, 
-                            summary=f"Sprint #{self.state.sprint.sprint_number} retrospective.", tags=["retrospective", "sprint"]))
-        self.state.sprint.sprint_number += 1
-        self.state.sprint.tickets_in_sprint = []
 
-        self._record_daily_actor(*list(LEADS.values()))
+        self._embed_and_count(
+            id=conf_id, type="confluence", title=f"Retro Sprint #{sprint_num}",
+            content=content, day=self.state.day, date=date_str, timestamp=meeting_time_iso,
+        )
+
+        self._mem.log_event(SimEvent(
+            type="retrospective",
+            timestamp=meeting_time_iso,
+            day=self.state.day,
+            date=date_str,
+            actors=attendees,
+            artifact_ids={"confluence": conf_id},
+            facts={
+                "sprint_number":  sprint_num,
+                "system_health":  self.state.system_health,
+                "team_morale":    self.state.team_morale,
+                "sprint_start":   sprint_start_iso,
+            },
+            summary=f"Sprint #{sprint_num} retrospective.",
+            tags=["retrospective", "sprint"],
+        ))
+
+        # ── Close sprint ─────────────────────────────────────────────────────────
+        self._close_sprint()
+        self._record_daily_actor(*attendees)
         self._record_daily_event("retrospective")
         logger.info(f"    [green]✓[/green] {conf_id}")
 
+
+    def _close_sprint(self) -> None:
+        """Advance sprint counter and reset per-sprint state."""
+        self.state.sprint.sprint_number    += 1
+        self.state.sprint.tickets_in_sprint = []
+
+    # ─── INCIDENT DETECTION ───────────────────
     # ─── INCIDENT DETECTION ───────────────────
     def _handle_incident(self):
         ticket_id     = next_jira_id(self.state, self._registry)
         on_call       = resolve_role("on_call_engineer")
         incident_lead = resolve_role("incident_commander")
-        eng_peer      = next((n for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), []) if n != on_call), on_call)
+        eng_peer      = next(
+            (n for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), []) if n != on_call),
+            on_call
+        )
 
-        incident_start = self._clock.tick_system(min_mins=30, max_mins=240)
+        incident_start     = self._clock.tick_system(min_mins=30, max_mins=240)
         incident_start_iso = incident_start.isoformat()
+        date_str           = str(self.state.current_date.date())
 
         self._clock.sync_to_system([on_call])
 
-        rc_agent = Agent(role="Senior Engineer", goal="Diagnose root cause.", backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics), llm=PLANNER_MODEL)
-        rc_task  = Task(description=f"Theme: {self.state.daily_theme}\nWrite ONE specific technical root cause (max 20 words).", expected_output="One sentence.", agent=rc_agent)
+        # ── 1. Root cause ─────────────────────────────────────────────────────
+        rc_agent   = Agent(
+            role="Senior Engineer",
+            goal="Diagnose root cause.",
+            backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics),
+            llm=PLANNER_MODEL,
+        )
+        rc_task    = Task(
+            description=(
+                f"Theme: {self.state.daily_theme}\n"
+                f"Write ONE specific technical root cause (max 20 words)."
+            ),
+            expected_output="One sentence.",
+            agent=rc_agent,
+        )
         root_cause = str(Crew(agents=[rc_agent], tasks=[rc_task], verbose=False).kickoff()).strip()
 
+        # ── 2. Knowledge gap detection ────────────────────────────────────────
         involves_gap = any(
             k.lower() in root_cause.lower()
             for emp in DEPARTED_EMPLOYEES.values()
             for k in emp["knew_about"]
         )
 
+        # Build detailed gap context for description + embedding
+        gap_areas:       List[str] = []
+        gap_context_str: str       = ""
+        if involves_gap:
+            departed_details: List[str] = []
+            for emp_name, emp in DEPARTED_EMPLOYEES.items():
+                hits = [k for k in emp["knew_about"] if k.lower() in root_cause.lower()]
+                if hits:
+                    gap_areas.extend(hits)
+                    departed_details.append(
+                        f"{emp_name} (ex-{emp['role']}, left {emp['left']}, "
+                        f"{int(emp['documented_pct'] * 100)}% documented) "
+                        f"owned: {', '.join(hits)}"
+                    )
+            if departed_details:
+                gap_context_str = (
+                    f"KNOWLEDGE GAP FLAG: This incident touches underdocumented systems. "
+                    f"{' | '.join(departed_details)}. "
+                    f"Resolution may be blocked pending knowledge recovery."
+                )
+
         self._lifecycle.scan_for_knowledge_gaps(
             text=root_cause,
             triggered_by=ticket_id,
             day=self.state.day,
-            date_str=str(self.state.current_date.date()),
+            date_str=date_str,
             state=self.state,
-            timestamp=incident_start_iso
+            timestamp=incident_start_iso,
         )
 
-        title  = f"{LEGACY['name']}: {self.state.daily_theme[:60]}"
-        ticket = {"id": ticket_id, "title": title, "status": "In Progress", "assignee": on_call, "root_cause": root_cause, "linked_prs": []}
-        self.state.jira_tickets.append(ticket)
-        save_json(f"{BASE}/jira/{ticket_id}.json", ticket)
-        self._embed_and_count(id=ticket_id, type="jira", title=title, content=json.dumps(ticket), day=self.state.day, 
-                              date=str(self.state.current_date.date()), timestamp=incident_start_iso)
-
-        inc = ActiveIncident(ticket_id=ticket_id, title=title, day_started=self.state.day, involves_gap_knowledge=involves_gap, root_cause=root_cause)
-        self.state.active_incidents.append(inc)
-
-        self.state.daily_incidents_opened += 1
-
-        self._emit_bot_message(
-            "system-alerts", 
-            "Datadog", 
-            f"🚨 [CRITICAL] Anomaly detected: {root_cause[:40]}... Error rate spiked 400%. System health dropped to {self.state.system_health}.",
-            incident_start_iso
+        # ── 3. Recurrence detection ───────────────────────────────────────────
+        prior             = self._recurrence_detector.find_prior_incident(
+                                root_cause, self.state.day, ticket_id)
+        recurrence_of     = prior.artifact_ids.get("jira") if prior else None
+        recurrence_gap    = (self.state.day - prior.day)   if prior else None
+        prior_postmortem  = (
+            self._recurrence_detector.find_postmortem_for_ticket(recurrence_of)
+            if recurrence_of else None
         )
-        self._emit_bot_message(
-            "incidents", 
-            "PagerDuty", 
-            f"📞 Paging on-call engineer: {on_call}. Incident linked to [{ticket_id}].",
-            incident_start_iso
+
+        recurrence_str = (
+            f"Prior occurrence: {recurrence_of} — {recurrence_gap} days ago."
+            if recurrence_of else "First occurrence of this issue."
         )
+
+        # ── 4. Escalation chain ───────────────────────────────────────────────
+        gap_kw = [k for emp in DEPARTED_EMPLOYEES.values() for k in emp["knew_about"]]
+        chain  = self.graph_dynamics.build_escalation_chain(
+            first_responder=on_call,
+            domain_keywords=gap_kw if involves_gap else None,
+        )
+        escalation_narrative = self.graph_dynamics.escalation_narrative(chain)
+        escalation_actors    = [n for n, _ in chain.chain]
+
+        # ── 5. Bot alerts — capture thread ids before ticket is built ─────────
+        datadog_text   = (
+            f"🚨 [CRITICAL] Anomaly detected: {root_cause[:40]}... "
+            f"Error rate spiked 400%. System health dropped to {self.state.system_health}."
+        )
+        pagerduty_text = (
+            f"📞 Paging on-call engineer: {on_call}. Incident linked to [{ticket_id}]."
+        )
+        datadog_thread = self._emit_bot_message(
+            "system-alerts", "Datadog",   datadog_text,   incident_start_iso)
+        pagerduty_thread = self._emit_bot_message(
+            "incidents",     "PagerDuty", pagerduty_text, incident_start_iso)
+
         self.state.system_health = max(0, self.state.system_health - 15)
 
+        # ── 6. Causal chain — start it now, append as artifacts are created ───
+        chain_handler = CausalChainHandler(ticket_id)
+        chain_handler.append(datadog_thread)
+        chain_handler.append(pagerduty_thread)
+
+        # ── 7. Generate ticket description — all context is available now ─────
+        title      = f"{LEGACY['name']}: {self.state.daily_theme[:60]}"
+        desc_agent = Agent(
+            role="Senior Engineer",
+            goal="Write a concise Jira ticket description for an incident.",
+            backstory=persona_backstory(on_call, self._mem, graph_dynamics=self.graph_dynamics),
+            llm=WORKER_MODEL,
+        )
+        desc_task  = Task(
+            description=(
+                f"Write a Jira ticket description for this incident.\n\n"
+                f"Title: {title}\n"
+                f"Root cause: {root_cause}\n"
+                f"Escalation path: {escalation_narrative}\n"
+                f"System health at incident open: {self.state.system_health}/100\n"
+                f"{gap_context_str}\n"
+                f"{recurrence_str}\n\n"
+                f"Include:\n"
+                f"  - What is broken and how it manifests (1-2 sentences)\n"
+                f"  - Which system or component is affected\n"
+                f"  - User or business impact\n"
+                f"{'  - Note the knowledge gap and documentation risk explicitly\n' if gap_areas else ''}"
+                f"  - One acceptance criterion for resolution\n\n"
+                f"Keep it under 100 words. Write as {on_call} would in Jira."
+            ),
+            expected_output="A Jira ticket description under 100 words.",
+            agent=desc_agent,
+        )
+        description = str(
+            Crew(agents=[desc_agent], tasks=[desc_task], verbose=False).kickoff()
+        ).strip()
+
+        # ── 8. Build ticket with full context ─────────────────────────────────
+        ticket = {
+            "id":                  ticket_id,
+            "title":               title,
+            "description":         description,
+            "status":              "In Progress",
+            "assignee":            on_call,
+            "root_cause":          root_cause,
+            "linked_prs":          [],
+            "dept":                dept_of(on_call),
+            "sprint":              self.state.sprint.sprint_number,
+            # Causal chain
+            "causal_chain":        chain_handler.snapshot(),
+            "bot_threads":         [datadog_thread, pagerduty_thread],
+            # Recurrence
+            "recurrence_of":       recurrence_of,
+            "recurrence_gap_days": recurrence_gap,
+            "prior_postmortem":    prior_postmortem,
+            # Knowledge gap
+            "gap_areas":           gap_areas,
+            # Escalation
+            "escalation_actors":   escalation_actors,
+            "escalation_narrative": escalation_narrative,
+        }
+
+        self._mem.upsert_ticket(ticket)
+        save_json(f"{BASE}/jira/{ticket_id}.json", ticket)
+
+        # ── 9. Embed — now maximally rich, called last ────────────────────────
+        embed_content = "\n\n".join(filter(None, [
+            title,
+            description,
+            f"Root cause: {root_cause}",
+            f"Escalation: {escalation_narrative}",
+            f"Knowledge gap areas: {', '.join(gap_areas)}" if gap_areas else "",
+            f"Recurrence of: {recurrence_of} ({recurrence_gap} days ago)" if recurrence_of else "",
+        ]))
+
+        self._embed_and_count(
+            id=ticket_id,
+            type="jira",
+            title=title,
+            content=embed_content,
+            day=self.state.day,
+            date=date_str,
+            timestamp=incident_start_iso,
+            metadata={
+                "assignee":       on_call,
+                "dept":           dept_of(on_call),
+                "recurrence_of":  recurrence_of,
+                "has_recurrence": recurrence_of is not None,
+                "has_gap":        bool(gap_areas),
+                "gap_areas":      gap_areas,
+            },
+        )
+
+        # ── 10. Activate incident — chain_handler travels with it ─────────────
+        inc = ActiveIncident(
+            ticket_id=ticket_id,
+            title=title,
+            day_started=self.state.day,
+            involves_gap_knowledge=involves_gap,
+            root_cause=root_cause,
+            causal_chain=chain_handler,
+            recurrence_of=recurrence_of,
+        )
+        self.state.active_incidents.append(inc)
+        self.state.daily_incidents_opened += 1
+
+        # ── 11. External contacts ─────────────────────────────────────────────
         triggered_contacts = self.graph_dynamics.relevant_external_contacts(
             event_type="incident_opened",
             system_health=self.state.system_health,
@@ -871,76 +1319,85 @@ class Flow(Flow[State]):
         for contact in triggered_contacts:
             self._handle_external_contact(inc, contact)
 
+        # ── 12. SimEvents ─────────────────────────────────────────────────────
         self._mem.log_event(SimEvent(
-            type="incident_opened", timestamp=incident_start_iso,
-            day=self.state.day, date=str(self.state.current_date.date()),
-            actors=[on_call, incident_lead],
-            artifact_ids={"jira": ticket_id},
-            facts={"title": title, "root_cause": root_cause, "involves_gap": involves_gap},
-            summary=f"P1 incident {ticket_id}: {root_cause}", tags=["incident", "P1"]
-        ))
-
-        self._record_daily_actor(on_call, incident_lead)
-        self._record_daily_event("incident_opened")
-
-        self.graph_dynamics.apply_incident_stress([on_call, incident_lead])
-        self.graph_dynamics.record_incident_collaboration([on_call, incident_lead])
-
-        gap_kw = [k for emp in DEPARTED_EMPLOYEES.values() for k in emp["knew_about"]]
-        chain  = self.graph_dynamics.build_escalation_chain(
-            first_responder=on_call,
-            domain_keywords=gap_kw if involves_gap else None,
-        )
-        self._mem.log_event(SimEvent(
-            type="escalation_chain", 
+            type="incident_opened",
             timestamp=incident_start_iso,
             day=self.state.day,
-            date=str(self.state.current_date.date()),
-            actors=[n for n, _ in chain.chain],
-            artifact_ids={"jira": ticket_id},
-            facts={"chain": chain.chain,
-                "narrative": self.graph_dynamics.escalation_narrative(chain)},
-            summary=self.graph_dynamics.escalation_narrative(chain),
+            date=date_str,
+            actors=[on_call, incident_lead],
+            artifact_ids={
+                ARTIFACT_KEY_JIRA:         ticket_id,
+                ARTIFACT_KEY_SLACK_THREAD: pagerduty_thread,
+            },
+            facts={
+                "title":               title,
+                "root_cause":          root_cause,
+                "involves_gap":        involves_gap,
+                "gap_areas":           gap_areas,
+                "causal_chain":        chain_handler.snapshot(),
+                "recurrence_of":       recurrence_of,
+                "recurrence_gap_days": recurrence_gap,
+                "prior_postmortem":    prior_postmortem,
+                "bot_threads":         [datadog_thread, pagerduty_thread],
+            },
+            summary=f"P1 incident {ticket_id}: {root_cause}",
+            tags=["incident", "P1"] + (["knowledge_gap"] if involves_gap else []) + (["recurrence"] if recurrence_of else []),
+        ))
+
+        self._mem.log_event(SimEvent(
+            type="escalation_chain",
+            timestamp=incident_start_iso,
+            day=self.state.day,
+            date=date_str,
+            actors=escalation_actors,
+            artifact_ids={ARTIFACT_KEY_JIRA: ticket_id},
+            facts={
+                "chain":     chain.chain,
+                "narrative": escalation_narrative,
+            },
+            summary=escalation_narrative,
             tags=["escalation", "incident"],
         ))
 
-        # Emit knowledge_gap_detected if this incident touches a departed employee's systems
         if involves_gap:
-            gap_areas = [
-                k for emp in DEPARTED_EMPLOYEES.values()
-                for k in emp["knew_about"]
-                if k.lower() in self.state.daily_theme.lower()
-            ]
             self._mem.log_event(SimEvent(
-                type="knowledge_gap_detected", 
+                type="knowledge_gap_detected",
                 timestamp=incident_start_iso,
-                day=self.state.day, date=str(self.state.current_date.date()),
+                day=self.state.day,
+                date=date_str,
                 actors=[on_call, eng_peer],
-                artifact_ids={"jira": ticket_id},
-                facts={"gap_area": gap_areas or [LEGACY["name"]], "involves_gap": True},
-                summary=f"Knowledge gap detected during {ticket_id}: systems owned by departed employee.",
-                tags=["knowledge_gap"]
+                artifact_ids={ARTIFACT_KEY_JIRA: ticket_id},
+                facts={
+                    "gap_area":    gap_areas or [LEGACY["name"]],
+                    "involves_gap": True,
+                    "gap_context": gap_context_str,
+                },
+                summary=f"Knowledge gap detected during {ticket_id}: {gap_context_str[:80]}",
+                tags=["knowledge_gap"],
             ))
 
+        # ── 13. Graph dynamics ────────────────────────────────────────────────
+        self._record_daily_actor(on_call, incident_lead)
+        self._record_daily_event("incident_opened")
+        self.graph_dynamics.apply_incident_stress([on_call, incident_lead])
+        self.graph_dynamics.record_incident_collaboration([on_call, incident_lead])
+
+        # ── 14. Dept plan pressure ────────────────────────────────────────────
         if self.state.org_day_plan:
-           eng_key = next((k for k in self.state.org_day_plan.dept_plans
-                           if "eng" in k.lower()), None)
-           if eng_key:
-               eng_dept_plan = self.state.org_day_plan.dept_plans[eng_key]
+            eng_key = next(
+                (k for k in self.state.org_day_plan.dept_plans if "eng" in k.lower()), None
+            )
+            if eng_key:
+                eng_dept_plan    = self.state.org_day_plan.dept_plans[eng_key]
+                primary_hrs_lost = round(random.uniform(2.0, 5.5), 1)
+                peer_hrs_lost    = round(primary_hrs_lost * random.uniform(0.2, 0.6), 1)
 
-               # 1. Primary rolls their independent time (2.0 to 5.5 hours)
-               primary_hrs_lost = round(random.uniform(2.0, 5.5), 1)
-               
-               # 2. Peer rolls a DEPENDENT time (e.g., 20% to 60% of the primary's time)
-               # This guarantees the peer never works longer than the primary.
-               peer_fraction = random.uniform(0.2, 0.6)
-               peer_hrs_lost = round(primary_hrs_lost * peer_fraction, 1)
-
-               for ep in eng_dept_plan.engineer_plans:
-                   if ep.name in [on_call, incident_lead]:
-                       ep.apply_incident_pressure(inc.title, hrs_lost=primary_hrs_lost)
-                   elif ep.name == eng_peer:
-                       ep.apply_incident_pressure(inc.title, hrs_lost=peer_hrs_lost)
+                for ep in eng_dept_plan.engineer_plans:
+                    if ep.name in [on_call, incident_lead]:
+                        ep.apply_incident_pressure(inc.title, hrs_lost=primary_hrs_lost)
+                    elif ep.name == eng_peer:
+                        ep.apply_incident_pressure(inc.title, hrs_lost=peer_hrs_lost)
 
         logger.info(f"    [red]🚨 {ticket_id}:[/red] {root_cause[:65]}")
 
@@ -961,16 +1418,13 @@ class Flow(Flow[State]):
                 pr = self._git.create_pr(author=on_call, ticket_id=inc.ticket_id, title=f"[{inc.ticket_id}] Fix: {inc.root_cause[:60]}",
                                           timestamp=cron_time_iso)
 
-                for t in self.state.jira_tickets:
-                    if t["id"] == inc.ticket_id:
-                        if pr["pr_id"] not in t.get("linked_prs", []):
-                            t.setdefault("linked_prs", []).append(pr["pr_id"])
-                        
-                        # Update the timestamp to match the PR creation time!
-                        t["updated_at"] = cron_time_iso 
-                        
-                        save_json(f"{BASE}/jira/{inc.ticket_id}.json", t) # Update the JSON on disk
-                        break
+                t = self._mem.get_ticket(inc.ticket_id)
+                if t:
+                    if pr["pr_id"] not in t.get("linked_prs", []):
+                        t.setdefault("linked_prs", []).append(pr["pr_id"])
+                    t["updated_at"] = cron_time_iso
+                    self._mem.upsert_ticket(t)
+                    save_json(f"{BASE}/jira/{inc.ticket_id}.json", t)
 
                 self._emit_bot_message(
                     "engineering",
@@ -979,6 +1433,9 @@ class Flow(Flow[State]):
                     cron_time_iso
                 )
                 inc.pr_id = pr["pr_id"]
+                if getattr(inc, "causal_chain", None):
+                    inc.causal_chain.append(pr["pr_id"])
+
                 logger.info(f"    [yellow]🔧 {inc.ticket_id}:[/yellow] {pr['pr_id']} opened.")
                 still_active.append(inc)
 
@@ -1010,7 +1467,8 @@ class Flow(Flow[State]):
                     type="incident_resolved", timestamp=cron_time_iso,
                     day=self.state.day, date=str(self.state.current_date.date()),
                     actors=[on_call, eng_peer], artifact_ids={"jira": inc.ticket_id, "pr": inc.pr_id or ""},
-                    facts={"root_cause": inc.root_cause, "duration_days": inc.days_active},
+                    facts={"root_cause": inc.root_cause, "duration_days": inc.days_active, 
+                           "causal_chain":  inc.causal_chain.snapshot() if getattr(inc, "causal_chain", None) else [],},
                     summary=f"{inc.ticket_id} resolved in {inc.days_active}d.", tags=["incident_resolved"]
                 ))
                 logger.info(f"    [green]✅ {inc.ticket_id} resolved.[/green]")
@@ -1029,7 +1487,7 @@ class Flow(Flow[State]):
              if n != on_call),
             on_call
         )
-        self._confluence.write_postmortem(
+        conf_id =self._confluence.write_postmortem(
             incident_id=inc.ticket_id,
             incident_title=inc.title,
             root_cause=inc.root_cause,
@@ -1038,26 +1496,27 @@ class Flow(Flow[State]):
             eng_peer=eng_peer,
         )
 
+        if conf_id and getattr(inc, "causal_chain", None):
+            inc.causal_chain.append(conf_id)
+
     def _emit_bot_message(self, channel: str, bot_name: str, text: str, timestamp: str):
-        """Injects a contextual bot message into a specific Slack channel."""
         date_str = str(self.state.current_date.date())
-        slack_path = f"{BASE}/slack/channels/{channel}/{date_str}_bots.json"
-        
-        # Load existing bot messages for the day if they exist
-        messages = []
-        if os.path.exists(slack_path):
-            with open(slack_path, "r") as f:
-                messages = json.load(f)
-                
-        messages.append({
-            "user": bot_name, 
+        message = {
+            "user":  bot_name,
             "email": f"{bot_name.lower()}@bot.{COMPANY_DOMAIN}",
-            "text": text, 
-            "ts": timestamp,
-            "is_bot": True
-        })
-        
-        save_json(slack_path, messages)
+            "text":  text,
+            "ts":    timestamp,
+            "date":  date_str,
+            "is_bot": True,
+        }
+
+        slack_path, thread_id = self._mem.log_slack_messages(
+            channel=channel,
+            messages=[message],
+            export_dir=EXPORT_DIR,
+        )
+
+        return thread_id
 
     def _generate_adhoc_confluence_page(
         self,
@@ -1175,8 +1634,8 @@ class Flow(Flow[State]):
         self.state.daily_incidents_resolved = 0
         self.state.daily_artifacts_created  = 0
         self.state.daily_external_contacts  = 0
-        self.state.daily_active_actors      = []   # new
-        self.state.daily_event_type_counts  = {}   # new
+        self.state.daily_active_actors      = []
+        self.state.daily_event_type_counts  = {}
 
         date_str = str(self.state.current_date.date())
         for dep in self._lifecycle._departed:
@@ -1231,10 +1690,10 @@ class Flow(Flow[State]):
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
         for row in [
-            ("Confluence Pages", str(len(self.state.confluence_pages))),
-            ("JIRA Tickets", str(len(self.state.jira_tickets))),
-            ("Slack Threads", str(len(self.state.slack_threads))),
-            ("Git PRs", str(len(self.state.pr_registry))),
+            ("Confluence Pages", str(self._mem._artifacts.count_documents({"type": "confluence"}))),
+            ("JIRA Tickets",     str(self._mem._jira.count_documents({}))),
+            ("Slack Threads",    str(self._mem._slack.count_documents({}))),
+            ("Git PRs",          str(self._mem._prs.count_documents({}))),
             ("Incidents Resolved", str(len(self.state.resolved_incidents))),
             ("Embedded Artifacts", str(s["artifact_count"])),
             ("Employees Departed", str(len(self._lifecycle._departed))),
@@ -1246,9 +1705,12 @@ class Flow(Flow[State]):
         logger.info("\n")
         logger.info(table)
         
+        _proj = {"_id": 0, "embedding": 0}
         snapshot = {
-            "confluence_pages": self.state.confluence_pages, "jira_tickets": self.state.jira_tickets,
-            "slack_threads": self.state.slack_threads, "pr_registry": self.state.pr_registry,
+            "confluence_pages": list(self._mem._artifacts.find({"type": "confluence"}, _proj)),
+            "jira_tickets":     list(self._mem._jira.find({}, {"_id": 0})),
+            "slack_threads":    list(self._mem._slack.find({}, {"_id": 0})),
+            "pr_registry":      list(self._mem._prs.find({}, {"_id": 0})),
             "resolved_incidents": self.state.resolved_incidents, "morale_history": self.state.morale_history,
             "system_health": self.state.system_health, "event_log": [e.to_dict() for e in self._mem.get_event_log()],
         }
@@ -1367,13 +1829,15 @@ class Flow(Flow[State]):
             }
         }
 
-        slack_path = f"{BASE}/slack/channels/incidents/{date_str}_{external_node}.json"
-        save_json(slack_path, [message])
-        self.state.slack_threads.append({
-            "date":          date_str,
-            "channel":       "incidents",
-            "message_count": 1,
-        })
+        message["date"] = date_str
+        slack_path, thread_id = self._mem.log_slack_messages(
+            channel="incidents",
+            messages=[message],
+            export_dir=EXPORT_DIR,
+        )
+
+        if thread_id and getattr(inc, "causal_chain", None):
+            inc.causal_chain.append(thread_id)
 
         # SimEvent — this is what makes it retrievable as ground truth
         self._mem.log_event(SimEvent(
@@ -1382,7 +1846,7 @@ class Flow(Flow[State]):
             day=self.state.day,
             date=date_str,
             actors=[liaison_name, external_node],
-            artifact_ids={"slack": slack_path, "jira": inc.ticket_id},
+            artifact_ids={"slack_thread": thread_id, "slack_path": slack_path, "jira": inc.ticket_id},
             facts={
                 "external_party":  display_name,
                 "org":             contact.get("org", "External"),
@@ -1410,7 +1874,6 @@ class Flow(Flow[State]):
                 "external_party": display_name,
                 "liaison":        liaison_name,
                 "incident":       inc.ticket_id,
-                "causal_parent":   inc.ticket_id,
             },
             timestamp=interaction_start_iso
         )

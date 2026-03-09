@@ -43,10 +43,10 @@ model_presets:
 
   cloud:
     provider: "bedrock"
-    # Claude 3.5 Sonnet on Bedrock — best for long-form corporate doc generation
-    planner: "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    # Claude 4.6 Sonnet on Bedrock — best for long-form corporate doc generation
+    planner: "bedrock/us.anthropic.claude-sonnet-4-6"
     # Llama 3.1 8B on Bedrock — fast, cheap for high-volume worker calls
-    worker: "bedrock/us.meta.llama3-1-8b-instruct-v1:0"
+    worker: "bedrock/us.anthropic.claude-sonnet-4-6"
     aws_region: "us-east-1"
     embed_provider: "openai"
     embed_model: "text-embedding-3-large"
@@ -69,6 +69,7 @@ simulation:
   max_incident_email_threads: 3
   new_hire: "Elena"
   new_hire_dept: "Product"
+  sprint_length_days: 10
 
 # ── MORALE ────────────────────────────────────────────────────
 morale:
@@ -95,49 +96,15 @@ incident_triggers:
   - "down"
   - "spike"
 
-# ── SPRINT TICKET THEMES ──────────────────────────────────────
-sprint_ticket_themes:
-  - "Refactor {legacy_system} connection pool"
-  - "Add retry logic to auth service"
-  - "Update {product_page} landing page"
-  - "Fix 500 errors on leaderboard endpoint"
-  - "QA regression suite"
-  - "Design onboarding flow"
-  - "Implement rate limiting middleware"
-  - "Improve error logging and alerting"
-  - "Performance audit on search API"
-  - "Update dependency versions"
-
-# ── AD-HOC CONFLUENCE TOPICS ──────────────────────────────────
-adhoc_confluence_topics:
-  - ["ENG", "API Rate Limiting Strategy"]
-  - ["MKT", "{product_page} Campaign Brief"]
-  - ["HR", "Remote Work Policy"]
-  - ["ENG", "On-Call Runbook"]
-  - ["PROD", "Q2 Roadmap Priorities"]
-
 # ── GENESIS DOCUMENTS ─────────────────────────────────────────
 genesis_docs:
   technical:
     count: 3
     id_prefix: "ENG"
-    prompt: >
-      Write a single Confluence page with ID {id} about {project_name}
-      and {legacy_system}. Authors: {authors}.
-      Existing pages you may reference: {related_pages}.
-      Do not invent any other CONF-* IDs.
-      Start directly with the  heading. Output only Markdown.
 
   business:
     count: 2
     id_prefix: "MKT"
-    prompt: >
-      Write a single Confluence page with ID {id} for {company_name}.
-      Topic: {product_page} campaign planning.
-      Authors: {authors}.
-      Existing pages you may reference: {related_pages}.
-      Do not invent any other CONF-* IDs.
-      Start directly with the  heading. Output only Markdown.
 
 # ── SPRINT GOAL TEMPLATE ──────────────────────────────────────
 sprint_goal_template: "Stabilize {legacy_system} and deliver sprint features"
@@ -161,7 +128,7 @@ roles:
   postmortem_writer: "Engineering_Backend"
   sprint_email_sender: "Product"
   sales_email_sender: "Sales_Marketing"
-  scrum_master: "HR_Ops"
+  scrum_master: "Product"
 
 # ── KNOWLEDGE GAPS ────────────────────────────────────────────
 knowledge_gaps:
@@ -260,21 +227,33 @@ personas:
     social_role: "The Cynical Gatekeeper"
     typing_quirks: "lowercase only, frequent use of '...', no emojis, technically dense fragments"
     pet_peeves: "over-engineering, 'urgent' pings without logs, missing documentation"
-    stress: 70
+    stress: 50
     expertise: ["backend", "TitanDB", "legacy-migration"]
     tenure: "5yr"
     is_lead: true
-
+    interests:
+      [
+        "restoring 70s analog synths",
+        "mechanical keyboards (linear switches only)",
+        "obscure linux distros",
+        "single-player retro RPGs",
+      ]
   Sarah:
     style: "The High-Stakes Driver"
     social_role: "The Urgent Taskmaster"
     typing_quirks: "Perfect grammar, heavy use of @mentions, bolding for emphasis, 'sent from mobile' typos when stressed"
     pet_peeves: "Vague timelines, missed standups, lack of 'alignment'"
-    stress: 85
+    stress: 55
     expertise: ["roadmap", "OKRs", "stakeholder-mgmt"]
     tenure: "2yr"
     is_lead: true
-
+    interests:
+      [
+        "peloton marathons",
+        "productivity hacking books",
+        "high-altitude hiking",
+        "meal prepping",
+      ]
   Deepa:
     style: "The Methodical Architect"
     social_role: "The Technical Anchor"
@@ -284,7 +263,13 @@ personas:
     expertise: ["backend", "infra", "distributed-systems"]
     tenure: "3yr"
     is_lead: false
-
+    interests:
+      [
+        "grandmaster chess strategy",
+        "woodworking",
+        "urban planning documentaries",
+        "sourdough fermentation",
+      ]
   Elena:
     style: "The Eager New Hire"
     social_role: "The Enthusiastic Learner"
@@ -294,7 +279,13 @@ personas:
     expertise: ["roadmap", "UX", "figma"]
     tenure: "1yr"
     is_lead: false
-
+    interests:
+      [
+        "bouldering",
+        "mechanical mechanical (pastel colored)",
+        "digital illustration",
+        "learning japanese on duolingo",
+      ]
   Priya:
     style: "The Creative Verbose"
     social_role: "The Brand Visionary"
@@ -304,7 +295,13 @@ personas:
     expertise: ["design", "brand", "storytelling"]
     tenure: "3yr"
     is_lead: true
-
+    interests:
+      [
+        "architectural photography",
+        "experimental jazz",
+        "collecting vintage typefaces",
+        "interior design",
+      ]
   Chloe:
     style: "The Fast & Opinionated"
     social_role: "The Mobile Specialist"
@@ -314,7 +311,13 @@ personas:
     expertise: ["mobile", "iOS", "swift-ui"]
     tenure: "3yr"
     is_lead: true
-
+    interests:
+      [
+        "Formula 1 racing",
+        "mechanical watch collecting",
+        "craft beer (IPAs only)",
+        "customizing home automation",
+      ]
   Nadia:
     style: "The Detail-Obsessed"
     social_role: "The Quality Guardian"
@@ -324,6 +327,13 @@ personas:
     expertise: ["QA", "testing", "automation"]
     tenure: "2yr"
     is_lead: true
+    interests:
+      [
+        "escape rooms",
+        "cross-stitching (pixel art)",
+        "detective novels",
+        "restoring vintage fountain pens",
+      ]
 
 default_persona:
   style: "professional"

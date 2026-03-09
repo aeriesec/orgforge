@@ -26,19 +26,11 @@ def test_embedder_fallback_mechanism():
     # 3. Different text must yield a different vector
     assert vec1 != vec3
 
-from unittest.mock import patch, MagicMock
-
-@patch("memory.build_embedder")
-@patch("memory.MongoClient")
-@patch("memory.Memory._init_vector_indexes")
-def test_memory_recall_pipeline_filters(mock_init_indexes, mock_mongo, mock_build_embedder):
+def test_memory_recall_pipeline_filters():
     """Verifies Memory.recall builds the correct MongoDB aggregation pipeline with filters."""
+    # conftest autouse fixture already patches MongoClient, build_embedder,
+    # and _init_vector_indexes — no per-test patching needed.
     from memory import Memory
-    
-    # Mock the embedder so we don't try to hit Ollama/OpenAI
-    mock_embedder_instance = MagicMock()
-    mock_embedder_instance.embed.return_value = [0.1] * 1024
-    mock_build_embedder.return_value = mock_embedder_instance
     
     mem = Memory()
     mem._artifacts.aggregate = MagicMock(return_value=[])
@@ -48,7 +40,7 @@ def test_memory_recall_pipeline_filters(mock_init_indexes, mock_mongo, mock_buil
         query="database crash", 
         n=5, 
         type_filter="jira", 
-        day_range=(2, 8)
+        day_range=(2, 8),
     )
     
     # Intercept the pipeline that was sent to MongoDB
@@ -64,6 +56,63 @@ def test_memory_recall_pipeline_filters(mock_init_indexes, mock_mongo, mock_buil
     assert search_filter["day"]["$gte"] == 2
     assert search_filter["day"]["$lte"] == 8
     assert vector_search_stage["limit"] == 5
+
+
+def test_memory_recall_pipeline_as_of_time_datetime():
+    """
+    recall() must translate a datetime as_of_time into a $lte timestamp
+    filter inside $vectorSearch.  Accepts datetime objects from SimClock.
+    """
+    from datetime import datetime
+    from memory import Memory
+
+    mem = Memory()
+    mem._artifacts.aggregate = MagicMock(return_value=[])
+
+    cutoff = datetime(2026, 1, 5, 14, 30, 0)
+    mem.recall(query="auth failure", n=3, as_of_time=cutoff)
+
+    pipeline = mem._artifacts.aggregate.call_args[0][0]
+    search_filter = pipeline[0]["$vectorSearch"].get("filter", {})
+
+    assert search_filter["timestamp"]["$lte"] == cutoff.isoformat()
+
+
+def test_memory_recall_pipeline_as_of_time_iso_string():
+    """
+    recall() must also accept a pre-formatted ISO string for as_of_time —
+    legacy callers that already hold a .isoformat() string must not break.
+    """
+    from memory import Memory
+
+    mem = Memory()
+    mem._artifacts.aggregate = MagicMock(return_value=[])
+
+    iso = "2026-01-05T14:30:00"
+    mem.recall(query="auth failure", n=3, as_of_time=iso)
+
+    pipeline = mem._artifacts.aggregate.call_args[0][0]
+    search_filter = pipeline[0]["$vectorSearch"].get("filter", {})
+
+    assert search_filter["timestamp"]["$lte"] == iso
+
+
+def test_memory_recall_pipeline_no_as_of_time():
+    """
+    When as_of_time is None no timestamp filter must appear in the pipeline —
+    genesis runs and offline tools must see the full artifact set.
+    """
+    from memory import Memory
+
+    mem = Memory()
+    mem._artifacts.aggregate = MagicMock(return_value=[])
+
+    mem.recall(query="anything", n=3)
+
+    pipeline = mem._artifacts.aggregate.call_args[0][0]
+    search_filter = pipeline[0]["$vectorSearch"].get("filter", {})
+
+    assert "timestamp" not in search_filter
 
 def test_simevent_serialization():
     """Verifies SimEvent can serialize to and from a dict without data loss."""
