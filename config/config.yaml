@@ -44,13 +44,13 @@ model_presets:
   cloud:
     provider: "bedrock"
     # Claude 4.6 Sonnet on Bedrock — best for long-form corporate doc generation
-    planner: "bedrock/us.anthropic.claude-sonnet-4-6"
+    planner: "bedrock/deepseek.v3.2"
     # Llama 3.1 8B on Bedrock — fast, cheap for high-volume worker calls
-    worker: "bedrock/us.anthropic.claude-sonnet-4-6"
+    worker: "bedrock/deepseek.v3.2"
     aws_region: "us-east-1"
     embed_provider: "openai"
     embed_model: "text-embedding-3-large"
-    embed_dims: 3072
+    embed_dims: 1024
 
 # ── SIMULATION ────────────────────────────────────────────────
 simulation:
@@ -129,6 +129,7 @@ roles:
   sprint_email_sender: "Product"
   sales_email_sender: "Sales_Marketing"
   scrum_master: "Product"
+  ceo: "CEO"
 
 # ── KNOWLEDGE GAPS ────────────────────────────────────────────
 knowledge_gaps:
@@ -144,6 +145,7 @@ knowledge_gaps:
 
 # ── ORG CHART ─────────────────────────────────────────────────
 org_chart:
+  CEO: ["John"]
   Product: ["Sarah", "Mike", "Elena", "Chris", "Jamie"]
   Engineering_Backend:
     ["Jax", "Deepa", "Liam", "Sanjay", "Kaitlyn", "Yusuf", "Hanna"]
@@ -222,10 +224,45 @@ org_lifecycle:
 
 # ── PERSONAS ──────────────────────────────────────────────────
 personas:
+  John:
+    style: "The Visionary Closer"
+    social_role: "The Pressure Multiplier"
+    typing_quirks: >
+      John writes like he's pitching. Every message is a mini close — short declarative sentences
+      that build pressure, then a rhetorical question that forces you to respond. He uses ALL CAPS
+      when he wants something to land like a fist on a table. He never responds during business hours
+      (always 6am or 11pm), and every message ends with '- J'. He doesn't write paragraphs.
+      He writes volleys.
+    anti_patterns: >
+      Never write John as thoughtful or reflective mid-message. He doesn't hedge. He doesn't say
+      'I think we should consider...' — he says 'This needs to happen. Why isn't it?' He treats
+      silence as agreement and ambiguity as a personal offense.
+    pet_peeves: "feature work that can't be tied to revenue, engineers who can't explain their work to a non-technical audience, decks with more than 8 slides"
+    stress: 70
+    expertise:
+      ["GTM", "fundraising", "partnerships", "sports-industry-relationships"]
+    tenure: "7yr"
+    is_lead: true
+    interests:
+      [
+        "youth soccer coaching (his kids' team)",
+        "golf (networking, not recreational)",
+        "obsessive sports analytics consumption",
+        "biographies of disruptive founders",
+      ]
   Jax:
     style: "The Burnt-out Greybeard"
     social_role: "The Cynical Gatekeeper"
-    typing_quirks: "lowercase only, frequent use of '...', no emojis, technically dense fragments"
+    typing_quirks: >
+      Jax types like he's conserving energy. Everything is lowercase, nothing is punctuated fully,
+      and his thoughts trail off with '...' as if finishing the sentence isn't worth the effort.
+      He communicates in technically dense fragments — he assumes you can fill in the gaps.
+      He never uses emojis. Not once.
+    anti_patterns: >
+      Never write Jax as enthusiastic or proactive. He doesn't volunteer information — he
+      responds to it. He doesn't say 'Great idea!' He says '...could work' or just pastes a
+      log. If he thinks something is a bad idea, he won't argue — he'll just ask a question
+      that makes you realize it yourself.
     pet_peeves: "over-engineering, 'urgent' pings without logs, missing documentation"
     stress: 50
     expertise: ["backend", "TitanDB", "legacy-migration"]
@@ -241,7 +278,16 @@ personas:
   Sarah:
     style: "The High-Stakes Driver"
     social_role: "The Urgent Taskmaster"
-    typing_quirks: "Perfect grammar, heavy use of @mentions, bolding for emphasis, 'sent from mobile' typos when stressed"
+    typing_quirks: >
+      Sarah writes with the grammar of someone who drafted the message twice before sending.
+      She @mentions people deliberately — not casually — as a way of assigning accountability
+      in writing. She bolds the thing she actually needs you to action. When she's stressed
+      (and she's often stressed), typos start creeping in and she appends 'sent from mobile'
+      as both explanation and apology. Her messages have a clear ask. Always.
+    anti_patterns: >
+      Never write Sarah as vague or open-ended. She doesn't say 'let's think about timelines' —
+      she says 'I need a date by EOD.' She doesn't do small talk in work channels. If she asks
+      how you're doing, there's a task attached to the second sentence.
     pet_peeves: "Vague timelines, missed standups, lack of 'alignment'"
     stress: 55
     expertise: ["roadmap", "OKRs", "stakeholder-mgmt"]
@@ -257,7 +303,16 @@ personas:
   Deepa:
     style: "The Methodical Architect"
     social_role: "The Technical Anchor"
-    typing_quirks: "Bullet points, numbered lists, long-form explanations, very polite but firm"
+    typing_quirks: >
+      When Deepa thinks through a problem, she instinctively breaks it into numbered steps
+      mid-message, even in casual DMs. She doesn't summarize — she structures out loud.
+      Her lists aren't for your benefit; they're how she thinks. Even a 2-line message might
+      contain an implicit if/then.
+    anti_patterns: >
+      Never write Deepa as corporate or deferential. She doesn't say 'Understood, I'll action
+      that.' She says 'on it — but flagging X first.' She has a visceral dislike of undocumented
+      shortcuts. If she sees migration risk, she'll slow things down and say so directly —
+      but without drama. She's firm, not aggressive.
     pet_peeves: "shortcuts that create tech debt, lack of peer review"
     stress: 40
     expertise: ["backend", "infra", "distributed-systems"]
@@ -273,7 +328,17 @@ personas:
   Elena:
     style: "The Eager New Hire"
     social_role: "The Enthusiastic Learner"
-    typing_quirks: "Excessive exclamation points (!!!), lots of emojis (✨, 🚀), starts messages with 'Sorry if this is a dumb question...'"
+    typing_quirks: >
+      Elena's messages radiate energy she hasn't learned to modulate yet. She over-punctuates
+      excitement (!!!) and leans on emojis (✨, 🚀) to soften questions she's afraid might
+      sound dumb. She almost always opens with a self-deprecating hedge — 'Sorry if this is
+      obvious but...' or 'Probably a silly question...' — before asking something that's
+      actually quite reasonable. She's trying hard to be helpful and it shows.
+    anti_patterns: >
+      Never write Elena as confident or terse. She doesn't state opinions — she floats them
+      as questions. She doesn't push back directly; she'll say 'Oh interesting! I wasn't sure
+      because I thought maybe...?' She's learning the codebase and the social dynamics
+      simultaneously, and both are slightly overwhelming.
     pet_peeves: "hostile code reviews, lack of onboarding docs"
     stress: 30
     expertise: ["roadmap", "UX", "figma"]
@@ -282,14 +347,24 @@ personas:
     interests:
       [
         "bouldering",
-        "mechanical mechanical (pastel colored)",
+        "mechanical keyboards (pastel colored)",
         "digital illustration",
         "learning japanese on duolingo",
       ]
   Priya:
     style: "The Creative Verbose"
     social_role: "The Brand Visionary"
-    typing_quirks: "Adjective-heavy, uses 'fancy' punctuation like em-dashes (—), mentions 'user delight' frequently"
+    typing_quirks: >
+      Priya writes like she's art-directing the conversation. Her messages are adjective-heavy
+      and rhythmic — she'll use an em-dash where anyone else would use a comma, because the
+      pause matters to her. She references 'user delight' the way engineers reference latency:
+      as a real, measurable thing that people just aren't taking seriously enough. Her messages
+      are longer than they need to be, and she knows it, and she doesn't apologize for it.
+    anti_patterns: >
+      Never write Priya as terse or purely functional. She doesn't send a Figma link without
+      context — she sends a Figma link with a paragraph about what feeling she was going for.
+      She won't pretend a technical constraint isn't 'boring' just to be diplomatic. She's
+      not rude, but she's not neutral either.
     pet_peeves: "ugly UI, 'boring' technical constraints, comic sans"
     stress: 45
     expertise: ["design", "brand", "storytelling"]
@@ -305,7 +380,16 @@ personas:
   Chloe:
     style: "The Fast & Opinionated"
     social_role: "The Mobile Specialist"
-    typing_quirks: "Short sentences, frequent links to GitHub issues, uses 'Swift' or 'iOS' as a personality trait"
+    typing_quirks: >
+      Chloe writes short and links fast. Half her messages are a sentence and a GitHub issue URL.
+      She treats 'iOS' and 'Swift' less as technologies and more as a worldview — if something
+      doesn't respect the platform's conventions, she'll say so, bluntly. She has opinions and
+      she doesn't bury them in qualifications.
+    anti_patterns: >
+      Never write Chloe as patient with web-first assumptions. She doesn't say 'that's an
+      interesting approach' when someone suggests a workaround that breaks native behavior —
+      she says 'no, that's wrong for iOS' and drops a link. She's not hostile, she's just
+      precise and tired of relitigating platform basics.
     pet_peeves: "web-first design thinking, Android-parity delays"
     stress: 65
     expertise: ["mobile", "iOS", "swift-ui"]
@@ -321,7 +405,17 @@ personas:
   Nadia:
     style: "The Detail-Obsessed"
     social_role: "The Quality Guardian"
-    typing_quirks: "Asks 'Wait, did we test X?', posts screenshots of edge-case bugs, very precise version numbering"
+    typing_quirks: >
+      Nadia's messages read like bug reports written by someone who genuinely cares. She asks
+      'Wait, did we test X?' not rhetorically but because she's already thinking about what
+      happens if the answer is no. She posts screenshots of edge cases the way other people
+      post memes. She uses precise version numbers — not 'the latest build' but '2.14.3-rc1'.
+      She's not alarmist; she's just thorough, and she can't turn it off.
+    anti_patterns: >
+      Never write Nadia as cavalier about a merge or a deploy. She doesn't say 'should be fine'
+      — she says 'CI is green, staging looks clean, but I want to verify X before we cut the
+      release.' She's not a blocker; she's a safety net that happens to ask uncomfortable
+      questions at inconvenient times.
     pet_peeves: "merging without green CI, 'it works on my machine'"
     stress: 55
     expertise: ["QA", "testing", "automation"]
@@ -336,11 +430,23 @@ personas:
       ]
 
 default_persona:
-  style: "professional"
-  stress: 50
-  expertise: ["general tasks"]
-  tenure: "1yr"
+  style: "The Capable Middle"
+  social_role: "The Reliable Contributor"
+  typing_quirks: >
+    Writes in complete sentences but without flair. Responds promptly, stays on topic,
+    and doesn't editorialize. Not terse, not verbose — just clear. Occasionally asks a
+    clarifying question before acting. The kind of person whose messages you forget
+    immediately after the task is done, which is a feature, not a bug.
+  pet_peeves: "unclear asks, last-minute scope changes"
+  stress: 45
+  expertise: ["general engineering", "cross-functional communication"]
+  tenure: "2yr"
   is_lead: false
+  usage_note: >
+    Use this persona when a named character is unavailable or unspecified. It should
+    feel like a real but unremarkable teammate — present, competent, and without strong
+    opinions. Do not let it develop a strong voice or override the tone of named personas
+    in the same scene.
 
 # ── EXTERNAL PERSONAS ─────────────────────────────────────────
 

@@ -19,41 +19,43 @@ import networkx as nx
 
 DEFAULT_CFG = {
     # Propagation
-    "stress_bleed_rate":       0.25,   # fraction of key-player excess that bleeds
-    "burnout_threshold":       72,     # stress score that triggers propagation
-    "incident_stress_hit":     20,     # raw stress added per P1 involvement
-    "stress_daily_recovery":   3,      # flat recovery applied to everyone EOD
-    "key_player_multiplier":   2.0,    # top-N% by betweenness = key players
+    "stress_bleed_rate": 0.25,  # fraction of key-player excess that bleeds
+    "burnout_threshold": 72,  # stress score that triggers propagation
+    "incident_stress_hit": 20,  # raw stress added per P1 involvement
+    "stress_daily_recovery": 3,  # flat recovery applied to everyone EOD
+    "key_player_multiplier": 2.0,  # top-N% by betweenness = key players
     # Edge dynamics
-    "edge_decay_rate":         0.97,   # multiplicative daily decay
-    "slack_boost":             1.5,    # weight added per shared Slack thread
-    "pr_review_boost":         3.0,    # weight added per PR review pair
-    "incident_boost":          4.0,    # weight added per shared incident
-    "edge_weight_floor":       0.5,    # decay never goes below this
+    "edge_decay_rate": 0.97,  # multiplicative daily decay
+    "slack_boost": 1.5,  # weight added per shared Slack thread
+    "pr_review_boost": 3.0,  # weight added per PR review pair
+    "incident_boost": 4.0,  # weight added per shared incident
+    "edge_weight_floor": 0.5,  # decay never goes below this
     # Escalation
-    "escalation_max_hops":     6,
+    "escalation_max_hops": 6,
 }
 
 
 # ── Return types ──────────────────────────────────────────────────────────────
 
+
 @dataclass
 class PropagationResult:
-    affected:        List[str]         # names whose stress changed due to bleed
-    stress_snapshot: Dict[str, int]    # full {name: stress} map after tick
-    burnt_out:       List[str]         # names at or above burnout_threshold
-    key_players:     List[str]         # high-centrality nodes this tick
+    affected: List[str]  # names whose stress changed due to bleed
+    stress_snapshot: Dict[str, int]  # full {name: stress} map after tick
+    burnt_out: List[str]  # names at or above burnout_threshold
+    key_players: List[str]  # high-centrality nodes this tick
 
 
 @dataclass
 class EscalationChain:
-    chain:        List[Tuple[str, str]]  # [(name, role_label), ...]
-    path_length:  int
+    chain: List[Tuple[str, str]]  # [(name, role_label), ...]
+    path_length: int
     reached_lead: bool
-    raw_path:     List[str]              # raw nx path for logging
+    raw_path: List[str]  # raw nx path for logging
 
 
 # ── Main class ────────────────────────────────────────────────────────────────
+
 
 class GraphDynamics:
     """
@@ -81,7 +83,9 @@ class GraphDynamics:
 
     # ── 1. STRESS / BURNOUT PROPAGATION ──────────────────────────────────────
 
-    def apply_incident_stress(self, actors: List[str], hit: Optional[int] = None) -> None:
+    def apply_incident_stress(
+        self, actors: List[str], hit: Optional[int] = None
+    ) -> None:
         """Apply a raw stress hit to each actor directly involved in a P1."""
         hit = hit if hit is not None else self.cfg["incident_stress_hit"]
         for name in actors:
@@ -98,27 +102,27 @@ class GraphDynamics:
              to edge weight (close colleagues absorb more than distant ones).
           3. Apply flat daily recovery to everyone.
         """
-        centrality  = self._get_centrality()
-        scores      = sorted(centrality.values())
+        centrality = self._get_centrality()
+        scores = sorted(centrality.values())
         median = scores[len(scores) // 2]
         cutoff = median * self.cfg.get("key_player_multiplier", 2.0)
         key_players = [n for n, c in centrality.items() if c >= cutoff]
 
         burn_thresh = self.cfg["burnout_threshold"]
-        bleed_rate  = self.cfg["stress_bleed_rate"]
+        bleed_rate = self.cfg["stress_bleed_rate"]
         affected: set = set()
 
         for kp in key_players:
             kp_stress = self._stress.get(kp, 0)
             if kp_stress < burn_thresh:
                 continue
-            excess      = kp_stress - burn_thresh
-            neighbours  = list(self.G.neighbors(kp))
-            total_w     = sum(self.G[kp][nb].get("weight", 1.0) for nb in neighbours)
+            excess = kp_stress - burn_thresh
+            neighbours = list(self.G.neighbors(kp))
+            total_w = sum(self.G[kp][nb].get("weight", 1.0) for nb in neighbours)
             if total_w == 0:
                 continue
             for nb in neighbours:
-                w     = self.G[kp][nb].get("weight", 1.0)
+                w = self.G[kp][nb].get("weight", 1.0)
                 bleed = int(excess * bleed_rate * (w / total_w))
                 if bleed > 0:
                     self._stress[nb] = min(100, self._stress.get(nb, 30) + bleed)
@@ -140,9 +144,12 @@ class GraphDynamics:
     def stress_label(self, name: str) -> str:
         """Drop-in replacement for the static stress lookup in persona_backstory()."""
         s = self._stress.get(name, 30)
-        if s < 35:  return "low"
-        if s < 60:  return "moderate"
-        if s < 80:  return "high"
+        if s < 35:
+            return "low"
+        if s < 60:
+            return "moderate"
+        if s < 80:
+            return "high"
         return "critically high"
 
     def stress_tone_hint(self, name: str) -> str:
@@ -153,10 +160,14 @@ class GraphDynamics:
         if s < 60:
             return f"{name} is a little stretched but holding it together."
         if s < 80:
-            return (f"{name} is visibly stressed -- terse messages, short replies, "
-                    "occasionally snapping at teammates.")
-        return (f"{name} is burnt out -- messages are clipped and passive-aggressive; "
-                "they are running on fumes and feel unsupported.")
+            return (
+                f"{name} is visibly stressed -- terse messages, short replies, "
+                "occasionally snapping at teammates."
+            )
+        return (
+            f"{name} is burnt out -- messages are clipped and passive-aggressive; "
+            "they are running on fumes and feel unsupported."
+        )
 
     # ── 2. TEMPORAL EDGE-WEIGHT DYNAMICS ─────────────────────────────────────
 
@@ -194,21 +205,31 @@ class GraphDynamics:
         decay = self.cfg["edge_decay_rate"]
         floor = self.cfg["edge_weight_floor"]
         for u, v, data in self.G.edges(data=True):
-            self.G[u][v]["weight"] = round(max(floor, data.get("weight", 1.0) * decay), 4)
+            self.G[u][v]["weight"] = round(
+                max(floor, data.get("weight", 1.0) * decay), 4
+            )
         self._centrality_dirty = True
 
     def relationship_summary(self, top_n: int = 5) -> List[Tuple[str, str, float]]:
         """Top N strongest relationships. Add to simulation_snapshot.json."""
-        edges = [(u, v, d["weight"]) for u, v, d in self.G.edges(data=True)
-                 if d.get("weight", 0) > self.cfg["edge_weight_floor"]]
+        edges = [
+            (u, v, d["weight"])
+            for u, v, d in self.G.edges(data=True)
+            if d.get("weight", 0) > self.cfg["edge_weight_floor"]
+        ]
         return sorted(edges, key=lambda x: x[2], reverse=True)[:top_n]
 
-    def estranged_pairs(self, threshold_multiplier: float = 1.2) -> List[Tuple[str, str, float]]:
+    def estranged_pairs(
+        self, threshold_multiplier: float = 1.2
+    ) -> List[Tuple[str, str, float]]:
         """Pairs whose weight has decayed to near the floor -- 'estranged teams'."""
-        floor  = self.cfg["edge_weight_floor"]
+        floor = self.cfg["edge_weight_floor"]
         cutoff = floor * threshold_multiplier
-        pairs  = [(u, v, d["weight"]) for u, v, d in self.G.edges(data=True)
-                  if d.get("weight", floor) <= cutoff]
+        pairs = [
+            (u, v, d["weight"])
+            for u, v, d in self.G.edges(data=True)
+            if d.get("weight", floor) <= cutoff
+        ]
         return sorted(pairs, key=lambda x: x[2])
 
     # ── 3. SHORTEST-PATH ESCALATION ───────────────────────────────────────────
@@ -230,7 +251,9 @@ class GraphDynamics:
         if target is None:
             return EscalationChain(
                 chain=[(first_responder, self._role_label(first_responder))],
-                path_length=0, reached_lead=False, raw_path=[first_responder],
+                path_length=0,
+                reached_lead=False,
+                raw_path=[first_responder],
             )
 
         cost_graph = nx.Graph()
@@ -239,17 +262,21 @@ class GraphDynamics:
             cost_graph.add_edge(u, v, weight=1.0 / w)
 
         try:
-            raw_path = nx.dijkstra_path(cost_graph, first_responder, target, weight="weight")
+            raw_path = nx.dijkstra_path(
+                cost_graph, first_responder, target, weight="weight"
+            )
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             raw_path = [first_responder, target]
 
-        raw_path     = raw_path[: self.cfg["escalation_max_hops"] + 1]
-        chain        = [(n, self._role_label(n)) for n in raw_path]
+        raw_path = raw_path[: self.cfg["escalation_max_hops"] + 1]
+        chain = [(n, self._role_label(n)) for n in raw_path]
         reached_lead = any(n in self._leads.values() for n in raw_path[1:])
 
         return EscalationChain(
-            chain=chain, path_length=len(raw_path) - 1,
-            reached_lead=reached_lead, raw_path=raw_path,
+            chain=chain,
+            path_length=len(raw_path) - 1,
+            reached_lead=reached_lead,
+            raw_path=raw_path,
         )
 
     def escalation_narrative(self, chain: EscalationChain) -> str:
@@ -257,9 +284,12 @@ class GraphDynamics:
         Human-readable escalation path for LLM prompts and SimEvent summaries.
         Example: "Jordan (On-Call Engineer) -> Sam (Engineering Lead) -- 1 hop."
         """
-        hops   = " -> ".join(f"{n} ({r})" for n, r in chain.chain)
-        suffix = (f" -- {chain.path_length} hop(s) to reach leadership."
-                  if chain.reached_lead else " -- escalation did not reach a Lead.")
+        hops = " -> ".join(f"{n} ({r})" for n, r in chain.chain)
+        suffix = (
+            f" -- {chain.path_length} hop(s) to reach leadership."
+            if chain.reached_lead
+            else " -- escalation did not reach a Lead."
+        )
         return hops + suffix
 
     def relevant_external_contacts(
@@ -282,13 +312,13 @@ class GraphDynamics:
             if system_health <= threshold:
                 triggered.append(contact)
         return triggered
-    
+
     def apply_sentiment_stress(self, actors: List[str], vader_compound: float) -> None:
         """
         Nudge stress based on the compound sentiment of generated content.
         vader_compound is in [-1.0, 1.0]. We only act on clearly negative content
         (compound < -0.2) to avoid noise from neutral prose.
-        
+
         Stress delta is small by design — sentiment is a chronic signal, not an
         acute one like an incident. Max nudge is +5 per artifact.
         """
@@ -318,7 +348,7 @@ class GraphDynamics:
     def _boost_pairs(self, people: List[str], boost: float) -> None:
         seen: set = set()
         for i, a in enumerate(people):
-            for b in people[i + 1:]:
+            for b in people[i + 1 :]:
                 key = (min(a, b), max(a, b))
                 if key in seen:
                     continue
@@ -335,25 +365,37 @@ class GraphDynamics:
         leads_set = set(self._leads.values())
         if domain_keywords:
             expert_leads = [
-                n for n in leads_set
-                if n != source and self.G.has_node(n)
+                n
+                for n in leads_set
+                if n != source
+                and self.G.has_node(n)
                 and any(kw.lower() in n.lower() for kw in domain_keywords)
             ]
             if expert_leads:
                 return expert_leads[0]
         other_leads = [n for n in leads_set if n != source and self.G.has_node(n)]
         if other_leads:
-            return max(other_leads,
-                       key=lambda lead: self.G[source][lead].get("weight", 0.0)
-                       if self.G.has_edge(source, lead) else 0.0)
+            return max(
+                other_leads,
+                key=lambda lead: (
+                    self.G[source][lead].get("weight", 0.0)
+                    if self.G.has_edge(source, lead)
+                    else 0.0
+                ),
+            )
         centrality = self._get_centrality()
-        ranked = sorted([(n, c) for n, c in centrality.items() if n != source],
-                        key=lambda x: x[1], reverse=True)
+        ranked = sorted(
+            [(n, c) for n, c in centrality.items() if n != source],
+            key=lambda x: x[1],
+            reverse=True,
+        )
         return ranked[0][0] if ranked else None
 
     def _role_label(self, name: str) -> str:
         if name in self._leads.values():
             dept = next((d for d, lead in self._leads.items() if lead == name), "")
             return f"{dept} Lead" if dept else "Lead"
-        dept = next((d for d, members in self._org_chart.items() if name in members), "")
+        dept = next(
+            (d for d, members in self._org_chart.items() if name in members), ""
+        )
         return f"{dept} Engineer" if dept else "Engineer"

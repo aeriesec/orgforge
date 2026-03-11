@@ -1,7 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from flow import Flow, ActiveIncident
-from memory import Memory, SimEvent
 from org_lifecycle import OrgLifecycleManager, patch_validator_for_lifecycle
 
 from datetime import datetime
@@ -11,6 +10,7 @@ from sim_clock import SimClock
 # ─────────────────────────────────────────────────────────────────────────────
 # FIXTURES
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def mock_flow(make_test_memory):
@@ -22,7 +22,8 @@ def mock_flow(make_test_memory):
         flow._registry = MagicMock()
         flow._confluence = MagicMock()
         return flow
-    
+
+
 @pytest.fixture
 def mock_clock():
     clock = MagicMock()
@@ -37,22 +38,38 @@ def lifecycle(mock_flow):
     Mirrors the setup in Flow.__init__ per the patch guide.
     """
     org_chart = {"Engineering": ["Alice", "Bob", "Carol"]}
-    personas  = {
-        "Alice": {"style": "direct", "expertise": ["backend"], "tenure": "3y", "stress": 30},
-        "Bob":   {"style": "casual", "expertise": ["infra"],   "tenure": "2y", "stress": 25},
-        "Carol": {"style": "quiet",  "expertise": ["frontend"],"tenure": "1y", "stress": 20},
+    personas = {
+        "Alice": {
+            "style": "direct",
+            "expertise": ["backend"],
+            "tenure": "3y",
+            "stress": 30,
+        },
+        "Bob": {
+            "style": "casual",
+            "expertise": ["infra"],
+            "tenure": "2y",
+            "stress": 25,
+        },
+        "Carol": {
+            "style": "quiet",
+            "expertise": ["frontend"],
+            "tenure": "1y",
+            "stress": 20,
+        },
     }
     all_names = ["Alice", "Bob", "Carol"]
-    leads     = {"Engineering": "Alice"}
+    leads = {"Engineering": "Alice"}
 
     # Build a fresh graph that matches the org_chart above
     import networkx as nx
     from graph_dynamics import GraphDynamics
+
     G = nx.Graph()
     for name in all_names:
         G.add_node(name, dept="Engineering", is_lead=(name == "Alice"), external=False)
     for i, a in enumerate(all_names):
-        for b in all_names[i + 1:]:
+        for b in all_names[i + 1 :]:
             G.add_edge(a, b, weight=5.0)
 
     config = {
@@ -83,6 +100,7 @@ def lifecycle(mock_flow):
 # 1. JIRA TICKET REASSIGNMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_departure_reassigns_open_tickets(lifecycle, mock_clock):
     """
     Verifies that non-Done JIRA tickets owned by a departing engineer are
@@ -91,18 +109,39 @@ def test_departure_reassigns_open_tickets(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
 
     for ticket in [
-        {"id": "ORG-101", "title": "Fix retry logic", "status": "In Progress",
-         "assignee": "Bob", "linked_prs": []},
-        {"id": "ORG-102", "title": "Write docs",      "status": "To Do",
-         "assignee": "Bob", "linked_prs": []},
-        {"id": "ORG-103", "title": "Already done",    "status": "Done",
-         "assignee": "Bob", "linked_prs": []},
+        {
+            "id": "ORG-101",
+            "title": "Fix retry logic",
+            "status": "In Progress",
+            "assignee": "Bob",
+            "linked_prs": [],
+        },
+        {
+            "id": "ORG-102",
+            "title": "Write docs",
+            "status": "To Do",
+            "assignee": "Bob",
+            "linked_prs": [],
+        },
+        {
+            "id": "ORG-103",
+            "title": "Already done",
+            "status": "Done",
+            "assignee": "Bob",
+            "linked_prs": [],
+        },
     ]:
         mgr._mem.upsert_ticket(ticket)
     state.active_incidents = []
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -112,11 +151,11 @@ def test_departure_reassigns_open_tickets(lifecycle, mock_clock):
 
     # In Progress with no PR → reset to To Do, reassigned to lead
     assert t101["assignee"] == "Alice"
-    assert t101["status"]   == "To Do"
+    assert t101["status"] == "To Do"
 
     # To Do → stays To Do, reassigned to lead
     assert t102["assignee"] == "Alice"
-    assert t102["status"]   == "To Do"
+    assert t102["status"] == "To Do"
 
     # Done → untouched
     assert t103["assignee"] == "Bob"
@@ -130,24 +169,36 @@ def test_departure_preserves_in_progress_ticket_with_pr(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
 
     mgr._mem.upsert_ticket(
-        {"id": "ORG-200", "title": "Hot fix", "status": "In Progress",
-         "assignee": "Bob", "linked_prs": ["PR-101"]}
+        {
+            "id": "ORG-200",
+            "title": "Hot fix",
+            "status": "In Progress",
+            "assignee": "Bob",
+            "linked_prs": ["PR-101"],
+        }
     )
     state.active_incidents = []
 
-    dep_cfg = {"name": "Bob", "reason": "layoff", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "layoff",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     t200 = mgr._mem.get_ticket("ORG-200")
     assert t200["assignee"] == "Alice"
-    assert t200["status"]   == "In Progress"   # status preserved
+    assert t200["status"] == "In Progress"  # status preserved
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. ACTIVE INCIDENT HANDOFF
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_departure_hands_off_active_incident(lifecycle, mock_clock):
     """
@@ -157,16 +208,32 @@ def test_departure_hands_off_active_incident(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
 
     mgr._mem.upsert_ticket(
-        {"id": "ORG-300", "title": "DB outage", "status": "In Progress",
-         "assignee": "Bob", "linked_prs": []}
+        {
+            "id": "ORG-300",
+            "title": "DB outage",
+            "status": "In Progress",
+            "assignee": "Bob",
+            "linked_prs": [],
+        }
     )
     state.active_incidents = [
-        ActiveIncident(ticket_id="ORG-300", title="DB outage",
-                       day_started=4, stage="investigating", root_cause="OOM"),
+        ActiveIncident(
+            ticket_id="ORG-300",
+            title="DB outage",
+            day_started=4,
+            stage="investigating",
+            root_cause="OOM",
+        ),
     ]
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -184,16 +251,32 @@ def test_handoff_emits_escalation_chain_simevent(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
 
     mgr._mem.upsert_ticket(
-        {"id": "ORG-301", "title": "API down", "status": "In Progress",
-         "assignee": "Carol", "linked_prs": []}
+        {
+            "id": "ORG-301",
+            "title": "API down",
+            "status": "In Progress",
+            "assignee": "Carol",
+            "linked_prs": [],
+        }
     )
     state.active_incidents = [
-        ActiveIncident(ticket_id="ORG-301", title="API down",
-                       day_started=4, stage="detected", root_cause="timeout"),
+        ActiveIncident(
+            ticket_id="ORG-301",
+            title="API down",
+            day_started=4,
+            stage="detected",
+            root_cause="timeout",
+        ),
     ]
 
-    dep_cfg = {"name": "Carol", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.8, "day": 5}
+    dep_cfg = {
+        "name": "Carol",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.8,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -201,7 +284,8 @@ def test_handoff_emits_escalation_chain_simevent(lifecycle, mock_clock):
     assert "escalation_chain" in logged_types
 
     escalation_event = next(
-        call.args[0] for call in mgr._mem.log_event.call_args_list
+        call.args[0]
+        for call in mgr._mem.log_event.call_args_list
         if call.args[0].type == "escalation_chain"
     )
     assert escalation_event.facts["trigger"] == "forced_handoff_on_departure"
@@ -211,6 +295,7 @@ def test_handoff_emits_escalation_chain_simevent(lifecycle, mock_clock):
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. CENTRALITY VACUUM
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_centrality_vacuum_stresses_neighbours(lifecycle, mock_clock):
     """
@@ -235,12 +320,12 @@ def test_centrality_vacuum_stresses_neighbours(lifecycle, mock_clock):
 
     # Outer ring — stays connected after Bob is removed
     G.add_edge("Alice", "Carol", weight=5.0)
-    G.add_edge("Carol", "Dave",  weight=5.0)
-    G.add_edge("Dave",  "Eve",   weight=5.0)
-    G.add_edge("Eve",   "Alice", weight=5.0)
+    G.add_edge("Carol", "Dave", weight=5.0)
+    G.add_edge("Dave", "Eve", weight=5.0)
+    G.add_edge("Eve", "Alice", weight=5.0)
     # Bob is an internal shortcut — high centrality, but not the only path
-    G.add_edge("Alice", "Bob",   weight=5.0)
-    G.add_edge("Bob",   "Dave",  weight=5.0)
+    G.add_edge("Alice", "Bob", weight=5.0)
+    G.add_edge("Bob", "Dave", weight=5.0)
 
     config = {
         "org_lifecycle": {"centrality_vacuum_stress_multiplier": 40},
@@ -253,16 +338,22 @@ def test_centrality_vacuum_stresses_neighbours(lifecycle, mock_clock):
     for name in ring_nodes:
         gd_ring._stress[name] = 25
 
-    mgr._gd        = gd_ring
+    mgr._gd = gd_ring
     mgr._org_chart = {"Engineering": list(ring_nodes)}
     mgr._all_names = list(ring_nodes)
-    mgr._leads     = {"Engineering": "Alice"}
+    mgr._leads = {"Engineering": "Alice"}
 
     remaining = ["Alice", "Carol", "Dave", "Eve"]
     stress_before = {n: gd_ring._stress.get(n, 25) for n in remaining}
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -287,8 +378,14 @@ def test_centrality_vacuum_stress_capped_at_20(lifecycle, mock_clock):
 
     stress_before = {n: gd._stress.get(n, 30) for n in all_names}
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -303,6 +400,7 @@ def test_centrality_vacuum_stress_capped_at_20(lifecycle, mock_clock):
 # 4. NODE REMOVAL & GRAPH INTEGRITY
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_departed_node_removed_from_graph(lifecycle, mock_clock):
     """The departing engineer's node must not exist in the graph after departure."""
     mgr, gd, org_chart, all_names, state = lifecycle
@@ -310,8 +408,14 @@ def test_departed_node_removed_from_graph(lifecycle, mock_clock):
 
     assert gd.G.has_node("Bob")
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -327,8 +431,14 @@ def test_departed_node_stress_entry_removed(lifecycle, mock_clock):
 
     gd._stress["Bob"] = 55
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -340,18 +450,25 @@ def test_departure_emits_employee_departed_simevent(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
     state.active_incidents = []
 
-    dep_cfg = {"name": "Bob", "reason": "layoff", "role": "Engineer",
-               "knowledge_domains": ["auth-service"], "documented_pct": 0.2, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "layoff",
+        "role": "Engineer",
+        "knowledge_domains": ["auth-service"],
+        "documented_pct": 0.2,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     departed_events = [
-        call.args[0] for call in mgr._mem.log_event.call_args_list
+        call.args[0]
+        for call in mgr._mem.log_event.call_args_list
         if call.args[0].type == "employee_departed"
     ]
     assert len(departed_events) == 1
     evt = departed_events[0]
-    assert evt.facts["name"]   == "Bob"
+    assert evt.facts["name"] == "Bob"
     assert evt.facts["reason"] == "layoff"
     assert "auth-service" in evt.facts["knowledge_domains"]
 
@@ -361,8 +478,14 @@ def test_departure_record_stored_on_state(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
     state.active_incidents = []
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Senior Engineer",
-               "knowledge_domains": ["redis-cache"], "documented_pct": 0.4, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Senior Engineer",
+        "knowledge_domains": ["redis-cache"],
+        "documented_pct": 0.4,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -375,6 +498,7 @@ def test_departure_record_stored_on_state(lifecycle, mock_clock):
 # 5. KNOWLEDGE GAP SCANNING
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_knowledge_gap_scan_detects_domain_hit(lifecycle, mock_clock):
     """
     scan_for_knowledge_gaps must emit a knowledge_gap_detected SimEvent when
@@ -384,9 +508,14 @@ def test_knowledge_gap_scan_detects_domain_hit(lifecycle, mock_clock):
     state.active_incidents = []
 
     # First, register a departure with known domains
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": ["auth-service", "redis-cache"],
-               "documented_pct": 0.25, "day": 3}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": ["auth-service", "redis-cache"],
+        "documented_pct": 0.25,
+        "day": 3,
+    }
     mgr._scheduled_departures = {3: [dep_cfg]}
     mgr.process_departures(day=3, date_str="2026-01-03", state=state, clock=mock_clock)
     mgr._mem.log_event.reset_mock()
@@ -398,17 +527,18 @@ def test_knowledge_gap_scan_detects_domain_hit(lifecycle, mock_clock):
         day=5,
         date_str="2026-01-05",
         state=state,
-        timestamp=mock_clock
+        timestamp=mock_clock,
     )
 
     assert len(gaps) == 1
-    assert gaps[0].domain_hit       == "auth-service"
-    assert gaps[0].departed_name    == "Bob"
-    assert gaps[0].triggered_by     == "ORG-400"
-    assert gaps[0].documented_pct   == 0.25
+    assert gaps[0].domain_hit == "auth-service"
+    assert gaps[0].departed_name == "Bob"
+    assert gaps[0].triggered_by == "ORG-400"
+    assert gaps[0].documented_pct == 0.25
 
     gap_events = [
-        call.args[0] for call in mgr._mem.log_event.call_args_list
+        call.args[0]
+        for call in mgr._mem.log_event.call_args_list
         if call.args[0].type == "knowledge_gap_detected"
     ]
     assert len(gap_events) == 1
@@ -422,23 +552,42 @@ def test_knowledge_gap_scan_deduplicates(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
     state.active_incidents = []
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": ["redis-cache"], "documented_pct": 0.5, "day": 3}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": ["redis-cache"],
+        "documented_pct": 0.5,
+        "day": 3,
+    }
     mgr._scheduled_departures = {3: [dep_cfg]}
     mgr.process_departures(day=3, date_str="2026-01-03", state=state, clock=mock_clock)
     mgr._mem.log_event.reset_mock()
 
     text = "redis-cache connection pool exhausted"
-    mgr.scan_for_knowledge_gaps(text=text, triggered_by="ORG-401",
-                                day=5, date_str="2026-01-05", state=state, timestamp=mock_clock)
-    mgr.scan_for_knowledge_gaps(text=text, triggered_by="ORG-402",
-                                day=6, date_str="2026-01-06", state=state, timestamp=mock_clock)
+    mgr.scan_for_knowledge_gaps(
+        text=text,
+        triggered_by="ORG-401",
+        day=5,
+        date_str="2026-01-05",
+        state=state,
+        timestamp=mock_clock,
+    )
+    mgr.scan_for_knowledge_gaps(
+        text=text,
+        triggered_by="ORG-402",
+        day=6,
+        date_str="2026-01-06",
+        state=state,
+        timestamp=mock_clock,
+    )
 
     gap_events = [
-        call.args[0] for call in mgr._mem.log_event.call_args_list
+        call.args[0]
+        for call in mgr._mem.log_event.call_args_list
         if call.args[0].type == "knowledge_gap_detected"
     ]
-    assert len(gap_events) == 1   # second scan must be a no-op
+    assert len(gap_events) == 1  # second scan must be a no-op
 
 
 def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):
@@ -446,8 +595,14 @@ def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
     state.active_incidents = []
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": ["auth-service"], "documented_pct": 0.5, "day": 3}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": ["auth-service"],
+        "documented_pct": 0.5,
+        "day": 3,
+    }
     mgr._scheduled_departures = {3: [dep_cfg]}
     mgr.process_departures(day=3, date_str="2026-01-03", state=state, clock=mock_clock)
     mgr._mem.log_event.reset_mock()
@@ -455,8 +610,10 @@ def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):
     gaps = mgr.scan_for_knowledge_gaps(
         text="Disk I/O throughput degraded on worker-node-3.",
         triggered_by="ORG-403",
-        day=5, date_str="2026-01-05", state=state,
-        timestamp=mock_clock
+        day=5,
+        date_str="2026-01-05",
+        state=state,
+        timestamp=mock_clock,
     )
     assert len(gaps) == 0
 
@@ -465,13 +622,20 @@ def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):
 # 6. NEW HIRE COLD START
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_new_hire_added_to_graph(lifecycle, mock_clock):
     """A hired engineer must appear in the graph and org_chart after process_hires."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python", "Kafka"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python", "Kafka"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_hires = {5: [hire_cfg]}
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -488,9 +652,15 @@ def test_new_hire_cold_start_edges(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
     floor = gd.cfg["edge_weight_floor"]
 
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_hires = {5: [hire_cfg]}
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -505,15 +675,21 @@ def test_new_hire_warm_up_edge(lifecycle, mock_clock):
     """warm_up_edge must increase the edge weight between the hire and a colleague."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_hires = {5: [hire_cfg]}
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     weight_before = gd.G["Taylor"]["Alice"]["weight"]
     mgr.warm_up_edge("Taylor", "Alice", boost=1.5)
-    weight_after  = gd.G["Taylor"]["Alice"]["weight"]
+    weight_after = gd.G["Taylor"]["Alice"]["weight"]
 
     assert weight_after == round(weight_before + 1.5, 4)
 
@@ -522,19 +698,26 @@ def test_new_hire_emits_simevent(lifecycle, mock_clock):
     """process_hires must emit an employee_hired SimEvent with correct facts."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python", "Kafka"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python", "Kafka"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_hires = {5: [hire_cfg]}
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     hired_events = [
-        call.args[0] for call in mgr._mem.log_event.call_args_list
+        call.args[0]
+        for call in mgr._mem.log_event.call_args_list
         if call.args[0].type == "employee_hired"
     ]
     assert len(hired_events) == 1
     evt = hired_events[0]
-    assert evt.facts["name"]       == "Taylor"
+    assert evt.facts["name"] == "Taylor"
     assert evt.facts["cold_start"] is True
     assert "Kafka" in evt.facts["expertise"]
 
@@ -543,9 +726,15 @@ def test_new_hire_stress_initialised_low(lifecycle, mock_clock):
     """New hires must start with a low stress score, not inherit the org average."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_hires = {5: [hire_cfg]}
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -556,9 +745,15 @@ def test_new_hire_record_stored_on_state(lifecycle, mock_clock):
     """state.new_hires must be populated with the hire's metadata."""
     mgr, gd, org_chart, all_names, state = lifecycle
 
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_hires = {5: [hire_cfg]}
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -570,6 +765,7 @@ def test_new_hire_record_stored_on_state(lifecycle, mock_clock):
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. VALIDATOR PATCH
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_patch_validator_removes_departed_actor(lifecycle, mock_clock):
     """
@@ -588,8 +784,14 @@ def test_patch_validator_removes_departed_actor(lifecycle, mock_clock):
     )
     assert "Bob" in validator._valid_actors
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -614,9 +816,15 @@ def test_patch_validator_adds_new_hire(lifecycle, mock_clock):
     )
     assert "Taylor" not in validator._valid_actors
 
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_hires = {5: [hire_cfg]}
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
@@ -629,6 +837,7 @@ def test_patch_validator_adds_new_hire(lifecycle, mock_clock):
 # 8. ROSTER CONTEXT
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_get_roster_context_reflects_departure_and_hire(lifecycle, mock_clock):
     """
     get_roster_context must surface both a recent departure and a recent hire
@@ -637,26 +846,40 @@ def test_get_roster_context_reflects_departure_and_hire(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
     state.active_incidents = []
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": ["redis-cache"], "documented_pct": 0.3, "day": 4}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": ["redis-cache"],
+        "documented_pct": 0.3,
+        "day": 4,
+    }
     mgr._scheduled_departures = {4: [dep_cfg]}
     mgr.process_departures(day=4, date_str="2026-01-04", state=state, clock=mock_clock)
 
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_hires = {5: [hire_cfg]}
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=mock_clock)
 
     context = mgr.get_roster_context()
 
-    assert "Bob"     in context
-    assert "Taylor"  in context
+    assert "Bob" in context
+    assert "Taylor" in context
     assert "redis-cache" in context
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHARED HELPER — real SimClock wired to a minimal state stub
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _make_real_clock(date: datetime) -> SimClock:
     """
@@ -673,6 +896,7 @@ def _make_real_clock(date: datetime) -> SimClock:
 # 9. DEPARTURE CLOCK — timestamp correctness
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_departure_simevent_timestamp_is_early_morning(lifecycle):
     """
     _execute_departure calls clock.schedule_meeting([name], min_hour=9,
@@ -684,16 +908,23 @@ def test_departure_simevent_timestamp_is_early_morning(lifecycle):
     state.active_incidents = []
 
     sim_date = datetime(2026, 1, 5, 0, 0, 0)
-    clock    = _make_real_clock(sim_date)
+    clock = _make_real_clock(sim_date)
     clock.reset_to_business_start(all_names)
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=clock)
 
     departed_events = [
-        c.args[0] for c in mgr._mem.log_event.call_args_list
+        c.args[0]
+        for c in mgr._mem.log_event.call_args_list
         if c.args[0].type == "employee_departed"
     ]
     assert len(departed_events) == 1
@@ -725,8 +956,14 @@ def test_departure_degenerate_hour_range_does_not_raise(lifecycle):
     clock = _make_real_clock(datetime(2026, 1, 5, 0, 0, 0))
     clock.reset_to_business_start(all_names)
 
-    dep_cfg = {"name": "Bob", "reason": "layoff", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "layoff",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
 
     try:
@@ -754,39 +991,50 @@ def test_departure_and_hire_same_day_timestamps_are_in_business_hours(lifecycle)
     state.active_incidents = []
 
     sim_date = datetime(2026, 1, 5, 0, 0, 0)
-    clock    = _make_real_clock(sim_date)
+    clock = _make_real_clock(sim_date)
     clock.reset_to_business_start(all_names + ["Taylor"])
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
-    hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                "expertise": ["Python"], "style": "methodical", "tenure": "new",
-                "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
+    hire_cfg = {
+        "name": "Taylor",
+        "dept": "Engineering",
+        "role": "Backend Engineer",
+        "expertise": ["Python"],
+        "style": "methodical",
+        "tenure": "new",
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
-    mgr._scheduled_hires      = {5: [hire_cfg]}
+    mgr._scheduled_hires = {5: [hire_cfg]}
 
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=clock)
     mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=clock)
 
     all_calls = mgr._mem.log_event.call_args_list
 
-    dep_evt  = next(c.args[0] for c in all_calls if c.args[0].type == "employee_departed")
+    dep_evt = next(
+        c.args[0] for c in all_calls if c.args[0].type == "employee_departed"
+    )
     hire_evt = next(c.args[0] for c in all_calls if c.args[0].type == "employee_hired")
 
     for label, evt in [("departure", dep_evt), ("hire", hire_evt)]:
         ts = datetime.fromisoformat(evt.timestamp)
-        assert ts.date() == sim_date.date(), (
-            f"{label} timestamp on wrong date: {ts}"
-        )
+        assert ts.date() == sim_date.date(), f"{label} timestamp on wrong date: {ts}"
         assert ts.hour >= 9, f"{label} timestamp before 09:00: {ts}"
-        assert (ts.hour, ts.minute) <= (17, 30), (
-            f"{label} timestamp after 17:30: {ts}"
-        )
+        assert (ts.hour, ts.minute) <= (17, 30), f"{label} timestamp after 17:30: {ts}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. HIRE CLOCK — timestamp correctness
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
     """
@@ -812,16 +1060,23 @@ def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
         config = {
             "org_lifecycle": {},
             "graph_dynamics": {},
-            "personas": {n: {"style": "direct", "expertise": [], "tenure": "1y", "stress": 20} for n in all_names},
+            "personas": {
+                n: {"style": "direct", "expertise": [], "tenure": "1y", "stress": 20}
+                for n in all_names
+            },
             "org_chart": {"Engineering": list(all_names)},
             "leads": {"Engineering": "Alice"},
         }
         from org_lifecycle import OrgLifecycleManager
+
         gd = GraphDynamics(G, config)
         mgr = OrgLifecycleManager(
-            config=config, graph_dynamics=gd,
-            mem=make_test_memory, org_chart=config["org_chart"],
-            personas=config["personas"], all_names=list(all_names),
+            config=config,
+            graph_dynamics=gd,
+            mem=make_test_memory,
+            org_chart=config["org_chart"],
+            personas=config["personas"],
+            all_names=list(all_names),
             leads=config["leads"],
         )
 
@@ -829,18 +1084,25 @@ def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
         state.new_hires = {}
 
         sim_date = datetime(2026, 1, 5, 0, 0, 0)
-        clock    = _make_real_clock(sim_date)
+        clock = _make_real_clock(sim_date)
         clock.reset_to_business_start(all_names)
 
-        hire_cfg = {"name": "Taylor", "dept": "Engineering", "role": "Backend Engineer",
-                    "expertise": ["Python"], "style": "methodical", "tenure": "new",
-                    "day": 5}
+        hire_cfg = {
+            "name": "Taylor",
+            "dept": "Engineering",
+            "role": "Backend Engineer",
+            "expertise": ["Python"],
+            "style": "methodical",
+            "tenure": "new",
+            "day": 5,
+        }
         mgr._scheduled_hires = {5: [hire_cfg]}
         make_test_memory.log_event.reset_mock()
         mgr.process_hires(day=5, date_str="2026-01-05", state=state, clock=clock)
 
         hire_events = [
-            c.args[0] for c in mgr._mem.log_event.call_args_list
+            c.args[0]
+            for c in mgr._mem.log_event.call_args_list
             if c.args[0].type == "employee_hired"
         ]
         assert len(hire_events) == 1, f"Trial {i}: expected 1 hire event"
@@ -855,6 +1117,7 @@ def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. CENTRALITY VACUUM — timestamp field correctness
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
     """
@@ -884,32 +1147,38 @@ def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
         G.add_node(n, dept="Engineering", is_lead=(n == "Alice"), external=False)
     # Left triangle — stays intact after Bob leaves
     G.add_edge("Alice", "Carol", weight=8.0)
-    G.add_edge("Alice", "Dave",  weight=8.0)
-    G.add_edge("Carol", "Dave",  weight=8.0)
+    G.add_edge("Alice", "Dave", weight=8.0)
+    G.add_edge("Carol", "Dave", weight=8.0)
     # Right pair
-    G.add_edge("Eve",   "Frank", weight=8.0)
+    G.add_edge("Eve", "Frank", weight=8.0)
     # Bob is the primary bridge left↔right
-    G.add_edge("Bob",   "Alice", weight=8.0)
-    G.add_edge("Bob",   "Eve",   weight=8.0)
+    G.add_edge("Bob", "Alice", weight=8.0)
+    G.add_edge("Bob", "Eve", weight=8.0)
     # Thin back-channel — keeps graph connected so Dave/Frank gain centrality
-    G.add_edge("Dave",  "Frank", weight=0.1)
+    G.add_edge("Dave", "Frank", weight=0.1)
 
     config = {
         # High multiplier ensures int(delta * multiplier) >= 1 even for small deltas
         "org_lifecycle": {"centrality_vacuum_stress_multiplier": 1000},
         "graph_dynamics": {},
-        "personas": {n: {"style": "direct", "expertise": [], "tenure": "1y", "stress": 25}
-                     for n in nodes},
+        "personas": {
+            n: {"style": "direct", "expertise": [], "tenure": "1y", "stress": 25}
+            for n in nodes
+        },
         "org_chart": {"Engineering": list(nodes)},
         "leads": {"Engineering": "Alice"},
     }
-    gd  = GraphDynamics(G, config)
+    gd = GraphDynamics(G, config)
     mem = MagicMock()
 
     mgr = OrgLifecycleManager(
-        config=config, graph_dynamics=gd, mem=mem,
-        org_chart=config["org_chart"], personas=config["personas"],
-        all_names=list(nodes), leads=config["leads"],
+        config=config,
+        graph_dynamics=gd,
+        mem=mem,
+        org_chart=config["org_chart"],
+        personas=config["personas"],
+        all_names=list(nodes),
+        leads=config["leads"],
     )
     for n in nodes:
         gd._stress[n] = 25
@@ -918,16 +1187,23 @@ def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
     state.active_incidents = []
 
     sim_date = datetime(2026, 1, 5, 0, 0, 0)
-    clock    = _make_real_clock(sim_date)
+    clock = _make_real_clock(sim_date)
     clock.reset_to_business_start(nodes)
 
-    dep_cfg = {"name": "Bob", "reason": "voluntary", "role": "Engineer",
-               "knowledge_domains": [], "documented_pct": 0.5, "day": 5}
+    dep_cfg = {
+        "name": "Bob",
+        "reason": "voluntary",
+        "role": "Engineer",
+        "knowledge_domains": [],
+        "documented_pct": 0.5,
+        "day": 5,
+    }
     mgr._scheduled_departures = {5: [dep_cfg]}
     mgr.process_departures(day=5, date_str="2026-01-05", state=state, clock=clock)
 
     vacuum_events = [
-        c.args[0] for c in mem.log_event.call_args_list
+        c.args[0]
+        for c in mem.log_event.call_args_list
         if c.args[0].type == "knowledge_gap_detected"
         and c.args[0].facts.get("trigger") == "centrality_vacuum"
     ]

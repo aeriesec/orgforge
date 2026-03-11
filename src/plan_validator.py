@@ -18,8 +18,7 @@ Checks every ProposedEvent against:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Set
-from dataclasses import dataclass
+from typing import Dict, List, Set
 
 from planner_models import (
     ProposedEvent,
@@ -39,26 +38,31 @@ _DEPARTED_NAMES: set = set()
 
 # Events that are inappropriate when system health is critically low
 _BLOCKED_WHEN_CRITICAL = {
-    "team_celebration", "hackathon", "offretreat", "deep_work_session",
+    "team_celebration",
+    "hackathon",
+    "offretreat",
+    "deep_work_session",
 }
 
 # Events that require at least one incident to have occurred recently
 _REQUIRES_PRIOR_INCIDENT = {
-    "postmortem_created", "escalation_chain", "stability_update_to_sales",
+    "postmortem_created",
+    "escalation_chain",
+    "stability_update_to_sales",
     "customer_escalation",
 }
 
 # Minimum days between repeated firings of the same event type
 _COOLDOWN_DAYS: Dict[str, int] = {
-    "retrospective":        9,
-    "sprint_planned":       9,
-    "morale_intervention":  5,
-    "hr_checkin":           3,
-    "leadership_sync":      2,
-    "vendor_meeting":       3,
-    "onboarding_session":   1,
-    "farewell_message":   999,
-    "warmup_1on1":          2,
+    "retrospective": 9,
+    "sprint_planned": 9,
+    "morale_intervention": 5,
+    "hr_checkin": 3,
+    "leadership_sync": 2,
+    "vendor_meeting": 3,
+    "onboarding_session": 1,
+    "farewell_message": 999,
+    "warmup_1on1": 2,
 }
 
 
@@ -77,21 +81,21 @@ class PlanValidator:
 
     def __init__(
         self,
-        all_names:              List[str],
+        all_names: List[str],
         external_contact_names: List[str],
-        config:                 dict,
+        config: dict,
     ):
         self._valid_actors: Set[str] = set(all_names) | set(external_contact_names)
         self._config = config
-        self._novel_log: List[ProposedEvent] = []   # accumulates for SimEvent logging
+        self._novel_log: List[ProposedEvent] = []  # accumulates for SimEvent logging
 
     # ─── PUBLIC ──────────────────────────────────────────────────────────────
 
     def validate_plan(
         self,
-        proposed:      List[ProposedEvent],
-        state,                              # flow.State — avoids circular import
-        recent_events: List[dict],          # last N day_summary facts dicts
+        proposed: List[ProposedEvent],
+        state,  # flow.State — avoids circular import
+        recent_events: List[dict],  # last N day_summary facts dicts
     ) -> List[ValidationResult]:
         """
         Validate every ProposedEvent in the plan.
@@ -99,9 +103,7 @@ class PlanValidator:
         """
         # Build cooldown tracker from recent events
         recent_event_types = self._recent_event_types(recent_events)
-        recent_incident_count = sum(
-            e.get("incidents_opened", 0) for e in recent_events
-        )
+        recent_incident_count = sum(e.get("incidents_opened", 0) for e in recent_events)
         # Live per-ticket actor tracking for today — read from state, not summaries.
         # state.ticket_actors_today is populated by flow.py as ticket_progress
         # events execute, and reset to {} at the top of each daily_cycle().
@@ -144,20 +146,23 @@ class PlanValidator:
 
     def _validate_one(
         self,
-        event:                 ProposedEvent,
+        event: ProposedEvent,
         state,
-        recent_event_types:    Dict[str, int],   # {event_type: days_since_last}
+        recent_event_types: Dict[str, int],  # {event_type: days_since_last}
         recent_incident_count: int,
-        ticket_actors_today:   Dict[str, set],   # {ticket_id: {actors who touched it today}}
+        ticket_actors_today: Dict[
+            str, set
+        ],  # {ticket_id: {actors who touched it today}}
     ) -> ValidationResult:
 
         # ── 1. Actor integrity ────────────────────────────────────────────────
         unknown_actors = [a for a in event.actors if a not in self._valid_actors]
         if unknown_actors:
             return ValidationResult(
-                approved=False, event=event,
+                approved=False,
+                event=event,
                 rejection_reason=f"Unknown actors: {unknown_actors}. "
-                                 f"LLM invented names not in org_chart.",
+                f"LLM invented names not in org_chart.",
             )
 
         # ── 1b. Departed-actor guard ──────────────────────────────────────────
@@ -166,7 +171,8 @@ class PlanValidator:
         departed_actors = [a for a in event.actors if a in _DEPARTED_NAMES]
         if departed_actors:
             return ValidationResult(
-                approved=False, event=event,
+                approved=False,
+                event=event,
                 rejection_reason=(
                     f"Actors {departed_actors} have departed the organisation. "
                     f"Remove them from this event."
@@ -183,12 +189,12 @@ class PlanValidator:
                     f"  [cyan]✨ Novel event approved (fallback artifact):[/cyan] "
                     f"{event.event_type} → {event.artifact_hint}"
                 )
-                return ValidationResult(
-                    approved=True, event=event, was_novel=True
-                )
+                return ValidationResult(approved=True, event=event, was_novel=True)
             else:
                 return ValidationResult(
-                    approved=False, event=event, was_novel=True,
+                    approved=False,
+                    event=event,
+                    was_novel=True,
                     rejection_reason=(
                         f"Novel event type '{event.event_type}' has no known "
                         f"artifact_hint. Logged for future implementation."
@@ -198,7 +204,8 @@ class PlanValidator:
         # ── 3. State plausibility ─────────────────────────────────────────────
         if event.event_type in _BLOCKED_WHEN_CRITICAL and state.system_health < 40:
             return ValidationResult(
-                approved=False, event=event,
+                approved=False,
+                event=event,
                 rejection_reason=(
                     f"'{event.event_type}' blocked: system health critical "
                     f"({state.system_health}). Inappropriate tone for current state."
@@ -207,7 +214,8 @@ class PlanValidator:
 
         if event.event_type in _REQUIRES_PRIOR_INCIDENT and recent_incident_count == 0:
             return ValidationResult(
-                approved=False, event=event,
+                approved=False,
+                event=event,
                 rejection_reason=(
                     f"'{event.event_type}' requires a prior incident in the "
                     f"recent window. None found."
@@ -220,7 +228,8 @@ class PlanValidator:
             days_since = recent_event_types.get(event.event_type, 999)
             if days_since < cooldown:
                 return ValidationResult(
-                    approved=False, event=event,
+                    approved=False,
+                    event=event,
                     rejection_reason=(
                         f"'{event.event_type}' in cooldown. "
                         f"Last fired {days_since}d ago, cooldown is {cooldown}d."
@@ -230,7 +239,8 @@ class PlanValidator:
         # ── 5. Morale-gated events ────────────────────────────────────────────
         if event.event_type == "morale_intervention" and state.team_morale > 0.6:
             return ValidationResult(
-                approved=False, event=event,
+                approved=False,
+                event=event,
                 rejection_reason=(
                     f"morale_intervention not warranted: morale={state.team_morale:.2f} "
                     f"is above intervention threshold."
@@ -248,7 +258,8 @@ class PlanValidator:
                 overlap = [a for a in event.actors if a in actors_on_ticket]
                 if overlap:
                     return ValidationResult(
-                        approved=False, event=event,
+                        approved=False,
+                        event=event,
                         rejection_reason=(
                             f"Duplicate ticket work: {overlap} already logged "
                             f"progress on {ticket_id} today."
@@ -258,9 +269,7 @@ class PlanValidator:
         # ── All checks passed ─────────────────────────────────────────────────
         return ValidationResult(approved=True, event=event)
 
-    def _recent_event_types(
-        self, recent_summaries: List[dict]
-    ) -> Dict[str, int]:
+    def _recent_event_types(self, recent_summaries: List[dict]) -> Dict[str, int]:
         """
         Returns {event_type: days_since_last_occurrence} from day_summary facts.
         Uses dominant_event and event_type_counts from the enriched summary.

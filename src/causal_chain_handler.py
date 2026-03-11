@@ -61,20 +61,20 @@ _RRF_K = 60
 
 # Default fusion weights — vector wins for semantic similarity since our
 # Ollama embedding model is local and essentially free to call
-_TEXT_WEIGHT   = 0.35
+_TEXT_WEIGHT = 0.35
 _VECTOR_WEIGHT = 0.65
 
 # Minimum scores to accept a match — tune these after reviewing
 # the recurrence_matches collection after a sim run
 _MIN_VECTOR_SCORE = 0.72
-_MIN_TEXT_SCORE   = 0.40
+_MIN_TEXT_SCORE = 0.40
 
 # How many candidates to retrieve from each source before fusion
 _RETRIEVAL_LIMIT = 10
 
-ARTIFACT_KEY_JIRA       = "jira"
+ARTIFACT_KEY_JIRA = "jira"
 ARTIFACT_KEY_CONFLUENCE = "confluence"
-ARTIFACT_KEY_SLACK      = "slack"
+ARTIFACT_KEY_SLACK = "slack"
 ARTIFACT_KEY_SLACK_THREAD = "digital-hq"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +82,7 @@ ARTIFACT_KEY_SLACK_THREAD = "digital-hq"
 # Tracks the growing set of artifact IDs that causally produced an incident.
 # Lives on an ActiveIncident — one instance per open incident.
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class CausalChainHandler:
     """
@@ -135,6 +136,7 @@ class CausalChainHandler:
 # threshold calibration.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class RecurrenceMatchStore:
     """
     Writes one document per recurrence detection attempt to the
@@ -178,47 +180,48 @@ class RecurrenceMatchStore:
     def log(
         self,
         *,
-        query_root_cause:    str,
-        current_ticket_id:   str,
-        current_day:         int,
-        matched_event:       Optional[SimEvent],
-        text_score:          float,
-        vector_score:        float,
-        fused_score:         float,
-        rrf_score:           float,
-        fusion_strategy:     str,
-        confidence:          str,
+        query_root_cause: str,
+        current_ticket_id: str,
+        current_day: int,
+        matched_event: Optional[SimEvent],
+        text_score: float,
+        vector_score: float,
+        fused_score: float,
+        rrf_score: float,
+        fusion_strategy: str,
+        confidence: str,
         candidates_evaluated: int,
-        threshold_gate:      Dict[str, float],
+        threshold_gate: Dict[str, float],
     ) -> None:
         doc: Dict[str, Any] = {
             # Query
-            "query_root_cause":   query_root_cause,
-            "current_ticket_id":  current_ticket_id,
-            "current_day":        current_day,
-
+            "query_root_cause": query_root_cause,
+            "current_ticket_id": current_ticket_id,
+            "current_day": current_day,
             # Match result
-            "matched":            matched_event is not None,
-            "matched_ticket_id":  matched_event.artifact_ids.get("jira") if matched_event else None,
-            "matched_root_cause": matched_event.facts.get("root_cause")  if matched_event else None,
-            "matched_day":        matched_event.day                       if matched_event else None,
+            "matched": matched_event is not None,
+            "matched_ticket_id": matched_event.artifact_ids.get("jira")
+            if matched_event
+            else None,
+            "matched_root_cause": matched_event.facts.get("root_cause")
+            if matched_event
+            else None,
+            "matched_day": matched_event.day if matched_event else None,
             "recurrence_gap_days": (
                 current_day - matched_event.day if matched_event else None
             ),
-
             # Scores
-            "text_score":          round(text_score,   4),
-            "vector_score":        round(vector_score, 4),
-            "fused_score":         round(fused_score,  4),
-            "rrf_score":           round(rrf_score,    4),
-            "fusion_strategy":     fusion_strategy,
-            "confidence":          confidence,
+            "text_score": round(text_score, 4),
+            "vector_score": round(vector_score, 4),
+            "fused_score": round(fused_score, 4),
+            "rrf_score": round(rrf_score, 4),
+            "fusion_strategy": fusion_strategy,
+            "confidence": confidence,
             "candidates_evaluated": candidates_evaluated,
-            "threshold_gate":      threshold_gate,
-
+            "threshold_gate": threshold_gate,
             # Metadata
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "sim_day":   current_day,
+            "sim_day": current_day,
         }
         try:
             self._coll.insert_one(doc)
@@ -231,6 +234,7 @@ class RecurrenceMatchStore:
 # Hybrid retrieval: fuses MongoDB text search + vector search to identify
 # whether a new incident root cause has occurred before.
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class RecurrenceDetector:
     """
@@ -256,18 +260,18 @@ class RecurrenceDetector:
 
     def __init__(
         self,
-        mem:            Memory,
-        text_weight:    float = _TEXT_WEIGHT,
-        vector_weight:  float = _VECTOR_WEIGHT,
-        min_vector:     float = _MIN_VECTOR_SCORE,
-        min_text:       float = _MIN_TEXT_SCORE,
+        mem: Memory,
+        text_weight: float = _TEXT_WEIGHT,
+        vector_weight: float = _VECTOR_WEIGHT,
+        min_vector: float = _MIN_VECTOR_SCORE,
+        min_text: float = _MIN_TEXT_SCORE,
     ):
-        self._mem           = mem
-        self._text_w        = text_weight
-        self._vector_w      = vector_weight
-        self._min_vector    = min_vector
-        self._min_text      = min_text
-        self._store         = RecurrenceMatchStore(mem)
+        self._mem = mem
+        self._text_w = text_weight
+        self._vector_w = vector_weight
+        self._min_vector = min_vector
+        self._min_text = min_text
+        self._store = RecurrenceMatchStore(mem)
 
         # Ensure text index exists on the events collection
         self._ensure_text_index()
@@ -276,8 +280,8 @@ class RecurrenceDetector:
 
     def find_prior_incident(
         self,
-        root_cause:        str,
-        current_day:       int,
+        root_cause: str,
+        current_day: int,
         current_ticket_id: str,
     ) -> Optional[SimEvent]:
         """
@@ -290,15 +294,15 @@ class RecurrenceDetector:
 
         # ── Stage 1: MongoDB text search ──────────────────────────────────────
         text_results = self._text_search(root_cause, current_day)
-        max_text     = max((r.get("score", 0) for r in text_results), default=1.0)
+        max_text = max((r.get("score", 0) for r in text_results), default=1.0)
 
         for rank, result in enumerate(text_results):
-            event     = SimEvent.from_dict(result)
-            key       = event.artifact_ids.get("jira", event.timestamp)
+            event = SimEvent.from_dict(result)
+            key = event.artifact_ids.get("jira", event.timestamp)
             normalised = result.get("score", 0) / max_text if max_text > 0 else 0.0
             candidates.setdefault(key, self._empty_candidate(event))
             candidates[key]["text_score"] = normalised
-            candidates[key]["text_rrf"]   = 1 / (rank + 1 + _RRF_K)
+            candidates[key]["text_rrf"] = 1 / (rank + 1 + _RRF_K)
 
         # ── Stage 2: Vector search ─────────────────────────────────────────────
         vector_results = self._vector_search(root_cause, current_day)
@@ -307,7 +311,7 @@ class RecurrenceDetector:
             key = event.artifact_ids.get("jira", event.timestamp)
             candidates.setdefault(key, self._empty_candidate(event))
             candidates[key]["vector_score"] = vscore
-            candidates[key]["vector_rrf"]   = 1 / (rank + 1 + _RRF_K)
+            candidates[key]["vector_rrf"] = 1 / (rank + 1 + _RRF_K)
 
         if not candidates:
             self._store.log(
@@ -327,21 +331,20 @@ class RecurrenceDetector:
             return None
 
         # ── Fusion ────────────────────────────────────────────────────────────
-        both_returned    = bool(text_results) and bool(vector_results)
-        fusion_strategy  = "rrf" if both_returned else (
-            "text_only"   if text_results else "vector_only"
+        both_returned = bool(text_results) and bool(vector_results)
+        fusion_strategy = (
+            "rrf" if both_returned else ("text_only" if text_results else "vector_only")
         )
 
         for c in candidates.values():
             c["fused_score"] = (
-                self._text_w   * c["text_score"] +
-                self._vector_w * c["vector_score"]
+                self._text_w * c["text_score"] + self._vector_w * c["vector_score"]
             )
             c["rrf_score"] = c.get("text_rrf", 0.0) + c.get("vector_rrf", 0.0)
 
         sort_key = "rrf_score" if both_returned else "fused_score"
-        ranked   = sorted(candidates.values(), key=lambda c: c[sort_key], reverse=True)
-        best     = ranked[0]
+        ranked = sorted(candidates.values(), key=lambda c: c[sort_key], reverse=True)
+        best = ranked[0]
 
         # ── Threshold gate ────────────────────────────────────────────────────
         is_confident = (
@@ -349,9 +352,13 @@ class RecurrenceDetector:
             or best["text_score"] >= self._min_text
         )
         confidence = (
-            "high"     if (best["vector_score"] >= self._min_vector
-                           and best["text_score"] >= self._min_text)
-            else "low" if is_confident
+            "high"
+            if (
+                best["vector_score"] >= self._min_vector
+                and best["text_score"] >= self._min_text
+            )
+            else "low"
+            if is_confident
             else "rejected"
         )
         matched_event = best["event"] if is_confident else None
@@ -396,7 +403,8 @@ class RecurrenceDetector:
         """
         event = next(
             (
-                e for e in self._mem.get_event_log()
+                e
+                for e in self._mem.get_event_log()
                 if e.type == "postmortem_created"
                 and e.artifact_ids.get("jira") == ticket_id
             ),
@@ -411,9 +419,9 @@ class RecurrenceDetector:
 
         Returns events sorted chronologically (earliest first).
         """
-        chain:   List[SimEvent] = []
-        visited: set            = set()
-        queue:   List[str]      = [artifact_id]
+        chain: List[SimEvent] = []
+        visited: set = set()
+        queue: List[str] = [artifact_id]
 
         while queue:
             aid = queue.pop(0)
@@ -422,7 +430,8 @@ class RecurrenceDetector:
             visited.add(aid)
 
             events = [
-                e for e in self._mem.get_event_log()
+                e
+                for e in self._mem.get_event_log()
                 if aid in e.artifact_ids.values()
                 or aid in e.facts.get("causal_chain", [])
                 or aid == e.facts.get("recurrence_of")
@@ -440,8 +449,8 @@ class RecurrenceDetector:
                     queue.append(prior)
 
         # Deduplicate (same event may appear via multiple paths)
-        seen_ids: set             = set()
-        unique:   List[SimEvent]  = []
+        seen_ids: set = set()
+        unique: List[SimEvent] = []
         for e in chain:
             eid = (e.day, e.type, e.timestamp)
             if eid not in seen_ids:
@@ -456,24 +465,23 @@ class RecurrenceDetector:
         parent — i.e. every time this class of problem has recurred.
         """
         return [
-            e for e in self._mem.get_event_log()
+            e
+            for e in self._mem.get_event_log()
             if e.facts.get("recurrence_of") == ticket_id
             or ticket_id in e.facts.get("causal_chain", [])
         ]
 
     # ── Private ───────────────────────────────────────────────────────────────
 
-    def _text_search(
-        self, root_cause: str, current_day: int
-    ) -> List[Dict[str, Any]]:
+    def _text_search(self, root_cause: str, current_day: int) -> List[Dict[str, Any]]:
         """MongoDB $text search over the events collection."""
         try:
             results = list(
                 self._mem._events.find(
                     {
                         "$text": {"$search": root_cause},
-                        "type":  {"$in": ["incident_opened", "incident_resolved"]},
-                        "day":   {"$lt": current_day},
+                        "type": {"$in": ["incident_opened", "incident_resolved"]},
+                        "day": {"$lt": current_day},
                     },
                     {"score": {"$meta": "textScore"}, "_id": 0},
                 )
@@ -519,19 +527,19 @@ class RecurrenceDetector:
     @staticmethod
     def _empty_candidate(event: SimEvent) -> Dict[str, Any]:
         return {
-            "event":        event,
-            "text_score":   0.0,
+            "event": event,
+            "text_score": 0.0,
             "vector_score": 0.0,
-            "text_rrf":     0.0,
-            "vector_rrf":   0.0,
-            "fused_score":  0.0,
-            "rrf_score":    0.0,
+            "text_rrf": 0.0,
+            "vector_rrf": 0.0,
+            "fused_score": 0.0,
+            "rrf_score": 0.0,
         }
 
     def _threshold_gate(self) -> Dict[str, float]:
         return {
             "min_vector": self._min_vector,
-            "min_text":   self._min_text,
+            "min_text": self._min_text,
         }
 
 
@@ -542,12 +550,13 @@ class RecurrenceDetector:
 # or copy-pasted into Memory directly.
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def search_events(
-    mem:         Memory,
-    query:       str,
+    mem: Memory,
+    query: str,
     event_types: Optional[List[str]] = None,
-    n:           int                 = 10,
-    as_of_day:   Optional[int]       = None,
+    n: int = 10,
+    as_of_day: Optional[int] = None,
 ) -> List[Tuple[SimEvent, float]]:
     """
     Vector search over the events collection.
@@ -570,18 +579,14 @@ def search_events(
     pipeline: List[Dict] = [
         {
             "$vectorSearch": {
-                "index":       "vector_index",
-                "path":        "embedding",
+                "index": "vector_index",
+                "path": "embedding",
                 "queryVector": query_vector,
                 "numCandidates": n * 10,
-                "limit":       n,
+                "limit": n,
             }
         },
-        {
-            "$addFields": {
-                "vector_score": {"$meta": "vectorSearchScore"}
-            }
-        },
+        {"$addFields": {"vector_score": {"$meta": "vectorSearchScore"}}},
         {"$project": {"_id": 0, "embedding": 0}},
     ]
 
