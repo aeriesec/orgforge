@@ -2,12 +2,17 @@ import pytest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
-from sim_clock import SimClock, DAY_START_HOUR, DAY_START_MINUTE, DAY_END_HOUR, DAY_END_MINUTE
+from sim_clock import (
+    SimClock,
+    DAY_START_HOUR,
+    DAY_START_MINUTE,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIXTURES
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def mock_state():
@@ -27,6 +32,7 @@ def clock(mock_state):
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. RESET TO BUSINESS START
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_reset_initialises_all_actors(clock, mock_state):
     """reset_to_business_start must set every actor and 'system' to 09:00 today."""
@@ -56,6 +62,7 @@ def test_reset_overwrites_existing_cursors(clock, mock_state):
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. ADVANCE ACTOR
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_advance_actor_moves_cursor_forward(clock, mock_state):
     """advance_actor must push the cursor forward by the given hours."""
@@ -104,23 +111,24 @@ def test_advance_actor_rolls_over_to_next_business_day(clock, mock_state):
 # 3. SYNC AND TICK
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_sync_and_tick_brings_laggard_forward(clock, mock_state):
     """sync_and_tick must pull slower actors up to the max cursor before ticking."""
     mock_state.actor_cursors["Alice"] = datetime(2026, 3, 10, 11, 0, 0)
-    mock_state.actor_cursors["Bob"]   = datetime(2026, 3, 10, 9,  0, 0)  # behind
+    mock_state.actor_cursors["Bob"] = datetime(2026, 3, 10, 9, 0, 0)  # behind
 
     result = clock.sync_and_tick(["Alice", "Bob"], min_mins=5, max_mins=5)
 
     # Both must be at or past 11:00 + 5 min
     assert mock_state.actor_cursors["Alice"] == result
-    assert mock_state.actor_cursors["Bob"]   == result
+    assert mock_state.actor_cursors["Bob"] == result
     assert result >= datetime(2026, 3, 10, 11, 5, 0)
 
 
 def test_sync_and_tick_result_advances_beyond_sync_point(clock, mock_state):
     """The returned time must be strictly after the maximum pre-sync cursor."""
     mock_state.actor_cursors["Alice"] = datetime(2026, 3, 10, 10, 0, 0)
-    mock_state.actor_cursors["Bob"]   = datetime(2026, 3, 10, 10, 0, 0)
+    mock_state.actor_cursors["Bob"] = datetime(2026, 3, 10, 10, 0, 0)
 
     result = clock.sync_and_tick(["Alice", "Bob"], min_mins=5, max_mins=5)
 
@@ -131,11 +139,10 @@ def test_sync_and_tick_enforces_business_hours_by_default(clock, mock_state):
     """Without allow_after_hours, sync_and_tick must not land past 17:30."""
     # Put actors near end-of-day so the tick pushes them over
     mock_state.actor_cursors["Alice"] = datetime(2026, 3, 10, 17, 25, 0)
-    mock_state.actor_cursors["Bob"]   = datetime(2026, 3, 10, 17, 25, 0)
+    mock_state.actor_cursors["Bob"] = datetime(2026, 3, 10, 17, 25, 0)
 
     result = clock.sync_and_tick(["Alice", "Bob"], min_mins=10, max_mins=10)
 
-    eod = datetime(2026, 3, 10, DAY_END_HOUR, DAY_END_MINUTE, 0)
     assert result != datetime(2026, 3, 10, 17, 35, 0), "Should not land after EOD"
     # Must roll to the next business day start
     assert result.hour == DAY_START_HOUR and result.minute == DAY_START_MINUTE
@@ -145,6 +152,7 @@ def test_sync_and_tick_enforces_business_hours_by_default(clock, mock_state):
 # 4. TICK MESSAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_tick_message_incident_cadence_is_faster_than_async(clock, mock_state):
     """
     Over many samples, incident cadence ticks should produce shorter average
@@ -153,20 +161,20 @@ def test_tick_message_incident_cadence_is_faster_than_async(clock, mock_state):
     import statistics
 
     results_incident = []
-    results_async    = []
+    results_async = []
 
     for _ in range(30):
         # Reset to a clean starting point each time
         mock_state.actor_cursors = {
             "Alice": datetime(2026, 3, 10, 10, 0, 0),
-            "Bob":   datetime(2026, 3, 10, 10, 0, 0),
+            "Bob": datetime(2026, 3, 10, 10, 0, 0),
         }
         t = clock.tick_message(["Alice", "Bob"], cadence="incident")
         results_incident.append((t - datetime(2026, 3, 10, 10, 0, 0)).total_seconds())
 
         mock_state.actor_cursors = {
             "Alice": datetime(2026, 3, 10, 10, 0, 0),
-            "Bob":   datetime(2026, 3, 10, 10, 0, 0),
+            "Bob": datetime(2026, 3, 10, 10, 0, 0),
         }
         t = clock.tick_message(["Alice", "Bob"], cadence="async")
         results_async.append((t - datetime(2026, 3, 10, 10, 0, 0)).total_seconds())
@@ -177,7 +185,7 @@ def test_tick_message_incident_cadence_is_faster_than_async(clock, mock_state):
 def test_tick_message_unknown_cadence_falls_back_to_normal(clock, mock_state):
     """tick_message with an unrecognised cadence must not raise; normal range applies."""
     mock_state.actor_cursors["Alice"] = datetime(2026, 3, 10, 10, 0, 0)
-    mock_state.actor_cursors["Bob"]   = datetime(2026, 3, 10, 10, 0, 0)
+    mock_state.actor_cursors["Bob"] = datetime(2026, 3, 10, 10, 0, 0)
 
     try:
         result = clock.tick_message(["Alice", "Bob"], cadence="made_up_cadence")
@@ -190,6 +198,7 @@ def test_tick_message_unknown_cadence_falls_back_to_normal(clock, mock_state):
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. TICK SYSTEM
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_tick_system_advances_only_system_cursor(clock, mock_state):
     """tick_system must only move the 'system' cursor, leaving human actors alone."""
@@ -216,6 +225,7 @@ def test_tick_system_moves_forward_in_time(clock, mock_state):
 # 6. AT (PINNED MEETING)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_at_stamps_artifact_at_exact_scheduled_time(clock, mock_state):
     """clock.at must return precisely the scheduled start time for artifact stamping."""
     clock.reset_to_business_start(["Alice", "Bob"])
@@ -233,14 +243,14 @@ def test_at_advances_cursors_to_meeting_end(clock, mock_state):
     expected_end = datetime(2026, 3, 10, 11, 45, 0)
 
     assert mock_state.actor_cursors["Alice"] == expected_end
-    assert mock_state.actor_cursors["Bob"]   == expected_end
+    assert mock_state.actor_cursors["Bob"] == expected_end
 
 
 def test_at_does_not_time_travel_actors_already_past_meeting(clock, mock_state):
     """Actors already past the meeting end must not be rewound."""
     future_time = datetime(2026, 3, 10, 14, 0, 0)
     mock_state.actor_cursors["Alice"] = future_time
-    mock_state.actor_cursors["Bob"]   = datetime(2026, 3, 10, 9, 0, 0)
+    mock_state.actor_cursors["Bob"] = datetime(2026, 3, 10, 9, 0, 0)
 
     clock.at(["Alice", "Bob"], hour=10, minute=0, duration_mins=60)
 
@@ -251,6 +261,7 @@ def test_at_does_not_time_travel_actors_already_past_meeting(clock, mock_state):
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. NOW
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_now_returns_cursor_without_advancing(clock, mock_state):
     """clock.now must read an actor's current time without side-effects."""
@@ -278,11 +289,12 @@ def test_now_defaults_unknown_actor_to_business_start(clock, mock_state):
 # 8. SYNC TO SYSTEM
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_sync_to_system_pulls_lagging_actors_forward(clock, mock_state):
     """sync_to_system must bring actors behind the system clock up to it."""
     sys_time = datetime(2026, 3, 10, 12, 0, 0)
     mock_state.actor_cursors["system"] = sys_time
-    mock_state.actor_cursors["Alice"]  = datetime(2026, 3, 10, 9, 30, 0)  # behind
+    mock_state.actor_cursors["Alice"] = datetime(2026, 3, 10, 9, 30, 0)  # behind
 
     clock.sync_to_system(["Alice"])
 
@@ -295,9 +307,9 @@ def test_sync_to_system_does_not_rewind_actors_ahead_of_system(clock, mock_state
     be pulled backward — the incident interrupts them, not rewinds them.
     """
     sys_time = datetime(2026, 3, 10, 10, 0, 0)
-    future   = datetime(2026, 3, 10, 14, 0, 0)
+    future = datetime(2026, 3, 10, 14, 0, 0)
     mock_state.actor_cursors["system"] = sys_time
-    mock_state.actor_cursors["Alice"]  = future
+    mock_state.actor_cursors["Alice"] = future
 
     clock.sync_to_system(["Alice"])
 
@@ -308,6 +320,7 @@ def test_sync_to_system_does_not_rewind_actors_ahead_of_system(clock, mock_state
 # 9. SCHEDULE MEETING
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_schedule_meeting_returns_time_within_window(clock, mock_state):
     """schedule_meeting must return a start time inside [min_hour, max_hour)."""
     clock.reset_to_business_start(["Alice", "Bob"])
@@ -315,7 +328,7 @@ def test_schedule_meeting_returns_time_within_window(clock, mock_state):
     for _ in range(20):  # randomised — run multiple trials
         mock_state.actor_cursors = {
             "Alice": datetime(2026, 3, 10, 9, 0, 0),
-            "Bob":   datetime(2026, 3, 10, 9, 0, 0),
+            "Bob": datetime(2026, 3, 10, 9, 0, 0),
         }
         result = clock.schedule_meeting(["Alice", "Bob"], min_hour=10, max_hour=12)
         assert 10 <= result.hour < 12, f"Meeting hour {result.hour} outside [10, 12)"
@@ -325,45 +338,49 @@ def test_schedule_meeting_advances_cursors_past_meeting_end(clock, mock_state):
     """After schedule_meeting, all participants must be at or after the meeting end."""
     mock_state.actor_cursors = {
         "Alice": datetime(2026, 3, 10, 9, 0, 0),
-        "Bob":   datetime(2026, 3, 10, 9, 0, 0),
+        "Bob": datetime(2026, 3, 10, 9, 0, 0),
     }
-    start = clock.schedule_meeting(["Alice", "Bob"], min_hour=10, max_hour=11, duration_mins=30)
+    start = clock.schedule_meeting(
+        ["Alice", "Bob"], min_hour=10, max_hour=11, duration_mins=30
+    )
     meeting_end = start + timedelta(minutes=30)
 
     assert mock_state.actor_cursors["Alice"] >= meeting_end
-    assert mock_state.actor_cursors["Bob"]   >= meeting_end
+    assert mock_state.actor_cursors["Bob"] >= meeting_end
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. SYNC AND ADVANCE
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_sync_and_advance_returns_sync_start_and_end(clock, mock_state):
     """sync_and_advance must return (meeting_start, new_cursor_horizon)."""
     mock_state.actor_cursors["Alice"] = datetime(2026, 3, 10, 10, 0, 0)
-    mock_state.actor_cursors["Bob"]   = datetime(2026, 3, 10, 9,  0, 0)  # behind
+    mock_state.actor_cursors["Bob"] = datetime(2026, 3, 10, 9, 0, 0)  # behind
 
     start, end = clock.sync_and_advance(["Alice", "Bob"], hours=1.0)
 
     # Start must be the max of the pre-sync cursors (Alice's 10:00)
     assert start == datetime(2026, 3, 10, 10, 0, 0)
-    assert end   == datetime(2026, 3, 10, 11, 0, 0)
+    assert end == datetime(2026, 3, 10, 11, 0, 0)
 
 
 def test_sync_and_advance_updates_all_participant_cursors(clock, mock_state):
     """Every actor in the list must end up at the returned end time."""
     mock_state.actor_cursors["Alice"] = datetime(2026, 3, 10, 10, 0, 0)
-    mock_state.actor_cursors["Bob"]   = datetime(2026, 3, 10, 10, 0, 0)
+    mock_state.actor_cursors["Bob"] = datetime(2026, 3, 10, 10, 0, 0)
 
     _, end = clock.sync_and_advance(["Alice", "Bob"], hours=2.0)
 
     assert mock_state.actor_cursors["Alice"] == end
-    assert mock_state.actor_cursors["Bob"]   == end
+    assert mock_state.actor_cursors["Bob"] == end
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. BUSINESS HOURS ENFORCEMENT
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_weekend_rolls_to_monday(clock, mock_state):
     """
@@ -377,8 +394,10 @@ def test_weekend_rolls_to_monday(clock, mock_state):
     _, new_cursor = clock.advance_actor("Alice", 1.0)
 
     # Must land on Monday (weekday 0)
-    assert new_cursor.weekday() == 0, f"Expected Monday, got weekday {new_cursor.weekday()}"
-    assert new_cursor.hour   == DAY_START_HOUR
+    assert new_cursor.weekday() == 0, (
+        f"Expected Monday, got weekday {new_cursor.weekday()}"
+    )
+    assert new_cursor.hour == DAY_START_HOUR
     assert new_cursor.minute == DAY_START_MINUTE
 
 

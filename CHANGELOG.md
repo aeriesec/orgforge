@@ -6,6 +6,33 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.6.0] — 2026-03-11
+
+### Added
+
+- **CEO Persona & Role (`config.yaml`, `flow.py`)**: Added "John" as the CEO persona with a "Visionary Closer" style and "Pressure Multiplier" social role to drive high-level organizational themes.
+- **Dynamic Tech Stack Generation (`confluence_writer.py`)**: The simulation now generates a canonical, industry-plausible tech stack at genesis, including legacy "warts" and technical debt, which is persisted to MongoDB for grounding all subsequent technical content.
+- **Context-Aware Voice Cards (`normal_day.py`)**: Introduced a modular voice card system that adjusts persona metadata (tenure, expertise, mood, anti-patterns) based on the interaction type (e.g., 1:1 vs. design discussion) to improve LLM character consistency.
+- **HyDE-Style Query Rewriting (`memory.py`)**: Implemented `recall_with_rewrite` to generate hypothetical passages before embedding, significantly improving RAG retrieval for ad-hoc documentation and design topics.
+- **Automated Conversation Summarization (`normal_day.py`)**: The final turn of 1:1s and mentoring sessions now generates a JSON-based third-person summary of the discussion for future reference in the actor’s memory.
+- **Social Graph Checkpointing (`flow.py`, `memory.py`)**: Daily state snapshots now include full serialization of the NetworkX social graph, allowing the simulation to resume with relationship weights and centrality metrics intact.
+
+### Changed
+
+- **Cloud Preset Default (`config.yaml`)**: The default `quality_preset` is now `cloud`, utilizing DeepSeek v3.2 on Bedrock for both planning and worker tasks.
+- **Persona Depth Expansion (`config.yaml`)**: Significantly expanded all primary personas with detailed "anti-patterns" (behaviors the LLM must avoid) and nuanced typing quirks to prevent "corporate drift".
+- **Multi-Agent Sequential Interactions (`normal_day.py`)**: Refactored Slack interactions (DMs, Async Q&A, Design) to use a dedicated Agent per participant in a sequential Crew, replacing the previous multi-turn single-agent approach.
+- **Unified Role Resolution (`config_loader.py`)**: Role resolution (e.g., `ceo`, `scrum_master`) is now centralized in `config_loader.py` to ensure consistency across the planner, email generator, and flow engine.
+- **Embedding Optimization (`config.yaml`)**: Default embedding dimensions reduced from 3072 to 1024 to align with updated Bedrock models.
+- **Infrastructure Update (`docker-compose.yaml`)**: Upgraded local MongoDB Atlas image to version 8 and enabled `DO_NOT_TRACK`.
+
+### Removed
+
+- **Hardcoded Tone Modifiers (`flow.py`)**: Replaced static stress-to-tone mappings in `persona_backstory` with dynamic, graph-driven `stress_tone_hint` logic.
+- **Redundant Stop Sequences (`flow.py`)**: Applied a patch to the CrewAI Bedrock provider to strip `stopSequences`, resolving compatibility issues with certain models.
+
+---
+
 ## [v0.5.0] — 2026-03-09
 
 ### Added

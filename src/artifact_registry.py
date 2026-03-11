@@ -50,7 +50,7 @@ _CONF_REF_RE = re.compile(r"\bCONF-[A-Z]+-\d+\b")
 # ── Chunking defaults ─────────────────────────────────────────────────────────
 # Cohere Embed v4 supports 128K tokens, but focused pages improve retrieval
 # precision. ~9 000 chars ≈ ~750 tokens — well inside any embedder's window.
-DEFAULT_CHUNK_CHARS   = 12_000
+DEFAULT_CHUNK_CHARS = 12_000
 DEFAULT_CHUNK_OVERLAP = 400
 
 
@@ -58,15 +58,17 @@ DEFAULT_CHUNK_OVERLAP = 400
 # DATA CLASSES
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class ConfluencePage:
     """A single generated (or chunked) Confluence page ready to be saved."""
-    id:        str
-    title:     str
-    content:   str
-    path:      str
+
+    id: str
+    title: str
+    content: str
+    path: str
     parent_id: Optional[str] = None
-    child_ids: List[str]     = field(default_factory=list)
+    child_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -83,17 +85,18 @@ class TicketSummary:
         summary = registry.ticket_summary(ticket, current_day)
         prompt  = f"Work on this ticket:\\n{summary.for_prompt()}"
     """
-    id:            str
-    title:         str
-    status:        str
-    assignee:      str
-    story_points:  Optional[int]
-    days_active:   int
+
+    id: str
+    title: str
+    status: str
+    assignee: str
+    story_points: Optional[int]
+    days_active: int
     comment_count: int
     last_comments: List[Dict]
-    linked_prs:    List[str]
-    was_blocked:   bool
-    sprint:        Optional[int]
+    linked_prs: List[str]
+    was_blocked: bool
+    sprint: Optional[int]
 
     def for_prompt(self) -> str:
         """Compact, human-readable block for LLM prompt injection."""
@@ -128,6 +131,7 @@ class TicketSummary:
 # EXCEPTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class DuplicateArtifactError(Exception):
     """Raised when an artifact ID is registered more than once."""
 
@@ -135,6 +139,7 @@ class DuplicateArtifactError(Exception):
 # ─────────────────────────────────────────────────────────────────────────────
 # REGISTRY
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class ArtifactRegistry:
     """
@@ -157,11 +162,11 @@ class ArtifactRegistry:
     """
 
     def __init__(self, mem: Memory, base_export_dir: str = "./export"):
-        self._mem  = mem
+        self._mem = mem
         self._base = base_export_dir
 
-        self._confluence: Dict[str, str] = {}   # CONF-ENG-001 → title
-        self._jira:       Dict[str, int] = {}   # ORG-100      → 100
+        self._confluence: Dict[str, str] = {}  # CONF-ENG-001 → title
+        self._jira: Dict[str, int] = {}  # ORG-100      → 100
 
         self._seed_from_mongo()
 
@@ -173,7 +178,9 @@ class ArtifactRegistry:
         """Populate both caches from MongoDB on startup."""
         try:
             # Seed Confluence (from artifacts collection)
-            for doc in self._mem._artifacts.find({"type": "confluence"}, {"_id": 1, "title": 1}):
+            for doc in self._mem._artifacts.find(
+                {"type": "confluence"}, {"_id": 1, "title": 1}
+            ):
                 self._confluence[doc["_id"]] = doc.get("title", "")
 
             # Seed JIRA (from new dedicated tickets collection)
@@ -183,10 +190,11 @@ class ArtifactRegistry:
                 if suffix.isdigit():
                     self._jira[jid] = int(suffix)
 
-            logger.info(f"[registry] Seeded {len(self._confluence)} CONF + {len(self._jira)} JIRA IDs.")
+            logger.info(
+                f"[registry] Seeded {len(self._confluence)} CONF + {len(self._jira)} JIRA IDs."
+            )
         except Exception as e:
             logger.warning(f"[registry] Seeding failed: {e}")
-
 
     # ─────────────────────────────────────────────
     # SHARED ALLOCATOR CORE
@@ -194,10 +202,10 @@ class ArtifactRegistry:
 
     @staticmethod
     def _allocate(
-        store:             Dict,
-        existing_nums_fn,       # callable(store) → List[int]
-        make_id_fn,             # callable(n: int) → str
-        reserve_value:     Any,
+        store: Dict,
+        existing_nums_fn,  # callable(store) → List[int]
+        make_id_fn,  # callable(n: int) → str
+        reserve_value: Any,
     ) -> str:
         """
         Generic ID allocator used by both namespaces.
@@ -205,7 +213,7 @@ class ArtifactRegistry:
         Adding a new artifact type means passing two small lambdas —
         the sequencing logic itself never needs to be duplicated.
         """
-        nums   = existing_nums_fn(store)
+        nums = existing_nums_fn(store)
         next_n = max(nums, default=0) + 1
         new_id = make_id_fn(next_n)
         store[new_id] = reserve_value
@@ -223,16 +231,16 @@ class ArtifactRegistry:
         next_id("ENG") → "CONF-ENG-002"   (second call)
         next_id("MKT") → "CONF-MKT-001"   (independent sequence)
         """
-        pat    = f"CONF-{prefix}-"
+        pat = f"CONF-{prefix}-"
         new_id = self._allocate(
-            store             = self._confluence,
-            existing_nums_fn  = lambda s: [
-                int(k[len(pat):])
+            store=self._confluence,
+            existing_nums_fn=lambda s: [
+                int(k[len(pat) :])
                 for k in s
-                if k.startswith(pat) and k[len(pat):].isdigit()
+                if k.startswith(pat) and k[len(pat) :].isdigit()
             ],
-            make_id_fn        = lambda n: f"CONF-{prefix}-{n:03d}",
-            reserve_value     = "__reserved__",
+            make_id_fn=lambda n: f"CONF-{prefix}-{n:03d}",
+            reserve_value="__reserved__",
         )
         logger.debug(f"[registry] Allocated Confluence ID: {new_id}")
         return new_id
@@ -273,15 +281,19 @@ class ArtifactRegistry:
         from there. Each call pre-reserves the slot immediately.
         """
         new_id = self._allocate(
-            store             = self._jira,
+            store=self._jira,
             # Parse the highest number from the keys, not the values
-            existing_nums_fn  = lambda s: [
-                int(k.replace("ORG-", "")) 
-                for k in s.keys() 
-                if k.startswith("ORG-") and k.replace("ORG-", "").isdigit()
-            ] if s else [99],
-            make_id_fn        = lambda n: f"ORG-{n}",
-            reserve_value     = 0,   # 0 = reserved sentinel; confirmed in register_jira
+            existing_nums_fn=lambda s: (
+                [
+                    int(k.replace("ORG-", ""))
+                    for k in s.keys()
+                    if k.startswith("ORG-") and k.replace("ORG-", "").isdigit()
+                ]
+                if s
+                else [99]
+            ),
+            make_id_fn=lambda n: f"ORG-{n}",
+            reserve_value=0,  # 0 = reserved sentinel; confirmed in register_jira
         )
         logger.debug(f"[registry] Allocated JIRA ID: {new_id}")
         return new_id
@@ -294,12 +306,10 @@ class ArtifactRegistry:
         suffix = jira_id.replace("ORG-", "")
         if not suffix.isdigit():
             raise ValueError(f"[registry] Malformed JIRA ID: '{jira_id}'")
-        n       = int(suffix)
+        n = int(suffix)
         current = self._jira.get(jira_id)
         if current is not None and current != 0:
-            raise DuplicateArtifactError(
-                f"[registry] Duplicate JIRA ID '{jira_id}'."
-            )
+            raise DuplicateArtifactError(f"[registry] Duplicate JIRA ID '{jira_id}'.")
         self._jira[jira_id] = n
         logger.debug(f"[registry] Confirmed JIRA {jira_id}")
 
@@ -331,11 +341,13 @@ class ArtifactRegistry:
         Returns:
             TicketSummary with a .for_prompt() method for prompt injection
         """
-        comments    = ticket.get("comments", [])
+        comments = ticket.get("comments", [])
         created_day = ticket.get("created_day", current_day)
         was_blocked = any(
-            any(kw in c.get("text", "").lower()
-                for kw in ("blocked", "blocker", "waiting on", "stuck", "can't proceed"))
+            any(
+                kw in c.get("text", "").lower()
+                for kw in ("blocked", "blocker", "waiting on", "stuck", "can't proceed")
+            )
             for c in comments
         )
 
@@ -344,24 +356,24 @@ class ArtifactRegistry:
         clean_comments = [
             {
                 "author": c.get("author", "?"),
-                "date":   c.get("date",   "?"),
-                "text":   c.get("text",   "").strip('"'),
+                "date": c.get("date", "?"),
+                "text": c.get("text", "").strip('"'),
             }
             for c in comments[-3:]
         ]
 
         return TicketSummary(
-            id            = ticket["id"],
-            title         = ticket.get("title", "Untitled"),
-            status        = ticket.get("status", "To Do"),
-            assignee      = ticket.get("assignee", "Unassigned"),
-            story_points  = ticket.get("story_points"),
-            days_active   = max(0, current_day - created_day),
-            comment_count = len(comments),
-            last_comments = clean_comments,
-            linked_prs    = ticket.get("linked_prs", []),
-            was_blocked   = was_blocked,
-            sprint        = ticket.get("sprint"),
+            id=ticket["id"],
+            title=ticket.get("title", "Untitled"),
+            status=ticket.get("status", "To Do"),
+            assignee=ticket.get("assignee", "Unassigned"),
+            story_points=ticket.get("story_points"),
+            days_active=max(0, current_day - created_day),
+            comment_count=len(comments),
+            last_comments=clean_comments,
+            linked_prs=ticket.get("linked_prs", []),
+            was_blocked=was_blocked,
+            sprint=ticket.get("sprint"),
         )
 
     # ─────────────────────────────────────────────
@@ -379,13 +391,11 @@ class ArtifactRegistry:
                 candidates.append((id_, "[Planned / Coming Soon]"))
             elif title != "":
                 candidates.append((id_, title))
-                
+
         if not candidates:
             return "None yet."
-            
-        return "\n".join(
-            f"- {id_}: {title}" for id_, title in candidates[-n:]
-        )
+
+        return "\n".join(f"- {id_}: {title}" for id_, title in candidates[-n:])
 
     # ─────────────────────────────────────────────
     # REFERENCE VALIDATION
@@ -425,16 +435,16 @@ class ArtifactRegistry:
 
     def chunk_into_pages(
         self,
-        parent_id:    str,
+        parent_id: str,
         parent_title: str,
-        content:      str,
-        prefix:       str,
-        state:        "State",
-        author:       str = "",
-        date_str:     str = "",
-        subdir:       str = "general",
-        max_chars:    int = DEFAULT_CHUNK_CHARS,
-        overlap:      int = DEFAULT_CHUNK_OVERLAP,
+        content: str,
+        prefix: str,
+        state: "State",
+        author: str = "",
+        date_str: str = "",
+        subdir: str = "general",
+        max_chars: int = DEFAULT_CHUNK_CHARS,
+        overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> List[ConfluencePage]:
         """
         Split *content* into a family of focused child pages plus a parent
@@ -451,9 +461,12 @@ class ArtifactRegistry:
 
         if len(sections) <= 1:
             page = self._make_page(
-                conf_id=parent_id, title=parent_title,
-                content=content, author=author,
-                date_str=date_str, subdir=subdir,
+                conf_id=parent_id,
+                title=parent_title,
+                content=content,
+                author=author,
+                date_str=date_str,
+                subdir=subdir,
             )
             self.register_confluence(parent_id, parent_title)
             return [page]
@@ -461,25 +474,34 @@ class ArtifactRegistry:
         # Build child pages
         child_pages: List[ConfluencePage] = []
         for i, section_text in enumerate(sections):
-            child_id    = f"{parent_id}-{str(i + 1).zfill(2)}"
-            sec_title   = self._extract_first_heading(section_text) or f"Part {i + 1}"
+            child_id = f"{parent_id}-{str(i + 1).zfill(2)}"
+            sec_title = self._extract_first_heading(section_text) or f"Part {i + 1}"
             child_title = f"{parent_title} — {sec_title}"
-            child_pages.append(self._make_page(
-                conf_id=child_id, title=child_title,
-                content=section_text, author=author,
-                date_str=date_str, subdir=subdir,
-                parent_id=parent_id, parent_title=parent_title,
-            ))
+            child_pages.append(
+                self._make_page(
+                    conf_id=child_id,
+                    title=child_title,
+                    content=section_text,
+                    author=author,
+                    date_str=date_str,
+                    subdir=subdir,
+                    parent_id=parent_id,
+                    parent_title=parent_title,
+                )
+            )
 
         # Build parent index
         child_links = "\n".join(f"- [{p.title}]({p.id})" for p in child_pages)
-        index_page  = self._make_page(
-            conf_id=parent_id, title=parent_title,
+        index_page = self._make_page(
+            conf_id=parent_id,
+            title=parent_title,
             content=(
                 f"This page is an index for **{parent_title}**.\n\n"
                 f"## Contents\n\n{child_links}\n"
             ),
-            author=author, date_str=date_str, subdir=subdir,
+            author=author,
+            date_str=date_str,
+            subdir=subdir,
             child_ids=[p.id for p in child_pages],
         )
 
@@ -500,15 +522,15 @@ class ArtifactRegistry:
 
     def _make_page(
         self,
-        conf_id:      str,
-        title:        str,
-        content:      str,
-        author:       str,
-        date_str:     str,
-        subdir:       str,
-        parent_id:    Optional[str] = None,
+        conf_id: str,
+        title: str,
+        content: str,
+        author: str,
+        date_str: str,
+        subdir: str,
+        parent_id: Optional[str] = None,
         parent_title: Optional[str] = None,
-        child_ids:    Optional[List[str]] = None,
+        child_ids: Optional[List[str]] = None,
     ) -> ConfluencePage:
         header_lines = [f"# {title}", f"**ID:** {conf_id}"]
         if author:
@@ -520,17 +542,17 @@ class ArtifactRegistry:
                 f"**Parent:** [{parent_title or parent_id}]({parent_id})"
             )
         return ConfluencePage(
-            id        = conf_id,
-            title     = title,
-            content   = "\n".join(header_lines) + "\n\n" + content.lstrip(),
-            path      = f"{self._base}/confluence/{subdir}/{conf_id}.md",
-            parent_id = parent_id,
-            child_ids = child_ids or [],
+            id=conf_id,
+            title=title,
+            content="\n".join(header_lines) + "\n\n" + content.lstrip(),
+            path=f"{self._base}/confluence/{subdir}/{conf_id}.md",
+            parent_id=parent_id,
+            child_ids=child_ids or [],
         )
 
     @staticmethod
     def _split_on_headings(content: str, max_chars: int, overlap: int) -> List[str]:
-        raw    = [s for s in re.split(r"(?=\n## )", content) if s.strip()]
+        raw = [s for s in re.split(r"(?=\n## )", content) if s.strip()]
         result: List[str] = []
         buffer = ""
         for section in raw:
@@ -540,7 +562,9 @@ class ArtifactRegistry:
                 if buffer:
                     result.append(buffer)
                 if len(section) > max_chars:
-                    result.extend(ArtifactRegistry._hard_split(section, max_chars, overlap))
+                    result.extend(
+                        ArtifactRegistry._hard_split(section, max_chars, overlap)
+                    )
                     buffer = ""
                 else:
                     buffer = section
@@ -552,7 +576,7 @@ class ArtifactRegistry:
     def _hard_split(text: str, max_chars: int, overlap: int) -> List[str]:
         chunks, start = [], 0
         while start < len(text):
-            chunks.append(text[start: start + max_chars])
+            chunks.append(text[start : start + max_chars])
             start += max_chars - overlap
         return chunks
 

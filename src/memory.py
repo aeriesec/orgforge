@@ -37,12 +37,14 @@ logger = logging.getLogger("orgforge.memory")
 # ─────────────────────────────────────────────
 # CONFIG  (all overridable via environment)
 # ─────────────────────────────────────────────
-MONGO_URI      = os.environ.get("MONGO_URI", "mongodb://localhost:27017/?directConnection=true")
-DB_NAME        = os.environ.get("DB_NAME", "orgforge")
-OLLAMA_HOST    = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+MONGO_URI = os.environ.get(
+    "MONGO_URI", "mongodb://localhost:27017/?directConnection=true"
+)
+DB_NAME = os.environ.get("DB_NAME", "orgforge")
+OLLAMA_HOST = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "ollama")
-EMBED_MODEL    = os.environ.get("EMBED_MODEL",  "mxbai-embed-large")
-EMBED_DIMS     = int(os.environ.get("EMBED_DIMS", "1024"))
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "mxbai-embed-large")
+EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "1024"))
 
 # ─────────────────────────────────────────────
 # TOKEN USAGE TRACKING  (debug mode only)
@@ -50,9 +52,7 @@ EMBED_DIMS     = int(os.environ.get("EMBED_DIMS", "1024"))
 # or pass debug_tokens=True to Memory.__init__
 # ─────────────────────────────────────────────
 
-DEBUG_TOKEN_TRACKING = (
-    os.environ.get("DEBUG_TOKEN_TRACKING", "false").lower() == "true"
-)
+DEBUG_TOKEN_TRACKING = os.environ.get("DEBUG_TOKEN_TRACKING", "false").lower() == "true"
 
 _SKIP_EMBED_TYPES = {
     "jira_ticket_created",
@@ -68,8 +68,25 @@ _SKIP_EMBED_TYPES = {
     "plan_rejected",
     "end_of_day",
     "agenda_item_deferred",
-    "proposed_event_rejected"
+    "proposed_event_rejected",
+    "watercooler_chat",
 }
+
+_TICKET_PROGRESS_PROJECTION = {
+    "_id": 0,
+    "id": 1,
+    "title": 1,
+    "status": 1,
+    "assignee": 1,
+    "root_cause": 1,
+    "description": 1,
+    "linked_prs": 1,
+    "gap_areas": 1,
+    "sprint": 1,
+    "story_points": 1,
+    "comments": {"$slice": -3},
+}
+
 
 # ─────────────────────────────────────────────
 # SIM EVENT
@@ -110,8 +127,9 @@ class SimEvent:
             artifact_ids=d.get("artifact_ids", {}),
             facts=d.get("facts", {}),
             summary=d.get("summary", ""),
-            tags=d.get("tags", [])
+            tags=d.get("tags", []),
         )
+
 
 # ─────────────────────────────────────────────
 # EMBEDDER INTERFACE
@@ -129,27 +147,31 @@ class BaseEmbedder(ABC):
 
     def _fallback(self, text: str) -> List[float]:
         """Deterministic hash-based pseudo-embedding used when provider is unreachable."""
-        h   = hashlib.sha256(text.encode()).digest()
+        h = hashlib.sha256(text.encode()).digest()
         vec = [(b / 255.0) - 0.5 for b in h] * (self.dims // 32 + 1)
-        return vec[:self.dims]
+        return vec[: self.dims]
 
 
 # ── LOCAL: Ollama ──────────────────────────────
 class OllamaEmbedder(BaseEmbedder):
     """Generates embeddings via a local Ollama instance."""
 
-    def __init__(self, model: str = EMBED_MODEL, host: str = OLLAMA_HOST, dims: int = EMBED_DIMS):
+    def __init__(
+        self, model: str = EMBED_MODEL, host: str = OLLAMA_HOST, dims: int = EMBED_DIMS
+    ):
         super().__init__(dims)
         self._model = model
-        self._host  = host
-        self._ok    = self._check_connection()
+        self._host = host
+        self._ok = self._check_connection()
 
     def _check_connection(self) -> bool:
         try:
             r = requests.get(f"{self._host}/api/tags", timeout=3)
             return r.status_code == 200
         except Exception:
-            logger.warning(f"[memory] ⚠️  Cannot connect to Ollama at {self._host}. Using fallback hashing.")
+            logger.warning(
+                f"[memory] ⚠️  Cannot connect to Ollama at {self._host}. Using fallback hashing."
+            )
             return False
 
     def embed(self, text: str, input_type: str = "search_document") -> List[float]:
@@ -162,15 +184,22 @@ class OllamaEmbedder(BaseEmbedder):
                 timeout=120,
             )
 
-            self._prompt_embed_tokens       = r.json()['prompt_eval_count']
-            
+            self._prompt_embed_tokens = r.json()["prompt_eval_count"]
+
             return r.json()["embeddings"][0]
-        except (requests.HTTPError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            logger.warning(f"[memory] Ollama embedding HTTP error: {e.response.status_code}")
+        except (
+            requests.HTTPError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as e:
+            logger.warning(
+                f"[memory] Ollama embedding HTTP error: {e.response.status_code}"
+            )
             return []
         except (KeyError, IndexError) as e:
             logger.warning(f"[memory] Ollama embedding response malformed: {e}")
             return []
+
 
 # ── CLOUD: OpenAI ──────────────────────────────
 class OpenAIEmbedder(BaseEmbedder):
@@ -184,11 +213,14 @@ class OpenAIEmbedder(BaseEmbedder):
         self._model = model
         try:
             from openai import OpenAI
+
             self._client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
             self._ok = True
             logger.info(f"[memory] OpenAI embedder ready ({model}, {dims} dims)")
         except ImportError:
-            logger.error("[memory] ⚠️  openai package not installed. Run: pip install openai")
+            logger.error(
+                "[memory] ⚠️  openai package not installed. Run: pip install openai"
+            )
             self._ok = False
         except Exception as e:
             logger.error(f"[memory] ⚠️  OpenAI init failed: {e}")
@@ -200,8 +232,8 @@ class OpenAIEmbedder(BaseEmbedder):
         try:
             resp = self._client.embeddings.create(
                 model=self._model,
-                input=text[:8191],          # OpenAI hard token limit
-                dimensions=self.dims,       # text-embedding-3-* supports custom dims
+                input=text[:8191],  # OpenAI hard token limit
+                dimensions=self.dims,  # text-embedding-3-* supports custom dims
             )
             return resp.data[0].embedding
         except Exception as e:
@@ -217,23 +249,31 @@ class BedrockEmbedder(BaseEmbedder):
     """
 
     EMBED_MODEL = "cohere.embed-v4:0"
-    EMBED_DIMS  = 1024
+    EMBED_DIMS = 1024
 
     def __init__(self, region: str = "us-east-1", dims: int = EMBED_DIMS):
         super().__init__(dims)
         self._region = region
         try:
-            import boto3, json as _json
+            import boto3
+            import json as _json
             from botocore.config import Config
-            self._client = boto3.client(service_name="bedrock-runtime", region_name=region, config=Config(
-                read_timeout=60,
-                connect_timeout=10,
-                max_pool_connections=50,
-                retries={"max_attempts": 2}
-            ))
-            self._json   = _json
-            self._ok     = True
-            logger.info(f"[memory] Bedrock embedder ready (Titan G1, {dims} dims, region={region})")
+
+            self._client = boto3.client(
+                service_name="bedrock-runtime",
+                region_name=region,
+                config=Config(
+                    read_timeout=60,
+                    connect_timeout=10,
+                    max_pool_connections=50,
+                    retries={"max_attempts": 2},
+                ),
+            )
+            self._json = _json
+            self._ok = True
+            logger.info(
+                f"[memory] Bedrock embedder ready (Titan G1, {dims} dims, region={region})"
+            )
         except ImportError:
             logger.error("[memory] ⚠️  boto3 not installed. Run: pip install boto3")
             self._ok = False
@@ -244,10 +284,17 @@ class BedrockEmbedder(BaseEmbedder):
     def embed(self, text: str, input_type: str = "search_document") -> List[float]:
         if not self._ok:
             return self._fallback(text)
-        
+
         for attempt in range(3):
             try:
-                body = self._json.dumps({"texts": [text], "input_type": input_type, "embedding_types": ["float"], "output_dimension": 1024})
+                body = self._json.dumps(
+                    {
+                        "texts": [text],
+                        "input_type": input_type,
+                        "embedding_types": ["float"],
+                        "output_dimension": 1024,
+                    }
+                )
                 resp = self._client.invoke_model(
                     modelId=self.EMBED_MODEL,
                     body=body,
@@ -255,16 +302,18 @@ class BedrockEmbedder(BaseEmbedder):
                     accept="application/json",
                 )
 
-                raw_body                    = resp["body"].read()
+                raw_body = resp["body"].read()
                 resp["body"].close()
 
-                result                      = self._json.loads(raw_body)
-                vector                      = result["embeddings"]["float"][0]
-                headers                     = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
-                self._prompt_embed_tokens   = int(headers.get("x-amzn-bedrock-input-token-count", 0))
+                result = self._json.loads(raw_body)
+                vector = result["embeddings"]["float"][0]
+                headers = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+                self._prompt_embed_tokens = int(
+                    headers.get("x-amzn-bedrock-input-token-count", 0)
+                )
                 return vector
             except self._client.exceptions.ThrottlingException:
-                wait = 6.2 * (attempt + 1)   # backoff: 6.2, 12.4, 18.6
+                wait = 6.2 * (attempt + 1)  # backoff: 6.2, 12.4, 18.6
                 logger.warning(f"[embed] throttled, waiting {wait}s")
                 time.sleep(wait)
             except Exception as e:
@@ -278,8 +327,8 @@ class BedrockEmbedder(BaseEmbedder):
 # ─────────────────────────────────────────────
 def build_embedder(
     provider: str = EMBED_PROVIDER,
-    model:    str = EMBED_MODEL,
-    dims:     int = EMBED_DIMS,
+    model: str = EMBED_MODEL,
+    dims: int = EMBED_DIMS,
     **kwargs,
 ) -> BaseEmbedder:
     """
@@ -294,7 +343,9 @@ def build_embedder(
     if provider == "openai":
         return OpenAIEmbedder(model=model, dims=dims)
     if provider == "bedrock":
-        region = kwargs.get("aws_region", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+        region = kwargs.get(
+            "aws_region", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+        )
         return BedrockEmbedder(region=region, dims=dims)
     # Default: Ollama (local)
     return OllamaEmbedder(model=model, dims=dims)
@@ -306,9 +357,9 @@ def build_embedder(
 class Memory:
     def __init__(
         self,
-        mongo_uri:    str         = MONGO_URI,
-        debug_tokens: bool        = False,
-        mongo_client              = None,   # inject mongomock.MongoClient() in tests
+        mongo_uri: str = MONGO_URI,
+        debug_tokens: bool = False,
+        mongo_client=None,  # inject mongomock.MongoClient() in tests
     ):
         self._embedder = build_embedder()
         # Accept an injected client (e.g. mongomock) so tests never touch a
@@ -316,50 +367,64 @@ class Memory:
         # real MongoClient as before.
         self._client = mongo_client or MongoClient(mongo_uri)
         self._db = self._client[DB_NAME]
-        
+
         self._artifacts = self._db["artifacts"]
         self._events = self._db["events"]
         self._debug_tokens = debug_tokens or DEBUG_TOKEN_TRACKING
-        self._token_usage  = self._db["token_usage"] if self._debug_tokens else None
+        self._token_usage = self._db["token_usage"] if self._debug_tokens else None
         self._artifacts = self._db["artifacts"]
         self._events = self._db["events"]
         self._jira = self._db["jira_tickets"]
         self._prs = self._db["pull_requests"]
         self._checkpoints = self._db["checkpoints"]
         self._slack = self._db["slack_messages"]
+        self._plans = self._db["dept_plans"]
+        self._conversation_summaries = self._db["conversation_summaries"]
 
         self._jira.create_index([("id", 1)], unique=True)
         self._jira.create_index([("assignee", 1), ("status", 1)])
         self._prs.create_index([("pr_id", 1)], unique=True)
         self._prs.create_index([("reviewers", 1), ("status", 1)])
         self._slack.create_index([("channel", 1), ("ts", 1)])
+        self._plans.create_index([("day", 1), ("dept", 1)])
+        self._conversation_summaries.create_index(
+            [("participants", 1), ("type", 1), ("day", -1)]
+        )
+        self._conversation_summaries.create_index([("day", -1)])
 
         self._current_day: int = 0
-        
+
         # In-memory ordered log for strict sequential access
         self._event_log: List[SimEvent] = []
-        
+
         self._init_vector_indexes()
 
-    def _embed(self, text: str, input_type: str = "search_document", caller: str = "unknown", doc_id: str = "", doc_type: str = "") -> list:
+    def _embed(
+        self,
+        text: str,
+        input_type: str = "search_document",
+        caller: str = "unknown",
+        doc_id: str = "",
+        doc_type: str = "",
+    ) -> list:
         """
         Single internal embed call. All methods route through here so token
         logging is guaranteed regardless of which path triggers the embed.
         """
         vector = self._embedder.embed(text, input_type=input_type)
         self.log_token_usage(
-            caller          = caller,
-            call_type       = "embed",
-            model           = EMBED_MODEL,
-            day             = getattr(self, "_current_day", 0),
-            timestamp       = datetime.now(timezone.utc).isoformat(),
-            total_tokens    = getattr(self._embedder, "_prompt_embed_tokens", 0),
-            prompt_tokens   = getattr(self._embedder, "_prompt_embed_tokens", 0),
-            extra        = {
-                "doc_id":   doc_id,
+            caller=caller,
+            call_type="embed",
+            model=EMBED_MODEL,
+            day=getattr(self, "_current_day", 0),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            total_tokens=getattr(self._embedder, "_prompt_embed_tokens", 0),
+            prompt_tokens=getattr(self._embedder, "_prompt_embed_tokens", 0),
+            extra={
+                "doc_id": doc_id,
                 "doc_type": doc_type,
                 "text_len": len(text),
-            }
+            },
         )
         return vector
 
@@ -372,16 +437,10 @@ class Memory:
                     "path": "embedding",
                     "numDimensions": EMBED_DIMS,
                     "similarity": "dotProduct",
-                    "quantization": "scalar"
+                    "quantization": "scalar",
                 },
-                {
-                    "type": "filter",
-                    "path": "type"
-                },
-                {
-                    "type": "filter",
-                    "path": "timestamp"
-                }
+                {"type": "filter", "path": "type"},
+                {"type": "filter", "path": "timestamp"},
             ]
         }
 
@@ -391,12 +450,12 @@ class Memory:
                 try:
                     self._db.create_collection(coll_name)
                     logger.info(f"[memory] Created collection: {coll_name}")
-                except Exception as e:
+                except Exception:
                     # Handle race conditions if another process created it simultaneously
                     pass
-            
+
             coll = self._db[coll_name]
-            
+
             # 2. Proceed with index creation
             existing_indexes = list(coll.list_search_indexes())
             if not any(idx.get("name") == "vector_index" for idx in existing_indexes):
@@ -404,7 +463,7 @@ class Memory:
                     search_index_model = SearchIndexModel(
                         definition=index_definition,
                         name="vector_index",
-                        type="vectorSearch"
+                        type="vectorSearch",
                     )
                     coll.create_search_index(model=search_index_model)
                     logger.info(f"[memory] Created vector_index on {coll.name}")
@@ -413,10 +472,26 @@ class Memory:
 
     # ─── WRITE ────────────────────────────────
 
-    def embed_artifact(self, id: str, type: str, title: str, content: str, day: int, date: str, timestamp: str, metadata: Optional[Dict] = None):
+    def embed_artifact(
+        self,
+        id: str,
+        type: str,
+        title: str,
+        content: str,
+        day: int,
+        date: str,
+        timestamp: str,
+        metadata: Optional[Dict] = None,
+    ):
         """Upsert artifact into MongoDB with vector embedding."""
         embed_text = f"{title}\n\n{content}"
-        vector = self._embed(embed_text, input_type="search_document", caller="embed_artifact", doc_id=id, doc_type=type)
+        vector = self._embed(
+            embed_text,
+            input_type="search_document",
+            caller="embed_artifact",
+            doc_id=id,
+            doc_type=type,
+        )
 
         doc = {
             "_id": id,
@@ -427,9 +502,9 @@ class Memory:
             "date": date,
             "timestamp": timestamp,
             "embedding": vector,
-            "metadata": metadata or {}
+            "metadata": metadata or {},
         }
-        
+
         self._artifacts.update_one({"_id": id}, {"$set": doc}, upsert=True)
 
     def log_event(self, event: SimEvent):
@@ -438,16 +513,21 @@ class Memory:
         event_id = f"EVT-{event.day}-{event.type}-{len(self._event_log)}"
 
         if event.type not in _SKIP_EMBED_TYPES:
-            logger.info(f"[embed] starting embed for {event_id} & {event.type}")
-            vector = self._embed(event.to_embed_text(), input_type="search_document", caller="log_event", doc_id=event_id, doc_type=event.type)
+            vector = self._embed(
+                event.to_embed_text(),
+                input_type="search_document",
+                caller="log_event",
+                doc_id=event_id,
+                doc_type=event.type,
+            )
         else:
             logger.debug(f"[embed] skipping embed for {event_id} (artifact-backed)")
             vector = None
-        
+
         doc = event.to_dict()
         doc["_id"] = event_id
         doc["embedding"] = vector
-        
+
         self._events.update_one({"_id": event_id}, {"$set": doc}, upsert=True)
 
     # ─── READ ─────────────────────────────────
@@ -470,19 +550,19 @@ class Memory:
 
     def recall(
         self,
-        query:       str,
-        n:           int            = 5,
-        type_filter: Optional[str]  = None,
-        day_range:   Optional[tuple]= None,
-        since:       Optional[Any]  = None,
-        as_of_time:  Optional[Any]  = None,
+        query: str,
+        n: int = 5,
+        type_filter: Optional[str] = None,
+        day_range: Optional[tuple] = None,
+        since: Optional[Any] = None,
+        as_of_time: Optional[Any] = None,
     ) -> List[Dict]:
         """
         Hybrid vector + metadata search over artifacts.
 
         since (datetime | str | None, SimClock-sourced):
             Hard causal floor — only artifacts whose timestamp is >= this
-            value are eligible. 
+            value are eligible.
 
         as_of_time (datetime | str | None, SimClock-sourced):
             Hard causal ceiling — only artifacts whose timestamp is <= this
@@ -490,24 +570,28 @@ class Memory:
             so the ANN candidate set is already bounded before scoring; no
             post-retrieval pruning is needed or performed.
 
-            Both `since` and `as_of_time` accept a datetime (``clock.now(actor)``) 
+            Both `since` and `as_of_time` accept a datetime (``clock.now(actor)``)
             or a pre-formatted ISO string — both are normalised internally via _to_iso().
         """
+        query_vec = self._embed(
+            query,
+            input_type="search_query",
+            caller="recall",
+            doc_id=query[:50],
+            doc_type="query",
+        )
 
-        logger.info(f"[embed] starting embed for query: {query[:50]}")
-        query_vec = self._embed(query, input_type="search_query", caller="recall", doc_id=query[:50], doc_type="query")
-        
         # Build the exact-match pre-filter for MongoDB Vector Search
         filter_doc: Dict[str, Any] = {}
         if type_filter:
             filter_doc["type"] = {"$eq": type_filter}
         if day_range:
             filter_doc["day"] = {"$gte": day_range[0], "$lte": day_range[1]}
-            
+
         # Handle time-based floor and ceiling
         iso_floor = self._to_iso(since)
         iso_ceiling = self._to_iso(as_of_time)
-        
+
         if iso_floor is not None or iso_ceiling is not None:
             timestamp_filter = {}
             if iso_floor is not None:
@@ -527,24 +611,26 @@ class Memory:
                 }
             }
         ]
-        
+
         if filter_doc:
             pipeline[0]["$vectorSearch"]["filter"] = filter_doc
 
         # Project output — include metadata so callers can read author,
         # parent_id, etc. without a second round-trip. Raw embedding excluded.
-        pipeline.append({
-            "$project": {
-                "id": "$_id",
-                "title": 1,
-                "type": 1,
-                "day": 1,
-                "date": 1,
-                "timestamp": 1,
-                "metadata": 1,
-                "score": {"$meta": "vectorSearchScore"}
+        pipeline.append(
+            {
+                "$project": {
+                    "id": "$_id",
+                    "title": 1,
+                    "type": 1,
+                    "day": 1,
+                    "date": 1,
+                    "timestamp": 1,
+                    "metadata": 1,
+                    "score": {"$meta": "vectorSearchScore"},
+                }
             }
-        })
+        )
 
         try:
             results = list(self._artifacts.aggregate(pipeline))
@@ -555,10 +641,10 @@ class Memory:
 
     def find_confluence_experts(
         self,
-        topic:           str,
-        score_threshold: float     = 0.75,
-        n:               int       = 5,
-        as_of_time:      Optional[Any] = None,
+        topic: str,
+        score_threshold: float = 0.75,
+        n: int = 5,
+        as_of_time: Optional[Any] = None,
     ) -> List[Dict[str, str]]:
         """
         Vector search over Confluence artifacts to find subject-matter experts
@@ -606,19 +692,21 @@ class Memory:
                 continue
             author = r.get("metadata", {}).get("author")
             if author:
-                experts.append({
-                    "title":  r.get("title", ""),
-                    "author": author,
-                    "score":  round(r.get("score", 0), 4),
-                    "day":    r.get("day", 0),
-                })
+                experts.append(
+                    {
+                        "title": r.get("title", ""),
+                        "author": author,
+                        "score": round(r.get("score", 0), 4),
+                        "day": r.get("day", 0),
+                    }
+                )
 
         return experts
 
     def recall_events(
         self,
-        query:      str,
-        n:          int          = 3,
+        query: str,
+        n: int = 3,
         as_of_time: Optional[Any] = None,
     ) -> List[SimEvent]:
         """
@@ -630,28 +718,24 @@ class Memory:
             normalised via _to_iso() internally.
         """
         query_filter: Dict[str, Any] = {}
-        
+
         iso = self._to_iso(as_of_time)
         if iso is not None:
             query_filter["timestamp"] = {"$lte": iso}
 
         results = (
-            self._events
-            .find(query_filter)
+            self._events.find(
+                query_filter,
+                {"_id": 0, "embedding": 0, "tags": 0, "artifacts": 0},
+            )
             .sort("timestamp", -1)
-            .limit(n * 3)
+            .limit(n)
         )
-
-        _MONGO_FIELDS = {"_id", "embedding"}
-        events = [
-            SimEvent(**{k: v for k, v in e.items() if k not in _MONGO_FIELDS})
-            for e in results
-        ]
 
         # Note: If you have vector embeddings on SimEvents, you would re-rank
         # them by the `query` text here. Otherwise, this returns the n most
         # recent events before the actor's current cursor.
-        return events[:n]
+        return [SimEvent(**{k: v for k, v in e.items()}) for e in results]
 
     # ─── HELPERS ──────────────────────────────
 
@@ -667,8 +751,8 @@ class Memory:
 
     def context_for_prompt(
         self,
-        query:      str,
-        n:          int          = 4,
+        query: str,
+        n: int = 4,
         as_of_time: Optional[Any] = None,
         since: Optional[Any] = None,
     ) -> str:
@@ -694,13 +778,10 @@ class Memory:
         # We oversample (n * 3) to give the vector scorer enough candidates
         # before the timestamp filter shrinks the eligible set.
         artifact_count = self._artifacts.count_documents({})
-        oversample     = max(n * 3, min(artifact_count // 10, 200))
+        oversample = max(n * 3, min(artifact_count // 10, 200))
 
         artifacts = self.recall(
-            query=query,
-            n=oversample,
-            as_of_time=as_of_time,
-            since=since
+            query=query, n=oversample, as_of_time=as_of_time, since=since
         )
         # Trim to the top-n by vector score after the pre-filter is applied
         artifacts = sorted(artifacts, key=lambda a: a.get("score", 0), reverse=True)[:n]
@@ -720,6 +801,10 @@ class Memory:
         # events collection — same datetime type, same contract.
         events = self.recall_events(query, n=3, as_of_time=as_of_time)
 
+        tech = self.tech_stack_for_prompt()
+        if tech:
+            lines.append(tech)
+
         if events:
             lines.append("=== RELEVANT EVENTS ===")
             for e in events:
@@ -734,21 +819,547 @@ class Memory:
 
         return "\n".join(lines)
 
+    def previous_day_context(self, current_day: int) -> str:
+        """
+        Returns a concise human-readable summary of the previous day's events
+        for use in the org theme prompt. Queries MongoDB directly — no vector search.
+        """
+        if current_day == 1:
+            # No prior day — ground the CEO in the company's known state instead
+            return (
+                "This is the first observed day. The company has existing systems, "
+                "legacy debt, and established teams. Key pressures already in play:\n"
+                + self._known_pressures_summary()
+            )
+        prev_day = current_day - 1
+        if prev_day < 1:
+            return "No prior day — this is the first day of the simulation."
+
+        docs = list(
+            self._events.find(
+                {"day": prev_day},
+                {
+                    "type": 1,
+                    "actors": 1,
+                    "facts": 1,
+                    "artifact_ids": 1,
+                    "date": 1,
+                    "_id": 0,
+                },
+            ).sort("timestamp", 1)
+        )
+
+        if not docs:
+            return f"No events recorded for Day {prev_day}."
+
+        # Event types that aren't useful signal for the CEO theme
+        _SKIP = {
+            "proposed_event_rejected",
+            "novel_event_proposed",
+            "agenda_item_deferred",
+            "day_summary",
+            "end_of_day",
+        }
+
+        lines = []
+        for doc in docs:
+            event_type = doc.get("type", "")
+            if event_type in _SKIP:
+                continue
+
+            actors = doc.get("actors", [])
+            if len(actors) > 3:
+                actor_str = f"{actors[0]}, {actors[1]} and {len(actors) - 2} others"
+            else:
+                actor_str = " and ".join(actors)
+            facts = doc.get("facts", {})
+            artifact_ids = doc.get("artifact_ids", {})
+            date = doc.get("date", "")
+
+            # Resolve the best available title/description
+            title = (
+                facts.get("title")
+                or facts.get("sprint_theme")
+                or facts.get("root_cause")
+                or facts.get("theme")
+                or facts.get("summary")
+                or artifact_ids.get("confluence")
+                or artifact_ids.get("jira")
+                or ""
+            )
+            label = event_type.replace("_", " ").title()
+
+            line = f"Day {prev_day} ({date}) - {label}"
+            if actor_str:
+                line += f" by {actor_str}"
+            if title:
+                line += f": {title}"
+
+            lines.append(line)
+
+        return (
+            "\n".join(lines) if lines else f"No significant events on Day {prev_day}."
+        )
+
+    def context_for_sprint_planning(
+        self,
+        sprint_num: int,
+        dept: str,
+        sprint_theme: str = "",
+        as_of_time: Optional[Any] = None,
+    ) -> str:
+        """
+        Purpose-built context for sprint planning — no embedding.
+
+        Returns formatted text covering:
+          - Open tickets for the dept (from jira_tickets)
+          - Recent incidents in the last 14 days (from events)
+          - Last checkpoint's velocity and system health
+
+        sprint_theme is optional; only included in the header when present
+        (not available yet during the theme-generation step).
+
+        Use this instead of context_for_prompt() in _handle_sprint_planning.
+        """
+        iso = self._to_iso(as_of_time)
+        lines: List[str] = []
+
+        header = f"=== SPRINT #{sprint_num} PLANNING CONTEXT"
+        if sprint_theme:
+            header += f" — {sprint_theme}"
+        if dept:
+            header += f" ({dept})"
+        header += " ==="
+        lines.append(header)
+
+        # ── Open tickets for this dept ─────────────────────────────────────────
+        ticket_filter: Dict[str, Any] = {"status": {"$ne": "Done"}}
+        _SPRINT_TICKET_PROJECTION = {
+            "_id": 0,
+            "id": 1,
+            "title": 1,
+            "status": 1,
+            "assignee": 1,
+            "dept": 1,
+            "story_points": 1,
+            "priority": 1,
+        }
+        if dept:
+            ticket_filter["dept"] = dept
+        open_tickets = list(
+            self._jira.find(ticket_filter, _SPRINT_TICKET_PROJECTION)
+            .sort("priority", 1)
+            .limit(10)
+        )
+        if open_tickets:
+            lines.append(f"  Open tickets ({dept or 'all depts'}):")
+            for t in open_tickets:
+                assignee = t.get("assignee", "unassigned")
+                priority = t.get("priority", "medium")
+                lines.append(
+                    f"    [{t['id']}] {t.get('title', '')} "
+                    f"(status={t.get('status', '?')}, priority={priority}, assignee={assignee})"
+                )
+        else:
+            lines.append(f"  No open tickets for {dept or 'any dept'}.")
+
+        # ── Recent incidents (last 14 sim-days) ───────────────────────────────
+        incident_filter: Dict[str, Any] = {"type": "incident_detected"}
+        if iso:
+            incident_filter["timestamp"] = {"$lte": iso}
+        recent_incidents = list(
+            self._events.find(incident_filter, {"_id": 0})
+            .sort("timestamp", -1)
+            .limit(5)
+        )
+        if recent_incidents:
+            lines.append("  Recent incidents:")
+            for inc in recent_incidents:
+                facts = inc.get("facts", {})
+                lines.append(
+                    f"    Day {inc.get('day', '?')} — {facts.get('title', facts.get('root_cause', 'Unknown'))}"
+                )
+
+        # ── Velocity from last checkpoint ─────────────────────────────────────
+        checkpoint = self._checkpoints.find_one(sort=[("day", -1)])
+        if checkpoint:
+            state = checkpoint.get("state", {})
+            velocity = state.get("velocity") or checkpoint.get("velocity")
+            sys_health = state.get("system_health")
+            if velocity is not None:
+                lines.append(f"  Last recorded velocity: {velocity} points")
+            if sys_health is not None:
+                lines.append(f"  System health at last checkpoint: {sys_health}/100")
+
+        return (
+            "\n".join(lines)
+            if len(lines) > 1
+            else f"No sprint planning context found for {dept}."
+        )
+
+    def context_for_retrospective(
+        self,
+        sprint_num: int,
+        since_iso: str,
+        as_of_iso: str,
+    ) -> str:
+        """
+        Purpose-built context for sprint retrospectives — no embedding.
+
+        Queries MongoDB directly for all tickets and notable events within the
+        sprint window (since_iso → as_of_iso).  Returns formatted text covering:
+          - Completed tickets (Done status) with assignee
+          - Tickets that carried over (not Done)
+          - Incidents that fired during the sprint
+          - Retrospective-relevant events (deploys, postmortems, etc.)
+
+        Use this instead of context_for_prompt() in _handle_retrospective.
+        """
+        lines: List[str] = [f"=== SPRINT #{sprint_num} RETROSPECTIVE CONTEXT ==="]
+
+        # ── Tickets active in this sprint window ──────────────────────────────
+        done_tickets = list(
+            self._jira.find(
+                {"status": "Done"},
+                {
+                    "_id": 0,
+                    "id": 1,
+                    "title": 1,
+                    "status": 1,
+                    "assignee": 1,
+                    "story_points": 1,
+                },
+            ).limit(15)
+        )
+        carried_tickets = list(
+            self._jira.find(
+                {"status": {"$ne": "Done"}},
+                {
+                    "_id": 0,
+                    "id": 1,
+                    "title": 1,
+                    "status": 1,
+                    "assignee": 1,
+                    "story_points": 1,
+                },
+            ).limit(10)
+        )
+
+        if done_tickets:
+            lines.append("  Completed this sprint:")
+            for t in done_tickets:
+                lines.append(
+                    f"    [{t['id']}] {t.get('title', '')} (assignee={t.get('assignee', '?')})"
+                )
+
+        if carried_tickets:
+            lines.append("  Carried over / incomplete:")
+            for t in carried_tickets:
+                lines.append(
+                    f"    [{t['id']}] {t.get('title', '')} "
+                    f"(status={t.get('status', '?')}, assignee={t.get('assignee', '?')})"
+                )
+
+        # ── Events in the sprint window ────────────────────────────────────────
+        _RETRO_TYPES = {
+            "incident_detected",
+            "incident_resolved",
+            "postmortem_published",
+            "deploy",
+            "sprint_started",
+            "retrospective",
+        }
+        event_filter: Dict[str, Any] = {
+            "type": {"$in": list(_RETRO_TYPES)},
+            "timestamp": {"$gte": since_iso, "$lte": as_of_iso},
+        }
+        sprint_events = list(
+            self._events.find(event_filter, {"_id": 0}).sort("timestamp", 1).limit(20)
+        )
+        if sprint_events:
+            lines.append("  Notable events this sprint:")
+            for e in sprint_events:
+                facts = e.get("facts", {})
+                label = e.get("type", "").replace("_", " ").title()
+                detail = (
+                    facts.get("title")
+                    or facts.get("root_cause")
+                    or facts.get("summary")
+                    or ""
+                )
+                actors = e.get("actors", [])
+                actor_str = f" ({actors[0]})" if actors else ""
+                lines.append(
+                    f"    Day {e.get('day', '?')} — {label}{actor_str}"
+                    + (f": {detail}" if detail else "")
+                )
+
+        # ── Velocity from the closing checkpoint ──────────────────────────────
+        checkpoint = self._checkpoints.find_one(sort=[("day", -1)])
+        if checkpoint:
+            state = checkpoint.get("state", {})
+            velocity = state.get("velocity") or checkpoint.get("velocity")
+            sys_health = state.get("system_health")
+            morale = state.get("team_morale")
+            if velocity is not None:
+                lines.append(f"  Sprint velocity: {velocity} points")
+            if sys_health is not None:
+                lines.append(f"  System health: {sys_health}/100")
+            if morale is not None:
+                lines.append(f"  Team morale: {morale:.2f}")
+
+        return (
+            "\n".join(lines)
+            if len(lines) > 1
+            else f"No retrospective context found for Sprint #{sprint_num}."
+        )
+
+    def context_for_incident(
+        self,
+        ticket_id: str,
+        as_of_time: Optional[Any] = None,
+    ) -> str:
+        """
+        Purpose-built context for incident-related LLM calls — no embedding.
+
+        Fetches:
+          - The incident ticket itself (jira_tickets)
+          - Any postmortem events linked to this ticket (events)
+          - The most recent prior incident for recurrence signal (events)
+
+        Use this instead of context_for_prompt(inc.root_cause) in
+        _handle_external_contact and any other incident-scoped call sites.
+        """
+        iso = self._to_iso(as_of_time)
+        lines: List[str] = [f"=== INCIDENT CONTEXT: {ticket_id} ==="]
+
+        # ── The ticket itself ─────────────────────────────────────────────────
+        ticket = self._jira.find_one(
+            {"id": ticket_id},
+            {
+                "_id": 0,
+                "id": 1,
+                "title": 1,
+                "description": 1,
+                "status": 1,
+                "assignee": 1,
+                "root_cause": 1,
+                "recurrence_of": 1,
+                "recurrence_gap_days": 1,
+                "gap_areas": 1,
+                "escalation_narrative": 1,
+                "linked_prs": 1,
+            },
+        )
+        if ticket:
+            lines.append(
+                f"  [{ticket_id}] {ticket.get('title', '')} "
+                f"(status={ticket.get('status', '?')}, "
+                f"priority={ticket.get('priority', '?')}, "
+                f"assignee={ticket.get('assignee', 'unassigned')})"
+            )
+            root_cause = ticket.get("root_cause") or ticket.get("facts", {}).get(
+                "root_cause"
+            )
+            if root_cause:
+                lines.append(f"  Root cause: {root_cause}")
+        else:
+            lines.append(f"  Ticket {ticket_id} not found in jira_tickets.")
+
+        # ── Linked postmortem events ──────────────────────────────────────────
+        pm_filter: Dict[str, Any] = {
+            "type": "postmortem_published",
+            "artifact_ids.jira": ticket_id,
+        }
+        if iso:
+            pm_filter["timestamp"] = {"$lte": iso}
+        postmortems = list(
+            self._events.find(pm_filter, {"_id": 0}).sort("timestamp", -1).limit(3)
+        )
+        if postmortems:
+            lines.append("  Postmortems:")
+            for pm in postmortems:
+                facts = pm.get("facts", {})
+                lines.append(
+                    f"    Day {pm.get('day', '?')} — "
+                    f"{facts.get('title', facts.get('summary', 'Postmortem'))}"
+                )
+
+        # ── Most recent prior incident for recurrence signal ──────────────────
+        prior_filter: Dict[str, Any] = {
+            "type": "incident_detected",
+            "_id": {"$ne": ticket_id},
+        }
+        if iso:
+            prior_filter["timestamp"] = {"$lte": iso}
+        prior = self._events.find_one(
+            prior_filter,
+            {"_id": 0},
+            sort=[("timestamp", -1)],
+        )
+        if prior:
+            facts = prior.get("facts", {})
+            lines.append(
+                f"  Prior incident: Day {prior.get('day', '?')} — "
+                f"{facts.get('title', facts.get('root_cause', 'Unknown'))}"
+            )
+
+        return "\n".join(lines)
+
+    def context_for_person(
+        self,
+        name: str,
+        as_of_time: Optional[Any] = None,
+        n: int = 3,
+    ) -> str:
+        """
+        Purpose-built context for per-person calls (standup, 1-on-1, etc.) — no embedding.
+
+        Returns formatted text covering:
+          - Open tickets assigned to this person (jira_tickets)
+          - Their n most recent events (events, by actor)
+
+        Use this instead of context_for_prompt(f"{name} {expertise} recent tasks")
+        in _handle_standup and _handle_one_on_one.
+        """
+        iso = self._to_iso(as_of_time)
+        lines: List[str] = [f"=== RECENT CONTEXT: {name} ==="]
+
+        # ── Open tickets for this person ──────────────────────────────────────
+        ticket_filter: Dict[str, Any] = {
+            "assignee": name,
+            "status": {"$ne": "Done"},
+        }
+        open_tickets = list(
+            self._jira.find(ticket_filter, {"_id": 0}).sort("priority", 1).limit(5)
+        )
+        if open_tickets:
+            lines.append("  Open tickets:")
+            for t in open_tickets:
+                lines.append(
+                    f"    [{t['id']}] {t.get('title', '')} "
+                    f"(status={t.get('status', '?')})"
+                )
+        else:
+            lines.append("  No open tickets assigned.")
+
+        # ── Recent events involving this person ───────────────────────────────
+        event_filter: Dict[str, Any] = {"actors": name}
+        if iso:
+            event_filter["timestamp"] = {"$lte": iso}
+        recent_events = list(
+            self._events.find(event_filter, {"_id": 0}).sort("timestamp", -1).limit(n)
+        )
+        if recent_events:
+            lines.append("  Recent activity:")
+            for e in recent_events:
+                facts = e.get("facts", {})
+                label = e.get("type", "").replace("_", " ").title()
+                detail = (
+                    facts.get("title")
+                    or facts.get("summary")
+                    or e.get("summary", "")
+                    or ""
+                )
+                lines.append(
+                    f"    Day {e.get('day', '?')} — {label}"
+                    + (f": {detail}" if detail else "")
+                )
+
+        return (
+            "\n".join(lines)
+            if len(lines) > 1
+            else f"No recent context found for {name}."
+        )
+
+    def recall_with_rewrite(
+        self,
+        raw_query: str,
+        n: int = 4,
+        as_of_time: Optional[Any] = None,
+        since: Optional[Any] = None,
+        llm_callable=None,
+    ) -> str:
+        """
+        HyDE variant — rewrites the query before embedding.
+
+        Use only when the query is dynamically generated (e.g. LLM-produced
+        topic strings in write_adhoc_page, write_design_doc). The rewrite step
+        generates a short hypothetical passage that captures what a relevant
+        document might say, then embeds that passage for better ANN recall.
+
+        Higher latency than context_for_prompt() due to the extra LLM call.
+        Do NOT use in hot paths (standup loop, per-dept ticket generation, etc.).
+
+        Args:
+            raw_query:    The raw, LLM-generated or free-form query string.
+            n:            Number of artifacts to retrieve.
+            as_of_time:   Causal ceiling — passed through to recall().
+            since:        Causal floor — passed through to recall().
+            llm_callable: Optional callable(prompt: str) -> str for the rewrite
+                          step.  If None, falls back to context_for_prompt()
+                          so callers degrade gracefully before an LLM is wired in.
+
+        Returns:
+            Formatted context string identical in shape to context_for_prompt().
+        """
+        if llm_callable is None:
+            # Graceful degradation — behaves like context_for_prompt() until
+            # an LLM callable is injected at the call site.
+            logger.debug(
+                "[memory] recall_with_rewrite: no llm_callable, falling back to context_for_prompt"
+            )
+            return self.context_for_prompt(
+                raw_query, n=n, as_of_time=as_of_time, since=since
+            )
+
+        rewritten = self._rewrite_query(raw_query, llm_callable)
+        return self.context_for_prompt(
+            rewritten, n=n, as_of_time=as_of_time, since=since
+        )
+
+    def _rewrite_query(self, raw_query: str, llm_callable) -> str:
+        """
+        Generates a short hypothetical passage for HyDE-style query rewriting.
+
+        The passage describes what a *relevant document* might say about the
+        topic — not an answer to it.  This produces a richer embedding target
+        than the raw topic string alone.
+        """
+        prompt = (
+            f"Write a short passage (2-3 sentences) that a relevant internal "
+            f"company document might contain about the following topic. "
+            f"Do not answer the topic — describe what the document would cover.\n\n"
+            f"Topic: {raw_query}\n\nPassage:"
+        )
+        try:
+            rewritten = llm_callable(prompt).strip()
+            logger.debug(
+                f"[memory] query rewrite: '{raw_query[:60]}' → '{rewritten[:80]}'"
+            )
+            return rewritten if rewritten else raw_query
+        except Exception as e:
+            logger.warning(f"[memory] _rewrite_query failed: {e} — using raw query")
+            return raw_query
+
     def facts_for_event_type(self, event_type: str) -> List[Dict]:
-        return [e.facts | {"date": e.date, "actors": e.actors, "artifact_ids": e.artifact_ids}
-                for e in self.events_by_type(event_type)]
+        return [
+            e.facts
+            | {"date": e.date, "actors": e.actors, "artifact_ids": e.artifact_ids}
+            for e in self.events_by_type(event_type)
+        ]
 
     def stats(self) -> Dict:
         embedder_ok = getattr(self._embedder, "_ok", True)
         return {
-            "artifact_count":   self._artifacts.count_documents({}),
-            "event_count":      self._events.count_documents({}),
-            "event_log_len":    len(self._event_log),
-            "embed_provider":   EMBED_PROVIDER,
-            "embed_model":      EMBED_MODEL,
-            "embed_dims":       self._embedder.dims,
-            "embedder_ok":      embedder_ok,
-            "mongodb_ok":       True,
+            "artifact_count": self._artifacts.count_documents({}),
+            "event_count": self._events.count_documents({}),
+            "event_log_len": len(self._event_log),
+            "embed_provider": EMBED_PROVIDER,
+            "embed_model": EMBED_MODEL,
+            "embed_dims": self._embedder.dims,
+            "embedder_ok": embedder_ok,
+            "mongodb_ok": True,
         }
 
     def reset(self, export_dir: Optional[str] = None):
@@ -758,6 +1369,7 @@ class Memory:
         self._jira.drop()
         self._prs.drop()
         self._slack.drop()
+        self._conversation_summaries.drop()
         self._event_log = []
         self._init_vector_indexes()
         self._artifacts.count_documents({})
@@ -777,25 +1389,27 @@ class Memory:
                 if isinstance(handler, logging.FileHandler):
                     handler.close()
                     root_logger.removeHandler(handler)
-            new_handler = logging.FileHandler(log_path, mode='a')
-            new_handler.setFormatter(logging.Formatter(
-                "%(asctime)s - %(levelname)s - %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S"
-            ))
+            new_handler = logging.FileHandler(log_path, mode="a")
+            new_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s - %(levelname)s - %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
             root_logger.addHandler(new_handler)
             logger.info(f"[memory] 🗑️  Export directory cleared: {export_path}")
 
     def log_token_usage(
         self,
-        caller: str,           # e.g. "write_adhoc_page", "_handle_async_question"
-        call_type: str,        # "llm" | "embed"
-        model: str,            # full model string, e.g. "bedrock/claude-sonnet-4-6"
+        caller: str,  # e.g. "write_adhoc_page", "_handle_async_question"
+        call_type: str,  # "llm" | "embed"
+        model: str,  # full model string, e.g. "bedrock/claude-sonnet-4-6"
         day: int,
         timestamp: str,
-        prompt_tokens: int     = 0,
+        prompt_tokens: int = 0,
         completion_tokens: int = 0,
-        total_tokens: int      = 0,
-        extra: Optional[Dict]  = None,   # any caller-specific metadata
+        total_tokens: int = 0,
+        extra: Optional[Dict] = None,  # any caller-specific metadata
     ) -> None:
         """
         Log a single LLM or embed call's token usage to MongoDB.
@@ -805,14 +1419,14 @@ class Memory:
             return
 
         doc = {
-            "day":               day,
-            "timestamp":         timestamp,
-            "call_type":         call_type,        # "llm" or "embed"
-            "caller":            caller,
-            "model":             model,
-            "prompt_tokens":     prompt_tokens,
+            "day": day,
+            "timestamp": timestamp,
+            "call_type": call_type,  # "llm" or "embed"
+            "caller": caller,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens":      total_tokens,
+            "total_tokens": total_tokens,
             **(extra or {}),
         }
         try:
@@ -832,11 +1446,15 @@ class Memory:
         pipeline = [
             {
                 "$group": {
-                    "_id":               {"call_type": "$call_type", "caller": "$caller", "model": "$model"},
-                    "total_tokens":      {"$sum": "$total_tokens"},
-                    "prompt_tokens":     {"$sum": "$prompt_tokens"},
+                    "_id": {
+                        "call_type": "$call_type",
+                        "caller": "$caller",
+                        "model": "$model",
+                    },
+                    "total_tokens": {"$sum": "$total_tokens"},
+                    "prompt_tokens": {"$sum": "$prompt_tokens"},
                     "completion_tokens": {"$sum": "$completion_tokens"},
-                    "call_count":        {"$sum": 1},
+                    "call_count": {"$sum": 1},
                 }
             },
             {"$sort": {"total_tokens": -1}},
@@ -846,11 +1464,11 @@ class Memory:
         grand_total = sum(r["total_tokens"] for r in rows)
 
         return {
-            "debug_tokens":  True,
-            "grand_total":   grand_total,
-            "by_caller":     rows,
+            "debug_tokens": True,
+            "grand_total": grand_total,
+            "by_caller": rows,
         }
-    
+
     def has_genesis_artifacts(self) -> bool:
         """
         Returns True if Genesis artifacts already exist.
@@ -859,24 +1477,29 @@ class Memory:
         # We check the events collection for any 'genesis' tag
         return self._events.count_documents({"tags": "genesis"}) > 0
 
-    def save_checkpoint(self, day: int, state_vars: Dict, stress: Dict, cursors: Dict):
+    def save_checkpoint(
+        self, day: int, state_vars: Dict, stress: Dict, cursors: Dict, graph_data: Dict
+    ):
         """Saves daily volatile state to MongoDB."""
         self._checkpoints.update_one(
-            {"day": day}, 
-            {"$set": {
-                "day": day,
-                "state": state_vars, 
-                "stress": stress,
-                "cursors": cursors,
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }}, 
-            upsert=True
+            {"day": day},
+            {
+                "$set": {
+                    "day": day,
+                    "state": state_vars,
+                    "stress": stress,
+                    "cursors": cursors,
+                    "graph": graph_data,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
         )
 
     def load_latest_checkpoint(self) -> Optional[Dict]:
         """Finds the most recent successful end-of-day snapshot."""
         return self._db["checkpoints"].find_one(sort=[("day", -1)])
-    
+
     def upsert_ticket(self, ticket: Dict):
         self._jira.update_one({"id": ticket["id"]}, {"$set": ticket}, upsert=True)
 
@@ -884,7 +1507,9 @@ class Memory:
         # Exclude _id so callers never receive a non-serialisable ObjectId
         return self._jira.find_one({"id": ticket_id}, {"_id": 0})
 
-    def get_open_tickets_for_dept(self, members: List[str], dept_name: str = "") -> List[Dict]:
+    def get_open_tickets_for_dept(
+        self, members: List[str], dept_name: str = ""
+    ) -> List[Dict]:
         query: Dict[str, Any] = {"status": {"$ne": "Done"}}
         if dept_name:
             query["dept"] = dept_name
@@ -898,12 +1523,15 @@ class Memory:
 
     def get_reviewable_prs_for(self, name: str) -> List[Dict]:
         return list(self._prs.find({"reviewers": name, "status": "open"}))
-    
-    def log_slack_messages(self, channel: str, messages: List[Dict], export_dir: Path) -> Tuple[str, str]:
+
+    def log_slack_messages(
+        self, channel: str, messages: List[Dict], export_dir: Path
+    ) -> Tuple[str, str]:
         """Batch saves Slack messages to JSON files and MongoDB."""
-        if not messages: return ("", "")
-        
-        date_str  = messages[0].get("date")
+        if not messages:
+            return ("", "")
+
+        date_str = messages[0].get("date")
         thread_id = f"slack_{channel}_{messages[0].get('ts', datetime.now(timezone.utc).isoformat())}"
 
         for m in messages:
@@ -917,22 +1545,26 @@ class Memory:
         history = []
         if file_path.exists():
             with open(file_path, "r") as f:
-                try: history = json.load(f)
-                except json.JSONDecodeError: pass
-        
+                try:
+                    history = json.load(f)
+                except json.JSONDecodeError:
+                    pass
+
         history.extend(messages)
         with open(file_path, "w") as f:
             json.dump(history, f, indent=2)
 
         # MongoDB batch sync
-        db_docs = [{**m, "channel": channel, "file_path": str(file_path)} for m in messages]
+        db_docs = [
+            {**m, "channel": channel, "file_path": str(file_path)} for m in messages
+        ]
         self._slack.insert_many(db_docs)
         return (str(file_path), thread_id)
 
     def get_slack_history(self, channel: str, limit: int = 10) -> List[Dict]:
         """Retrieve recent messages for a channel."""
         return list(self._slack.find({"channel": channel}).sort("ts", -1).limit(limit))
-    
+
     def get_recent_day_summaries(self, current_day: int, window: int = 7) -> List[dict]:
         """
         Returns facts dicts from day_summary events in the last `window` days.
@@ -941,7 +1573,435 @@ class Memory:
         """
         cutoff = max(1, current_day - window)
         docs = self._events.find(
-            {"type": "day_summary", "day": {"$gte": cutoff}},
-            {"facts": 1, "_id": 0}
+            {"type": "day_summary", "day": {"$gte": cutoff}}, {"facts": 1, "_id": 0}
         ).sort("day", 1)
         return [d["facts"] for d in docs if "facts" in d]
+
+    def log_dept_plan(
+        self,
+        day: int,
+        date: str,
+        dept: str,
+        lead: str,
+        theme: str,
+        engineer_plans: List[Dict],
+        proposed_events: List[Dict],
+        raw: dict,
+    ) -> None:
+        logger.info("Log Dept Plan")
+        logger.info(raw)
+        logger.info(proposed_events)
+        logger.info(engineer_plans)
+        doc = {
+            "day": day,
+            "date": date,
+            "dept": dept,
+            "lead": lead,
+            "theme": theme,
+            "engineer_plans": engineer_plans,
+            "proposed_events": proposed_events,
+            "raw": raw,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self._plans.insert_one(doc)
+        except Exception as e:
+            logger.warning(f"[memory] dept_plan insert failed: {e}")
+
+    def _known_pressures_summary(self) -> str:
+        lines = []
+        for doc in self._artifacts.find(
+            {"metadata.phase": "genesis"}, {"title": 1, "_id": 0}
+        ).limit(5):
+            lines.append(f"  - Existing doc: {doc['title']}")
+        return "\n".join(lines) if lines else "  - No prior artifacts found."
+
+    def save_tech_stack(self, stack: dict) -> None:
+        self._db["sim_config"].update_one(
+            {"_id": "tech_stack"},
+            {
+                "$set": {
+                    "_id": "tech_stack",
+                    "stack": stack,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+
+    def get_tech_stack(self) -> Optional[dict]:
+        doc = self._db["sim_config"].find_one({"_id": "tech_stack"})
+        return doc["stack"] if doc else None
+
+    def tech_stack_for_prompt(self) -> str:
+        stack = self.get_tech_stack()
+        if not stack:
+            return ""
+        lines = [
+            "CANONICAL TECH STACK — always reference these, never invent alternatives:"
+        ]
+        for key, value in stack.items():
+            lines.append(f"  {key}: {value}")
+        return "\n".join(lines)
+
+    def context_for_ticket_progress(
+        self,
+        ticket_id: str,
+        assignee: str,
+        as_of_time: Optional[Any] = None,
+    ) -> str:
+        """
+        Purpose-built context for _handle_ticket_progress — no embedding.
+
+        Returns a tight context block covering:
+        - The ticket itself (title, status, description, last 3 comments)
+        - blocker_flagged events on this ticket (is it stuck?)
+        - incident_opened events that reference this ticket (incident origin?)
+        - ticket_progress events by this assignee on this ticket (recent momentum)
+
+        No artifacts are fetched — the ticket document already contains everything
+        the LLM needs to write a realistic JIRA comment.
+
+        Args:
+            ticket_id:   The JIRA ticket ID being worked on.
+            assignee:    The engineer doing the work — used to scope event lookup.
+            as_of_time:  Causal ceiling (datetime or ISO string).
+        """
+        iso = self._to_iso(as_of_time)
+        lines: List[str] = [f"=== TICKET CONTEXT: {ticket_id} ==="]
+
+        # ── The ticket document ───────────────────────────────────────────────────
+        ticket = self._jira.find_one({"id": ticket_id}, _TICKET_PROGRESS_PROJECTION)
+        if not ticket:
+            lines.append(f"  Ticket {ticket_id} not found.")
+            return "\n".join(lines)
+
+        lines.append(
+            f"  [{ticket_id}] {ticket.get('title', '')} "
+            f"(status={ticket.get('status', '?')}, "
+            f"assignee={ticket.get('assignee', 'unassigned')}, "
+            f"points={ticket.get('story_points', '?')})"
+        )
+
+        description = ticket.get("description", "").strip()
+        if description:
+            # Cap at 200 chars — enough for context, not enough to bloat the prompt
+            lines.append(f"  Description: {description[:200]}")
+
+        if ticket.get("root_cause"):
+            lines.append(f"  Root cause: {ticket['root_cause']}")
+
+        if ticket.get("gap_areas"):
+            lines.append(f"  Knowledge gap areas: {', '.join(ticket['gap_areas'])}")
+
+        # ── Prior comments (already sliced to last 3 by projection) ──────────────
+        comments = ticket.get("comments", [])
+        if comments:
+            lines.append("  Recent comments:")
+            for c in comments:
+                author = c.get("author", "?")
+                date = c.get("date", "")
+                text = c.get("text", "").strip().strip('"')[:150]
+                lines.append(f"    {author} ({date}): {text}")
+
+        # ── Linked PRs ────────────────────────────────────────────────────────────
+        linked_prs = ticket.get("linked_prs", [])
+        if linked_prs:
+            lines.append(f"  Linked PRs: {', '.join(linked_prs)}")
+
+        # ── Blocker events on this ticket ─────────────────────────────────────────
+        blocker_filter: Dict = {
+            "type": "blocker_flagged",
+            "artifact_ids.jira": ticket_id,
+        }
+        if iso:
+            blocker_filter["timestamp"] = {"$lte": iso}
+
+        blockers = list(
+            self._events.find(
+                blocker_filter,
+                {"_id": 0, "day": 1, "actors": 1, "facts.blocker_reason": 1},
+            )
+            .sort("timestamp", -1)
+            .limit(2)
+        )
+        if blockers:
+            lines.append("  Recent blockers:")
+            for b in blockers:
+                reason = b.get("facts", {}).get("blocker_reason", "")[:120]
+                actors = b.get("actors", [])
+                actor_str = actors[0] if actors else "?"
+                lines.append(f"    Day {b.get('day', '?')} — {actor_str}: {reason}")
+
+        # ── Incident origin — did an incident open this ticket? ───────────────────
+        incident_filter: Dict = {
+            "type": "incident_opened",
+            "artifact_ids.jira": ticket_id,
+        }
+        if iso:
+            incident_filter["timestamp"] = {"$lte": iso}
+
+        incident_origin = self._events.find_one(
+            incident_filter,
+            {"_id": 0, "day": 1, "facts.root_cause": 1},
+        )
+        if incident_origin:
+            root_cause = incident_origin.get("facts", {}).get("root_cause", "")
+            lines.append(
+                f"  Incident origin (Day {incident_origin.get('day', '?')}): {root_cause[:120]}"
+            )
+
+        # ── Recent ticket_progress events by this assignee on this ticket ─────────
+        # Gives momentum signal — what was done on previous days?
+        progress_filter: Dict = {
+            "type": "ticket_progress",
+            "actors": assignee,
+            "artifact_ids.jira": ticket_id,
+        }
+        if iso:
+            progress_filter["timestamp"] = {"$lte": iso}
+
+        prior_progress = list(
+            self._events.find(
+                progress_filter,
+                {"_id": 0, "day": 1, "summary": 1},
+            )
+            .sort("timestamp", -1)
+            .limit(3)
+        )
+        if prior_progress:
+            lines.append("  Prior progress:")
+            for p in prior_progress:
+                lines.append(f"    Day {p.get('day', '?')} — {p.get('summary', '')}")
+
+        return "\n".join(lines)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # CONVERSATION SUMMARY STORE
+    # Used by 1on1 and mentoring — summary is extracted from the last turn's output
+    # by the LLM itself (no extra call). Call save_conversation_summary() at write
+    # time, context_for_person_conversations() at read time.
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def save_conversation_summary(
+        self,
+        conv_type: str,  # "1on1" | "mentoring"
+        participants: List[str],  # both names, order doesn't matter
+        summary: str,  # extracted from last-turn JSON output
+        day: int,
+        date: str,
+        timestamp: str,
+        slack_thread_id: str = "",
+        extra_facts: Optional[Dict] = None,
+    ) -> None:
+        """
+        Persist a conversation summary to the conversation_summaries collection.
+
+        The summary text is produced by the LLM as part of the last speaker's
+        task output (see _last_turn_desc() helper in normal_day.py).  This method
+        stores it so future context_for_person_conversations() calls can retrieve
+        it cheaply with a structured query — no embedding required.
+
+        Args:
+            conv_type:       "1on1" or "mentoring"
+            participants:    Both participant names.
+            summary:         The tightened summary extracted from the last turn JSON.
+            day:             Simulation day.
+            date:            ISO date string.
+            timestamp:       ISO timestamp of the conversation.
+            slack_thread_id: Thread ID for cross-referencing.
+            extra_facts:     Any additional fields to store (e.g. topic, ticket_id).
+        """
+        doc = {
+            "type": conv_type,
+            "participants": sorted(participants),  # sorted for consistent set-queries
+            "summary": summary,
+            "day": day,
+            "date": date,
+            "timestamp": timestamp,
+            "slack_thread_id": slack_thread_id,
+            **(extra_facts or {}),
+        }
+        try:
+            self._conversation_summaries.insert_one(doc)
+        except Exception as e:
+            logger.warning(f"[memory] conversation_summary insert failed: {e}")
+
+    def context_for_person_conversations(
+        self,
+        name: str,
+        conv_type: Optional[str] = None,  # None = both 1on1 and mentoring
+        as_of_time: Optional[Any] = None,
+        n: int = 3,
+    ) -> str:
+        """
+        Retrieve recent conversation summaries involving a person.
+        Used by _handle_one_on_one and _handle_mentoring to give the LLM
+        continuity across sessions — "last time we talked about X".
+
+        Args:
+            name:        The participant to search for.
+            conv_type:   Filter to "1on1" or "mentoring", or None for both.
+            as_of_time:  Causal ceiling.
+            n:           Max summaries to return.
+        """
+        iso = self._to_iso(as_of_time)
+
+        query: Dict = {"participants": name}
+        if conv_type:
+            query["type"] = conv_type
+        if iso:
+            query["timestamp"] = {"$lte": iso}
+
+        docs = list(
+            self._conversation_summaries.find(
+                query,
+                {
+                    "_id": 0,
+                    "type": 1,
+                    "participants": 1,
+                    "summary": 1,
+                    "day": 1,
+                    "slack_thread_id": 1,
+                },
+            )
+            .sort("day", -1)
+            .limit(n)
+        )
+
+        if not docs:
+            return ""
+
+        lines = [f"=== PAST CONVERSATIONS: {name} ==="]
+        for d in docs:
+            other = next((p for p in d["participants"] if p != name), "?")
+            label = d.get("type", "conversation").replace("_", " ").title()
+            lines.append(
+                f"  Day {d.get('day', '?')} [{label} with {other}]: {d.get('summary', '')}"
+            )
+
+        return "\n".join(lines)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # DESIGN DISCUSSION LINKAGE FOR ASYNC QUESTIONS
+    # Finds design_discussion events where the involved actors overlap with
+    # the ticket's known participants, and returns their slack thread IDs.
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def design_discussions_for_ticket(
+        self,
+        ticket_id: str,
+        actors: List[str],
+        as_of_time: Optional[Any] = None,
+        n: int = 2,
+    ) -> List[Dict]:
+        """
+        Find design_discussion SimEvents that are likely related to a ticket,
+        identified by actor overlap.
+
+        This avoids embedding entirely — it's a set intersection on participant
+        names.  At least 2 of the ticket's actors must appear in the discussion's
+        participants for it to be returned.
+
+        Returns a list of dicts with: day, topic, participants, slack_thread_id.
+        These can be injected into the async_question context so participants
+        know what design decisions have already been made.
+
+        Args:
+            ticket_id:   Used to check if the ticket was directly referenced in
+                        the discussion's facts (belt-and-suspenders).
+            actors:      The participants in the current async thread — used for
+                        actor overlap matching.
+            as_of_time:  Causal ceiling.
+            n:           Max discussions to return.
+        """
+        iso = self._to_iso(as_of_time)
+
+        # Match: design_discussion events where at least one actor overlaps
+        # AND the event happened before as_of_time.
+        # MongoDB $in on an array field checks if any element matches.
+        query: Dict = {
+            "type": "design_discussion",
+            "$or": [
+                {"facts.participants": {"$in": actors}},  # actor overlap
+                {"artifact_ids.jira": ticket_id},  # direct ticket ref
+            ],
+        }
+        if iso:
+            query["timestamp"] = {"$lte": iso}
+
+        docs = list(
+            self._events.find(
+                query,
+                {
+                    "_id": 0,
+                    "day": 1,
+                    "facts.topic": 1,
+                    "facts.participants": 1,
+                    "artifact_ids.slack_thread": 1,
+                    "artifact_ids.confluence": 1,
+                },
+            )
+            .sort("timestamp", -1)
+            .limit(n * 3)  # oversample before actor-overlap scoring
+        )
+
+        # Score by actor overlap — prefer discussions with more shared participants
+        scored = []
+        actor_set = set(actors)
+        for d in docs:
+            discussion_participants = set(d.get("facts", {}).get("participants", []))
+            overlap = len(actor_set & discussion_participants)
+            if overlap >= 1:
+                scored.append((overlap, d))
+
+        # Sort descending by overlap, take top n
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results = []
+        for _, d in scored[:n]:
+            results.append(
+                {
+                    "day": d.get("day", "?"),
+                    "topic": d.get("facts", {}).get("topic", ""),
+                    "participants": d.get("facts", {}).get("participants", []),
+                    "slack_thread_id": d.get("artifact_ids", {}).get(
+                        "slack_thread", ""
+                    ),
+                    "confluence_id": d.get("artifact_ids", {}).get("confluence", ""),
+                }
+            )
+        return results
+
+    def format_design_discussions_hint(self, discussions: List[Dict]) -> str:
+        """
+        Formats the output of design_discussions_for_ticket() into a prompt-ready
+        string for injection into _handle_async_question.
+
+        Call this as a module-level helper (not a method) since it operates on
+        already-fetched data and has no memory dependency.
+
+        Usage in normal_day.py:
+            from memory import format_design_discussions_hint
+            discussions = self._mem.design_discussions_for_ticket(
+                ticket_id, all_actors, meeting_time_iso
+            )
+            design_hint = format_design_discussions_hint(discussions)
+            # inject design_hint into the first task description only
+        """
+        if not discussions:
+            return ""
+
+        lines = [
+            "Note: related design discussions already happened — reference if relevant:"
+        ]
+        for d in discussions:
+            parts = [f"  Day {d['day']}"]
+            if d["topic"]:
+                parts.append(f"topic: '{d['topic'][:80]}'")
+            if d["participants"]:
+                parts.append(f"participants: {', '.join(d['participants'])}")
+            if d["confluence_id"]:
+                parts.append(f"doc: {d['confluence_id']}")
+            lines.append(" — ".join(parts))
+
+        return "\n".join(lines)

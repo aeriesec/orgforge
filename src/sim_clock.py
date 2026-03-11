@@ -3,17 +3,17 @@ sim_clock.py
 ============
 Actor-Local simulation clock for OrgForge.
 
-This clock guarantees perfect forensic timelines by tracking time per-employee. 
-It prevents "Engineer Cloning" (an employee doing two things at the exact same 
+This clock guarantees perfect forensic timelines by tracking time per-employee.
+It prevents "Engineer Cloning" (an employee doing two things at the exact same
 millisecond) and allows true parallel activity across the company.
 
 Two core mechanisms:
-  AMBIENT (advance_actor): 
-      Moves an individual's cursor forward based on the estimated hours of their 
+  AMBIENT (advance_actor):
+      Moves an individual's cursor forward based on the estimated hours of their
       AgendaItem task. Other employees are unaffected.
-      
-  CAUSAL (sync_and_tick / tick_message): 
-      Finds the latest cursor among all participating actors, brings everyone up 
+
+  CAUSAL (sync_and_tick / tick_message):
+      Finds the latest cursor among all participating actors, brings everyone up
       to that time (simulating asynchronous delay/waiting), and then ticks forward.
 """
 
@@ -24,25 +24,25 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:
-    pass   # State imported at runtime to avoid circular imports
+    pass  # State imported at runtime to avoid circular imports
 
 # ── Business hours config ─────────────────────────────────────────────────────
-DAY_START_HOUR   = 9
+DAY_START_HOUR = 9
 DAY_START_MINUTE = 0
-DAY_END_HOUR     = 17
-DAY_END_MINUTE   = 30
+DAY_END_HOUR = 17
+DAY_END_MINUTE = 30
 
 # ── Per-cadence reply spacing (minutes) ──────────────────────────────────────
 CADENCE_RANGES = {
-    "incident": (1, 4),    # urgent — tight back-and-forth
-    "normal":   (3, 12),   # standard conversation pace
-    "async":    (10, 35),  # heads-down work, slow replies
+    "incident": (1, 4),  # urgent — tight back-and-forth
+    "normal": (3, 12),  # standard conversation pace
+    "async": (10, 35),  # heads-down work, slow replies
 }
 
 
 class SimClock:
     """
-    Manages time cursors for every actor in the simulation. 
+    Manages time cursors for every actor in the simulation.
     Guarantees no overlapping tasks for individuals while allowing the org to run in parallel.
     """
 
@@ -60,10 +60,10 @@ class SimClock:
         skipping weekends automatically.
         """
         base = self._get_default_start()
-        
+
         # Reset all human actors
         self._state.actor_cursors = {a: base for a in all_actors}
-        
+
         # Reset a dedicated system cursor for independent bot alerts
         self._state.actor_cursors["system"] = base
 
@@ -76,7 +76,7 @@ class SimClock:
         current = self._get_cursor(actor)
         delta = timedelta(hours=hours)
         end_time = self._enforce_business_hours(current + delta)
-        
+
         # Sample a random time within the block for the actual JIRA/Confluence timestamp
         total_seconds = int((end_time - current).total_seconds())
         if total_seconds > 0:
@@ -97,13 +97,13 @@ class SimClock:
     ) -> datetime:
         """
         CAUSAL WORK: Synchronizes multiple actors, then ticks forward.
-        Finds the latest time among participants (meaning the thread cannot 
-        start until the busiest person is free), moves everyone to that time, 
+        Finds the latest time among participants (meaning the thread cannot
+        start until the busiest person is free), moves everyone to that time,
         and advances by a random delta.
         """
         # 1. Sync everyone to the maximum cursor
         synced_time = self._sync_time(actors)
-        
+
         # 2. Tick forward from the synced time
         delta = timedelta(minutes=random.randint(min_mins, max_mins))
         candidate = synced_time + delta
@@ -114,7 +114,7 @@ class SimClock:
         # 3. Update all participants
         for a in actors:
             self._set_cursor(a, candidate)
-            
+
         return candidate
 
     def tick_message(
@@ -124,12 +124,12 @@ class SimClock:
         allow_after_hours: bool = False,
     ) -> datetime:
         """
-        CAUSAL WORK: Advance sim_time for a specific group of actors by a 
+        CAUSAL WORK: Advance sim_time for a specific group of actors by a
         cadence-appropriate amount. Use inside _parse_slack_messages().
         """
         min_mins, max_mins = CADENCE_RANGES.get(cadence, CADENCE_RANGES["normal"])
         return self.sync_and_tick(actors, min_mins, max_mins, allow_after_hours)
-    
+
     def tick_system(self, min_mins: int = 2, max_mins: int = 5) -> datetime:
         """Advances the independent system clock for automated bot alerts."""
         current = self._get_cursor("system")
@@ -138,30 +138,32 @@ class SimClock:
         self._set_cursor("system", candidate)
         return candidate
 
-    def at(self, actors: List[str], hour: int, minute: int, duration_mins: int = 30) -> datetime:
+    def at(
+        self, actors: List[str], hour: int, minute: int, duration_mins: int = 30
+    ) -> datetime:
         """
-        Pins a scheduled meeting to a specific time. 
+        Pins a scheduled meeting to a specific time.
         Returns the exact meeting start time for artifact stamping.
         """
         meeting_start = self._get_default_start().replace(hour=hour, minute=minute)
         meeting_end = meeting_start + timedelta(minutes=duration_mins)
-        
+
         for a in actors:
             # Only advance people who are behind the meeting's end time.
             # If someone is already past it, they "missed" it, but we don't time-travel them back.
             if self._get_cursor(a) < meeting_end:
                 self._set_cursor(a, meeting_end)
-                
+
         # The artifact itself is stamped exactly when scheduled
         return meeting_start
 
     def now(self, actor: str) -> datetime:
         """Return a specific actor's current time without advancing it."""
         return self._get_cursor(actor)
-    
+
     def sync_to_system(self, actors: List[str]) -> datetime:
         """
-        INCIDENT RESPONSE: Forces specific actors to jump to the current system 
+        INCIDENT RESPONSE: Forces specific actors to jump to the current system
         clock (e.g., when an incident fires).
         """
         sys_time = self._get_cursor("system")
@@ -171,8 +173,10 @@ class SimClock:
             if self._get_cursor(a) < sys_time:
                 self._set_cursor(a, sys_time)
         return sys_time
-    
-    def schedule_meeting(self, actors: List[str], min_hour: int, max_hour: int, duration_mins: int = 45) -> datetime:
+
+    def schedule_meeting(
+        self, actors: List[str], min_hour: int, max_hour: int, duration_mins: int = 45
+    ) -> datetime:
         """
         Schedules a ceremony within a specific window and syncs all participants to it.
         Example: schedule_meeting(leads, 9, 11) for Sprint Planning.
@@ -180,27 +184,29 @@ class SimClock:
         # Pick a random top-of-the-hour or half-hour slot in the window
         hour = random.randint(min_hour, max(min_hour, max_hour - 1))
         minute = random.choice([0, 15, 30, 45])
-        
+
         # Use the at() method we defined earlier to pin the actors
         return self.at(actors, hour, minute, duration_mins)
-    
-    def sync_and_advance(self, actors: List[str], hours: float) -> tuple[datetime, datetime]:
+
+    def sync_and_advance(
+        self, actors: List[str], hours: float
+    ) -> tuple[datetime, datetime]:
         """
-        Synchronizes multiple actors to the latest available cursor, 
+        Synchronizes multiple actors to the latest available cursor,
         then advances all of them by the specified hours.
         Returns (meeting_start_time, new_cursor_horizon).
         """
         # 1. Find the latest time among all participants
         start_time = self._sync_time(actors)
-        
+
         # 2. Calculate the end time based on the agenda item's duration
         delta = timedelta(hours=hours)
         end_time = self._enforce_business_hours(start_time + delta)
-        
+
         # 3. Fast-forward everyone to the end of the meeting
         for a in actors:
             self._set_cursor(a, end_time)
-            
+
         return start_time, end_time
 
     # ── Private ───────────────────────────────────────────────────────────────
@@ -227,11 +233,11 @@ class SimClock:
         """Finds the latest cursor among actors and pulls everyone up to it."""
         if not actors:
             return self._get_cursor("system")
-            
+
         max_time = max(self._get_cursor(a) for a in actors)
         for a in actors:
             self._set_cursor(a, max_time)
-            
+
         return max_time
 
     def _enforce_business_hours(self, dt: datetime) -> datetime:
@@ -259,3 +265,15 @@ class SimClock:
             second=0,
             microsecond=0,
         )
+
+    def tick_speaker(self, actor: str, cadence: str = "normal") -> datetime:
+        """
+        Advances only the current speaker's cursor by a cadence-appropriate delta.
+        Use inside _parse_slack_messages() instead of tick_message().
+        """
+        min_mins, max_mins = CADENCE_RANGES.get(cadence, CADENCE_RANGES["normal"])
+        current = self._get_cursor(actor)
+        delta = timedelta(minutes=random.randint(min_mins, max_mins))
+        candidate = self._enforce_business_hours(current + delta)
+        self._set_cursor(actor, candidate)
+        return candidate
