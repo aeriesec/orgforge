@@ -6,6 +6,7 @@ Uses NetworkX for social graphs. Uses MongoDB for vector/artifact storage.
 """
 
 from config_loader import (
+    COMPANY_DESCRIPTION,
     EXPORT_DIR,
     CONFIG,
     COMPANY_NAME,
@@ -45,6 +46,7 @@ from normal_day import NormalDayHandler, dept_of_name
 from artifact_registry import ArtifactRegistry
 from confluence_writer import ConfluenceWriter
 from token_tracker import orgforge_token_listener
+from external_email_ingest import ExternalEmailIngestor
 from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.table import Table
@@ -448,6 +450,7 @@ class GitSimulator:
             )
             task = Task(
                 description=(
+                    f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                     f"You are {author}. Write a GitHub Pull Request description.\n\n"
                     f"FORMAT — respond in Markdown with exactly these two sections:\n"
                     f"## What Changed\n"
@@ -539,6 +542,7 @@ def persona_backstory(
 
     sections = [
         f"IDENTITY: You are {name} ({tenure} tenure). Role: {p.get('social_role', 'Contributor')}.",
+        f"COMPANY: You work at {COMPANY_NAME}, which {COMPANY_DESCRIPTION}.",
         f"BASE STYLE: {p.get('typing_quirks', 'standard professional grammar')}",
         f"CURRENT MENTAL STATE: {tone_modifier}",
     ]
@@ -647,6 +651,18 @@ class Flow(Flow[State]):
             persona_helper=persona_backstory,
             graph_dynamics=self.graph_dynamics,
         )
+        self._email_ingestor = ExternalEmailIngestor(
+            config=CONFIG,
+            mem=self._mem,
+            worker_llm=WORKER_MODEL,
+            planner_llm=PLANNER_MODEL,
+            export_dir=BASE,
+            leads=LEADS,
+            org_chart=LIVE_ORG_CHART,
+            personas=LIVE_PERSONAS,
+            registry=self._registry,
+            clock=self._clock,
+        )
         self._normal_day = NormalDayHandler(
             config=CONFIG,
             mem=self._mem,
@@ -745,13 +761,15 @@ class Flow(Flow[State]):
         self._confluence.generate_tech_stack()
         tech_context = self._mem.tech_stack_for_prompt()
 
+        self._email_ingestor.generate_sources()
+
         # Technical pages — one LLM call per page, no PAGE BREAK parsing
         self._confluence.write_genesis_batch(
             prefix=tech_cfg.get("id_prefix", "CONF-ENG").replace("CONF-", ""),
             count=tech_cfg.get("count", 3),
             prompt_tpl=(
-                "You are {author}. Write a single Confluence page with ID {id} about {project_name} "
-                "and {legacy_system}. "
+                "You are {author}. Write a single Confluence page with ID {id} {company} which {COMPANY_DESCRIPTION} "
+                "about {project_name} and {legacy_system}. "
                 "Existing related pages you may reference: {related_pages}. "
                 "Use only the following canonical tech stack — never invent or substitute alternatives:\n{tech_stack}\n"
                 "Output only Markdown. Do not include an author block, contributor list, "
@@ -767,7 +785,7 @@ class Flow(Flow[State]):
             prefix=biz_cfg.get("id_prefix", "CONF-MKT").replace("CONF-", ""),
             count=biz_cfg.get("count", 2),
             prompt_tpl=(
-                "You are {author}. Write a single Confluence page with ID {id} for {company} "
+                "You are {author}. Write a single Confluence page with ID {id} for {company} which {COMPANY_DESCRIPTION}"
                 "about {product_page} campaign planning and go-to-market strategy. "
                 "Existing related pages you may reference: {related_pages}. "
                 "Output only Markdown. Do not include an author block, contributor list, "
@@ -841,12 +859,15 @@ class Flow(Flow[State]):
                     self._day_planner._validator, self._lifecycle
                 )
 
+            vendor_signals = self._email_ingestor.generate_pre_standup(state=self.state)
+
             org_plan = self._day_planner.plan(
                 self.state,
                 self._mem,
                 self.graph_dynamics,
                 lifecycle_context=self._lifecycle.get_roster_context(),
                 clock=self._clock,
+                email_signals=vendor_signals,
             )
             if org_plan is None:
                 logger.error(
@@ -878,6 +899,8 @@ class Flow(Flow[State]):
                 self._handle_incident()
             else:
                 self._normal_day.handle(self.state.org_day_plan)
+                self._email_ingestor.generate_business_hours(state=self.state)
+                self._email_ingestor.generate_hr_outbound(state=self.state)
                 if random.random() < CONFIG["simulation"].get(
                     "adhoc_confluence_prob", 0.3
                 ):
@@ -946,7 +969,7 @@ class Flow(Flow[State]):
         )
         product_task = Task(
             description=(
-                f"It's Sprint #{sprint_num} planning at {COMPANY_NAME}.\n"
+                f"It's Sprint #{sprint_num} planning at {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                 f"System health: {self.state.system_health}/100. Morale: {self.state.team_morale:.2f}.\n"
                 f"Recent context:\n{ctx}\n\n"
                 f"Propose a sprint theme as a single sentence grounded in customer needs, "
@@ -970,6 +993,7 @@ class Flow(Flow[State]):
         )
         eng_task = Task(
             description=(
+                f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                 f"The Product Manager has just proposed a sprint theme (see context above).\n"
                 f"System health: {self.state.system_health}/100. "
                 f"Morale: {self.state.team_morale:.2f}.\n\n"
@@ -1032,6 +1056,7 @@ class Flow(Flow[State]):
                 description=(
                     f'Sprint #{sprint_num} theme: "{sprint_theme}"\n'
                     f"Department: {dept}\n"
+                    f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                     f"Team members and their expertise:\n{expertise_str}\n"
                     f"Recent dept context:\n{dept_ctx}\n\n"
                     f"Create exactly {n_per_dept} Jira tickets for this sprint.\n"
@@ -1241,6 +1266,7 @@ class Flow(Flow[State]):
             )
             task = Task(
                 description=(
+                    f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                     f"You are {name}. It's the morning standup.\n\n"
                     f"YOUR ASSIGNED TICKETS FOR THIS SPRINT:\n"
                     f"{owned_str}\n\n"
@@ -1387,7 +1413,10 @@ class Flow(Flow[State]):
                 llm=PLANNER_MODEL,
             )
             task = Task(
-                description=f"Context from this sprint:\n{ctx}\n\n{desc}",
+                description=(
+                    f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
+                    f"Context from this sprint:\n{ctx}\n\n{desc}"
+                ),
                 expected_output="Markdown contribution to the retrospective.",
                 agent=agent,
                 context=[prev_task] if prev_task else [],
@@ -1610,6 +1639,7 @@ class Flow(Flow[State]):
         desc_task = Task(
             description=(
                 f"Write a Jira ticket description for this incident.\n\n"
+                f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                 f"Title: {title}\n"
                 f"Root cause: {root_cause}\n"
                 f"Escalation path: {escalation_narrative}\n"
@@ -2271,6 +2301,7 @@ class Flow(Flow[State]):
         )
         task = Task(
             description=(
+                f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                 f"You just got off a call/email with {display_name} "
                 f"({contact.get('org', 'external party')}) regarding incident "
                 f"{inc.ticket_id}: {inc.root_cause}.\n"

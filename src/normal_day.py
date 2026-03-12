@@ -261,17 +261,22 @@ class NormalDayHandler:
                         self._clock.advance_actor(eng_plan.name, penalty_hours)
                         distraction_fired = True
 
-                    if (
-                        item.activity_type in ("design_discussion", "mentoring")
-                        and item.collaborator
+                    if item.activity_type in (
+                        "design_discussion",
+                        "mentoring",
+                        "1on1",
+                        "async_question",
+                        "pr_review",
                     ):
-                        if item.activity_type == "mentoring":
-                            key = frozenset([eng_plan.name] + list(item.collaborator))
+                        collaborators = list(item.collaborator) if item.collaborator else []
+                        participant_set = frozenset([eng_plan.name] + collaborators)
+
+                        if item.activity_type == "design_discussion":
+                            # Include description so two different design discussions
+                            # between the same people on the same day both fire.
+                            key = ("design_discussion", participant_set, item.description)
                         else:
-                            key = (
-                                frozenset([eng_plan.name] + list(item.collaborator)),
-                                item.description,
-                            )
+                            key = (item.activity_type, participant_set)
 
                         if key in seen_discussions:
                             continue

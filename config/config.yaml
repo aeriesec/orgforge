@@ -56,6 +56,7 @@ model_presets:
 simulation:
   company_name: "Apex Athletics"
   industry: "sports technology"
+  company_description: "builds advanced wearables that provide athletes with the real-time data and insights needed to optimize their performance."
   domain: "apexathletics.io"
   output_dir: "./export"
   db_name: "orgforge"

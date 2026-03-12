@@ -1643,6 +1643,18 @@ class Memory:
         for key, value in stack.items():
             lines.append(f"  {key}: {value}")
         return "\n".join(lines)
+    
+    def save_inbound_email_sources(self, sources: list) -> None:
+        self._db["sim_config"].update_one(
+            {"_id": "inbound_email_sources"},
+            {"$set": {"_id": "inbound_email_sources", "sources": sources,
+                    "created_at": datetime.now(timezone.utc).isoformat()}},
+            upsert=True,
+        )
+
+    def get_inbound_email_sources(self) -> Optional[list]:
+        doc = self._db["sim_config"].find_one({"_id": "inbound_email_sources"})
+        return doc["sources"] if doc else None
 
     def context_for_ticket_progress(
         self,

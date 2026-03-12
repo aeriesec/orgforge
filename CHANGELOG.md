@@ -6,6 +6,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.7.0] — 2026-03-11
+
+### Added
+
+- **Inbound & Outbound Email Engine (`external_email_ingest.py`)**: Introduced a system for generating and routing realistic external communications.
+- **Tech Vendor Alerts**: Automated alerts arriving pre-standup (e.g., AWS quota limits) are now semantically routed to the engineer whose expertise best matches the topic. If the topic overlaps with an active incident, the email is automatically appended to the incident's causal chain.
+- **Customer Complaints**: Customer emails arriving during business hours are routed through a gatekeeper chain (Sales → Product). High-priority emails can automatically generate JIRA tickets.
+- **HR Outbound**: The system now fires offer letters and onboarding prep emails 1-3 days before a scheduled new hire arrives, linking them to the hire's arrival event.
+
+- **Eval Dataset Generator (`eval_harness.py`)**: Added a post-simulation evaluation tool that processes the `SimEvent` log to produce deterministic datasets for RAG testing.
+- **Causal Thread Reconstruction**: Reconstructs explicit artifact graphs (e.g., email → Slack ping → JIRA ticket) to track the flow of information.
+- **Automated Q&A Generation**: Uses the LLM to generate natural language questions (Retrieval, Causal, Temporal, Gap Detection, Routing) based on the deterministic ground-truth data from the simulation.
+
+- **Dropped Email Simulation (`external_email_ingest.py`)**: Implemented a probabilistic drop rate (~15%) for customer emails, creating intentional gaps where an email is received but no downstream action (Slack/JIRA) occurs. These gaps are logged as `email_dropped` events for the eval harness to detect.
+
+### Changed
+
+- **Genesis Source Generation (`external_email_ingest.py`)**: External email sources (vendors, customers) are now generated via LLM during the genesis phase, grounded in the company's established tech stack, and persisted to MongoDB (`sim_config["inbound_email_sources"]`).
+- **Causal Chain Integration (`flow.py`, `external_email_ingest.py`)**: Emails are now assigned `embed_id`s and rooted in a `CausalChainHandler`. This ensures every downstream artifact (Slack threads, JIRA tickets) is appended in order and snapshotted into `SimEvent` facts.
+
+---
+
 ## [v0.6.0] — 2026-03-11
 
 ### Added

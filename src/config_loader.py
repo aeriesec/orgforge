@@ -33,6 +33,7 @@ CONFIG: Dict[str, Any] = _data
 # ── Top-level constants ───────────────────────────────────────────────────────
 COMPANY_NAME = CONFIG["simulation"]["company_name"]
 COMPANY_DOMAIN = CONFIG["simulation"]["domain"]
+COMPANY_DESCRIPTION = CONFIG["simulation"]["company_description"]
 INDUSTRY = CONFIG["simulation"].get("industry", "technology")
 BASE = CONFIG["simulation"].get("output_dir", str(EXPORT_DIR))
 ORG_CHART = CONFIG["org_chart"]
