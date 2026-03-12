@@ -703,6 +703,47 @@ class Memory:
 
         return experts
 
+    def find_expert_by_skill(self, topic: str, n: int = 1) -> List[Dict]:
+        """
+        DRY: Uses the existing recall() pattern to find the best persona match.
+        """
+        results = self.recall(query=topic, n=n, type_filter="persona_skill")
+
+        return [
+            {
+                "name": r.get("metadata", {}).get("name"),
+                "dept": r.get("metadata", {}).get("dept"),
+                "score": r.get("score"),
+            }
+            for r in results
+            if r.get("score", 0) > 0.65
+        ]
+
+    def embed_persona_skills(
+        self, name: str, data: Dict[str, Any], dept: str, day: int, timestamp_iso: str
+    ):
+        """
+        Standardizes employee expertise into searchable 'persona_skill' artifacts
+        using the simulation's current clock time.
+        """
+        skill_text = (
+            f"Employee: {name}. Dept: {dept}. "
+            f"Expertise: {', '.join(data.get('expertise', []))}. "
+            f"Role: {data.get('social_role', '')}. "
+            f"Style: {data.get('style', '')}"
+        )
+
+        self.embed_artifact(
+            id=f"skill_{name.lower()}",
+            type="persona_skill",
+            title=f"Expertise Profile: {name}",
+            content=skill_text,
+            day=day,
+            date=timestamp_iso,
+            timestamp=timestamp_iso,
+            metadata={"name": name, "dept": dept},
+        )
+
     def recall_events(
         self,
         query: str,
@@ -743,8 +784,11 @@ class Memory:
         relevant = [e for e in self._event_log if name in e.actors]
         return relevant[-n:]
 
-    def get_event_log(self) -> List[SimEvent]:
-        return list(self._event_log)
+    def get_event_log(self, from_db: bool = False) -> List[SimEvent]:
+        if from_db:
+            raw = self._events.find({}, {"_id": 0}).sort("timestamp", 1)
+            return [SimEvent.from_dict(r) for r in raw]
+        return self._event_log
 
     def events_by_type(self, event_type: str) -> List[SimEvent]:
         return [e for e in self._event_log if e.type == event_type]
@@ -1588,10 +1632,6 @@ class Memory:
         proposed_events: List[Dict],
         raw: dict,
     ) -> None:
-        logger.info("Log Dept Plan")
-        logger.info(raw)
-        logger.info(proposed_events)
-        logger.info(engineer_plans)
         doc = {
             "day": day,
             "date": date,
@@ -1643,12 +1683,17 @@ class Memory:
         for key, value in stack.items():
             lines.append(f"  {key}: {value}")
         return "\n".join(lines)
-    
+
     def save_inbound_email_sources(self, sources: list) -> None:
         self._db["sim_config"].update_one(
             {"_id": "inbound_email_sources"},
-            {"$set": {"_id": "inbound_email_sources", "sources": sources,
-                    "created_at": datetime.now(timezone.utc).isoformat()}},
+            {
+                "$set": {
+                    "_id": "inbound_email_sources",
+                    "sources": sources,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
             upsert=True,
         )
 

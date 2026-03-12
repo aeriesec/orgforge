@@ -28,6 +28,10 @@ def mock_flow(make_test_memory):
 def mock_clock():
     clock = MagicMock()
     clock.schedule_meeting.return_value = datetime(2026, 1, 5, 9, 0, 0)
+
+    test_date = datetime(2026, 1, 5, 9, 0, 0)
+    clock.now.return_value = test_date
+
     return clock
 
 
