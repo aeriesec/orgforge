@@ -871,6 +871,91 @@ class TestDepartmentPlannerPlan:
         assert plan is not None
 
 
+
+    def test_planner_deduplicates_mirrored_collaborations(self):
+        # 1. Setup a minimal planner (we don't need real LLMs just to test parsing)
+        config = {"simulation": {"company_name": "TestCorp"}}
+        members = ["Jax", "Deepa"]
+        
+        planner = DepartmentPlanner(
+            dept="engineering",
+            members=members,
+            config=config,
+            worker_llm=None,  # Not needed for _parse_plan
+        )
+        
+        # 2. Create a mock LLM output that exhibits the duplicate/mirrored bug
+        # Jax lists Deepa for a 1on1, and Deepa lists Jax for the SAME 1on1.
+        mock_llm_json = json.dumps({
+            "dept_theme": "Testing Deduplication",
+            "engineer_plans": [
+                {
+                    "name": "Jax",
+                    "agenda": [
+                        {
+                            "activity_type": "1on1",
+                            "description": "Catch up with Deepa",
+                            "collaborator": ["Deepa"]
+                        },
+                        {
+                            "activity_type": "ticket_progress",
+                            "description": "Solo work on API",
+                            "collaborator": []
+                        }
+                    ]
+                },
+                {
+                    "name": "Deepa",
+                    "agenda": [
+                        {
+                            "activity_type": "1on1",
+                            "description": "Weekly sync with Jax",
+                            "collaborator": ["Jax"]
+                        },
+                        {
+                            "activity_type": "design_discussion",
+                            "description": "Review architecture with Jax",
+                            "collaborator": ["Jax"]
+                        }
+                    ]
+                }
+            ]
+        })
+        
+        # 3. Parse the plan
+        plan, _ = planner._parse_plan(
+            raw=mock_llm_json,
+            org_theme="Global Theme",
+            day=1,
+            date="2026-03-11",
+            cross_signals=[]
+        )
+        
+        # 4. Extract all collaborative events from the parsed plan
+        collaborative_events = []
+        for ep in plan.engineer_plans:
+            for item in ep.agenda:
+                if item.activity_type in ("1on1", "mentoring", "design_discussion", "async_question"):
+                    # Normalize participants to a frozenset for easy comparison
+                    participants = frozenset([ep.name] + item.collaborator)
+                    collaborative_events.append((item.activity_type, participants))
+                    
+        # 5. Assertions to ensure the fix stays sticky
+        
+        # A. The mirrored 1on1 should be collapsed into a single event
+        one_on_ones = [e for e in collaborative_events if e[0] == "1on1"]
+        assert len(one_on_ones) == 1, "Mirrored 1-on-1s were not deduplicated!"
+        
+        # B. Solo work should be completely unaffected
+        jax_plan = next(ep for ep in plan.engineer_plans if ep.name == "Jax")
+        solo_items = [a for a in jax_plan.agenda if a.activity_type == "ticket_progress"]
+        assert len(solo_items) == 1, "Solo work was accidentally stripped!"
+        
+        # C. Un-mirrored collaborative events should remain intact
+        design_discussions = [e for e in collaborative_events if e[0] == "design_discussion"]
+        assert len(design_discussions) == 1, "Valid single-sided collaborative events were lost!"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. DayPlannerOrchestrator construction
 # ─────────────────────────────────────────────────────────────────────────────

@@ -40,7 +40,8 @@ from planner_models import (
 )
 from plan_validator import PlanValidator
 from ticket_assigner import TicketAssigner
-from config_loader import LEADS, LIVE_ORG_CHART, PERSONAS, DEFAULT_PERSONA, resolve_role
+from external_email_ingest import ExternalEmailSignal
+from config_loader import LEADS, LIVE_ORG_CHART, PERSONAS, DEFAULT_PERSONA, COMPANY_DESCRIPTION, resolve_role
 
 logger = logging.getLogger("orgforge.planner")
 
@@ -72,7 +73,7 @@ class DepartmentPlanner:
 
     # Prompt template — kept here so it's easy to tune without touching logic
     _PLAN_PROMPT = """
-    You are the planning agent for the {dept} department at {company}.
+    You are the planning agent for the {dept} department at {company} which {company_description}.
     Today is Day {day} ({date}).
 
     ## ABSOLUTE RULES — apply these before writing a single agenda item
@@ -100,9 +101,10 @@ class DepartmentPlanner:
         recruitment, sales calls, policy, etc.
     - Do NOT propose ticket_progress, pr_review, or code-related activities.
 
-    5. NO EVENT REDUNDANCY.
-    - Do not schedule duplicate design_discussion or async_question events
-        for the same topic across multiple people. One initiator is enough.
+    5. NO EVENT REDUNDANCY (CRITICAL TO AVOID DUPLICATES).
+    - NEVER put collaborative meetings (1on1, mentoring, design_discussion, async_question) in the individual agendas of BOTH participants.
+    - Assign the meeting to the INITIATOR'S agenda ONLY. 
+    - List the other participants in the `collaborator` array. The simulation engine will automatically pull them into the meeting.
 
     6. NOVEL EVENTS.
     - You may propose new event types if the situation genuinely calls for it.
@@ -215,6 +217,7 @@ class DepartmentPlanner:
         sprint_context: Optional[SprintContext] = None,
         eng_plan: Optional[DepartmentDayPlan] = None,  # None for Engineering itself
         lifecycle_context: str = "",
+        email_signals: Optional[List["ExternalEmailSignal"]] = None,
     ) -> DepartmentDayPlan:
         """
         Produce a DepartmentDayPlan. eng_plan is provided to non-Engineering
@@ -225,6 +228,9 @@ class DepartmentPlanner:
         roster = self._build_roster(graph_dynamics)
         dept_history = self._dept_history(mem, day)
         cross_str = self._format_cross_signals(cross_signals, eng_plan)
+        email_str = self._format_email_signals(email_signals or [], self.dept)
+        if email_str:
+            cross_str = cross_str + "\n\n" + email_str
         known_str = ", ".join(sorted(KNOWN_EVENT_TYPES))
         morale_label = (
             "low"
@@ -281,7 +287,7 @@ class DepartmentPlanner:
 
         lead_context = (
             f"You are {lead_name}, lead of {self.dept} at "
-            f"{self.config['simulation']['company_name']}. "
+            f"{self.config['simulation']['company_name']} which {COMPANY_DESCRIPTION}. "
             f"Your current stress is {lead_stress}/100"
             + (" — you are on-call today." if lead_name == on_call_name else ".")
             + f" Your style: {lead_style}. "
@@ -300,6 +306,7 @@ class DepartmentPlanner:
         prompt = self._PLAN_PROMPT.format(
             dept=self.dept,
             company=self.config["simulation"]["company_name"],
+            company_description=COMPANY_DESCRIPTION,
             day=day,
             date=date,
             org_theme=org_theme,
@@ -439,6 +446,22 @@ class DepartmentPlanner:
             if name not in planned_names:
                 eng_plans.append(self._default_engineer_plan(name))
 
+        seen_collaborations = set()
+        for ep in eng_plans:
+            unique_agenda = []
+            for a in ep.agenda:
+                if a.activity_type in ("1on1", "mentoring", "design_discussion", "async_question"):
+                    # Create a normalized key of the participants
+                    participants = frozenset([ep.name] + a.collaborator)
+                    collab_key = (a.activity_type, participants)
+                    
+                    if collab_key in seen_collaborations:
+                        continue  # We already kept the initiator's version of this meeting
+                    seen_collaborations.add(collab_key)
+                    
+                unique_agenda.append(a)
+            ep.agenda = unique_agenda
+
         # ── Proposed events ───────────────────────────────────────────────────
         proposed: List[ProposedEvent] = []
         for pe in data.get("proposed_events", []):
@@ -542,6 +565,30 @@ class DepartmentPlanner:
                     f"{ep.agenda[0].description if ep.agenda else '?'}"
                 )
         return "\n".join(lines) if lines else "  (no cross-dept signals today)"
+    
+    def _format_email_signals(
+        self,
+        signals: List[ExternalEmailSignal],
+        liaison_dept: str,
+    ) -> str:
+        # Only vendor signals reach planner prompts;
+        # customer signals carry forward as CrossDeptSignals tomorrow.
+        relevant = [
+            s for s in signals
+            if not s.dropped
+            and s.category == "vendor"
+            and s.internal_liaison.lower() == liaison_dept.lower()
+        ]
+        if not relevant:
+            return ""
+        lines = ["### INBOUND VENDOR EMAILS THIS MORNING (act on these if relevant)"]
+        for s in relevant:
+            lines.append(
+                f"  From: {s.source_name} ({s.source_org})\n"
+                f"  Subject: \"{s.subject}\"\n"
+                f"  Preview: {s.body_preview}"
+            )
+        return "\n".join(lines)
 
     # ─── Fallbacks ────────────────────────────────────────────────────────────
 
@@ -603,7 +650,7 @@ class OrgCoordinator:
     """
 
     _COORD_PROMPT = """
-    You are the Org Coordinator for {company} on Day {day}.
+    You are the Org Coordinator for {company} which {company_description} on Day {day}.
     Your job is to find ONE realistic cross-department interaction that neither
     department planned for — a natural collision caused by stress, competing
     priorities, or misaligned timing.
@@ -696,6 +743,7 @@ class OrgCoordinator:
 
         prompt = self._COORD_PROMPT.format(
             company=self._config["simulation"]["company_name"],
+            company_description=COMPANY_DESCRIPTION,
             day=day,
             other_plans_with_stress=other_plans_str,
             health=state.system_health,
@@ -838,6 +886,7 @@ class DayPlannerOrchestrator:
         graph_dynamics: GraphDynamics,
         clock,
         lifecycle_context: str = "",
+        email_signals: Optional[List["ExternalEmailSignal"]] = None,
     ) -> OrgDayPlan:
         """
         Full planning pass for one day.
@@ -891,6 +940,7 @@ class DayPlannerOrchestrator:
                 cross_signals=cross_signals_by_dept.get(eng_key, []),
                 sprint_context=sprint_contexts.get(eng_key),
                 eng_plan=None,
+                email_signals=email_signals,
             )
             self._patch_stress_levels(eng_plan, graph_dynamics)
             dept_plans[eng_key] = eng_plan
@@ -917,6 +967,7 @@ class DayPlannerOrchestrator:
                 sprint_context=sprint_contexts.get(dept),
                 eng_plan=eng_plan,
                 lifecycle_context=lifecycle_context,
+                email_signals=email_signals,
             )
             self._patch_stress_levels(plan, graph_dynamics)
             dept_plans[dept] = plan
@@ -1007,7 +1058,7 @@ class DayPlannerOrchestrator:
             goal="Decide today's dominant org theme based on what you know about your company right now.",
             backstory=(
                 f"You are {ceo_name}, CEO of "
-                f"{self._config['simulation']['company_name']}. "
+                f"{self._config['simulation']['company_name']} which {COMPANY_DESCRIPTION}. "
                 f"Your current stress is {ceo_stress}/100. "
                 f"Your style: {ceo_style}. "
                 f"You set the tone for the whole org each morning based on "
@@ -1054,6 +1105,10 @@ class DayPlannerOrchestrator:
             "customer_escalation",
             "morale_intervention",
             "hr_checkin",
+            "customer_email_routed",
+            "customer_escalation",
+            "vendor_email_routed",
+            "inbound_external_email",
         }
 
         recent = [

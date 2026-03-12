@@ -59,12 +59,6 @@ The postmortem references the same root cause as the ticket. The sales email tha
 
 ---
 
-## Why Does This Exist?
-
-The only widely-used corporate dataset is the Enron email corpus — 25 years old, legally sensitive, and covering one company in crisis. OrgForge generates a modern corpus from scratch, parameterized to any company, industry, or org structure. LLMs write the prose; the facts are controlled by the state machine.
-
----
-
 ## What Gets Generated
 
 A default 22-day simulation produces:

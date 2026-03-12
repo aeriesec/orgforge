@@ -88,6 +88,7 @@ class ConfluenceWriter:
         self._gd = graph_dynamics
         self._base = base_export_dir
         self._company = config["simulation"]["company_name"]
+        self._company_description = config["simulation"]["company_description"]
         self._industry = config["simulation"].get("industry", "technology")
         self._legacy = config.get("legacy_system", {})
         self._all_names = [n for dept in config["org_chart"].values() for n in dept]

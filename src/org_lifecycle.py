@@ -781,6 +781,8 @@ class OrgLifecycleManager:
         if hire_time.minute < 30 and hire_time.hour == 9:
             hire_time = hire_time.replace(minute=random.randint(30, 59))
 
+        hr_email_id = hire_cfg.get("_hr_email_embed_id")
+
         self._mem.log_event(
             SimEvent(
                 type="employee_hired",
@@ -788,7 +790,9 @@ class OrgLifecycleManager:
                 day=day,
                 date=date_str,
                 actors=[name],
-                artifact_ids={},
+                artifact_ids={
+                    **({"hr_email": hr_email_id} if hr_email_id else {}),
+                },
                 facts={
                     "name": name,
                     "dept": dept,
@@ -797,6 +801,7 @@ class OrgLifecycleManager:
                     "tenure": tenure,
                     "cold_start": True,
                     "edge_weight_floor": floor,
+                    "hr_email_embed_id": hr_email_id,
                 },
                 summary=(
                     f"{name} joined {dept} as {role} on Day {day}. "
