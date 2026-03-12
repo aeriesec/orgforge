@@ -237,6 +237,7 @@ def dept_planner(mock_llm):
         config=CONFIG,
         worker_llm=mock_llm,
         is_primary=True,
+        clock=MagicMock(),
     )
 
 
@@ -546,7 +547,7 @@ class TestDepartmentPlannerHelpers:
         ]
         result = dept_planner._format_cross_signals(signals, None)
         # Change the assertion to look for the member name 'Dave' or the summary
-        assert "Dave" in result 
+        assert "Dave" in result
         assert "customer_escalation" in result
         assert "Big client unhappy" in result
 
@@ -573,7 +574,7 @@ class TestDepartmentPlannerHelpers:
 class TestExtractCrossSignals:
     def _make_orchestrator(self):
         with patch("day_planner.PlanValidator"), patch("day_planner.OrgCoordinator"):
-            return DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            return DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
 
     def test_no_events_returns_empty_signals(self, mock_mem):
         orch = self._make_orchestrator()
@@ -675,7 +676,7 @@ class TestExtractCrossSignals:
 class TestPatchStressLevels:
     def _make_orchestrator(self):
         with patch("day_planner.PlanValidator"), patch("day_planner.OrgCoordinator"):
-            return DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            return DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
 
     def test_stress_patched_from_graph_dynamics(self, mock_graph_dynamics):
         orch = self._make_orchestrator()
@@ -870,90 +871,102 @@ class TestDepartmentPlannerPlan:
             )
         assert plan is not None
 
-
-
     def test_planner_deduplicates_mirrored_collaborations(self):
         # 1. Setup a minimal planner (we don't need real LLMs just to test parsing)
         config = {"simulation": {"company_name": "TestCorp"}}
         members = ["Jax", "Deepa"]
-        
+
         planner = DepartmentPlanner(
             dept="engineering",
             members=members,
             config=config,
             worker_llm=None,  # Not needed for _parse_plan
+            clock=MagicMock(),
         )
-        
+
         # 2. Create a mock LLM output that exhibits the duplicate/mirrored bug
         # Jax lists Deepa for a 1on1, and Deepa lists Jax for the SAME 1on1.
-        mock_llm_json = json.dumps({
-            "dept_theme": "Testing Deduplication",
-            "engineer_plans": [
-                {
-                    "name": "Jax",
-                    "agenda": [
-                        {
-                            "activity_type": "1on1",
-                            "description": "Catch up with Deepa",
-                            "collaborator": ["Deepa"]
-                        },
-                        {
-                            "activity_type": "ticket_progress",
-                            "description": "Solo work on API",
-                            "collaborator": []
-                        }
-                    ]
-                },
-                {
-                    "name": "Deepa",
-                    "agenda": [
-                        {
-                            "activity_type": "1on1",
-                            "description": "Weekly sync with Jax",
-                            "collaborator": ["Jax"]
-                        },
-                        {
-                            "activity_type": "design_discussion",
-                            "description": "Review architecture with Jax",
-                            "collaborator": ["Jax"]
-                        }
-                    ]
-                }
-            ]
-        })
-        
+        mock_llm_json = json.dumps(
+            {
+                "dept_theme": "Testing Deduplication",
+                "engineer_plans": [
+                    {
+                        "name": "Jax",
+                        "agenda": [
+                            {
+                                "activity_type": "1on1",
+                                "description": "Catch up with Deepa",
+                                "collaborator": ["Deepa"],
+                            },
+                            {
+                                "activity_type": "ticket_progress",
+                                "description": "Solo work on API",
+                                "collaborator": [],
+                            },
+                        ],
+                    },
+                    {
+                        "name": "Deepa",
+                        "agenda": [
+                            {
+                                "activity_type": "1on1",
+                                "description": "Weekly sync with Jax",
+                                "collaborator": ["Jax"],
+                            },
+                            {
+                                "activity_type": "design_discussion",
+                                "description": "Review architecture with Jax",
+                                "collaborator": ["Jax"],
+                            },
+                        ],
+                    },
+                ],
+            }
+        )
+
         # 3. Parse the plan
         plan, _ = planner._parse_plan(
             raw=mock_llm_json,
             org_theme="Global Theme",
             day=1,
             date="2026-03-11",
-            cross_signals=[]
+            cross_signals=[],
         )
-        
+
         # 4. Extract all collaborative events from the parsed plan
         collaborative_events = []
         for ep in plan.engineer_plans:
             for item in ep.agenda:
-                if item.activity_type in ("1on1", "mentoring", "design_discussion", "async_question"):
+                if item.activity_type in (
+                    "1on1",
+                    "mentoring",
+                    "design_discussion",
+                    "async_question",
+                ):
                     # Normalize participants to a frozenset for easy comparison
                     participants = frozenset([ep.name] + item.collaborator)
                     collaborative_events.append((item.activity_type, participants))
-                    
+
         # 5. Assertions to ensure the fix stays sticky
-        
+
         # A. The mirrored 1on1 should be collapsed into a single event
         one_on_ones = [e for e in collaborative_events if e[0] == "1on1"]
         assert len(one_on_ones) == 1, "Mirrored 1-on-1s were not deduplicated!"
-        
+
         # B. Solo work should be completely unaffected
         jax_plan = next(ep for ep in plan.engineer_plans if ep.name == "Jax")
-        solo_items = [a for a in jax_plan.agenda if a.activity_type == "ticket_progress"]
+        solo_items = [
+            a for a in jax_plan.agenda if a.activity_type == "ticket_progress"
+        ]
         assert len(solo_items) == 1, "Solo work was accidentally stripped!"
-        
+
         # C. Un-mirrored collaborative events should remain intact
-        design_discussions = [e for e in collaborative_events if e[0] == "design_discussion"]
-        assert len(design_discussions) == 1, "Valid single-sided collaborative events were lost!"
+        design_discussions = [
+            e for e in collaborative_events if e[0] == "design_discussion"
+        ]
+        assert len(design_discussions) == 1, (
+            "Valid single-sided collaborative events were lost!"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -968,7 +981,7 @@ class TestDayPlannerOrchestratorInit:
             patch("day_planner.OrgCoordinator"),
             patch("day_planner.LIVE_ORG_CHART", ORG_CHART),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
         assert set(orch._dept_planners.keys()) == {"Engineering", "Sales"}
 
     def test_engineering_is_primary(self):
@@ -977,7 +990,7 @@ class TestDayPlannerOrchestratorInit:
             patch("day_planner.OrgCoordinator"),
             patch("day_planner.LIVE_ORG_CHART", ORG_CHART),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
         assert orch._dept_planners["Engineering"].is_primary is True
 
     def test_sales_is_not_primary(self):
@@ -986,7 +999,7 @@ class TestDayPlannerOrchestratorInit:
             patch("day_planner.OrgCoordinator"),
             patch("day_planner.LIVE_ORG_CHART", ORG_CHART),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
         assert orch._dept_planners["Sales"].is_primary is False
 
     def test_ticket_assigner_starts_as_none(self):
@@ -995,7 +1008,7 @@ class TestDayPlannerOrchestratorInit:
             patch("day_planner.OrgCoordinator"),
             patch("day_planner.LIVE_ORG_CHART", ORG_CHART),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
         assert orch._ticket_assigner is None
 
     def test_external_contacts_included_in_validator(self):
@@ -1006,7 +1019,7 @@ class TestDayPlannerOrchestratorInit:
             patch("day_planner.OrgCoordinator"),
             patch("day_planner.LIVE_ORG_CHART", ORG_CHART),
         ):
-            DayPlannerOrchestrator(cfg, MagicMock(), MagicMock())
+            DayPlannerOrchestrator(cfg, MagicMock(), MagicMock(), MagicMock())
         call_kwargs = mock_validator_cls.call_args
         ext_names = (
             call_kwargs.kwargs.get("external_contact_names") or call_kwargs.args[1]
@@ -1033,7 +1046,7 @@ class TestDayPlannerOrchestratorPlan:
             patch("day_planner.PlanValidator") as mock_validator_cls,
             patch("day_planner.OrgCoordinator") as mock_coord_cls,
         ):
-            orch = DayPlannerOrchestrator(CONFIG, mock_worker, mock_planner)
+            orch = DayPlannerOrchestrator(CONFIG, mock_worker, mock_planner, MagicMock())
         return orch, mock_validator_cls, mock_coord_cls
 
     def _make_clock(self, state):
@@ -1059,7 +1072,7 @@ class TestDayPlannerOrchestratorPlan:
                 DayPlannerOrchestrator, "_recent_day_summaries", return_value=[]
             ),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
 
             # Set up TicketAssigner stub
             mock_ta = MagicMock()
@@ -1119,7 +1132,7 @@ class TestDayPlannerOrchestratorPlan:
                 DayPlannerOrchestrator, "_recent_day_summaries", return_value=[]
             ),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
 
             mock_ta = MagicMock()
             mock_ta.build.return_value = _make_sprint_context(
@@ -1192,7 +1205,7 @@ class TestDayPlannerOrchestratorPlan:
                 DayPlannerOrchestrator, "_recent_day_summaries", return_value=[]
             ),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
 
             mock_ta = MagicMock()
             mock_ta.build.return_value = _make_sprint_context()
@@ -1260,7 +1273,7 @@ class TestDayPlannerOrchestratorPlan:
                 DayPlannerOrchestrator, "_recent_day_summaries", return_value=[]
             ),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
 
             mock_ta = MagicMock()
             mock_ta.build.return_value = _make_sprint_context()
@@ -1321,7 +1334,7 @@ class TestDayPlannerOrchestratorPlan:
                 DayPlannerOrchestrator, "_recent_day_summaries", return_value=[]
             ),
         ):
-            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock())
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
 
             mock_ta = MagicMock()
             mock_ta.build.return_value = _make_sprint_context()

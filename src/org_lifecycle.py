@@ -718,16 +718,37 @@ class OrgLifecycleManager:
         name = hire_cfg["name"]
         dept = hire_cfg.get("dept", list(self._org_chart.keys())[0])
         role = hire_cfg.get("role", "Engineer")
-        G = self._gd.G
-
-        if name in G:
-            logger.warning(f"[lifecycle] '{name}' already in graph — skipping hire.")
-            return None
-
         expertise = hire_cfg.get("expertise", ["general"])
         style = hire_cfg.get("style", "collaborative")
         tenure = hire_cfg.get("tenure", "new")
         floor = self._gd.cfg.get("edge_weight_floor", 0.5)
+        G = self._gd.G
+
+        self._personas[name] = {
+            "style": style,
+            "expertise": expertise,
+            "tenure": tenure,
+            "stress": 20,
+            "social_role": hire_cfg.get(
+                "social_role", "The Reliable Contributor"
+            ),  # Capture from config
+            "typing_quirks": hire_cfg.get(
+                "typing_quirks", "Standard professional grammar."
+            ),  # Capture from config
+        }
+
+        persona_data = self._personas.get(name, {})
+        self._mem.embed_persona_skills(
+            name,
+            persona_data,
+            dept,
+            day=day,
+            timestamp_iso=clock.now("system").isoformat(),
+        )
+
+        if name in G:
+            logger.warning(f"[lifecycle] '{name}' already in graph — skipping hire.")
+            return None
 
         if dept not in self._org_chart:
             self._org_chart[dept] = []

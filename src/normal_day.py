@@ -268,13 +268,19 @@ class NormalDayHandler:
                         "async_question",
                         "pr_review",
                     ):
-                        collaborators = list(item.collaborator) if item.collaborator else []
+                        collaborators = (
+                            list(item.collaborator) if item.collaborator else []
+                        )
                         participant_set = frozenset([eng_plan.name] + collaborators)
 
                         if item.activity_type == "design_discussion":
                             # Include description so two different design discussions
                             # between the same people on the same day both fire.
-                            key = ("design_discussion", participant_set, item.description)
+                            key = (
+                                "design_discussion",
+                                participant_set,
+                                item.description,
+                            )
                         else:
                             key = (item.activity_type, participant_set)
 
@@ -643,6 +649,41 @@ class NormalDayHandler:
         if reply_thread_id:
             artifact_ids["slack_thread"] = reply_thread_id
 
+        linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
+        causal_facts: dict = {}
+
+        active_inc = next(
+            (
+                i
+                for i in self._state.active_incidents
+                if i.ticket_id == linked_ticket_id
+            ),
+            None,
+        )
+        if active_inc and getattr(active_inc, "causal_chain", None):
+            active_inc.causal_chain.append(pr.get("pr_id", pr_id or ""))
+            causal_facts["causal_chain"] = active_inc.causal_chain.snapshot()
+
+        elif linked_ticket_id:
+            prior = self._mem._events.find_one(
+                {
+                    "type": "ticket_progress",
+                    "artifact_ids.jira": linked_ticket_id,
+                    "facts.causal_chain": {"$exists": True},
+                },
+                {"facts.causal_chain": 1, "_id": 0},
+                sort=[("timestamp", -1)],
+            )
+            ticket_chain = CausalChainHandler(linked_ticket_id)
+            if prior:
+                for artifact_id in prior.get("facts", {}).get("causal_chain", []):
+                    ticket_chain.append(artifact_id)
+            ticket_chain.append(pr.get("pr_id", pr_id or ""))
+            causal_facts["causal_chain"] = ticket_chain.snapshot()
+            artifact_ids["jira"] = (
+                linked_ticket_id  # ← also needed for cross-referencing
+            )
+
         self._mem.log_event(
             SimEvent(
                 type="pr_review",
@@ -657,41 +698,12 @@ class NormalDayHandler:
                     "pr_title": pr_title,
                     "review_text": review_text,
                     "has_question": "?" in review_text,
+                    **causal_facts,  # ← injects causal_chain when present
                 },
                 summary=f"{reviewer} reviewed {pr.get('pr_id', 'PR')} by {author}.",
                 tags=["pr_review", "engineering"],
             )
         )
-
-        linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
-
-        active_inc = next(
-            (
-                i
-                for i in self._state.active_incidents
-                if i.ticket_id == linked_ticket_id
-            ),
-            None,
-        )
-        if active_inc and getattr(active_inc, "causal_chain", None):
-            active_inc.causal_chain.append(pr.get("pr_id", pr_id or ""))
-
-        if linked_ticket_id and not active_inc:
-            prior = self._mem._events.find_one(
-                {
-                    "type": "ticket_progress",
-                    "artifact_ids.jira": linked_ticket_id,
-                    "facts.causal_chain": {"$exists": True},
-                },
-                {"facts.causal_chain": 1, "_id": 0},
-                sort=[("timestamp", -1)],
-            )
-            ticket_chain = CausalChainHandler(linked_ticket_id)
-            if prior:
-                for artifact_id in prior.get("facts", {}).get("causal_chain", []):
-                    ticket_chain.append(artifact_id)
-
-            ticket_chain.append(pr.get("pr_id", pr_id or ""))
 
         if self._vader:
             self._score_and_apply_sentiment(review_text, [reviewer], self._vader)

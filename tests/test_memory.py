@@ -116,6 +116,60 @@ def test_memory_recall_pipeline_no_as_of_time():
     assert "timestamp" not in search_filter
 
 
+def test_log_dept_plan_serializes_nested_dataclasses(make_test_memory):
+    """
+    log_dept_plan must successfully insert into MongoDB even when
+    engineer_plans contain nested AgendaItem dataclasses.
+
+    Regression test for the __dict__ / asdict() bug: ep.__dict__ produces a
+    shallow dict whose 'agenda' field still holds raw AgendaItem objects,
+    which pymongo cannot encode. dataclasses.asdict() recurses and fixes it.
+    """
+    from dataclasses import asdict
+    from planner_models import AgendaItem, EngineerDayPlan, ProposedEvent
+
+    mem = make_test_memory  # real mongomock instance, not the MagicMock MongoClient
+
+    agenda = [
+        AgendaItem(
+            activity_type="deep_work",
+            description="Finish the migration doc",
+            estimated_hrs=2.0,
+        )
+    ]
+    eng_plan = EngineerDayPlan(
+        name="Sarah",
+        dept="Product",
+        agenda=agenda,
+        stress_level=0,
+    )
+    event = ProposedEvent(
+        event_type="design_discussion",
+        actors=["Sarah", "Jax"],
+        rationale="Clarify TitanDB inputs",
+        facts_hint={},
+        priority=1,
+    )
+
+    # This must not raise — previously failed with "cannot encode object: AgendaItem(...)"
+    mem.log_dept_plan(
+        day=1,
+        date="2026-03-11",
+        dept="Product",
+        lead="Sarah",
+        theme="Migration week",
+        engineer_plans=[asdict(eng_plan)],
+        proposed_events=[asdict(event)],
+        raw={},
+    )
+
+    # Verify the document actually landed in the collection
+    doc = mem._plans.find_one({"dept": "Product", "day": 1})
+    assert doc is not None
+    assert doc["engineer_plans"][0]["name"] == "Sarah"
+    assert doc["engineer_plans"][0]["agenda"][0]["activity_type"] == "deep_work"
+
+
 def test_simevent_serialization():
     """Verifies SimEvent can serialize to and from a dict without data loss."""
     from memory import SimEvent

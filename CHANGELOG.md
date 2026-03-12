@@ -6,6 +6,33 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.7.1] — 2026-03-12
+
+### Added
+
+- **Persona Skill Embeddings (`memory.py`, `org_lifecycle.py`)**: Introduced `embed_persona_skills` and `find_expert_by_skill` to store employee expertise as searchable `persona_skill` artifacts at genesis and on hire, enabling semantic expert lookup via RAG.
+- **Postmortem SimEvent Logging (`flow.py`, `confluence_writer.py`)**: Postmortem creation now emits a `postmortem_created` SimEvent with causal chain and timestamp, and `write_postmortem` returns the Confluence ID alongside its timestamp.
+- **Dept Plan SimEvent (`day_planner.py`)**: `DepartmentPlanner` now logs a `dept_plan_created` SimEvent after each successful plan, capturing theme and per-engineer agendas.
+- **Clock Injection (`day_planner.py`)**: `DepartmentPlanner` and `DayPlannerOrchestrator` now accept a `SimClock` instance for timestamped event logging.
+- **Scheduled Hire Persona Fields (`config.yaml`)**: Taylor and Reese now include `social_role` and `typing_quirks` in their hire configs for richer character grounding.
+
+### Changed
+
+- **Cloud Preset Models (`config.yaml`)**: Switched planner and worker from `deepseek.v3.2` to `openai.gpt-oss-120b-1:0`; embedding provider changed from OpenAI `text-embedding-3-large` (1024d) to Ollama `stella_en_1.5b_v5` (1536d).
+- **Email Source Count (`external_email_ingest.py`)**: Default source count increased from 5 to 7; source generation prompt now includes explicit departmental liaison routing rules and stricter tech stack adherence constraints.
+- **PR Review Causal Chain (`normal_day.py`)**: `pr_review` SimEvents now include a `causal_chain` fact when the PR is linked to an active incident or a prior ticket progress event.
+- **`on_call` Field Added to `ActiveIncident` (`flow.py`)**: The on-call engineer is now stored directly on the incident model.
+- **`get_event_log` DB Mode (`memory.py`)**: Accepts a `from_db` flag to query events from MongoDB sorted by timestamp, rather than always reading from the in-memory list.
+- **Persona Embeddings at Genesis (`flow.py`)**: Persona skills are now embedded for all org members during the genesis phase before Confluence page generation.
+- **`ARTIFACT_KEY_SLACK_THREAD` Renamed (`causal_chain_handler.py`)**: Constant corrected from `"digital-hq"` to `"slack_thread"`.
+- **`knowledge_gap_detected` Removed from Known Event Types (`planner_models.py`)**: Cleaned up duplicate and stale entries in `KNOWN_EVENT_TYPES`.
+
+### Removed
+
+- **`eval_harness.py`**: Removed the post-simulation eval dataset generator (causal thread builder and typed Q&A generator) from the source tree.
+
+---
+
 ## [v0.7.0] — 2026-03-11
 
 ### Added

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict as _asdict
 
 from agent_factory import make_agent
 from crewai import Task, Crew
@@ -41,7 +42,14 @@ from planner_models import (
 from plan_validator import PlanValidator
 from ticket_assigner import TicketAssigner
 from external_email_ingest import ExternalEmailSignal
-from config_loader import LEADS, LIVE_ORG_CHART, PERSONAS, DEFAULT_PERSONA, COMPANY_DESCRIPTION, resolve_role
+from config_loader import (
+    LEADS,
+    LIVE_ORG_CHART,
+    PERSONAS,
+    DEFAULT_PERSONA,
+    COMPANY_DESCRIPTION,
+    resolve_role,
+)
 
 logger = logging.getLogger("orgforge.planner")
 
@@ -123,6 +131,14 @@ class DepartmentPlanner:
     3. Propose 1-3 events that should fire today, ordered by priority (1=must, 3=optional).
     4. Note your reasoning briefly inside the JSON (rationale fields).
 
+    ## BEFORE YOU OUTPUT — verify each of these:
+    [ ] No collaborative meeting (1on1, mentoring, design_discussion, async_question) 
+        appears in more than one engineer's agenda
+    [ ] All related_ids are null or from that engineer's own owned ticket list
+    [ ] No engineer's estimated_hrs total exceeds their listed capacity
+
+    Only output the JSON after confirming all three.
+
     ---
     ## OUTPUT SCHEMA
 
@@ -197,6 +213,7 @@ class DepartmentPlanner:
         members: List[str],
         config: dict,
         worker_llm,
+        clock,
         is_primary: bool = False,
     ):
         self.dept = dept
@@ -204,6 +221,7 @@ class DepartmentPlanner:
         self.config = config
         self._llm = worker_llm
         self.is_primary = is_primary  # True for Engineering
+        self.clock = clock
 
     def plan(
         self,
@@ -339,10 +357,31 @@ class DepartmentPlanner:
             date=date,
             dept=self.dept,
             lead=lead_name,
-            theme=org_theme,
-            engineer_plans=[ep.__dict__ for ep in result.engineer_plans],
-            proposed_events=[e.__dict__ for e in result.proposed_events],
+            theme=result.theme,
+            engineer_plans=[_asdict(ep) for ep in result.engineer_plans],
+            proposed_events=[_asdict(e) for e in result.proposed_events],
             raw=raw_data,
+        )
+
+        system_time_iso = self.clock.now("system").isoformat()
+
+        mem.log_event(
+            SimEvent(
+                type="dept_plan_created",
+                day=day,
+                date=date,
+                timestamp=system_time_iso,
+                actors=[lead_name],
+                artifact_ids={"dept_plan": f"PLAN-{day}-{self.dept}"},
+                facts={
+                    "dept": self.dept,
+                    "theme": result.theme,
+                    "lead": lead_name,
+                    "engineer_plans": [_asdict(ep) for ep in result.engineer_plans],
+                },
+                summary=f"{self.dept} plan created for Day {day}. Theme: {result.theme}.",
+                tags=["dept_plan_created", self.dept.lower()],
+            )
         )
 
         return result
@@ -450,15 +489,20 @@ class DepartmentPlanner:
         for ep in eng_plans:
             unique_agenda = []
             for a in ep.agenda:
-                if a.activity_type in ("1on1", "mentoring", "design_discussion", "async_question"):
+                if a.activity_type in (
+                    "1on1",
+                    "mentoring",
+                    "design_discussion",
+                    "async_question",
+                ):
                     # Create a normalized key of the participants
                     participants = frozenset([ep.name] + a.collaborator)
                     collab_key = (a.activity_type, participants)
-                    
+
                     if collab_key in seen_collaborations:
                         continue  # We already kept the initiator's version of this meeting
                     seen_collaborations.add(collab_key)
-                    
+
                 unique_agenda.append(a)
             ep.agenda = unique_agenda
 
@@ -565,7 +609,7 @@ class DepartmentPlanner:
                     f"{ep.agenda[0].description if ep.agenda else '?'}"
                 )
         return "\n".join(lines) if lines else "  (no cross-dept signals today)"
-    
+
     def _format_email_signals(
         self,
         signals: List[ExternalEmailSignal],
@@ -574,7 +618,8 @@ class DepartmentPlanner:
         # Only vendor signals reach planner prompts;
         # customer signals carry forward as CrossDeptSignals tomorrow.
         relevant = [
-            s for s in signals
+            s
+            for s in signals
             if not s.dropped
             and s.category == "vendor"
             and s.internal_liaison.lower() == liaison_dept.lower()
@@ -585,7 +630,7 @@ class DepartmentPlanner:
         for s in relevant:
             lines.append(
                 f"  From: {s.source_name} ({s.source_org})\n"
-                f"  Subject: \"{s.subject}\"\n"
+                f'  Subject: "{s.subject}"\n'
                 f"  Preview: {s.body_preview}"
             )
         return "\n".join(lines)
@@ -850,10 +895,11 @@ class DayPlannerOrchestrator:
         self.state.org_day_plan  = org_plan   # add org_day_plan: Optional[Any] to State
     """
 
-    def __init__(self, config: dict, worker_llm, planner_llm):
+    def __init__(self, config: dict, worker_llm, planner_llm, clock):
         self._config = config
         self._worker_llm = worker_llm
         self._planner_llm = planner_llm
+        self._clock = clock
 
         # Build one DepartmentPlanner per department
         self._dept_planners: Dict[str, DepartmentPlanner] = {}
@@ -865,6 +911,7 @@ class DayPlannerOrchestrator:
                 config=config,
                 worker_llm=worker_llm,
                 is_primary=is_primary,
+                clock=self._clock,
             )
 
         self._coordinator = OrgCoordinator(config, planner_llm)

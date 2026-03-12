@@ -75,7 +75,7 @@ _RETRIEVAL_LIMIT = 10
 ARTIFACT_KEY_JIRA = "jira"
 ARTIFACT_KEY_CONFLUENCE = "confluence"
 ARTIFACT_KEY_SLACK = "slack"
-ARTIFACT_KEY_SLACK_THREAD = "digital-hq"
+ARTIFACT_KEY_SLACK_THREAD = "slack_thread"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAUSAL CHAIN HANDLER

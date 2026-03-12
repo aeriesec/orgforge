@@ -46,6 +46,7 @@ import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agent_factory import make_agent
+from config_loader import COMPANY_DESCRIPTION
 from crewai import Task, Crew
 from memory import Memory, SimEvent
 from artifact_registry import ArtifactRegistry, ConfluencePage
@@ -213,7 +214,7 @@ class ConfluenceWriter:
         days_active: int,
         on_call: str,
         eng_peer: str,
-    ) -> str:
+    ) -> tuple:
         """
         Generate a postmortem Confluence page for a resolved incident.
 
@@ -265,7 +266,7 @@ class ConfluenceWriter:
             extra_artifact_ids={"jira": incident_id},
         )
         logger.info(f"    [green]📄 Postmortem:[/green] {conf_ids[0]}")
-        return conf_ids[0]
+        return conf_ids[0], timestamp
 
     def write_design_doc(
         self,
@@ -793,7 +794,7 @@ class ConfluenceWriter:
         task = Task(
             description=(
                 f"Define the canonical tech stack for {self._company} "
-                f"in the {self._industry} industry.\n\n"
+                f"which {COMPANY_DESCRIPTION}\n\n"
                 f"The legacy system is called '{self._legacy.get('name', '')}' "
                 f"({self._legacy.get('description', '')}).\n\n"
                 f"Respond ONLY with a JSON object with these keys:\n"

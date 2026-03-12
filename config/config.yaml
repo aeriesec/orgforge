@@ -20,7 +20,7 @@
 #                Best output quality. Requires AWS credentials and
 #                OPENAI_API_KEY. Use for production dataset generation.
 #
-quality_preset: "local_cpu"
+quality_preset: "cloud"
 
 model_presets:
   local_cpu:
@@ -44,13 +44,13 @@ model_presets:
   cloud:
     provider: "bedrock"
     # Claude 4.6 Sonnet on Bedrock — best for long-form corporate doc generation
-    planner: "bedrock/deepseek.v3.2"
+    planner: "bedrock/openai.gpt-oss-120b-1:0"
     # Llama 3.1 8B on Bedrock — fast, cheap for high-volume worker calls
-    worker: "bedrock/deepseek.v3.2"
+    worker: "bedrock/openai.gpt-oss-120b-1:0"
     aws_region: "us-east-1"
-    embed_provider: "openai"
-    embed_model: "text-embedding-3-large"
-    embed_dims: 1024
+    embed_provider: "ollama"
+    embed_model: "Losspost/stella_en_1.5b_v5:latest"
+    embed_dims: 1536
 
 # ── SIMULATION ────────────────────────────────────────────────
 simulation:
@@ -196,25 +196,29 @@ org_lifecycle:
   # events naturally once the roster context shows them as "still warming up".
   scheduled_hires:
     - name: "Taylor"
-      day: 15 # arrives 3 days after Jordan leaves
-      dept: "Engineering"
+      day: 15
+      dept: "Engineering_Backend"
       role: "Backend Engineer"
-      expertise:
-        - "Python"
-        - "FastAPI"
-        - "PostgreSQL"
+      expertise: ["Python", "FastAPI", "PostgreSQL", "TitanDB"]
       style: "methodical, asks lots of questions before writing code"
+      social_role: "The Diligent Observer"
+      typing_quirks: >
+        Taylor writes in long, grammatically perfect sentences. They use nested parentheses (like this) 
+        to add technical caveats mid-thought. They always end messages with "Hope that clarifies things!" 
+        to soften their intense level of detail.
       tenure: "new"
 
     - name: "Reese"
       day: 35
-      dept: "Engineering"
+      dept: "Engineering_Backend"
       role: "DevOps Engineer"
-      expertise:
-        - "Kubernetes"
-        - "Terraform"
-        - "AWS"
+      expertise: ["Kubernetes", "Terraform", "AWS", "Infrastructure"]
       style: "direct, prefers async communication, strong documentation habit"
+      social_role: "The Automation Purist"
+      typing_quirks: >
+        Reese avoids capital letters entirely. They communicate primarily in bullet points or 
+        backticked `shell commands`. If a question can be answered with a link to documentation, 
+        they will only send the link—no greeting, no sign-off.
       tenure: "new"
 
   # ── Random attrition (optional, off by default) ───────────────────────────

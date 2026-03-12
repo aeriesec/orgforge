@@ -278,6 +278,7 @@ class ActiveIncident(BaseModel):
     root_cause: str = ""
     causal_chain: Any = None
     recurrence_of: Optional[str] = None
+    on_call: str = ""
 
 
 class SprintState(BaseModel):
@@ -625,8 +626,10 @@ class Flow(Flow[State]):
         self.graph_dynamics = GraphDynamics(build_social_graph(), CONFIG)
         self.social_graph = self.graph_dynamics.G
         self._git = GitSimulator(self.state, self._mem, self.social_graph, WORKER_MODEL)
-        self._day_planner = DayPlannerOrchestrator(CONFIG, WORKER_MODEL, PLANNER_MODEL)
         self._clock = SimClock(self.state)
+        self._day_planner = DayPlannerOrchestrator(
+            CONFIG, WORKER_MODEL, PLANNER_MODEL, clock=self._clock
+        )
         self._lifecycle = OrgLifecycleManager(
             config=CONFIG,
             graph_dynamics=self.graph_dynamics,
@@ -761,14 +764,23 @@ class Flow(Flow[State]):
         self._confluence.generate_tech_stack()
         tech_context = self._mem.tech_stack_for_prompt()
 
-        self._email_ingestor.generate_sources()
+        for dept, members in ORG_CHART.items():
+            for name in members:
+                persona_data = PERSONAS.get(name, DEFAULT_PERSONA)
+                self._mem.embed_persona_skills(
+                    name,
+                    persona_data,
+                    dept,
+                    day=0,
+                    timestamp_iso=self._clock.now("system").isoformat(),
+                )
 
         # Technical pages — one LLM call per page, no PAGE BREAK parsing
         self._confluence.write_genesis_batch(
             prefix=tech_cfg.get("id_prefix", "CONF-ENG").replace("CONF-", ""),
             count=tech_cfg.get("count", 3),
             prompt_tpl=(
-                "You are {author}. Write a single Confluence page with ID {id} {company} which {COMPANY_DESCRIPTION} "
+                "You are {author}. Write a single Confluence page with ID {id} for {company} "
                 "about {project_name} and {legacy_system}. "
                 "Existing related pages you may reference: {related_pages}. "
                 "Use only the following canonical tech stack — never invent or substitute alternatives:\n{tech_stack}\n"
@@ -785,7 +797,7 @@ class Flow(Flow[State]):
             prefix=biz_cfg.get("id_prefix", "CONF-MKT").replace("CONF-", ""),
             count=biz_cfg.get("count", 2),
             prompt_tpl=(
-                "You are {author}. Write a single Confluence page with ID {id} for {company} which {COMPANY_DESCRIPTION}"
+                "You are {author}. Write a single Confluence page with ID {id} for {company} "
                 "about {product_page} campaign planning and go-to-market strategy. "
                 "Existing related pages you may reference: {related_pages}. "
                 "Output only Markdown. Do not include an author block, contributor list, "
@@ -1733,6 +1745,7 @@ class Flow(Flow[State]):
             root_cause=root_cause,
             causal_chain=chain_handler,
             recurrence_of=recurrence_of,
+            on_call=on_call,
         )
         self.state.active_incidents.append(inc)
         self.state.daily_incidents_opened += 1
@@ -1950,7 +1963,7 @@ class Flow(Flow[State]):
             ),
             on_call,
         )
-        conf_id = self._confluence.write_postmortem(
+        conf_id, timestamp = self._confluence.write_postmortem(
             incident_id=inc.ticket_id,
             incident_title=inc.title,
             root_cause=inc.root_cause,
@@ -1961,6 +1974,22 @@ class Flow(Flow[State]):
 
         if conf_id and getattr(inc, "causal_chain", None):
             inc.causal_chain.append(conf_id)
+            self._mem.log_event(
+                SimEvent(
+                    type="postmortem_created",
+                    timestamp=timestamp,
+                    day=self.state.day,
+                    date=str(self.state.current_date.date()),
+                    actors=[on_call, eng_peer],
+                    artifact_ids={"confluence": conf_id, "jira": inc.ticket_id},
+                    facts={
+                        "causal_chain": inc.causal_chain.snapshot(),
+                        "root_cause": inc.root_cause,
+                    },
+                    summary=f"Postmortem {conf_id} written for {inc.ticket_id}",
+                    tags=["postmortem", "incident"],
+                )
+            )
 
     def _emit_bot_message(self, channel: str, bot_name: str, text: str, timestamp: str):
         date_str = str(self.state.current_date.date())
