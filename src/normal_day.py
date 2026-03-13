@@ -68,6 +68,46 @@ class NormalDayHandler:
 
     # ─── VOICE CARD ───────────────────────────────────────────────────────────
 
+    def _deduped_voice_cards(self, names: list, context: str) -> str:
+        """
+        Build a joined voice card string for a list of participants,
+        merging cards that are identical (e.g. multiple default-persona users).
+
+        Participants with the same card body (everything below the header line)
+        are collapsed into a single card with a combined header:
+            "Raj / Miki / Taylor | Role: Contributor | Expertise: general engineering"
+
+        This saves tokens when several engineers share the same default persona
+        and mood, which is common for un-configured org members.
+        """
+        card_body_to_names: dict[str, list[str]] = {}
+        card_body_to_first_card: dict[str, str] = {}
+
+        for name in names:
+            card = self._voice_card(name, context)
+            lines = card.split("\n")
+            # Body = everything after the header line
+            body = "\n".join(lines[1:])
+            if body not in card_body_to_names:
+                card_body_to_names[body] = []
+                card_body_to_first_card[body] = card
+            card_body_to_names[body].append(name)
+
+        parts = []
+        for body, group_names in card_body_to_names.items():
+            if len(group_names) == 1:
+                parts.append(card_body_to_first_card[body])
+            else:
+                # Merge: replace first name in header with "Name1 / Name2 / ..."
+                first_card = card_body_to_first_card[body]
+                header = first_card.split("\n")[0]
+                merged_header = header.replace(
+                    group_names[0], " / ".join(group_names), 1
+                )
+                parts.append(merged_header + "\n" + body)
+
+        return "\n\n".join(parts)
+
     def _voice_card(self, name: str, context: str = "general") -> str:
         """
         Returns a concise persona card for injection into LLM prompts.
@@ -887,7 +927,7 @@ class NormalDayHandler:
         """
         Engineer asks a question in a channel.
         Generates: Slack thread with 2-4 replies from colleagues.
-        Each participant speaks from their own persona via a dedicated Agent.
+        Uses a single-shot JSON generation to save output tokens while preserving personas.
         """
         asker = eng_plan.name
         collaborator = next(iter(item.collaborator), None) or self._closest_colleague(
@@ -957,76 +997,62 @@ class NormalDayHandler:
 
         voice_cards = "\n\n".join(self._voice_card(n, "async") for n in all_actors)
 
-        agents = []
-        tasks = []
-        speakers = []
-        messages = []
-        prev_task = None
-        personas = self._config.get("personas", {})
+        # Build a natural speaker sequence for the JSON prompt
+        responders = [a for a in all_actors if a != asker]
+        turn_speakers = [asker] + responders
+        if random.random() > 0.5 and responders:
+            turn_speakers.append(asker)  # Asker sometimes follows up
+        speaker_sequence = ", ".join(turn_speakers)
 
-        for i, name in enumerate(all_actors):
-            p = personas.get(name, {})
-            backstory = self._persona_helper(
-                name, mem=self._mem, graph_dynamics=self._gd
+        combined_hint = f"{doc_hint}\n\n{design_hint}" if design_hint else doc_hint
+
+        agent = make_agent(
+            role="Slack Conversation Simulator",
+            goal="Write a realistic casual Slack Q&A thread between coworkers.",
+            backstory="You write authentic workplace Slack conversations that reflect each person's distinct voice, typing quirks, and current mood.",
+            llm=self._worker,
+        )
+
+        task = Task(
+            description=(
+                f"Write a full Slack thread where a colleague asks a question.\n\n"
+                f"Topic: {ticket_title}\n"
+                f"Participants (Voice Cards):\n{voice_cards}\n\n"
+                f"Relevant context: {ctx}\n"
+                f"{combined_hint}\n\n"
+                f"Turn order: {speaker_sequence}\n\n"
+                f"Rules:\n"
+                f"- {asker} must open the thread by stating what they are stuck on.\n"
+                f"- Responders reply to what came before, ask clarifying questions, or suggest docs.\n"
+                f"- CRITICAL: DO NOT use generic corporate openers like 'Hey [Name], could you clarify...', 'Need clarification on...', or 'Hi [Name], could you share...'. Drop right into the question or state a broken assumption.\n"
+                f"- Each message must sound distinctly like that person based on their voice card.\n"
+                f"- Each message 1-3 sentences max. Do not add narration.\n\n"
+                f"Respond ONLY with a JSON array. No preamble, no markdown fences.\n"
+                f'[{{"speaker": "Name", "message": "text"}}, ...]'
+            ),
+            expected_output='A JSON array of objects with "speaker" and "message" keys.',
+            agent=agent,
+        )
+
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+
+        try:
+            clean = raw.replace("```json", "").replace("```", "").strip()
+            turns = json.loads(clean)
+            if not isinstance(turns, list):
+                turns = []
+        except json.JSONDecodeError:
+            logger.warning(
+                "[async_question] Failed to parse JSON, falling back to empty thread."
             )
-
-            agent = make_agent(
-                role=f"{name} — {p.get('tenure', 'Engineer')}",
-                goal=f"Respond authentically as {name} in a Slack Q&A thread.",
-                backstory=backstory,
-                llm=self._worker,
-            )
-
-            if i == 0:
-                # Asker opens the thread
-                combined_hint = (
-                    f"{doc_hint}\n\n{design_hint}" if design_hint else doc_hint
-                )
-                desc = (
-                    f"You are {name}. You have a question related to your work on: {ticket_title}\n\n"
-                    f"Participants in this thread:\n{voice_cards}\n\n"
-                    f"Relevant context: {ctx}\n"
-                    f"{combined_hint}\n\n"
-                    f"Post your opening question exactly as {name} would — use your typing quirks, "
-                    f"reflect your current mood, and be specific about what you're stuck on. "
-                    f"1-3 sentences. Format: {name}: [message]"
-                )
-            else:
-                # Responders reply to what came before
-                desc = (
-                    f"You are {name}. A colleague just asked a question in Slack about: {ticket_title}\n\n"
-                    f"Participants:\n{voice_cards}\n\n"
-                    f"Relevant context: {ctx}\n"
-                    f"{doc_hint}\n\n"
-                    f"Reply naturally as {name} would — use your typing quirks, reflect your mood. "
-                    f"You may have the answer, ask a clarifying question, say you don't know but "
-                    f"suggest someone else, or reference internal docs if relevant. "
-                    f"1-3 sentences. Format: {name}: [message]"
-                )
-
-            task = Task(
-                description=desc,
-                expected_output=f"One Slack message from {name} in format: {name}: [message]",
-                agent=agent,
-                context=[prev_task] if prev_task else [],
-            )
-
-            agents.append(agent)
-            tasks.append(task)
-            speakers.append(name)
-            prev_task = task
-
-            Crew(
-                agents=agents, tasks=tasks, process=Process.sequential, verbose=False
-            ).kickoff()
+            turns = []
 
         messages = []
         current_msg_time = datetime.fromisoformat(meeting_time_iso)
-        for speaker, task in zip(speakers, tasks):
-            text = (task.output.raw or "").strip() if task.output else ""
-            if text.lower().startswith(f"{speaker.lower()}:"):
-                text = text[len(speaker) + 1 :].strip()
-            if text:
+        for turn in turns:
+            speaker = turn.get("speaker", "").strip()
+            text = turn.get("message", "").strip()
+            if speaker and text:
                 messages.append(
                     {"user": speaker, "text": text, "ts": current_msg_time.isoformat()}
                 )
@@ -1112,6 +1138,7 @@ class NormalDayHandler:
         """
         Small group design discussion — typically 2-3 engineers.
         Generates: Slack thread + optional Confluence stub.
+        Uses a single-shot JSON generation to save output tokens while preserving personas.
         """
         initiator = eng_plan.name
         collaborators = item.collaborator or (
@@ -1126,10 +1153,6 @@ class NormalDayHandler:
         )
         meeting_time_iso = provisional_start.isoformat()
 
-        # Augment with expertise-matched participants.  The helper injects:
-        #   - the author of any published-today Confluence page on this topic
-        #   - up to 1 extra person with overlapping expertise and graph proximity.
-        # This replaces the previous ad-hoc topic keyword scan.
         participants = self._expertise_matched_participants(
             topic=item.description,
             seed_participants=participants,
@@ -1149,66 +1172,58 @@ class NormalDayHandler:
 
         voice_cards = "\n\n".join(self._voice_card(p, "design") for p in participants)
 
-        agents, tasks, prev_task = [], [], None
-        # Initiator opens, then round-robin through participants for 5-8 turns total
-        turn_speakers = [initiator] + (
-            [
-                participants[i % len(participants)]
-                for i in range(1, random.randint(5, 8))
-            ]
+        # Build turn sequence (5-8 turns total)
+        turn_speakers = [initiator] + [
+            participants[i % len(participants)] for i in range(1, random.randint(5, 8))
+        ]
+        speaker_sequence = ", ".join(turn_speakers)
+
+        agent = make_agent(
+            role="Slack Conversation Simulator",
+            goal="Write a realistic multi-turn Slack technical design discussion.",
+            backstory="You write authentic workplace Slack threads where engineers debate technical trade-offs based on their distinct personas.",
+            llm=self._planner,
         )
 
-        for i, speaker in enumerate(turn_speakers):
-            p = self._config.get("personas", {}).get(speaker, {})
-            backstory = self._persona_helper(
-                speaker, mem=self._mem, graph_dynamics=self._gd
-            )
-            agent = make_agent(
-                role=f"{speaker} — {p.get('social_role', 'Engineer')}",
-                goal=f"Contribute authentically to a technical design discussion as {speaker}.",
-                backstory=backstory,
-                llm=self._planner,
-            )
-            if i == 0:
-                desc = (
-                    f"You are {speaker}, opening a Slack design discussion.\n\n"
-                    f"Topic: {item.description}\n\n"
-                    f"Participants:\n{voice_cards}\n\n"
-                    f"Context: {ctx}\n\n"
-                    f"Frame the problem or decision that needs to be made. "
-                    f"Be specific — name constraints, risks, or the trade-off you're wrestling with. "
-                    f"Use your typing quirks. 2-3 sentences max. Format: {speaker}: [message]"
-                )
-            else:
-                desc = (
-                    f"You are {speaker}. Respond to the design thread about: {item.description}.\n\n"
-                    f"Participants:\n{voice_cards}\n\n"
-                    f"React as an engineer actually working through this — raise a trade-off, "
-                    f"ask 'what about X', push back, or propose a concrete next step. "
-                    f"Don't just agree. Stay in character. "
-                    f"Format: {speaker}: [message]"
-                )
-            task = Task(
-                description=desc,
-                expected_output=f"One message from {speaker} in format: {speaker}: [message]",
-                agent=agent,
-                context=[prev_task] if prev_task else [],
-            )
-            agents.append(agent)
-            tasks.append(task)
-            prev_task = task
+        task = Task(
+            description=(
+                f"Write a full Slack thread for a design discussion.\n\n"
+                f"Topic: {item.description}\n"
+                f"Participants (Voice Cards):\n{voice_cards}\n\n"
+                f"Relevant context: {ctx}\n\n"
+                f"Turn order: {speaker_sequence}\n\n"
+                f"Rules:\n"
+                f"- {initiator} opens by framing the problem, constraints, or trade-off they are wrestling with.\n"
+                f"- Others react as engineers working through it — raise a trade-off, push back, or propose a next step. Do not just agree.\n"
+                f"- CRITICAL: DO NOT use generic corporate openers like 'Hey team, let's discuss...' or 'Could you clarify...'. Start naturally.\n"
+                f"- Each message must sound distinctly like that person based on their voice card and mood.\n"
+                f"- Each message 1-3 sentences max. Do not add narration.\n\n"
+                f"Respond ONLY with a JSON array. No preamble, no markdown fences.\n"
+                f'[{{"speaker": "Name", "message": "text"}}, ...]'
+            ),
+            expected_output='A JSON array of objects with "speaker" and "message" keys.',
+            agent=agent,
+        )
 
-            Crew(
-                agents=agents, tasks=tasks, process=Process.sequential, verbose=False
-            ).kickoff()
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+
+        try:
+            clean = raw.replace("```json", "").replace("```", "").strip()
+            turns = json.loads(clean)
+            if not isinstance(turns, list):
+                turns = []
+        except json.JSONDecodeError:
+            logger.warning(
+                "[design_discussion] Failed to parse JSON, falling back to empty thread."
+            )
+            turns = []
 
         messages = []
         current_msg_time = datetime.fromisoformat(meeting_time_iso)
-        for speaker, task in zip(turn_speakers, tasks):
-            text = (task.output.raw or "").strip() if task.output else ""
-            if text.lower().startswith(f"{speaker.lower()}:"):
-                text = text[len(speaker) + 1 :].strip()
-            if text:
+        for turn in turns:
+            speaker = turn.get("speaker", "").strip()
+            text = turn.get("message", "").strip()
+            if speaker and text:
                 messages.append(
                     {"user": speaker, "text": text, "ts": current_msg_time.isoformat()}
                 )
@@ -1226,10 +1241,8 @@ class NormalDayHandler:
             messages, dept_channel, interaction_type="design"
         )
 
-        # 30% chance a design discussion spawns a Confluence stub
         conf_id = None
         if random.random() < 0.30 and messages:
-            # pass the generated Slack messages into the doc generator
             conf_id = self._create_design_doc_stub(
                 initiator, participants, item.description, ctx, date_str, messages
             )
@@ -1376,9 +1389,9 @@ class NormalDayHandler:
             tasks.append(task)
             prev_task = task
 
-            Crew(
-                agents=agents, tasks=tasks, process=Process.sequential, verbose=False
-            ).kickoff()
+        Crew(
+            agents=agents, tasks=tasks, process=Process.sequential, verbose=False
+        ).kickoff()
 
         messages = []
         current_msg_time = datetime.fromisoformat(meeting_time_iso)
@@ -1447,8 +1460,8 @@ class NormalDayHandler:
 
     def _handle_collision_event(self, event: ProposedEvent, date_str: str):
         """Renders the unplanned cross-dept interaction as a Slack thread.
-        Each participant speaks in their own voice via a dedicated Agent,
-        matching the pattern used by _handle_async_question and _handle_mentoring.
+        Uses a single LLM call to generate the full conversation, giving the
+        model full arc awareness so tension can escalate or resolve naturally.
         """
         participants = event.actors
         tension = event.facts_hint.get("tension_level", "medium")
@@ -1464,10 +1477,7 @@ class NormalDayHandler:
             event.rationale, n=2, as_of_time=thread_start_iso
         )
 
-        # Build voice cards so each agent knows who else is in the thread
-        voice_cards = "\n\n".join(
-            self._voice_card(p, "collision") for p in participants
-        )
+        voice_cards = self._deduped_voice_cards(participants, "collision")
 
         # Tension-driven turn structure:
         # high   → initiator opens hard, others react defensively, more turns
@@ -1482,71 +1492,69 @@ class NormalDayHandler:
         turn_speakers = [participants[0]] + [
             participants[i % len(participants)] for i in range(1, n_turns)
         ]
+        speaker_sequence = ", ".join(turn_speakers)
 
-        agents, tasks, prev_task = [], [], None
+        tension_guidance = {
+            "high": (
+                "The exchange should feel genuinely tense — the opener is direct and pressured, "
+                "others push back or defend their team, and the thread escalates before any "
+                "tentative resolution (or none at all)."
+            ),
+            "medium": (
+                "The exchange is a back-and-forth negotiation — collegial but with real friction. "
+                "Each person is trying to get what their team needs while staying professional."
+            ),
+            "low": (
+                "The exchange is collaborative — there's a real problem to solve but no hostility. "
+                "It resolves with a clear next step or agreement."
+            ),
+        }.get(tension, "")
 
-        for i, speaker in enumerate(turn_speakers):
-            p = self._config.get("personas", {}).get(speaker, {})
-            backstory = self._persona_helper(
-                speaker, mem=self._mem, graph_dynamics=self._gd
+        agent = make_agent(
+            role="Slack Conversation Simulator",
+            goal="Write a realistic multi-turn Slack exchange between coworkers.",
+            backstory="You write authentic workplace Slack conversations that reflect each person's distinct voice and the emotional arc of the situation.",
+            llm=self._planner,
+        )
+        task = Task(
+            description=(
+                f"Write a full Slack thread between coworkers having an unplanned cross-team exchange.\n\n"
+                f"Situation: {event.rationale}\n"
+                f"Tension level: {tension}\n\n"
+                f"{tension_guidance}\n\n"
+                f"Participants (voice cards — each person's style, mood, and pet peeves):\n{voice_cards}\n\n"
+                f"Context: {ctx}\n\n"
+                f"Turn order: {speaker_sequence}\n\n"
+                f"Rules:\n"
+                f"- Each message must sound distinctly like that person — use their typing quirks\n"
+                f"- The conversation must have a natural arc: opening → escalation or negotiation → some resolution or stalemate\n"
+                f"- Each message 1-2 sentences\n"
+                f"- Do not add narration or stage directions\n\n"
+                f"Respond ONLY with a JSON array. No preamble, no markdown fences.\n"
+                f'[{{"speaker": "Name", "message": "text"}}, ...]'
+            ),
+            expected_output='A JSON array of objects with "speaker" and "message" keys, one per turn.',
+            agent=agent,
+        )
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+
+        try:
+            clean = raw.replace("```json", "").replace("```", "").strip()
+            turns = json.loads(clean)
+            if not isinstance(turns, list):
+                turns = []
+        except json.JSONDecodeError:
+            logger.warning(
+                "[collision] Failed to parse JSON, falling back to empty thread."
             )
-            agent = Agent(
-                role=f"{speaker} — {p.get('social_role', 'Team Member')}",
-                goal=(
-                    f"Respond authentically as {speaker} in a "
-                    f"{'tense' if tension == 'high' else 'collaborative'} "
-                    f"cross-team Slack exchange."
-                ),
-                backstory=backstory,
-                llm=self._planner,
-            )
-
-            if i == 0:
-                desc = (
-                    f"You are {speaker}. You are starting a Slack message "
-                    f"that will create friction or spark a cross-team conversation.\n\n"
-                    f"Situation: {event.rationale}\n"
-                    f"Tension level: {tension}\n\n"
-                    f"Participants:\n{voice_cards}\n\n"
-                    f"Context: {ctx}\n\n"
-                    f"Open the exchange as {speaker} would — use your typing quirks "
-                    f"and reflect your current mood. "
-                    f"{'Be direct about the pressure or problem.' if tension == 'high' else 'Be collegial but clear about what you need.'} "
-                    f"1-2 sentences. Format: {speaker}: [message]"
-                )
-            else:
-                desc = (
-                    f"You are {speaker}. You just received a Slack message "
-                    f"as part of a cross-team exchange about: {event.rationale}\n\n"
-                    f"Tension level: {tension}\n\n"
-                    f"Participants:\n{voice_cards}\n\n"
-                    f"React as {speaker} would — use your typing quirks and reflect "
-                    f"your current mood. "
-                    f"{'Push back, defend your team, or escalate if needed.' if tension == 'high' else 'Try to find common ground or clarify your position.'} "
-                    f"1-2 sentences. Format: {speaker}: [message]"
-                )
-
-            task = Task(
-                description=desc,
-                expected_output=f"One Slack message from {speaker} in format: {speaker}: [message]",
-                agent=agent,
-                context=[prev_task] if prev_task else [],
-            )
-            agents.append(agent)
-            tasks.append(task)
-            prev_task = task
-
-            Crew(
-                agents=agents, tasks=tasks, process=Process.sequential, verbose=False
-            ).kickoff()
+            turns = []
 
         messages = []
         current_msg_time = datetime.fromisoformat(thread_start_iso)
-        for speaker, task in zip(turn_speakers, tasks):
-            text = (task.output.raw or "").strip() if task.output else ""
-            if text.lower().startswith(f"{speaker.lower()}:"):
-                text = text[len(speaker) + 1 :].strip()
-            if text:
+        for turn in turns:
+            speaker = turn.get("speaker", "").strip()
+            text = turn.get("message", "").strip()
+            if speaker and text:
                 messages.append(
                     {"user": speaker, "text": text, "ts": current_msg_time.isoformat()}
                 )
@@ -1942,79 +1950,61 @@ class NormalDayHandler:
         ).strip()
 
         # ── Build rich per-person voice cards from personas ───────────────────
-        voice_cards = "\n\n".join(
-            self._voice_card(n, "watercooler") for n in participants
+        voice_cards = self._deduped_voice_cards(participants, "watercooler")
+
+        # ── One-shot full conversation generation ────────────────────────────
+        speaker_sequence = ", ".join(
+            participants[i % len(participants)] for i in range(len(participants) + 1)
         )
 
-        # ── One agent per participant — each speaks in their own voice ────────
-        agents = []
-        tasks = []
-        speakers = []
-        prev_task = None
+        agent = make_agent(
+            role="Slack Conversation Simulator",
+            goal="Write a realistic casual Slack conversation between coworkers.",
+            backstory="You write authentic workplace small-talk that reflects each person's distinct personality and current mood.",
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Write a short casual Slack conversation between coworkers chatting about: {topic}\n\n"
+                f"Participants (voice cards — each person's typing style and current mood):\n{voice_cards}\n\n"
+                f"Turn order: {speaker_sequence}\n\n"
+                f"Rules:\n"
+                f"- Keep it casual and non-work — this is a distraction, not a meeting\n"
+                f"- Each message must sound like that specific person — use their typing quirks and mood\n"
+                f"- Messages should feel spontaneous and build on each other naturally\n"
+                f"- Each message 1-2 sentences max\n"
+                f"- Do not add narration or stage directions\n\n"
+                f"Respond ONLY with a JSON array. No preamble, no markdown fences.\n"
+                f'[{{"speaker": "Name", "message": "text"}}, ...]'
+            ),
+            expected_output='A JSON array of objects with "speaker" and "message" keys, one per turn.',
+            agent=agent,
+        )
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
 
-        for i, name in enumerate(participants):
-            p = personas.get(name, {})
-            backstory = self._persona_helper(
-                name, mem=self._mem, graph_dynamics=self._gd
+        try:
+            clean = raw.replace("```json", "").replace("```", "").strip()
+            turns = json.loads(clean)
+            if not isinstance(turns, list):
+                turns = []
+        except json.JSONDecodeError:
+            logger.warning(
+                "[watercooler] Failed to parse JSON, falling back to empty thread."
             )
-
-            agent = make_agent(
-                role=f"{name} — {p.get('social_role', 'Team Member')}",
-                goal=f"Chat naturally as {name} would in a casual Slack conversation.",
-                backstory=backstory,
-                llm=self._worker,
-            )
-
-            if i == 0:
-                # Initiator — starts the thread
-                desc = (
-                    f"You are {name}. You just opened a Slack message to your colleagues "
-                    f"about: {topic}.\n\n"
-                    f"Participants in this chat:\n{voice_cards}\n\n"
-                    f"Write your opening message exactly as {name} would — use your typing "
-                    f"quirks, reflect your mood, and make it feel spontaneous. "
-                    f"1-2 sentences max. Format: {name}: [message]"
-                )
-            else:
-                # Responders — react to what came before
-                desc = (
-                    f"You are {name}. You just received a Slack message from your colleague "
-                    f"about: {topic}.\n\n"
-                    f"Participants:\n{voice_cards}\n\n"
-                    f"Reply naturally as {name} would. Use your typing quirks and reflect "
-                    f"your current mood. Keep it casual and non-work. "
-                    f"1-2 sentences. Format: {name}: [message]"
-                )
-
-            task = Task(
-                description=desc,
-                expected_output=f"One Slack message from {name} in format: {name}: [message]",
-                agent=agent,
-                context=[prev_task] if prev_task else [],
-            )
-
-            agents.append(agent)
-            tasks.append(task)
-            speakers.append(name)
-            prev_task = task
-
-            Crew(
-                agents=agents, tasks=tasks, process=Process.sequential, verbose=False
-            ).kickoff()
+            turns = []
 
         messages = []
         current_msg_time = datetime.fromisoformat(thread_start_iso)
-        for speaker, task in zip(speakers, tasks):
-            text = (task.output.raw or "").strip() if task.output else ""
-            if text.lower().startswith(f"{speaker.lower()}:"):
-                text = text[len(speaker) + 1 :].strip()
-            if text:
+        for turn in turns:
+            speaker = turn.get("speaker", "").strip()
+            text = turn.get("message", "").strip()
+            if speaker and text:
                 messages.append(
                     {
                         "user": speaker,
                         "text": text,
                         "ts": current_msg_time.isoformat(),
-                        "date": date_str,  # required by log_slack_messages for filename
+                        "date": date_str,
                     }
                 )
                 current_msg_time += timedelta(minutes=random.randint(1, 4))

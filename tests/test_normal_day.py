@@ -506,9 +506,9 @@ def test_async_question_emits_simevent(handler, mock_state):
         patch("normal_day.Crew") as mock_crew,
     ):
         mock_crew.return_value.kickoff.return_value = (
-            "Carol: Anyone know why the cache isn't invalidating?\n"
-            "Bob: Did you check the TTL setting?\n"
-            "Carol: Oh good call, looking now."
+            '[{"speaker": "Carol", "message": "Anyone know why the cache isn\'t invalidating?"}, '
+            '{"speaker": "Bob", "message": "Did you check the TTL setting?"}, '
+            '{"speaker": "Carol", "message": "Oh good call, looking now."}]'
         )
         handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
 
@@ -541,7 +541,8 @@ def test_async_question_cross_dept_uses_digital_hq(handler, mock_state):
         patch("normal_day.Crew") as mock_crew,
     ):
         mock_crew.return_value.kickoff.return_value = (
-            "Carol: Dave, can you clarify the quota?\nDave: Sure, let me pull it up."
+            '[{"speaker": "Carol", "message": "Dave, can you clarify the quota?"}, '
+            '{"speaker": "Dave", "message": "Sure, let me pull it up."}]'
         )
         handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
 
@@ -637,8 +638,8 @@ def test_design_discussion_confluence_stub_created_sometimes(handler, mock_state
         patch("random.random", return_value=0.10),
     ):  # trigger Confluence path
         mock_crew.return_value.kickoff.return_value = (
-            "Alice: We need a clear retry policy.\n"
-            "Bob: Exponential back-off seems right."
+            '[{"speaker": "Alice", "message": "We need a clear retry policy."}, '
+            '{"speaker": "Bob", "message": "Exponential back-off seems right."}]'
         )
         handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
 

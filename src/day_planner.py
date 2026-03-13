@@ -114,10 +114,9 @@ class DepartmentPlanner:
     - Assign the meeting to the INITIATOR'S agenda ONLY. 
     - List the other participants in the `collaborator` array. The simulation engine will automatically pull them into the meeting.
 
-    6. NOVEL EVENTS.
-    - You may propose new event types if the situation genuinely calls for it.
-    - If you propose a novel event, set "is_novel": true and set "artifact_hint"
-        to exactly one of: "slack", "jira", "confluence", or "email".
+    6. EXPERTISE ALIGNMENT IS STRICT.
+    - Every agenda item (especially design_discussion and async_question) MUST map directly to the assigned engineer's specific `Expertise` tags listed in the roster below.
+    - NEVER assign backend, infrastructure, or database topics to Design, Brand, or UX personnel.
 
     Engineering is the primary driver of the company. If {dept} is Engineering,
     your plan shapes what other departments react to. Be specific — reference
@@ -160,17 +159,6 @@ class DepartmentPlanner:
                         "estimated_hrs": float
                     }}
                 ]
-            }}
-        ],
-        "proposed_events": [
-            {{
-                "event_type": "string",
-                "actors": ["string"],
-                "rationale": "string",
-                "facts_hint": {{}},
-                "priority": "int — 1=must fire, 2=should fire, 3=optional",
-                "is_novel": false,
-                "artifact_hint": "string — one of: slack | jira | confluence | email | null"
             }}
         ]
     }}
@@ -449,12 +437,19 @@ class DepartmentPlanner:
                         )
                         continue
 
+                # Get the flat list of all valid employee names
+                all_valid_names = {n for members in LIVE_ORG_CHART.values() for n in members}
+                
+                # Coerce the raw LLM output, but strictly filter out hallucinated names
+                raw_collabs = _coerce_collaborators(a.get("collaborator"))
+                valid_collabs = [c for c in raw_collabs if c in all_valid_names]
+
                 agenda.append(
                     AgendaItem(
                         activity_type=activity_type,
                         description=a.get("description", ""),
                         related_id=related_id,
-                        collaborator=_coerce_collaborators(a.get("collaborator")),
+                        collaborator=valid_collabs,
                         estimated_hrs=float(a.get("estimated_hrs", 2.0)),
                     )
                 )
@@ -543,7 +538,15 @@ class DepartmentPlanner:
         for name in self.members:
             stress = graph_dynamics._stress.get(name, 30)
             tone = graph_dynamics.stress_tone_hint(name)
-            lines.append(f"  - {name}: stress={stress}/100. {tone}")
+
+            # Fetch expertise from the persona config
+            persona = self.config.get("personas", {}).get(name, {})
+            expertise = ", ".join(persona.get("expertise", ["general operations"]))
+
+            # Inject expertise into the LLM's view of the roster
+            lines.append(
+                f"  - {name} (Expertise: [{expertise}]): stress={stress}/100. {tone}"
+            )
         return "\n".join(lines)
 
     def _open_tickets(self, state, mem: Memory) -> str:
@@ -582,6 +585,7 @@ class DepartmentPlanner:
                 f"  Day {s.day}: health={s.facts.get('system_health')} "
                 f"morale={s.facts.get('morale_trend', '?')} "
                 f"dominant={s.facts.get('dominant_event', '?')} "
+                f"open_incidents={s.facts.get('open_incidents', [])} "
                 f"dept_actors={dept_actors}"
             )
         return "\n".join(lines) if lines else "  (dept was quiet recently)"
