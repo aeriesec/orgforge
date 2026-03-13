@@ -6,6 +6,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.7.2] — 2026-03-12
+
+### Added
+
+- **Expertise-Aware Roster Injection (`day_planner.py`)**: The `DepartmentPlanner` now injects specific expertise tags from persona configs into the roster view, allowing the LLM to make more informed task assignments.
+- **Persona Card Deduplication (`normal_day.py`)**: Introduced `_deduped_voice_cards` to merge identical persona/mood descriptions into a single header (e.g., "Raj / Miki / Taylor"). This significantly reduces token usage when multiple unconfigured "default" engineers are present in a thread.
+- **Robust JSON Extraction (`confluence_writer.py`)**: Added a regex-like manual brace-matching wrapper around design doc parsing to ensure the system can extract valid JSON even if the LLM includes leading or trailing prose.
+
+### Changed
+
+- **Single-Shot Slack Simulation (`normal_day.py`)**: Refactored `async_question`, `design_discussion`, `collision_event`, and `watercooler_chat` to use a single LLM call returning a JSON array of turns. This replaces the sequential multi-agent "Crew" approach, providing the model with "full arc awareness" for better conversation flow while drastically reducing API overhead.
+- **Strict Expertise Alignment (`day_planner.py`)**: Instructions now explicitly forbid assigning backend/infra topics to Design or UX personnel, requiring a direct map between agenda items and the engineer's `Expertise` tags.
+- **Collaborator Validation (`day_planner.py`)**: Implemented strict filtering of collaborator lists against the `LIVE_ORG_CHART` to prevent the LLM from hallucinating or misspelling employee names.
+- **Anti-Corporate Prompting (`normal_day.py`)**: Added "CRITICAL" negative constraints to Slack generation tasks to prevent generic corporate openers (e.g., "Hey team, let's discuss...") in favor of natural, direct workplace communication.
+- **Improved Parsing Logs (`confluence_writer.py`, `normal_day.py`)**: Enhanced error logging to capture and display the first 200 characters of failed JSON attempts for easier debugging of LLM output drift.
+
+### Removed
+
+- **Novel Event Proposing (`day_planner.py`)**: Removed the `proposed_events` schema and the "NOVEL EVENTS" instruction block from the `DepartmentPlanner` to streamline planning focus on core agenda items.
+
+---
+
 ## [v0.7.1] — 2026-03-12
 
 ### Added

@@ -326,13 +326,29 @@ class ConfluenceWriter:
         raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
         clean = raw.replace("```json", "").replace("```", "").strip()
 
+        # Extract the JSON object robustly: find the outermost { ... } block
+        # so any leading/trailing prose from the LLM doesn't break the parse.
+        try:
+            brace_start = clean.index("{")
+            brace_end = clean.rindex("}") + 1
+            clean = clean[brace_start:brace_end]
+        except ValueError:
+            logger.warning(
+                f"[confluence] No JSON object found in design doc response — "
+                f"raw output: {clean[:200]!r}"
+            )
+            clean = "{}"
+
         try:
             parsed = json.loads(clean)
             content = parsed.get("markdown_doc", "Draft pending.")
             new_tickets = parsed.get("new_tickets", [])
         except json.JSONDecodeError as e:
-            logger.warning(f"[confluence] JSON parse failed for design doc: {e}")
-            content = clean  # save whatever the LLM produced
+            logger.warning(
+                f"[confluence] JSON parse failed for design doc: {e} — "
+                f"raw JSON attempt: {clean[:200]!r}"
+            )
+            content = raw  # save the original unmodified LLM output as the doc
             new_tickets = []
 
         conf_ids = self._finalise_page(

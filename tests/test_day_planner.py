@@ -1046,7 +1046,9 @@ class TestDayPlannerOrchestratorPlan:
             patch("day_planner.PlanValidator") as mock_validator_cls,
             patch("day_planner.OrgCoordinator") as mock_coord_cls,
         ):
-            orch = DayPlannerOrchestrator(CONFIG, mock_worker, mock_planner, MagicMock())
+            orch = DayPlannerOrchestrator(
+                CONFIG, mock_worker, mock_planner, MagicMock()
+            )
         return orch, mock_validator_cls, mock_coord_cls
 
     def _make_clock(self, state):
