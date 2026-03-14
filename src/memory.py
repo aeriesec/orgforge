@@ -184,11 +184,24 @@ class OllamaEmbedder(BaseEmbedder):
                 timeout=120,
             )
 
+            r.raise_for_status()
+
             self._prompt_embed_tokens = r.json()["prompt_eval_count"]
 
             return r.json()["embeddings"][0]
+        except requests.exceptions.HTTPError as e:
+            # 2. Attempt to pull the specific error message from Ollama's JSON
+            error_details = ""
+            try:
+                error_details = f" Details: {e.response.json().get('error', '')}"
+            except Exception:
+                pass  # Fails gracefully if response wasn't JSON
+
+            logger.warning(
+                f"[memory] Ollama embedding HTTP error: {e.response.status_code}.{error_details}"
+            )
+            return []
         except (
-            requests.HTTPError,
             requests.exceptions.ConnectionError,
             requests.exceptions.Timeout,
         ) as e:
@@ -553,6 +566,7 @@ class Memory:
         query: str,
         n: int = 5,
         type_filter: Optional[str] = None,
+        type_exclude: Optional[List[str]] = None,
         day_range: Optional[tuple] = None,
         since: Optional[Any] = None,
         as_of_time: Optional[Any] = None,
@@ -583,8 +597,14 @@ class Memory:
 
         # Build the exact-match pre-filter for MongoDB Vector Search
         filter_doc: Dict[str, Any] = {}
+        if type_filter and type_exclude:
+            raise ValueError(
+                "recall(): type_filter and type_exclude are mutually exclusive"
+            )
         if type_filter:
             filter_doc["type"] = {"$eq": type_filter}
+        if type_exclude:
+            filter_doc["type"] = {"$nin": type_exclude}
         if day_range:
             filter_doc["day"] = {"$gte": day_range[0], "$lte": day_range[1]}
 
@@ -825,7 +845,11 @@ class Memory:
         oversample = max(n * 3, min(artifact_count // 10, 200))
 
         artifacts = self.recall(
-            query=query, n=oversample, as_of_time=as_of_time, since=since
+            query=query,
+            n=oversample,
+            as_of_time=as_of_time,
+            since=since,
+            type_exclude=["persona_skill"],
         )
         # Trim to the top-n by vector score after the pre-filter is applied
         artifacts = sorted(artifacts, key=lambda a: a.get("score", 0), reverse=True)[:n]
@@ -865,85 +889,98 @@ class Memory:
 
     def previous_day_context(self, current_day: int) -> str:
         """
-        Returns a concise human-readable summary of the previous day's events
-        for use in the org theme prompt. Queries MongoDB directly — no vector search.
+        Returns a tight CEO-oriented summary of the previous day for the org
+        theme prompt.  Bounded output regardless of sim length — pulls the
+        day_summary health snapshot plus a small allowlist of high-signal
+        events only.  No vector search.
         """
         if current_day == 1:
-            # No prior day — ground the CEO in the company's known state instead
             return (
                 "This is the first observed day. The company has existing systems, "
                 "legacy debt, and established teams. Key pressures already in play:\n"
                 + self._known_pressures_summary()
             )
+
         prev_day = current_day - 1
-        if prev_day < 1:
-            return "No prior day — this is the first day of the simulation."
+
+        # ── 1. Health header from day_summary facts ───────────────────────────
+        # One structured document gives health/morale/incident counts without
+        # enumerating every individual event.
+        summary_doc = self._events.find_one(
+            {"type": "day_summary", "day": prev_day},
+            {"facts": 1, "date": 1, "_id": 0},
+            sort=[("timestamp", -1)],
+        )
+        header = ""
+        date_str = ""
+        if summary_doc:
+            f = summary_doc.get("facts", {})
+            date_str = summary_doc.get("date", "")
+            header = (
+                f"Yesterday (Day {prev_day}): "
+                f"system health {f.get('system_health', '?')}, "
+                f"morale {f.get('morale', '?'):.2f}, "
+                f"{f.get('incidents_opened', 0)} incident(s) opened, "
+                f"{f.get('incidents_resolved', 0)} resolved. "
+                f"Health trend: {f.get('health_trend', 'unknown')}."
+            )
+
+        # ── 2. High-signal events only ────────────────────────────────────────
+        # Explicit allowlist keeps output bounded as the sim grows.
+        # Operational noise (deep_work, watercooler, async_question, mentoring,
+        # 1on1, design_discussion, jira_ticket_created, confluence_created) is
+        # intentionally excluded — the CEO sets tone from pressure and risk, not
+        # from knowing who mentored who yesterday.
+        _ALLOW = {
+            "incident_opened",
+            "incident_resolved",
+            "postmortem_created",
+            "sprint_planned",
+            "customer_escalation",
+            "customer_email_routed",
+            "knowledge_gap_detected",
+            "morale_intervention",
+            "employee_departed",
+            "employee_hired",
+        }
 
         docs = list(
             self._events.find(
-                {"day": prev_day},
-                {
-                    "type": 1,
-                    "actors": 1,
-                    "facts": 1,
-                    "artifact_ids": 1,
-                    "date": 1,
-                    "_id": 0,
-                },
+                {"day": prev_day, "type": {"$in": list(_ALLOW)}},
+                {"type": 1, "actors": 1, "facts": 1, "artifact_ids": 1, "_id": 0},
             ).sort("timestamp", 1)
         )
-
-        if not docs:
-            return f"No events recorded for Day {prev_day}."
-
-        # Event types that aren't useful signal for the CEO theme
-        _SKIP = {
-            "proposed_event_rejected",
-            "novel_event_proposed",
-            "agenda_item_deferred",
-            "day_summary",
-            "end_of_day",
-        }
 
         lines = []
         for doc in docs:
             event_type = doc.get("type", "")
-            if event_type in _SKIP:
-                continue
-
-            actors = doc.get("actors", [])
-            if len(actors) > 3:
-                actor_str = f"{actors[0]}, {actors[1]} and {len(actors) - 2} others"
-            else:
-                actor_str = " and ".join(actors)
             facts = doc.get("facts", {})
             artifact_ids = doc.get("artifact_ids", {})
-            date = doc.get("date", "")
 
-            # Resolve the best available title/description
             title = (
-                facts.get("title")
+                facts.get("root_cause")
+                or facts.get("title")
                 or facts.get("sprint_theme")
-                or facts.get("root_cause")
-                or facts.get("theme")
-                or facts.get("summary")
-                or artifact_ids.get("confluence")
+                or facts.get("subject")
                 or artifact_ids.get("jira")
                 or ""
             )
+
             label = event_type.replace("_", " ").title()
-
-            line = f"Day {prev_day} ({date}) - {label}"
-            if actor_str:
-                line += f" by {actor_str}"
+            line = f"- {label}"
             if title:
-                line += f": {title}"
-
+                line += f": {title[:120]}"
             lines.append(line)
 
-        return (
-            "\n".join(lines) if lines else f"No significant events on Day {prev_day}."
-        )
+        if not header and not lines:
+            return f"No significant events on Day {prev_day}."
+
+        parts = []
+        if header:
+            parts.append(header)
+        if lines:
+            parts.append("\n".join(lines))
+        return "\n".join(parts)
 
     def context_for_sprint_planning(
         self,
@@ -1566,7 +1603,7 @@ class Memory:
         self._prs.update_one({"pr_id": pr["pr_id"]}, {"$set": pr}, upsert=True)
 
     def get_reviewable_prs_for(self, name: str) -> List[Dict]:
-        return list(self._prs.find({"reviewers": name, "status": "open"}))
+        return list(self._prs.find({"reviewers": name, "status": "open"}, {"_id": 0}))
 
     def log_slack_messages(
         self, channel: str, messages: List[Dict], export_dir: Path
@@ -2062,3 +2099,51 @@ class Memory:
             lines.append(" — ".join(parts))
 
         return "\n".join(lines)
+
+    def search_events(
+        self,
+        query: str,
+        event_types: Optional[List[str]] = None,
+        n: int = 10,
+        as_of_day: Optional[int] = None,
+    ) -> List[Tuple["SimEvent", float]]:
+        """
+        Vector search over the events collection.
+        Returns (SimEvent, score) pairs sorted by descending relevance.
+        """
+        query_vector = self._embedder.embed(query)
+        if not query_vector:
+            return []
+
+        pipeline_filter: Dict[str, Any] = {}
+        if event_types:
+            pipeline_filter["type"] = {"$in": event_types}
+        if as_of_day is not None:
+            pipeline_filter["day"] = {"$lte": as_of_day}
+
+        pipeline: List[Dict] = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index",
+                    "path": "embedding",
+                    "queryVector": query_vector,
+                    "numCandidates": n * 10,
+                    "limit": n,
+                }
+            },
+            {"$addFields": {"vector_score": {"$meta": "vectorSearchScore"}}},
+            {"$project": {"_id": 0, "embedding": 0}},
+        ]
+
+        if pipeline_filter:
+            pipeline[0]["$vectorSearch"]["filter"] = pipeline_filter
+
+        try:
+            results = list(self._events.aggregate(pipeline))
+            return [
+                (SimEvent.from_dict(r), round(r.get("vector_score", 0.0), 4))
+                for r in results
+            ]
+        except Exception as e:
+            logger.warning(f"[memory] search_events failed: {e}")
+            return []

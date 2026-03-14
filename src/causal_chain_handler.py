@@ -288,18 +288,26 @@ class RecurrenceDetector:
         Main entry point. Returns the best-matching prior SimEvent, or None
         if no confident match is found.
 
+        Change from original: collects ALL candidates above threshold and
+        returns the EARLIEST one (lowest day) to prevent daisy-chaining.
+
         Always writes one document to recurrence_matches regardless of outcome.
         """
+        import math
+
         candidates: Dict[str, Dict[str, Any]] = {}
 
         # ── Stage 1: MongoDB text search ──────────────────────────────────────
         text_results = self._text_search(root_cause, current_day)
-        max_text = max((r.get("score", 0) for r in text_results), default=1.0)
 
+        # Fixed normalisation: use a corpus-calibrated ceiling rather than
+        # result-set max, so rank-1 doesn't always get 1.0
+        _TEXT_CEILING = 8.0
         for rank, result in enumerate(text_results):
             event = SimEvent.from_dict(result)
             key = event.artifact_ids.get("jira", event.timestamp)
-            normalised = result.get("score", 0) / max_text if max_text > 0 else 0.0
+            raw = result.get("score", 0)
+            normalised = round(min(raw / _TEXT_CEILING, 1.0), 4)
             candidates.setdefault(key, self._empty_candidate(event))
             candidates[key]["text_score"] = normalised
             candidates[key]["text_rrf"] = 1 / (rank + 1 + _RRF_K)
@@ -344,13 +352,42 @@ class RecurrenceDetector:
 
         sort_key = "rrf_score" if both_returned else "fused_score"
         ranked = sorted(candidates.values(), key=lambda c: c[sort_key], reverse=True)
-        best = ranked[0]
 
-        # ── Threshold gate ────────────────────────────────────────────────────
-        is_confident = (
-            best["vector_score"] >= self._min_vector
-            or best["text_score"] >= self._min_text
-        )
+        # ── Threshold gate — collect ALL passing candidates ───────────────────
+        accepted = [
+            c
+            for c in ranked
+            if c["vector_score"] >= self._min_vector
+            or c["text_score"] >= self._min_text
+        ]
+
+        if not accepted:
+            best = ranked[0]
+            self._store.log(
+                query_root_cause=root_cause,
+                current_ticket_id=current_ticket_id,
+                current_day=current_day,
+                matched_event=None,
+                text_score=best["text_score"],
+                vector_score=best["vector_score"],
+                fused_score=best["fused_score"],
+                rrf_score=best["rrf_score"],
+                fusion_strategy=fusion_strategy,
+                confidence="rejected",
+                candidates_evaluated=len(candidates),
+                threshold_gate=self._threshold_gate(),
+            )
+            logger.debug(
+                f"[causal_chain] No prior incident — "
+                f"best vector={best['vector_score']:.3f}, "
+                f"text={best['text_score']:.3f}"
+            )
+            return None
+
+        # Anti-daisy-chain: among all passing candidates, pick the EARLIEST
+        # so ORG-164 links to ORG-140, not ORG-161
+        best = min(accepted, key=lambda c: c["event"].day)
+
         confidence = (
             "high"
             if (
@@ -358,17 +395,13 @@ class RecurrenceDetector:
                 and best["text_score"] >= self._min_text
             )
             else "low"
-            if is_confident
-            else "rejected"
         )
-        matched_event = best["event"] if is_confident else None
 
-        # ── Persist match decision ─────────────────────────────────────────────
         self._store.log(
             query_root_cause=root_cause,
             current_ticket_id=current_ticket_id,
             current_day=current_day,
-            matched_event=matched_event,
+            matched_event=best["event"],
             text_score=best["text_score"],
             vector_score=best["vector_score"],
             fused_score=best["fused_score"],
@@ -379,22 +412,15 @@ class RecurrenceDetector:
             threshold_gate=self._threshold_gate(),
         )
 
-        if matched_event:
-            logger.info(
-                f"[causal_chain] Recurrence matched ({confidence}): "
-                f"{matched_event.artifact_ids.get('jira', '?')} "
-                f"(vector={best['vector_score']:.3f}, "
-                f"text={best['text_score']:.3f}, "
-                f"gap={current_day - matched_event.day}d)"
-            )
-        else:
-            logger.debug(
-                f"[causal_chain] No prior incident — "
-                f"best vector={best['vector_score']:.3f}, "
-                f"text={best['text_score']:.3f}"
-            )
+        logger.info(
+            f"[causal_chain] Recurrence matched ({confidence}): "
+            f"{best['event'].artifact_ids.get('jira', '?')} "
+            f"(vector={best['vector_score']:.3f}, "
+            f"text={best['text_score']:.3f}, "
+            f"gap={current_day - best['event'].day}d)"
+        )
 
-        return matched_event
+        return best["event"]
 
     def find_postmortem_for_ticket(self, ticket_id: str) -> Optional[str]:
         """
@@ -474,7 +500,7 @@ class RecurrenceDetector:
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _text_search(self, root_cause: str, current_day: int) -> List[Dict[str, Any]]:
-        """MongoDB $text search over the events collection."""
+        """MongoDB $text search — returns results with normalised scores."""
         try:
             results = list(
                 self._mem._events.find(
@@ -488,10 +514,35 @@ class RecurrenceDetector:
                 .sort([("score", {"$meta": "textScore"})])
                 .limit(_RETRIEVAL_LIMIT)
             )
-            return results
         except Exception as e:
             logger.warning(f"[causal_chain] Text search failed: {e}")
             return []
+
+        if not results:
+            return []
+
+        # Normalise against the MAX score in this result set, not rank-1.
+        # This means rank-1 still gets 1.0, but rank-2 gets a real relative score
+        # rather than everyone below rank-1 getting arbitrary lower values.
+        # More importantly, when there's only ONE candidate it still gets 1.0 —
+        # the threshold check (min_text=0.4) then does actual filtering work
+        # because a weak single match will have a low raw score.
+        raw_scores = [r.get("score", 0.0) for r in results]
+        max_score = max(raw_scores) if raw_scores else 1.0
+
+        # Use log-normalisation so weak matches don't cluster near 1.0
+        import math
+
+        normalised = []
+        for r, raw in zip(results, raw_scores):
+            # log1p normalisation preserves ordering, spreads out the range
+            norm_score = (
+                math.log1p(raw) / math.log1p(max_score) if max_score > 0 else 0.0
+            )
+            r["text_score"] = round(norm_score, 4)
+            normalised.append(r)
+
+        return normalised
 
     def _vector_search(
         self, root_cause: str, current_day: int

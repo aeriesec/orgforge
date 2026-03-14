@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
 from agent_factory import make_agent
+from config_loader import COMPANY_DESCRIPTION
 from crewai import Agent, Process, Task, Crew
 
 from memory import Memory, SimEvent
@@ -521,10 +522,37 @@ class NormalDayHandler:
         ticket["updated_at"] = current_actor_time_iso
         comment_id = f"{ticket_id}_comment_{len(ticket['comments'])}"
 
-        # 5. Save and Embed — upsert first so status is persisted even if
-        # _save_ticket is patched out in tests
+        # 5. Save and Embed
         self._mem.upsert_ticket(ticket)
         self._save_ticket(ticket)
+
+        # Embed the ticket document itself
+        ticket_body = "\n".join(
+            filter(
+                None,
+                [
+                    ticket.get("title", ""),
+                    ticket.get("description", ""),
+                    ticket.get("root_cause", ""),
+                    "\n".join(c.get("text", "") for c in ticket.get("comments", [])),
+                ],
+            )
+        )
+        self._mem.embed_artifact(
+            id=ticket_id,
+            type="jira",
+            title=ticket.get("title", ticket_id),
+            content=ticket_body,
+            day=self._state.day,
+            date=date_str,
+            timestamp=current_actor_time_iso,
+            metadata={
+                "assignee": ticket.get("assignee", ""),
+                "status": ticket["status"],
+            },
+        )
+
+        # Also embed the individual comment
         self._mem.embed_artifact(
             id=comment_id,
             type="jira_comment",
@@ -532,8 +560,8 @@ class NormalDayHandler:
             content=comment_text,
             day=self._state.day,
             date=date_str,
-            metadata={"ticket_id": ticket_id, "author": assignee},
             timestamp=current_actor_time_iso,
+            metadata={"ticket_id": ticket_id, "author": assignee},
         )
 
         active_inc = next(
@@ -750,6 +778,165 @@ class NormalDayHandler:
 
         logger.info(f"    [dim]🔍 {reviewer} reviewed {pr.get('pr_id', 'PR')}[/dim]")
         return actors
+
+    def _handle_pr_review_for_incident(
+        self,
+        reviewer: str,
+        pr: dict,
+        date_str: str,
+        timestamp: str,
+    ) -> None:
+        """
+        Generate a PR review comment for an incident PR during the review_pending
+        stage.  Unlike _handle_pr_review(), this method accepts the PR document
+        and reviewer directly (no agenda item needed) so it can be driven from
+        flow._advance_incidents() without touching the planner.
+
+        Side-effects:
+          - Appends a comment to the PR document in both MongoDB and on disk.
+          - Emits a GitHub bot message in #engineering.
+          - Emits an author reply if the comment contains a question.
+          - Logs a pr_review SimEvent (consistent with normal-day reviews).
+          - Updates the social graph (pr_review edge).
+        """
+        import os
+        import json as _json
+
+        pr_id = pr.get("pr_id", "")
+        author = pr.get("author", reviewer)
+        pr_title = pr.get("title", "Unknown PR")
+
+        # Advance reviewer's clock by a short review block (30–60 min)
+        review_hrs = 0.5
+        artifact_time, _ = self._clock.advance_actor(reviewer, hours=review_hrs)
+        current_actor_time = artifact_time.isoformat()
+
+        ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
+        backstory = self._persona_helper(
+            reviewer,
+            mem=self._mem,
+            graph_dynamics=self._gd,
+            extra=f"You are {reviewer}, reviewing an incident fix PR by {author}: {pr_title}.",
+        )
+
+        agent = make_agent(
+            role=f"{reviewer}, Code Reviewer",
+            goal=f"Write a PR review comment as {reviewer} would, reflecting your current stress and style.",
+            backstory=backstory,
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"You are {reviewer}. You are reviewing this incident fix PR by {author}: {pr_title}\n\n"
+                f"This is an urgent incident fix — keep the review focused on correctness and "
+                f"potential regressions rather than style. Write 1-3 sentences as a GitHub PR "
+                f"review comment. Be specific — mention the fix approach, flag any edge case, "
+                f"or ask a targeted clarifying question.\n\n"
+                f"Output the comment text only. No preamble, no 'Here is my review:'.\n\n"
+                f"--- CONTEXT ---\n{ctx}"
+            ),
+            expected_output=(
+                f"A plain review comment from {reviewer}, 1-3 sentences. "
+                f"No preamble, no labels, no quotes around the output."
+            ),
+            agent=agent,
+        )
+        review_text = str(
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        ).strip()
+
+        # Append comment to PR document and persist to both stores
+        pr_comment = {
+            "author": reviewer,
+            "date": date_str,
+            "timestamp": current_actor_time,
+            "text": review_text,
+        }
+        pr.setdefault("comments", []).append(pr_comment)
+
+        pr_path = f"{self._base}/git/prs/{pr_id}.json"
+        os.makedirs(os.path.dirname(pr_path), exist_ok=True)
+        with open(pr_path, "w") as f:
+            _json.dump(pr, f, indent=2)
+        self._mem.upsert_pr(pr)
+
+        # Emit GitHub bot message in #engineering
+        self._emit_bot_message(
+            "engineering",
+            "GitHub",
+            f'💬 {reviewer} reviewed {pr_id}: "{review_text[:120]}"',
+            current_actor_time,
+        )
+
+        # If the comment is a question, generate an author reply
+        reply_thread_id = None
+        if "?" in review_text:
+            actors, reply_thread_id = self._emit_review_reply(
+                author,
+                reviewer,
+                pr_id,
+                review_text,
+                date_str,
+                current_actor_time,
+            )
+        else:
+            actors = [reviewer, author]
+
+        # Boost the review relationship in the social graph
+        self._gd.record_pr_review(author, [reviewer])
+
+        artifact_ids: dict = {"pr": pr_id}
+        if reply_thread_id:
+            artifact_ids["slack_thread"] = reply_thread_id
+
+        # Attach to the incident's causal chain if one is live
+        linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
+        causal_facts: dict = {}
+        active_inc = next(
+            (
+                i
+                for i in self._state.active_incidents
+                if i.ticket_id == linked_ticket_id
+            ),
+            None,
+        )
+        if active_inc and getattr(active_inc, "causal_chain", None):
+            active_inc.causal_chain.append(pr_id)
+            causal_facts["causal_chain"] = active_inc.causal_chain.snapshot()
+            # Persist updated chain to the ticket document
+            t = self._mem.get_ticket(linked_ticket_id)
+            if t:
+                t["causal_chain"] = active_inc.causal_chain.snapshot()
+                t["updated_at"] = current_actor_time
+                self._mem.upsert_ticket(t)
+                self._save_ticket(t)
+
+        self._mem.log_event(
+            SimEvent(
+                type="pr_review",
+                timestamp=current_actor_time,
+                day=self._state.day,
+                date=date_str,
+                actors=actors,
+                artifact_ids=artifact_ids,
+                facts={
+                    "reviewer": reviewer,
+                    "author": author,
+                    "pr_title": pr_title,
+                    "review_text": review_text,
+                    "has_question": "?" in review_text,
+                    "incident_review": True,
+                    **causal_facts,
+                },
+                summary=f"{reviewer} reviewed incident PR {pr_id} by {author}.",
+                tags=["pr_review", "engineering", "incident"],
+            )
+        )
+
+        if self._vader:
+            self._score_and_apply_sentiment(review_text, [reviewer], self._vader)
+
+        logger.info(f"    [dim]🔍 {reviewer} reviewed incident PR {pr_id}[/dim]")
 
     def _handle_one_on_one(
         self,
@@ -1015,6 +1202,7 @@ class NormalDayHandler:
 
         task = Task(
             description=(
+                f"COMPANY CONTEXT: {self._company} which {COMPANY_DESCRIPTION}\n"
                 f"Write a full Slack thread where a colleague asks a question.\n\n"
                 f"Topic: {ticket_title}\n"
                 f"Participants (Voice Cards):\n{voice_cards}\n\n"
@@ -1187,6 +1375,7 @@ class NormalDayHandler:
 
         task = Task(
             description=(
+                f"COMPANY CONTEXT: {self._company} which {COMPANY_DESCRIPTION}\n"
                 f"Write a full Slack thread for a design discussion.\n\n"
                 f"Topic: {item.description}\n"
                 f"Participants (Voice Cards):\n{voice_cards}\n\n"
@@ -1331,7 +1520,6 @@ class NormalDayHandler:
         )
         meeting_time_iso = meeting_start.isoformat()
 
-        # Tier 2: improved natural language query.
         ctx = self._mem.context_for_prompt(
             f"What skills is {mentee} developing and what technical areas have they been involved in recently?",
             n=2,
@@ -2185,12 +2373,12 @@ class NormalDayHandler:
             "date": date_str,
             "is_bot": True,
         }
-        slack_path, thread_id = self._mem.log_slack_messages(
-            channel=channel,
-            messages=[msg],
-            export_dir=Path(self._base),
-        )
 
+        _, thread_id = self._save_slack(
+            messages=[msg],
+            channel=channel,
+            interaction_type="bot_message",
+        )
         return thread_id
 
     def _find_ticket(self, ticket_id: Optional[str]) -> Optional[dict]:
@@ -2201,7 +2389,7 @@ class NormalDayHandler:
     def _find_pr(self, pr_id: Optional[str]) -> Optional[dict]:
         if not pr_id:
             return None
-        return self._mem._prs.find_one({"pr_id": pr_id})
+        return self._mem._prs.find_one({"pr_id": pr_id}, {"_id": 0})
 
     def _find_reviewable_pr(self, reviewer: str) -> Optional[dict]:
         """Find an open PR where this person is listed as a reviewer."""
@@ -2212,14 +2400,14 @@ class NormalDayHandler:
         """Returns the highest-weight neighbour in the social graph."""
         if name not in self._graph:
             return None
-        neighbours = [
+        neighbors = [
             (n, self._graph[name][n].get("weight", 0))
             for n in self._graph.neighbors(name)
             if n in self._all_names
         ]
-        if not neighbours:
+        if not neighbors:
             return None
-        return max(neighbours, key=lambda x: x[1])[0]
+        return max(neighbors, key=lambda x: x[1])[0]
 
     def _find_lead_for(self, name: str) -> Optional[str]:
         dept = dept_of_name(name, self._org_chart)

@@ -99,40 +99,30 @@ class DepartmentPlanner:
     3. COMPANY CONTEXT — {company} IS ESTABLISHED, NOT A STARTUP.
     - Day {day} is the first day we are observing them, NOT the founding day.
     - They have years of existing code, legacy systems, and established processes.
-    - DO NOT write about "Day 1 kickoffs", "establishing foundational knowledge",
-        or "defining core contracts from scratch".
     - DO write about maintaining systems, paying down tech debt, iterating on
         existing features, and routine corporate work.
 
     4. NON-ENGINEERING TEAMS (applies if {dept} is not Engineering).
-    - Agenda items must reflect actual business functions only:
-        recruitment, sales calls, policy, etc.
+    - Agenda items must reflect actual business functions only.
     - Do NOT propose ticket_progress, pr_review, or code-related activities.
 
     5. NO EVENT REDUNDANCY (CRITICAL TO AVOID DUPLICATES).
     - NEVER put collaborative meetings (1on1, mentoring, design_discussion, async_question) in the individual agendas of BOTH participants.
     - Assign the meeting to the INITIATOR'S agenda ONLY. 
-    - List the other participants in the `collaborator` array. The simulation engine will automatically pull them into the meeting.
+    - List the other participants in the `collaborator` array.
 
     6. EXPERTISE ALIGNMENT IS STRICT.
-    - Every agenda item (especially design_discussion and async_question) MUST map directly to the assigned engineer's specific `Expertise` tags listed in the roster below.
-    - NEVER assign backend, infrastructure, or database topics to Design, Brand, or UX personnel.
-
-    Engineering is the primary driver of the company. If {dept} is Engineering,
-    your plan shapes what other departments react to. Be specific — reference
-    real ticket IDs, real names, and real system states.
+    - Every agenda item MUST map directly to the assigned engineer's specific `Expertise` tags listed in the roster below.
 
     ---
     ## YOUR TASK
 
-    1. Write a department theme for today (one sentence, specific to {dept}).
-    2. For each team member, write a 2-4 item agenda reflecting what they plan to work on.
-    3. Propose 1-3 events that should fire today, ordered by priority (1=must, 3=optional).
-    4. Note your reasoning briefly inside the JSON (rationale fields).
+    1. Write a department theme for today (max 10 words).
+    2. Provide a 1-sentence reasoning for the overall plan.
+    3. For each team member, write a 1-3 item agenda (keep descriptions under 6 words).
 
     ## BEFORE YOU OUTPUT — verify each of these:
-    [ ] No collaborative meeting (1on1, mentoring, design_discussion, async_question) 
-        appears in more than one engineer's agenda
+    [ ] No collaborative meeting appears in more than one engineer's agenda
     [ ] All related_ids are null or from that engineer's own owned ticket list
     [ ] No engineer's estimated_hrs total exceeds their listed capacity
 
@@ -145,16 +135,17 @@ class DepartmentPlanner:
     Do not include any text before or after the JSON block.
 
     {{
-        "dept_theme": "string — one sentence specific to {dept} today",
+        "dept_theme": "string — max 10 words",
+        "planner_reasoning": "string — max 1 sentence",
         "engineer_plans": [
             {{
                 "name": "string — must match a name from YOUR TEAM TODAY",
-                "focus_note": "string — one sentence about their headspace today",
+                "focus_note": "string — max 6 words about headspace",
                 "agenda": [
                     {{
                         "activity_type": "exactly one of: ticket_progress | pr_review | 1on1 | async_question | design_discussion | mentoring | deep_work",
-                        "description": "string",
-                        "related_id": "string — MUST be from this engineer's OWNED tickets only, or null",
+                        "description": "string — max 6 words",
+                        "related_id": "string — MUST be from owned tickets or null",
                         "collaborator": ["string"],
                         "estimated_hrs": float
                     }}
@@ -280,7 +271,6 @@ class DepartmentPlanner:
             if getattr(inc, "causal_chain", None):
                 open_chains.append(
                     f'- {inc.ticket_id} ({inc.stage}): "{inc.root_cause[:80]}"\n'
-                    f"  Artifacts so far: {inc.causal_chain.snapshot()}\n"
                     f"  On-call: {inc.on_call}. Day {inc.days_active} active."
                 )
 
@@ -438,8 +428,10 @@ class DepartmentPlanner:
                         continue
 
                 # Get the flat list of all valid employee names
-                all_valid_names = {n for members in LIVE_ORG_CHART.values() for n in members}
-                
+                all_valid_names = {
+                    n for members in LIVE_ORG_CHART.values() for n in members
+                }
+
                 # Coerce the raw LLM output, but strictly filter out hallucinated names
                 raw_collabs = _coerce_collaborators(a.get("collaborator"))
                 valid_collabs = [c for c in raw_collabs if c in all_valid_names]
@@ -596,12 +588,25 @@ class DepartmentPlanner:
         eng_plan: Optional[DepartmentDayPlan],
     ) -> str:
         lines = []
-        for s in signals:
-            members = self.config.get("org_chart", {}).get(s.source_dept, [])
-            members_str = ", ".join(members) if members else s.source_dept
+
+        # Prioritize high-signal events (incidents/escalations) and cap at top 4
+        priority_ranking = {
+            "incident_opened": 0,
+            "customer_escalation": 1,
+            "incident_resolved": 2,
+            "postmortem_created": 3,
+        }
+        sorted_signals = sorted(
+            signals, key=lambda s: priority_ranking.get(s.event_type, 99)
+        )
+        capped_signals = sorted_signals[:4]
+
+        for s in capped_signals:
+            # Use source_dept directly instead of listing every member's name
             lines.append(
-                f"  [{members_str}] {s.event_type} (Day {s.day}): {s.summary} [{s.relevance}]"
+                f"  [{s.source_dept}] {s.event_type} (Day {s.day}): {s.summary} [{s.relevance}]"
             )
+
         # Non-Engineering depts also see Engineering's proposed events for today
         if eng_plan and not self.is_primary:
             lines.append("\n  ENGINEERING'S PLAN TODAY:")
@@ -1158,8 +1163,6 @@ class DayPlannerOrchestrator:
             "hr_checkin",
             "customer_email_routed",
             "customer_escalation",
-            "vendor_email_routed",
-            "inbound_external_email",
         }
 
         recent = [

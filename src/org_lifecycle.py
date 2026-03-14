@@ -242,7 +242,7 @@ class OrgLifecycleManager:
             for domain in record.knowledge_domains:
                 if domain.lower() not in text_lower:
                     continue
-                gap_key = f"{record.name}:{domain}"
+                gap_key = f"{record.name}:{domain}:{triggered_by}"
                 if gap_key in self._domains_surfaced:
                     continue
                 self._domains_surfaced.add(gap_key)
@@ -262,10 +262,10 @@ class OrgLifecycleManager:
                         day=day,
                         date=date_str,
                         actors=[record.name],
-                        artifact_ids={"trigger": triggered_by},
+                        artifact_ids={"jira": triggered_by},
                         facts={
                             "departed_employee": record.name,
-                            "domain": domain,
+                            "gap_areas": [domain],
                             "triggered_by": triggered_by,
                             "documented_pct": record.documented_pct,
                             "days_since_departure": day - record.day,
