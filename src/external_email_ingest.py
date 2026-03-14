@@ -400,6 +400,13 @@ class ExternalEmailIngestor:
             if ticket_id:
                 signal.causal_chain.append(ticket_id)
 
+        # Hop 3: Sales sends acknowledgment reply to the customer
+        reply_id = self._send_customer_reply(
+            signal, sales_lead, is_high, state, date_str
+        )
+        if reply_id:
+            signal.causal_chain.append(reply_id)
+
         self._mem.log_event(
             SimEvent(
                 type="customer_email_routed",
@@ -479,6 +486,7 @@ class ExternalEmailIngestor:
                 actors=[sales_lead, product_lead],
                 artifact_ids={
                     "slack_thread": thread_id,
+                    "email": signal.embed_id,
                     "source_email": signal.embed_id,
                 },
                 facts={
@@ -602,6 +610,11 @@ class ExternalEmailIngestor:
             ticket_id = self._engineer_opens_jira(signal, recipient, state, date_str)
             if ticket_id:
                 signal.causal_chain.append(ticket_id)
+
+        # Outbound acknowledgment reply to the vendor
+        ack_id = self._send_vendor_ack(signal, recipient, state, date_str)
+        if ack_id:
+            signal.causal_chain.append(ack_id)
 
         self._mem.log_event(
             SimEvent(
@@ -772,7 +785,7 @@ class ExternalEmailIngestor:
                 day=state.day,
                 date=date_str,
                 actors=[hr_lead, name],
-                artifact_ids={"eml_path": str(eml_path), "embed_id": embed_id},
+                artifact_ids={"email": embed_id, "eml_path": str(eml_path)},
                 facts={
                     "email_type": email_type,
                     "prospect": name,
@@ -792,6 +805,238 @@ class ExternalEmailIngestor:
             f"  [magenta]📤 HR → {name}:[/magenta] {subject} "
             f"({days_until}d before Day {hire['day']})"
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # OUTBOUND REPLIES
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _send_customer_reply(
+        self,
+        signal: ExternalEmailSignal,
+        sales_lead: str,
+        is_high: bool,
+        state,
+        date_str: str,
+    ) -> Optional[str]:
+        """
+        Sales lead sends an acknowledgment / follow-up reply to the customer.
+        Always fires for routed (non-dropped) customer emails.
+        High-priority emails get a more substantive response that references
+        the internal escalation and promises a follow-up timeline.
+        """
+        reply_time, _ = self._clock.sync_and_advance([sales_lead], hours=0.4)
+
+        urgency_hint = (
+            "This is high priority — acknowledge urgency, mention it has been escalated "
+            "internally, and commit to a follow-up within 24 hours."
+            if is_high
+            else "This is routine — thank them, confirm receipt, and say the team will be in touch."
+        )
+
+        agent = make_agent(
+            role=f"{sales_lead}, Sales Lead",
+            goal=f"Reply to a customer email on behalf of {self._company_name}.",
+            backstory=self._persona_hint(sales_lead),
+            llm=self._worker_llm,
+        )
+        task = Task(
+            description=(
+                f"You are {sales_lead} at {self._company_name}. "
+                f"You received this email from {signal.source_name}:\n"
+                f"Subject: {signal.subject}\n{signal.full_body}\n\n"
+                f"{urgency_hint}\n"
+                f"Under 80 words. Professional, warm. No [PLACEHOLDER] tokens. "
+                f"Output body only — no subject line."
+            ),
+            expected_output="Email reply body under 80 words.",
+            agent=agent,
+        )
+        try:
+            body = str(
+                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            ).strip()
+        except Exception as exc:
+            logger.warning(f"[external_email] Customer reply LLM failed: {exc}")
+            return None
+
+        embed_id = (
+            f"reply_customer_{signal.source_name.lower().replace(' ', '_')}_{state.day}"
+        )
+        subject = f"Re: {signal.subject}"
+
+        eml_path = self._write_eml(
+            date_str=date_str,
+            from_name=sales_lead,
+            from_addr=self._email_of(sales_lead),
+            to_name=signal.source_name,
+            to_addr=signal.source_email,
+            subject=subject,
+            body=body,
+            timestamp_iso=reply_time.isoformat(),
+            direction="outbound",
+        )
+
+        self._mem.embed_artifact(
+            id=embed_id,
+            type="email",
+            title=subject,
+            content=f"To: {signal.source_name}\n\n{body}",
+            day=state.day,
+            date=date_str,
+            timestamp=reply_time.isoformat(),
+            metadata={
+                "direction": "outbound",
+                "reply_to_email_id": signal.embed_id,
+                "customer": signal.source_name,
+                "sent_by": sales_lead,
+                "high_priority": is_high,
+            },
+        )
+
+        self._mem.log_event(
+            SimEvent(
+                type="customer_reply_sent",
+                timestamp=reply_time.isoformat(),
+                day=state.day,
+                date=date_str,
+                actors=[sales_lead, signal.source_name],
+                artifact_ids={
+                    "eml_path": str(eml_path),
+                    "embed_id": embed_id,
+                    "source_email": signal.embed_id,
+                },
+                facts={
+                    "customer": signal.source_name,
+                    "subject": subject,
+                    "sent_by": sales_lead,
+                    "high_priority": is_high,
+                    "causal_chain": signal.causal_chain.snapshot(),
+                },
+                summary=(
+                    f'{sales_lead} replied to {signal.source_name}: "{subject[:50]}"'
+                ),
+                tags=["email", "outbound", "customer_reply", "causal_chain"],
+            )
+        )
+        logger.info(f"    [cyan]📤 Reply → {signal.source_name}:[/cyan] {subject[:60]}")
+        return embed_id
+
+    def _send_vendor_ack(
+        self,
+        signal: ExternalEmailSignal,
+        recipient: str,
+        state,
+        date_str: str,
+    ) -> Optional[str]:
+        """
+        The assigned engineer sends a brief acknowledgment to the vendor.
+        Confirms receipt, states the issue is being investigated, and
+        references any JIRA ticket already in the causal chain.
+        """
+        ack_time, _ = self._clock.sync_and_advance([recipient], hours=0.3)
+
+        # Surface the JIRA id if one was opened, so the reply can reference it
+        jira_ref = next(
+            (
+                a
+                for a in signal.causal_chain.snapshot()
+                if str(a).startswith("JIRA-") or str(a).upper().startswith("PROJ-")
+            ),
+            None,
+        )
+        jira_hint = (
+            f"Reference ticket {jira_ref} as the tracking issue."
+            if jira_ref
+            else "No ticket number yet — just say it is being investigated."
+        )
+
+        agent = make_agent(
+            role=f"{recipient}, Engineer",
+            goal=f"Acknowledge a vendor alert email on behalf of {self._company_name}.",
+            backstory=self._persona_hint(recipient),
+            llm=self._worker_llm,
+        )
+        task = Task(
+            description=(
+                f"You are {recipient} at {self._company_name}. "
+                f"You received this alert from {signal.source_org}:\n"
+                f"Subject: {signal.subject}\n{signal.full_body}\n\n"
+                f"Write a short acknowledgment email. Confirm receipt, state "
+                f"you are investigating. {jira_hint}\n"
+                f"Under 60 words. Technical, professional. Output body only."
+            ),
+            expected_output="Acknowledgment email body under 60 words.",
+            agent=agent,
+        )
+        try:
+            body = str(
+                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            ).strip()
+        except Exception as exc:
+            logger.warning(f"[external_email] Vendor ack LLM failed: {exc}")
+            return None
+
+        embed_id = (
+            f"ack_vendor_{signal.source_name.lower().replace(' ', '_')}_{state.day}"
+        )
+        subject = f"Re: {signal.subject}"
+
+        eml_path = self._write_eml(
+            date_str=date_str,
+            from_name=recipient,
+            from_addr=self._email_of(recipient),
+            to_name=signal.source_name,
+            to_addr=signal.source_email,
+            subject=subject,
+            body=body,
+            timestamp_iso=ack_time.isoformat(),
+            direction="outbound",
+        )
+
+        self._mem.embed_artifact(
+            id=embed_id,
+            type="email",
+            title=subject,
+            content=f"To: {signal.source_name} ({signal.source_org})\n\n{body}",
+            day=state.day,
+            date=date_str,
+            timestamp=ack_time.isoformat(),
+            metadata={
+                "direction": "outbound",
+                "reply_to_email_id": signal.embed_id,
+                "vendor": signal.source_name,
+                "sent_by": recipient,
+                "jira_ref": jira_ref,
+            },
+        )
+
+        self._mem.log_event(
+            SimEvent(
+                type="vendor_ack_sent",
+                timestamp=ack_time.isoformat(),
+                day=state.day,
+                date=date_str,
+                actors=[recipient, signal.source_name],
+                artifact_ids={
+                    "eml_path": str(eml_path),
+                    "embed_id": embed_id,
+                    "source_email": signal.embed_id,
+                },
+                facts={
+                    "vendor": signal.source_name,
+                    "subject": subject,
+                    "sent_by": recipient,
+                    "jira_ref": jira_ref,
+                    "causal_chain": signal.causal_chain.snapshot(),
+                },
+                summary=(
+                    f'{recipient} acknowledged {signal.source_name}: "{subject[:50]}"'
+                ),
+                tags=["email", "outbound", "vendor_ack", "causal_chain"],
+            )
+        )
+        logger.info(f"    [cyan]📤 Ack → {signal.source_name}:[/cyan] {subject[:60]}")
+        return embed_id
 
     # ─────────────────────────────────────────────────────────────────────────
     # DROPPED EMAIL
@@ -944,7 +1189,7 @@ class ExternalEmailIngestor:
                 day=state.day,
                 date=date_str,
                 actors=[source_name, liaison_name],
-                artifact_ids={"eml_path": str(eml_path), "embed_id": embed_id},
+                artifact_ids={"email": embed_id, "eml_path": str(eml_path)},
                 facts={
                     "source": source_name,
                     "org": source_org,

@@ -6,6 +6,45 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.7.3] — 2026-03-14
+
+### Added
+
+- **Outbound Email Replies (`external_email_ingest.py`)**: The simulation now generates outbound acknowledgment emails for both customer and vendor inbound emails. Sales leads send warm follow-up replies to customers (with escalation context for high-priority emails), while engineers send brief technical acknowledgments to vendors, optionally referencing the linked JIRA ticket.
+- **Domain-Expert Incident Routing (`flow.py`)**: Introduced `_select_domain_expert()` which uses cosine similarity against engineer expertise embeddings to route incidents to the most relevant backend or mobile engineer, rather than always defaulting to the static `incident_commander` role.
+- **Incident PR Review Stage (`flow.py`, `normal_day.py`)**: Added a `review_pending` stage to the incident lifecycle. When a fix PR is ready, assigned reviewers now generate genuine review comments (with optional author replies for questions) before the incident is resolved. Review activity is appended to the incident's causal chain.
+- **Recurrence Chain Traversal (`flow.py`)**: Incident objects now track `recurrence_chain_root` and `recurrence_chain_depth` by walking the full ancestry of recurring incidents, preventing shallow recurrence links (e.g. ORG-164 → ORG-161 instead of ORG-164 → ORG-140).
+- **Standup Thread Embedding (`flow.py`)**: Standup Slack threads are now embedded as `slack_thread` artifacts in the memory store for retrieval in future prompts.
+- **Event Vector Search (`memory.py`)**: Added `search_events()` to `Memory`, enabling vector search over the events collection with optional type and day filters.
+- **`type_exclude` Filter for Recall (`memory.py`)**: `Memory.recall()` now accepts a `type_exclude` list as a mutually exclusive alternative to `type_filter`, allowing callers to exclude artifact types (e.g. `persona_skill`) from retrieval results.
+- **Pre-Sim Employee Departure Logging (`flow.py`)**: Genesis now reads `knowledge_gaps` from config and logs historical `employee_departed` events at their correct negative day offsets, grounding the simulation in pre-existing org knowledge loss.
+- **Company Description in Slack Tasks (`normal_day.py`)**: Async question and design discussion prompts now include the `COMPANY_DESCRIPTION` constant for richer, company-aware Slack generation.
+- **JIRA Ticket Embedding on Progress (`normal_day.py`)**: When ticket progress is recorded, the full ticket document (title, description, root cause, comments) is now embedded as a `jira` artifact, making ticket content directly retrievable via vector search.
+- **Incident PR Review Handler (`normal_day.py`)**: Added `_handle_pr_review_for_incident()` as a standalone method callable from the incident flow without requiring a planner agenda item.
+
+### Changed
+
+- **Embed Model Updated (`config/config.yaml`)**: Switched from `stella_en_1.5b_v5` (1536 dims) to `mxbai-embed-large` (1024 dims) for the Ollama embed provider.
+- **Anti-Daisy-Chain Recurrence Matching (`causal_chain_handler.py`)**: `RecurrenceDetector` now collects all candidates above the confidence threshold and returns the **earliest** matching incident rather than the top-ranked one, preventing chains like A→B→C where A→C is the correct root link.
+- **Corpus-Calibrated Text Score Normalisation (`causal_chain_handler.py`)**: Text search scores are now normalised against a fixed ceiling (`_TEXT_CEILING = 8.0`) and log-normalised within the result set, preventing rank-1 from artificially always scoring 1.0.
+- **Focused Previous-Day Context (`memory.py`)**: `previous_day_context()` now uses an allowlist of high-signal event types (incidents, escalations, sprint planning, etc.) and leads with a structured health/morale header from the `day_summary` document, replacing the previous verbose enumeration of all events.
+- **Prioritised Cross-Signal Formatting (`day_planner.py`)**: `_format_cross_signals()` now sorts signals by event priority (incidents first), caps output at 4 signals, and uses `source_dept` instead of enumerating every member's name.
+- **Condensed Planner Prompt (`day_planner.py`)**: Agenda descriptions, focus notes, and the department theme are now length-capped (6 words / 10 words respectively), and the task is reduced from 4 steps to 3 to cut prompt token usage.
+- **Causal Chain Persisted on PR Open (`flow.py`)**: When a PR is opened for an active incident, the updated causal chain is immediately persisted back to the ticket document in both MongoDB and on disk.
+- **State Resume Key Fix (`flow.py`)**: Fixed a resume bug where `state_vars` was referenced incorrectly; the correct key is `state` (for `morale`, `health`, and `date`).
+- **Email Sources Loaded on Resume (`flow.py`)**: `generate_sources()` is now called during resume so that pre-standup and business-hours email generation has source data available even when genesis is skipped.
+- **Ollama HTTP Error Handling (`memory.py`)**: HTTP errors from Ollama embeddings are now caught separately with a detailed log message including the status code and error body, rather than being swallowed by the generic connection error handler.
+- **Knowledge Gap Key Includes Trigger (`org_lifecycle.py`)**: The deduplication key for surfaced knowledge gaps now includes the triggering ticket ID, allowing the same domain gap to surface across multiple distinct incidents.
+- **`vendor_email_routed` / `inbound_external_email` Removed from Planner Filter (`day_planner.py`)**: These event types are no longer included in the recent-events filter used by the orchestrator.
+- **DeepSeek Drop-Params Removed (`flow.py`)**: The special-cased `drop_params` workaround for DeepSeek Bedrock models has been removed; `max_tokens: 8192` is now set uniformly.
+
+### Fixed
+
+- **Incorrect `artifact_ids` Keys (`external_email_ingest.py`, `org_lifecycle.py`)**: Standardised artifact ID keys to use `"email"` (instead of `"embed_id"`) and `"jira"` (instead of `"trigger"`) for consistency with the rest of the event schema.
+- **`_find_pr` / `get_reviewable_prs_for` Leaking `_id` (`normal_day.py`, `memory.py`)**: MongoDB `_id` fields are now explicitly excluded from PR document queries.
+
+---
+
 ## [v0.7.2] — 2026-03-12
 
 ### Added

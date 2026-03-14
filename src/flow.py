@@ -45,6 +45,7 @@ from day_planner import DayPlannerOrchestrator
 from normal_day import NormalDayHandler, dept_of_name
 from artifact_registry import ArtifactRegistry
 from confluence_writer import ConfluenceWriter
+from ticket_assigner import _cosine, TicketAssigner
 from token_tracker import orgforge_token_listener
 from external_email_ingest import ExternalEmailIngestor
 from pydantic import BaseModel, Field
@@ -142,18 +143,8 @@ def build_llm(model_key: str):
                 "model": model,
                 "region_name": region,
                 "temperature": 0.7,
+                "max_tokens": 8192,
             }
-
-            if "deepseek" in model.lower():
-                llm_args["drop_params"] = True
-                llm_args["additional_drop_params"] = [
-                    "stop",
-                    "temperature",
-                    "stopSequences",
-                ]
-                logger.info(
-                    f"[config] Adding drop_params=True for Bedrock model: {model}"
-                )
 
             llm = LLM(**llm_args)
 
@@ -681,6 +672,11 @@ class Flow(Flow[State]):
             vader=vader,
         )
         self._recurrence_detector = RecurrenceDetector(self._mem)
+        self._ticket_assigner = TicketAssigner(
+            config=CONFIG,
+            graph_dynamics=self.graph_dynamics,
+            mem=self._mem,
+        )
         orgforge_token_listener.attach(self._mem)
 
         stats = self._mem.stats()
@@ -737,6 +733,9 @@ class Flow(Flow[State]):
                 "[bold green]⏩ Genesis Guard: Corporate history exists. Skipping LLM generation.[/bold green]"
             )
             # The Registry seeds itself from Mongo in __init__, so IDs are already synced.
+            # Email sources are idempotent — load them even on resume so daily
+            # generate_pre_standup / generate_business_hours have something to fire against.
+            self._email_ingestor.generate_sources()
             return
 
         logger.info(
@@ -764,6 +763,10 @@ class Flow(Flow[State]):
         self._confluence.generate_tech_stack()
         tech_context = self._mem.tech_stack_for_prompt()
 
+        # Generate email sources after tech stack so vendor choices are grounded
+        # in the company's actual infrastructure.
+        self._email_ingestor.generate_sources()
+
         for dept, members in ORG_CHART.items():
             for name in members:
                 persona_data = PERSONAS.get(name, DEFAULT_PERSONA)
@@ -774,6 +777,43 @@ class Flow(Flow[State]):
                     day=0,
                     timestamp_iso=self._clock.now("system").isoformat(),
                 )
+
+        # ── Genesis: log pre-sim employee departures from config ─────────────────
+        sim_start = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
+        for gap in CONFIG.get("knowledge_gaps", []):
+            name = gap["name"]
+            left_date = gap["left"]  # "2024-06"
+            left_dt = datetime.strptime(left_date, "%Y-%m")
+            departure_day = -(sim_start - left_dt).days
+
+            self._mem.log_event(
+                SimEvent(
+                    type="employee_departed",
+                    day=departure_day,
+                    date=f"{left_date}-01",
+                    timestamp=f"{left_date}-01T09:00:00",
+                    actors=[name],
+                    artifact_ids={},
+                    facts={
+                        "name": name,
+                        "role": gap.get("role", ""),
+                        "knowledge_domains": gap.get("knew_about", []),
+                        "documented_pct": gap.get("documented_pct", 0.0),
+                        "reason": "voluntary",
+                        "scheduled": True,
+                    },
+                    summary=(
+                        f"{name} ({gap.get('role', 'unknown role')}) departed "
+                        f"Day {departure_day} [voluntary]. "
+                        f"Gaps: {', '.join(gap.get('knew_about', []))}. "
+                        f"~{int(gap.get('documented_pct', 0) * 100)}% documented."
+                    ),
+                    tags=["employee_departed", "lifecycle", "genesis"],
+                )
+            )
+            logger.info(
+                f"[genesis] Logged pre-sim departure: {name} (Day {departure_day})"
+            )
 
         # Technical pages — one LLM call per page, no PAGE BREAK parsing
         self._confluence.write_genesis_batch(
@@ -823,8 +863,8 @@ class Flow(Flow[State]):
                 f"[bold cyan]♻️ Resuming simulation from Day {latest['day']}...[/bold cyan]"
             )
             self.state.day = latest["day"] + 1
-            self.state.team_morale = latest["state_vars"]["morale"]
-            self.state.system_health = latest["state_vars"]["health"]
+            self.state.team_morale = latest["state"]["morale"]
+            self.state.system_health = latest["state"]["health"]
 
             # Restore the 'Live' state of the secondary systems
             self.graph_dynamics._stress = latest["stress"]
@@ -832,7 +872,7 @@ class Flow(Flow[State]):
 
             # Re-sync current_date string back to a datetime object
             self.state.current_date = datetime.strptime(
-                latest["state_vars"]["date"], "%Y-%m-%d"
+                latest["state"]["date"], "%Y-%m-%d"
             )
 
             if "graph" in latest:
@@ -1315,6 +1355,23 @@ class Flow(Flow[State]):
             "standup", messages, export_dir=EXPORT_DIR
         )
 
+        if thread_id and messages:
+            full_transcript = "\n".join(f"{m['user']}: {m['text']}" for m in messages)
+            self._embed_and_count(
+                id=thread_id,
+                type="slack_thread",
+                title=f"Standup Day {self.state.day}",
+                content=full_transcript,
+                day=self.state.day,
+                date=date_str,
+                timestamp=meeting_time_iso,
+                metadata={
+                    "interaction_type": "standup",
+                    "participants": [m["user"] for m in messages],
+                    "message_count": len(messages),
+                },
+            )
+
         self._mem.log_event(
             SimEvent(
                 type="standup",
@@ -1491,15 +1548,6 @@ class Flow(Flow[State]):
     def _handle_incident(self):
         ticket_id = next_jira_id(self.state, self._registry)
         on_call = resolve_role("on_call_engineer")
-        incident_lead = resolve_role("incident_commander")
-        eng_peer = next(
-            (
-                n
-                for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), [])
-                if n != on_call
-            ),
-            on_call,
-        )
 
         incident_start = self._clock.tick_system(min_mins=30, max_mins=240)
         incident_start_iso = incident_start.isoformat()
@@ -1552,6 +1600,19 @@ class Flow(Flow[State]):
             Crew(agents=[rc_agent], tasks=[rc_task], verbose=False).kickoff()
         ).strip()
 
+        # ── 2. Domain-routed incident lead ────────────────────────────────────
+        incident_lead = self._select_domain_expert(root_cause, exclude=on_call)
+
+        # eng_peer: a different active engineer from incident_lead's department.
+        # Falls back to on_call if no peer exists in that dept.
+        eng_peer = next(
+            (
+                n for n in LIVE_ORG_CHART.get(dept_of(incident_lead), [])
+                if n != incident_lead and n != on_call
+            ),
+            on_call,
+        )
+
         # ── 2. Knowledge gap detection ────────────────────────────────────────
         involves_gap = any(
             k.lower() in root_cause.lower()
@@ -1588,6 +1649,8 @@ class Flow(Flow[State]):
             state=self.state,
             timestamp=incident_start_iso,
         )
+
+        
 
         # ── 3. Recurrence detection ───────────────────────────────────────────
         prior = self._recurrence_detector.find_prior_incident(
@@ -1639,7 +1702,10 @@ class Flow(Flow[State]):
         chain_handler.append(pagerduty_thread)
 
         # ── 7. Generate ticket description — all context is available now ─────
-        title = f"{LEGACY['name']}: {self.state.daily_theme[:60]}"
+        _rc_slug = root_cause[:80].rstrip(".,;")
+        _gap_tag = f" [{gap_areas[0]} undocumented]" if involves_gap and gap_areas else ""
+        _recur_tag = f" [recurrence of {recurrence_of}]" if recurrence_of else ""
+        title = f"P1 incident {ticket_id}: {_rc_slug}{_gap_tag}{_recur_tag}"
         desc_agent = make_agent(
             role="Senior Engineer",
             goal="Write a concise Jira ticket description for an incident.",
@@ -1673,6 +1739,27 @@ class Flow(Flow[State]):
             Crew(agents=[desc_agent], tasks=[desc_task], verbose=False).kickoff()
         ).strip()
 
+        _chain_root = recurrence_of
+        _cursor = recurrence_of
+        _chain_visited: set = set()
+        while _cursor and _cursor not in _chain_visited:
+            _chain_visited.add(_cursor)
+            _ancestor = next(
+                (
+                    e
+                    for e in self._mem._event_log
+                    if e.type == "incident_opened"
+                    and e.artifact_ids.get("jira") == _cursor
+                    and e.facts.get("recurrence_of")
+                ),
+                None,
+            )
+            if _ancestor:
+                _cursor = _ancestor.facts["recurrence_of"]
+                _chain_root = _cursor
+            else:
+                break
+
         # ── 8. Build ticket with full context ─────────────────────────────────
         ticket = {
             "id": ticket_id,
@@ -1690,6 +1777,8 @@ class Flow(Flow[State]):
             # Recurrence
             "recurrence_of": recurrence_of,
             "recurrence_gap_days": recurrence_gap,
+            "recurrence_chain_root": _chain_root,
+            "recurrence_chain_depth": len(_chain_visited) + 1 if recurrence_of else 0,
             "prior_postmortem": prior_postmortem,
             # Knowledge gap
             "gap_areas": gap_areas,
@@ -1779,6 +1868,10 @@ class Flow(Flow[State]):
                     "causal_chain": chain_handler.snapshot(),
                     "recurrence_of": recurrence_of,
                     "recurrence_gap_days": recurrence_gap,
+                    "recurrence_chain_root": _chain_root,
+                    "recurrence_chain_depth": len(_chain_visited) + 1
+                    if recurrence_of
+                    else 0,
                     "prior_postmortem": prior_postmortem,
                     "bot_threads": [datadog_thread, pagerduty_thread],
                 },
@@ -1798,8 +1891,9 @@ class Flow(Flow[State]):
                 actors=escalation_actors,
                 artifact_ids={ARTIFACT_KEY_JIRA: ticket_id},
                 facts={
-                    "chain": chain.chain,
-                    "narrative": escalation_narrative,
+                    "escalation_actors": escalation_actors,
+                    "escalation_narrative": escalation_narrative,
+                    "chain_detail": chain.chain,
                 },
                 summary=escalation_narrative,
                 tags=["escalation", "incident"],
@@ -1816,7 +1910,7 @@ class Flow(Flow[State]):
                     actors=[on_call, eng_peer],
                     artifact_ids={ARTIFACT_KEY_JIRA: ticket_id},
                     facts={
-                        "gap_area": gap_areas or [LEGACY["name"]],
+                        "gap_areas": gap_areas or [LEGACY["name"]],
                         "involves_gap": True,
                         "gap_context": gap_context_str,
                     },
@@ -1895,6 +1989,14 @@ class Flow(Flow[State]):
                 inc.pr_id = pr["pr_id"]
                 if getattr(inc, "causal_chain", None):
                     inc.causal_chain.append(pr["pr_id"])
+                    # Persist the updated causal chain back to the ticket so it
+                    # reflects the PR link immediately (fixes missing PR in chain).
+                    t = self._mem.get_ticket(inc.ticket_id)
+                    if t:
+                        t["causal_chain"] = inc.causal_chain.snapshot()
+                        t["updated_at"] = cron_time_iso
+                        self._mem.upsert_ticket(t)
+                        save_json(f"{BASE}/jira/{inc.ticket_id}.json", t)
 
                 logger.info(
                     f"    [yellow]🔧 {inc.ticket_id}:[/yellow] {pr['pr_id']} opened."
@@ -1911,6 +2013,30 @@ class Flow(Flow[State]):
                     self._handle_external_contact(inc, contact)
 
             elif inc.stage == "fix_in_progress":
+                # Trigger PR review — reviewers leave comments before merge.
+                # This produces genuine review activity on incident PRs, not
+                # just a silent open→merge status flip.
+                inc.stage = "review_pending"
+                if inc.pr_id:
+                    pr_doc = self._mem._prs.find_one({"pr_id": inc.pr_id}, {"_id": 0})
+                    if pr_doc:
+                        reviewers = pr_doc.get("reviewers", [])
+                        for reviewer in reviewers:
+                            try:
+                                self._normal_day._handle_pr_review_for_incident(
+                                    reviewer=reviewer,
+                                    pr=pr_doc,
+                                    date_str=str(self.state.current_date.date()),
+                                    timestamp=cron_time_iso,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    f"[advance_incidents] PR review failed for "
+                                    f"{reviewer} on {inc.pr_id}: {exc}"
+                                )
+                still_active.append(inc)
+
+            elif inc.stage == "review_pending":
                 # Resolve: merge PR, write postmortem, log event — do NOT append to still_active
                 inc.stage = "resolved"
                 if inc.pr_id:
@@ -2007,6 +2133,18 @@ class Flow(Flow[State]):
             messages=[message],
             export_dir=EXPORT_DIR,
         )
+
+        if thread_id:
+            self._embed_and_count(
+                id=thread_id,
+                type="slack_thread",
+                title=f"Bot message in #{channel}",
+                content=text,
+                day=self.state.day,
+                date=date_str,
+                timestamp=timestamp,
+                metadata={"bot": bot_name, "channel": channel},
+            )
 
         return thread_id
 
@@ -2427,6 +2565,46 @@ class Flow(Flow[State]):
             f"    [cyan]🌐 External contact:[/cyan] {liaison_name} summarized "
             f"{display_name} re {inc.ticket_id} in #incidents"
         )
+
+
+    def _select_domain_expert(self, root_cause: str, exclude: str) -> str:
+        """
+        Find the active engineering team member whose expertise embedding is
+        most similar to the incident root cause. Scoped to Engineering_Backend
+        and Engineering_Mobile only — never routes incidents to Sales, Design, etc.
+        Falls back to incident_commander role if embedding fails or no candidates.
+        """
+        rc_vec = self._mem._embed(
+            root_cause, input_type="search_query",
+            caller="incident_routing", doc_id="rc"
+        )
+        if not rc_vec:
+            return resolve_role("incident_commander")
+
+        _ENG_DEPTS = {"Engineering_Backend", "Engineering_Mobile"}
+        candidates = [
+            n for dept, members in ORG_CHART.items()
+            if dept in _ENG_DEPTS
+            for n in members
+            if n != exclude
+            and n in LIVE_ORG_CHART.get(dept, [])
+            and n in self._ticket_assigner._engineer_vectors
+        ]
+
+        if not candidates:
+            return resolve_role("incident_commander")
+
+        best_name, best_score = resolve_role("incident_commander"), 0.0
+        for name in candidates:
+            score = _cosine(rc_vec, self._ticket_assigner._engineer_vectors[name])
+            if score > best_score:
+                best_score, best_name = score, name
+
+        logger.info(
+            f"[incident] domain expert for '{root_cause[:60]}': "
+            f"{best_name} (score={best_score:.3f})"
+        )
+        return best_name
 
 
 if __name__ == "__main__":

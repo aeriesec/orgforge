@@ -134,9 +134,8 @@ def test_vendor_email_appends_to_active_incident(ingestor, mock_state):
         causal_chain=CausalChainHandler("email_aws_123"),
     )
 
-    # Mock the Jira creation so it doesn't try to use LLMs
     ingestor._engineer_opens_jira = MagicMock(return_value=None)
-
+    ingestor._send_vendor_ack = MagicMock(return_value="mock_ack_id")
     ingestor._route_vendor_email(signal, mock_state)
 
     # The vendor email's embed_id should now be in the incident's causal chain

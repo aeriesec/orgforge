@@ -46,7 +46,7 @@ import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agent_factory import make_agent
-from config_loader import COMPANY_DESCRIPTION
+from config_loader import COMPANY_DESCRIPTION, PERSONAS
 from crewai import Task, Crew
 from memory import Memory, SimEvent
 from artifact_registry import ArtifactRegistry, ConfluencePage
@@ -229,6 +229,22 @@ class ConfluenceWriter:
 
         backstory = self._persona(on_call, mem=self._mem, graph_dynamics=self._gd)
         related = self._registry.related_context(topic=root_cause, n=3)
+        _qa_lead = next(
+            (name for name, p in PERSONAS.items() if "QA" in p.get("expertise", [])),
+            eng_peer,
+        )
+        _infra_lead = next(
+            (name for name, p in PERSONAS.items() if "infra" in p.get("expertise", [])),
+            eng_peer,
+        )
+        _action_owners = (
+            f"Use these real names as action item owners:\n"
+            f"  - Engineering fixes: {on_call}\n"
+            f"  - Code review / PR: {eng_peer}\n"
+            f"  - Test coverage / QA: {_qa_lead}\n"
+            f"  - Infra / alerting: {_infra_lead}\n"
+            f"Do NOT use role labels like 'backend lead' or 'qa lead' — use the names above."
+        )
 
         writer = make_agent(
             role="Senior Engineer",
@@ -244,7 +260,8 @@ class ConfluenceWriter:
                 f"Root Cause: {root_cause}\n"
                 f"Duration: {days_active} days.\n"
                 f"You may reference these existing pages if relevant:\n{related}\n"
-                f"Format as Markdown. Start directly with the # heading. "
+                f"{_action_owners}\n"
+                f"Format as Markdown. Do NOT write a main # title — start directly with ## Executive Summary. "
                 f"Include: Executive Summary, Timeline, Root Cause, Impact, "
                 f"What Went Wrong, What Went Right, Action Items."
             ),
@@ -252,6 +269,15 @@ class ConfluenceWriter:
             agent=writer,
         )
         raw = str(Crew(agents=[writer], tasks=[task], verbose=False).kickoff()).strip()
+
+        self._lifecycle.scan_for_knowledge_gaps(
+            text=raw,
+            triggered_by=conf_id,
+            day=self._state.day,
+            date_str=date_str,
+            state=self._state,
+            timestamp=timestamp,
+        )
 
         conf_ids = self._finalise_page(
             raw_content=raw,

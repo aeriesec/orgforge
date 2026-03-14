@@ -49,8 +49,8 @@ model_presets:
     worker: "bedrock/openai.gpt-oss-120b-1:0"
     aws_region: "us-east-1"
     embed_provider: "ollama"
-    embed_model: "Losspost/stella_en_1.5b_v5:latest"
-    embed_dims: 1536
+    embed_model: "mxbai-embed-large"
+    embed_dims: 1024
 
 # ── SIMULATION ────────────────────────────────────────────────
 simulation:

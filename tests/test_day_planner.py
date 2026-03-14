@@ -546,10 +546,10 @@ class TestDepartmentPlannerHelpers:
             )
         ]
         result = dept_planner._format_cross_signals(signals, None)
-        # Change the assertion to look for the member name 'Dave' or the summary
-        assert "Dave" in result
-        assert "customer_escalation" in result
+
+        assert "[Sales]" in result
         assert "Big client unhappy" in result
+        assert "Dave" not in result
 
     def test_format_cross_signals_non_primary_appends_eng_plan(self, dept_planner):
         """Non-primary departments should see Engineering's proposed events."""
