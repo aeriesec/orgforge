@@ -45,7 +45,7 @@ from day_planner import DayPlannerOrchestrator
 from normal_day import NormalDayHandler, dept_of_name
 from artifact_registry import ArtifactRegistry
 from confluence_writer import ConfluenceWriter
-from ticket_assigner import _cosine
+from ticket_assigner import _cosine, TicketAssigner
 from token_tracker import orgforge_token_listener
 from external_email_ingest import ExternalEmailIngestor
 from pydantic import BaseModel, Field
@@ -672,6 +672,11 @@ class Flow(Flow[State]):
             vader=vader,
         )
         self._recurrence_detector = RecurrenceDetector(self._mem)
+        self._ticket_assigner = TicketAssigner(
+            config=CONFIG,
+            graph_dynamics=self.graph_dynamics,
+            mem=self._mem,
+        )
         orgforge_token_listener.attach(self._mem)
 
         stats = self._mem.stats()
@@ -1697,7 +1702,10 @@ class Flow(Flow[State]):
         chain_handler.append(pagerduty_thread)
 
         # ── 7. Generate ticket description — all context is available now ─────
-        title = f"{LEGACY['name']}: {self.state.daily_theme[:60]}"
+        _rc_slug = root_cause[:80].rstrip(".,;")
+        _gap_tag = f" [{gap_areas[0]} undocumented]" if involves_gap and gap_areas else ""
+        _recur_tag = f" [recurrence of {recurrence_of}]" if recurrence_of else ""
+        title = f"P1 incident {ticket_id}: {_rc_slug}{_gap_tag}{_recur_tag}"
         desc_agent = make_agent(
             role="Senior Engineer",
             goal="Write a concise Jira ticket description for an incident.",

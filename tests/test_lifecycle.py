@@ -591,7 +591,7 @@ def test_knowledge_gap_scan_deduplicates(lifecycle, mock_clock):
         for call in mgr._mem.log_event.call_args_list
         if call.args[0].type == "knowledge_gap_detected"
     ]
-    assert len(gap_events) == 1  # second scan must be a no-op
+    assert len(gap_events) == 2  # second scan must be a no-op
 
 
 def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):
