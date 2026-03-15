@@ -404,6 +404,14 @@ class Memory:
             [("participants", 1), ("type", 1), ("day", -1)]
         )
         self._conversation_summaries.create_index([("day", -1)])
+        self._events.create_index([("type", 1), ("day", 1)])
+        self._events.create_index([("type", 1), ("timestamp", -1)])
+        self._events.create_index([("actors", 1), ("timestamp", -1)])
+        self._events.create_index([("type", 1), ("artifact_ids.jira", 1)])
+        self._events.create_index([("tags", 1)])
+        self._events.create_index([("type", 1), ("facts.participants", 1)])
+        self._checkpoints.create_index([("day", -1)])
+        self._jira.create_index([("dept", 1), ("status", 1)])
 
         self._current_day: int = 0
 

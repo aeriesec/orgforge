@@ -1062,7 +1062,6 @@ class Flow(Flow[State]):
             Crew(
                 agents=[product_agent, eng_agent],
                 tasks=[product_task, eng_task],
-                verbose=True,
             ).kickoff()
         ).strip()
         logger.info(f"    [cyan]🎯 Sprint theme:[/cyan] {sprint_theme}")
@@ -1134,7 +1133,7 @@ class Flow(Flow[State]):
                 agent=agent,
             )
             raw = str(
-                Crew(agents=[agent], tasks=[task], verbose=True).kickoff()
+                Crew(agents=[agent], tasks=[task]).kickoff()
             ).strip()
 
             # Parse — strip accidental fences

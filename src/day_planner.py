@@ -174,15 +174,15 @@ class DepartmentPlanner:
     ### ENGINEER CAPACITY TODAY (hours available after stress/on-call)
     {capacity_section}
 
-    ### RECENT DEPARTMENT HISTORY (last 7 days)
+    ### RECENT DEPARTMENT HISTORY (last 2 days)
     {dept_history}
 
-    ### CROSS-DEPARTMENT SIGNALS (what other teams are dealing with)
+    ### CROSS-DEPARTMENT SIGNALS
     {cross_signals}
 
     {lifecycle_context}
 
-    ### ACTIVE INCIDENTS (do not duplicate work already captured)
+    ### ACTIVE INCIDENTS
     {open_chains_str}
     """
 
@@ -558,27 +558,33 @@ class DepartmentPlanner:
         )
 
     def _dept_history(self, mem: Memory, day: int) -> str:
-        """Last 7 day_summary SimEvents filtered to this dept's actors."""
+        """
+        Last 2 day_summary SimEvents filtered to this dept's actors.
+
+        Capped at 2 days (down from 7) — older history adds noise without
+        changing planning decisions, and open_incidents is omitted here since
+        it's already listed in the ACTIVE INCIDENTS section of the prompt.
+        Non-engineering depts skip days where they had no active members.
+        """
         summaries = [
             e
             for e in mem.get_event_log()
-            if e.type == "day_summary" and e.day >= max(1, day - 7)
+            if e.type == "day_summary" and e.day >= max(1, day - 2)
         ]
         if not summaries:
             return "  (no recent history)"
         lines = []
-        for s in summaries[-7:]:
+        for s in summaries[-2:]:
             dept_actors = [
                 a for a in s.facts.get("active_actors", []) if a in self.members
             ]
             if not dept_actors and not self.is_primary:
-                continue  # this dept was quiet that day — skip
+                continue  # dept was quiet — skip rather than add empty line
             lines.append(
                 f"  Day {s.day}: health={s.facts.get('system_health')} "
                 f"morale={s.facts.get('morale_trend', '?')} "
                 f"dominant={s.facts.get('dominant_event', '?')} "
-                f"open_incidents={s.facts.get('open_incidents', [])} "
-                f"dept_actors={dept_actors}"
+                f"active={dept_actors}"
             )
         return "\n".join(lines) if lines else "  (dept was quiet recently)"
 
@@ -589,7 +595,15 @@ class DepartmentPlanner:
     ) -> str:
         lines = []
 
-        # Prioritize high-signal events (incidents/escalations) and cap at top 4
+        # Non-engineering departments only receive [direct] signals — indirect
+        # signals (e.g. older incidents from other teams) are noise for Sales,
+        # Design, QA etc. and waste tokens without changing planning decisions.
+        # Engineering (is_primary) still sees all signals ranked by priority.
+        if not self.is_primary:
+            signals = [s for s in signals if s.relevance == "direct"]
+
+        # Prioritize high-signal events and cap at 2 for non-engineering,
+        # 4 for engineering (primary driver needs fuller picture).
         priority_ranking = {
             "incident_opened": 0,
             "customer_escalation": 1,
@@ -599,24 +613,25 @@ class DepartmentPlanner:
         sorted_signals = sorted(
             signals, key=lambda s: priority_ranking.get(s.event_type, 99)
         )
-        capped_signals = sorted_signals[:4]
+        cap = 4 if self.is_primary else 2
+        capped_signals = sorted_signals[:cap]
 
         for s in capped_signals:
-            # Use source_dept directly instead of listing every member's name
             lines.append(
                 f"  [{s.source_dept}] {s.event_type} (Day {s.day}): {s.summary} [{s.relevance}]"
             )
 
-        # Non-Engineering depts also see Engineering's proposed events for today
+        # Non-Engineering depts see a compact summary of Engineering's plan —
+        # one line per engineer (first agenda item only), no proposed_events.
         if eng_plan and not self.is_primary:
-            lines.append("\n  ENGINEERING'S PLAN TODAY:")
-            for e in eng_plan.proposed_events[:3]:
-                lines.append(f"    - {e.event_type}: {e.rationale}")
-            for ep in eng_plan.engineer_plans[:3]:
-                lines.append(
-                    f"    - {ep.name} is focused on: "
-                    f"{ep.agenda[0].description if ep.agenda else '?'}"
-                )
+            eng_lines = [
+                f"    - {ep.name}: {ep.agenda[0].description if ep.agenda else '?'}"
+                for ep in eng_plan.engineer_plans[:3]
+            ]
+            if eng_lines:
+                lines.append("\n  ENGINEERING TODAY:")
+                lines.extend(eng_lines)
+
         return "\n".join(lines) if lines else "  (no cross-dept signals today)"
 
     def _format_email_signals(
