@@ -6,6 +6,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.0.0-preprint] — 2026-03-15
+
+### Changed
+
+- **Reduced Department History Window (`day_planner.py`)**: The recent department history used in planner prompts is now capped at the last 2 days (down from 7). Older history added noise without meaningfully changing planning decisions; open incidents are already surfaced separately in the Active Incidents section.
+- **Scoped Cross-Department Signals for Non-Engineering (`day_planner.py`)**: Non-engineering departments (Sales, Design, QA, etc.) now only receive `direct` relevance signals, capped at 2 (down from 4). Engineering retains the full ranked view of up to 4 signals. Engineering's daily plan summary shown to other departments is now condensed to one line per engineer rather than enumerating proposed events.
+- **Condensed Planner Prompt Labels (`day_planner.py`)**: Section headers for department history, cross-department signals, and active incidents have been shortened to reduce prompt token usage.
+- **Verbose Crew Logging Removed (`flow.py`)**: `verbose=True` has been dropped from `Crew` instantiation in the sprint theme and standup generation paths, reducing log noise.
+
+### Added
+
+- **MongoDB Index Coverage (`memory.py`)**: Added compound indexes on the `_events`, `_checkpoints`, and `_jira` collections covering common query patterns (type + day, type + timestamp, actors + timestamp, type + JIRA artifact ID, tags, and type + participants), improving query performance at scale.
+
+### Fixed
+
+- **Agent Factory Debug Logging (`agent_factory.py`)**: Removed a verbose per-agent `DEBUG` block that logged role, goal, and backstory on every agent creation, which was generating excessive output without operational value.
+
+---
+
 ## [v0.7.3] — 2026-03-14
 
 ### Added
