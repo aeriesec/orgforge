@@ -6,6 +6,16 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.0.1] — 2026-03-15
+
+### Added
+
+- **Eval Harness (`eval/eval_harness.py`)**: New post-simulation eval dataset generator for OrgForge. Produces structured evaluation datasets from completed simulation runs.
+- **HuggingFace Export Pipeline (`eval/export_to_hf.py`)**: Normalises OrgForge simulation artifacts into a flat HuggingFace-ready corpus. Runs BM25 and dense-retrieval baselines, produces Parquet files, and writes a dataset card to `export/hf_dataset/`.
+- **Eval Scorer (`eval/scorer.py`)**: Per-question-type scoring for the OrgForge eval dataset.
+
+---
+
 ## [v1.0.0-preprint] — 2026-03-15
 
 ### Changed
