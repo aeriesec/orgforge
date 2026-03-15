@@ -4,6 +4,7 @@
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19036018.svg)](https://doi.org/10.5281/zenodo.19036018)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)
 [![Run Tests](https://github.com/aeriesec/orgforge/actions/workflows/tests.yml/badge.svg)](https://github.com/aeriesec/orgforge/actions/workflows/tests.yml)
+[![Dataset on HuggingFace](https://img.shields.io/badge/🤗%20Dataset-aeriesec%2Forgforge-yellow)](https://huggingface.co/datasets/aeriesec/orgforge)
 
 ### A deterministic corporate simulator for generating ground-truth ecosystems and evaluating enterprise AI agents
 
@@ -73,12 +74,8 @@ A default 22-day simulation produces:
 | `jira/`                    | Sprint tickets, P1 incident tickets with linked PRs                                                                         |
 | `slack/channels/`          | Standup transcripts, incident alerts, engineering chatter, bot messages                                                     |
 | `git/prs/`                 | Pull requests with reviewers, merge status, linked tickets                                                                  |
-| `emails/threads/`          | Multi-turn incident escalation and knowledge gap threads                                                                    |
-| `emails/sprint/`           | Sprint kickoff and mid-point check-in emails                                                                                |
-| `emails/leadership/`       | Weekly leadership sync summaries                                                                                            |
-| `emails/hr/`               | Welcome emails, morale interventions, remote policy                                                                         |
-| `emails/sales/`            | Weekly pipeline updates referencing actual incident stability                                                               |
-| `servers/logs/`            | AWS cost alerts, Snyk security findings, GitHub Actions output                                                              |
+| `emails/inbound/`          | External emails received by the org — customer complaints, vendor messages, inbound escalations                             |
+| `emails/outbound/`         | External emails sent by org members — HR communications, leadership syncs, sales updates                                    |
 | `simulation_snapshot.json` | Full state: incidents, morale curve, system health, relationship graph, departed employees, new hires, knowledge gap events |
 | `simulation.log`           | Complete chronological system and debug logs for the entire run                                                             |
 
@@ -356,8 +353,8 @@ orgforge/
 - [ ] Plugin architecture for community artifact types (Zoom, Zendesk, PagerDuty, Salesforce)
 - [ ] Domain packs — pre-configured `config.yaml` templates for healthcare, fintech, legal
 - [ ] ONNX embedding support for faster CPU inference
-- [ ] Export to HuggingFace dataset format
-- [ ] Evaluation harness — benchmark RAG retrieval against SimEvent ground truth
+- [x] Export to HuggingFace dataset format
+- [x] Evaluation harness — benchmark RAG retrieval against SimEvent ground truth
 
 ---
 
