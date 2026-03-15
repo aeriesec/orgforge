@@ -11,15 +11,7 @@ AGENT_DEFAULTS = {
 
 
 def make_agent(role: str, goal: str, backstory: str, llm, **kwargs) -> Agent:
-    logger = logging.getLogger("orgforge.agent_factory")
-    logger.setLevel(logging.DEBUG)
-    logger.debug(
-        f"\n=== AGENT CREATED ===\n"
-        f"  Role:      {role}\n"
-        f"  Goal:      {goal}\n"
-        f"  Backstory: {backstory}\n"
-        f"{'=' * 21}"
-    )
+    logging.getLogger("orgforge.agent_factory")
     params = {**AGENT_DEFAULTS, "llm": llm}
     params.update(kwargs)
     return Agent(role=role, goal=goal, backstory=backstory, verbose=True, **params)
