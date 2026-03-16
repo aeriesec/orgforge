@@ -88,6 +88,16 @@ with open(Path(__file__).resolve().parent.parent / "config" / "config.yaml") as 
 
 _SIM_CFG = _CFG.get("simulation", {})
 _ORG_CFG = _CFG.get("org", {})
+_ORG_CHART = (
+    _ORG_CFG.get("org_chart")
+    or _CFG.get("org_chart")
+    or {}
+)
+_ACTOR_TO_DEPT: Dict[str, str] = {}
+for _dept, _members in _ORG_CHART.items():
+    if isinstance(_members, list):
+        for _name in _members:
+            _ACTOR_TO_DEPT[str(_name).strip()] = _dept
 
 BASE = Path(_SIM_CFG.get("output_dir", "./export"))
 EVAL_DIR = BASE / "eval"
@@ -143,6 +153,21 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _dept_from_artifact_id(artifact_id: str) -> str:
+    """Derive department from artifact ID prefix e.g. CONF-ENG-019 -> Engineering."""
+    parts = artifact_id.split("-")
+    if len(parts) < 2:
+        return ""
+    code = parts[1].upper()
+    return {
+        "ENG":   "Engineering",
+        "PRD":   "Product",
+        "MKT":   "Sales_Marketing",
+        "QA":    "QA_Support",
+        "RETRO": "",
+    }.get(code, "")
+
+
 class CorpusBuilder:
     """
     Reads the MongoDB-persisted artifacts (via Memory) and the SimEvent log,
@@ -169,106 +194,156 @@ class CorpusBuilder:
     def build(self) -> List[dict]:
         rows: List[dict] = []
 
-        # 1. One row per SimEvent (always available)
+        # 1. One or more rows per SimEvent (always available)
+        # Events with both jira + confluence keys emit a row for each artifact
         for evt in self._events:
-            row = self._sim_event_to_row(evt)
-            if row:
-                rows.append(row)
+            evt_rows = self._sim_event_to_row(evt)
+            if evt_rows:
+                rows.extend(evt_rows)
 
         # 2. Supplement with richer artifact bodies from MongoDB if available
         if self._mem is not None:
             rows = self._enrich_from_mongo(rows)
             rows.extend(self._plans_to_corpus_rows())
 
+        # Deduplicate: keep the row with the longest body for each doc_id
+        seen: Dict[str, dict] = {}
+        for row in rows:
+            did = row["doc_id"]
+            if did not in seen or len(row.get("body", "")) > len(seen[did].get("body", "")):
+                seen[did] = row
+        rows = list(seen.values())
+
         logger.info(f"  corpus: {len(rows)} documents")
         return rows
 
     # ── PRIVATE ───────────────────────────────────────────────────────────────
 
-    def _sim_event_to_row(self, evt: dict) -> Optional[dict]:
-        """Convert a raw SimEvent dict to a corpus row."""
+    def _sim_event_to_row(self, evt: dict) -> List[dict]:
+        """
+        Convert a SimEvent to one or more corpus rows.
+        Events that reference multiple artifact types (e.g. both jira and
+        confluence) emit one row per artifact so no artifact is silently dropped.
+        """
         event_type = evt.get("type", "")
         artifact_ids = evt.get("artifact_ids", {})
         facts = evt.get("facts", {})
 
-        # Determine primary doc_id and doc_type
-        if "jira" in artifact_ids:
-            doc_id = artifact_ids["jira"]
-            doc_type = "jira"
-            title = facts.get("title", facts.get("root_cause", doc_id))
-            body = self._jira_body(facts)
-        elif "confluence" in artifact_ids or any(
-            str(v).startswith("CONF-")
-            for v in artifact_ids.values()
-            if not isinstance(v, list)
-        ):
-            conf_key = artifact_ids.get("confluence") or next(
-                (v for v in artifact_ids.values() if str(v).startswith("CONF-")), None
-            )
-            doc_id = conf_key or "CONF-UNKNOWN"
-            doc_type = "confluence"
-            title = facts.get("title", doc_id)
-            body = facts.get("content", facts.get("summary", ""))
-        elif "email" in artifact_ids or event_type in (
-            "inbound_external_email",
-            "hr_outbound_email",
-            "customer_email_routed",
-            "vendor_email_routed",
-            "email_dropped",
-        ):
-            doc_id = artifact_ids.get("email", f"EMAIL-{evt.get('day', 0)}-{id(evt)}")
-            doc_type = "email"
-            title = facts.get("subject", facts.get("summary", doc_id))
-            body = self._email_body(facts, evt)
-        elif "slack_thread" in artifact_ids:
-            doc_id = artifact_ids["slack_thread"]
-            doc_type = "slack"
-            title = (
-                facts.get("channel", "#general") + ": " + facts.get("summary", "")[:80]
-            )
-            body = facts.get("content", facts.get("summary", ""))
-        elif "pr" in artifact_ids:
-            doc_id = artifact_ids["pr"]
-            doc_type = "pr"
-            title = facts.get("title", doc_id)
-            body = facts.get("description", facts.get("summary", ""))
-        else:
-            # Fallback: use the SimEvent itself as a lightweight document
-            doc_id = f"EVENT-{evt.get('day', 0)}-{event_type}"
-            doc_type = "sim_event"
-            title = event_type.replace("_", " ").title()
-            body = evt.get("summary", "")
+        # Shared fields derived once per event
+        evt_actors = evt.get("actors", [])
+        dept_val = str(facts.get("dept", "")).strip()
+        if not dept_val and evt_actors:
+            for _actor in evt_actors:
+                _d = _ACTOR_TO_DEPT.get(str(_actor).strip(), "")
+                if _d:
+                    dept_val = _d
+                    break
 
-        if not body:
-            body = evt.get("summary", "")
+        is_incident = event_type in (
+            "incident_opened", "incident_resolved",
+            "escalation_chain", "postmortem_created",
+        )
+        is_external = event_type in (
+            "inbound_external_email", "customer_email_routed",
+            "vendor_email_routed", "email_dropped",
+        )
 
-        return {
-            "doc_id": doc_id,
-            "doc_type": doc_type,
-            "title": str(title)[:512],
-            "body": str(body),
-            "day": int(evt.get("day", 0)),
-            "date": str(evt.get("date", "")),
-            "timestamp": str(evt.get("timestamp", "")),
-            "actors": json.dumps(evt.get("actors", [])),
-            "tags": json.dumps(evt.get("tags", [])),
+        shared = {
+            "day":          int(evt.get("day", 0)),
+            "date":         str(evt.get("date", "")),
+            "timestamp":    str(evt.get("timestamp", "")),
+            "actors":       json.dumps(evt_actors),
+            "tags":         json.dumps(evt.get("tags", [])),
             "artifact_ids": json.dumps(artifact_ids),
-            "dept": str(facts.get("dept", "")),
-            "is_incident": event_type
-            in (
-                "incident_opened",
-                "incident_resolved",
-                "escalation_chain",
-                "postmortem_created",
-            ),
-            "is_external": event_type
-            in (
-                "inbound_external_email",
-                "customer_email_routed",
-                "vendor_email_routed",
-                "email_dropped",
-            ),
+            "dept":         dept_val,
+            "is_incident":  is_incident,
+            "is_external":  is_external,
         }
+
+        rows: List[dict] = []
+
+        # ── JIRA ──────────────────────────────────────────────────────────────
+        jira_id = artifact_ids.get("jira", "")
+        if jira_id:
+            rows.append({
+                **shared,
+                "doc_id":   jira_id,
+                "doc_type": "jira",
+                "title":    str(facts.get("title", facts.get("root_cause", jira_id)))[:512],
+                "body":     self._jira_body(facts),
+            })
+
+        # ── CONFLUENCE ────────────────────────────────────────────────────────
+        conf_id = artifact_ids.get("confluence", "") or next(
+            (v for v in artifact_ids.values()
+             if isinstance(v, str) and str(v).startswith("CONF-")), ""
+        )
+        if conf_id:
+            body = facts.get("content", facts.get("summary", "")) or evt.get("summary", "")
+            rows.append({
+                **shared,
+                "doc_id":   conf_id,
+                "doc_type": "confluence",
+                "title":    str(facts.get("title", conf_id))[:512],
+                "body":     body,
+                "dept":     dept_val or _dept_from_artifact_id(conf_id),
+            })
+
+        # ── EMAIL ─────────────────────────────────────────────────────────────
+        email_id = artifact_ids.get("email", "")
+        if email_id or event_type in (
+            "inbound_external_email", "hr_outbound_email",
+            "customer_email_routed", "vendor_email_routed", "email_dropped",
+        ):
+            rows.append({
+                **shared,
+                "doc_id":   email_id or f"EMAIL-{evt.get('day', 0)}-{id(evt)}",
+                "doc_type": "email",
+                "title":    str(facts.get("subject", facts.get("summary", email_id)))[:512],
+                "body":     self._email_body(facts, evt),
+            })
+
+        # ── SLACK ─────────────────────────────────────────────────────────────
+        # Only use slack_thread as the canonical ID — slack and slack_path
+        # are file paths or message fragments, not retrievable thread documents
+        slack_id = artifact_ids.get("slack_thread", "")
+        if slack_id:
+            channel = facts.get("channel", "#general")
+            rows.append({
+                **shared,
+                "doc_id":   slack_id,
+                "doc_type": "slack",
+                "title":    str(channel + ": " + facts.get("summary", "")[:80])[:512],
+                "body":     facts.get("content", facts.get("summary", "")),
+            })
+
+        # ── PR ────────────────────────────────────────────────────────────────
+        pr_id = artifact_ids.get("pr", "")
+        if pr_id:
+            rows.append({
+                **shared,
+                "doc_id":   pr_id,
+                "doc_type": "pr",
+                "title":    str(facts.get("title", pr_id))[:512],
+                "body":     facts.get("description", facts.get("summary", "")),
+            })
+
+        # ── FALLBACK ──────────────────────────────────────────────────────────
+        if not rows:
+            rows.append({
+                **shared,
+                "doc_id":   f"EVENT-{evt.get('day', 0)}-{event_type}",
+                "doc_type": "sim_event",
+                "title":    event_type.replace("_", " ").title(),
+                "body":     evt.get("summary", ""),
+            })
+
+        # Ensure every row has a non-empty body
+        for row in rows:
+            if not row.get("body"):
+                row["body"] = evt.get("summary", "")
+
+        return rows
 
     def _jira_body(self, facts: dict) -> str:
         parts = []
@@ -375,13 +450,35 @@ class CorpusBuilder:
             rich_map: Dict[str, str] = {}
 
             # Confluence pages
+            # Also build a snippet index so CONF-UNKNOWN rows can be
+            # re-identified by matching their thin body against MongoDB content.
+            conf_id_map: Dict[str, str] = {}   # content_snippet_or_title -> page_id
             for page in self._mem._db["confluence_pages"].find(
-                {}, {"_id": 0, "id": 1, "content": 1}
+                {}, {"_id": 0, "id": 1, "content": 1, "title": 1}
             ):
                 if page.get("id") and page.get("content"):
                     rich_map[page["id"]] = page["content"]
+                    snippet = page["content"][:120].strip()
+                    if snippet:
+                        conf_id_map[snippet] = page["id"]
+                    title_key = page.get("title", "").strip()
+                    if title_key:
+                        conf_id_map[title_key] = page["id"]
 
-            # JIRA tickets
+            # JIRA tickets + jira_comment artifacts folded into parent body
+            comment_map: Dict[str, List[str]] = defaultdict(list)
+            for comment in self._mem._db["artifacts"].find(
+                {"type": "jira_comment"},
+                {"_id": 0, "parent_id": 1, "body": 1, "author": 1}
+            ):
+                parent = comment.get("parent_id", "")
+                cbody = comment.get("body", "")
+                cauthor = comment.get("author", "")
+                if parent and cbody:
+                    comment_map[parent].append(
+                        f"comment ({cauthor}): {cbody}" if cauthor else f"comment: {cbody}"
+                    )
+
             for ticket in self._mem._db["jira_tickets"].find(
                 {},
                 {
@@ -403,11 +500,104 @@ class CorpusBuilder:
                 ]
                 for c in ticket.get("comments") or []:
                     parts.append(str(c.get("body", "")))
+                for c in comment_map.get(tid, []):
+                    parts.append(c)
                 rich_map[tid] = "\n".join(p for p in parts if p)
 
             for row in rows:
-                if row["doc_id"] in rich_map:
+                if row["doc_id"] == "CONF-UNKNOWN" and row["doc_type"] == "confluence":
+                    # Try to resolve the real ID via body snippet or title match
+                    body_snippet = (row.get("body") or "")[:120].strip()
+                    title_key = (row.get("title") or "").strip()
+                    resolved_id = (
+                        conf_id_map.get(body_snippet)
+                        or conf_id_map.get(title_key)
+                    )
+                    if resolved_id:
+                        row["doc_id"] = resolved_id
+                        row["title"] = resolved_id  # was also CONF-UNKNOWN
+                        row["body"] = rich_map[resolved_id]
+                        if not row.get("dept"):
+                            row["dept"] = _dept_from_artifact_id(resolved_id)
+                    else:
+                        # No real Confluence page exists — upstream emitted a
+                        # confluence key with an empty value on a Slack-style
+                        # social interaction. Reclassify correctly.
+                        row["doc_type"] = "slack"
+                        row["doc_id"] = (
+                            f"SLACK-SOCIAL-{row.get('day', 0)}-"
+                            f"{abs(hash(body_snippet)) % 10000:04d}"
+                        )
+                        row["title"] = (row.get("body") or "")[:80].strip()
+                        logger.debug(
+                            f"Reclassified CONF-UNKNOWN social event as slack: "
+                            f"{row['doc_id']}"
+                        )
+                elif row["doc_id"] in rich_map:
                     row["body"] = rich_map[row["doc_id"]]
+                    if row["doc_type"] == "confluence" and not row.get("dept"):
+                        row["dept"] = _dept_from_artifact_id(row["doc_id"])
+            # ── Orphan sweep ──────────────────────────────────────────────
+            # Create corpus rows for any artifacts in MongoDB not yet in corpus.
+            # Covers all retrievable types; excludes jira_comment (folded above)
+            # and persona_skill (not a corpus artifact).
+            # slack_thread = full thread document (correct corpus unit)
+            # slack = individual message fragments — excluded, same as jira_comment
+            # slack_messages collection also excluded for same reason
+            _TYPE_MAP = {
+                "confluence":   "confluence",
+                "slack_thread": "slack",
+                "email":        "email",
+                "pr":           "pr",
+                "jira":         "jira",
+            }
+            existing_ids = {row["doc_id"] for row in rows}
+            for artifact in self._mem._db["artifacts"].find(
+                {"type": {"$in": list(_TYPE_MAP.keys())}},
+                {"_id": 1, "type": 1, "content": 1, "body": 1, "title": 1,
+                 "subject": 1, "day": 1, "date": 1, "timestamp": 1,
+                 "metadata": 1, "author": 1, "actors": 1}
+            ):
+                art_id = str(artifact.get("_id", ""))
+                art_type = artifact.get("type", "")
+                doc_type = _TYPE_MAP.get(art_type, "sim_event")
+                if not art_id or art_id in existing_ids:
+                    continue
+                meta = artifact.get("metadata", {})
+                author = artifact.get("author") or meta.get("author", "")
+                actors = artifact.get("actors") or ([author] if author else [])
+                tags = meta.get("tags", [art_type])
+                body = (
+                    artifact.get("content")
+                    or artifact.get("body")
+                    or artifact.get("subject")
+                    or ""
+                )
+                title = artifact.get("title") or artifact.get("subject") or art_id
+                dept = (
+                    _dept_from_artifact_id(art_id)
+                    or next(
+                        (_ACTOR_TO_DEPT.get(str(a), "") for a in actors
+                         if _ACTOR_TO_DEPT.get(str(a))), ""
+                    )
+                )
+                rows.append({
+                    "doc_id":       art_id,
+                    "doc_type":     doc_type,
+                    "title":        str(title)[:512],
+                    "body":         str(body),
+                    "day":          int(artifact.get("day", 0)),
+                    "date":         str(artifact.get("date", "")),
+                    "timestamp":    str(artifact.get("timestamp", "")),
+                    "actors":       json.dumps(actors),
+                    "tags":         json.dumps(tags),
+                    "artifact_ids": json.dumps({art_type: art_id}),
+                    "dept":         dept,
+                    "is_incident":  any(t in tags for t in ("postmortem", "incident")),
+                    "is_external":  art_type == "email",
+                })
+                logger.debug(f"  orphan artifact added: {art_id} ({doc_type})")
+
         except Exception as exc:
             logger.debug(f"MongoDB enrichment skipped: {exc}")
         return rows
