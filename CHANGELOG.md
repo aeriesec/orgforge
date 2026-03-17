@@ -6,6 +6,29 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.0.2] — 2026-03-16
+
+### Changed
+
+- **Multi-Artifact Corpus Rows (`eval/export_to_hf.py`)**: `_sim_event_to_row` now returns a list of rows instead of a single row, emitting one corpus entry per artifact type (JIRA, Confluence, email, Slack, PR) when an event references multiple artifact IDs. Previously, only the first matched artifact type was captured per event, silently dropping the rest.
+- **Corpus Deduplication by Body Length (`eval/export_to_hf.py`)**: After row generation, duplicates sharing a `doc_id` are collapsed by keeping the row with the longest body, ensuring the richest available content wins.
+- **Evidence Overlap Metric: Jaccard → Recall (`eval/scorer.py`)**: `_evidence_overlap` now computes recall (`hits / |ground_truth chain|`) instead of Jaccard similarity. Jaccard structurally capped scores for short evidence chains retrieved in a fixed top-K window, causing accuracy to read as 0 regardless of answer quality.
+- **Actor-to-Department Inference (`eval/export_to_hf.py`)**: Corpus rows now populate `dept` by walking the event's actor list against an `_ACTOR_TO_DEPT` map built from `org_chart` config, falling back to `_dept_from_artifact_id` for Confluence IDs. Previously `dept` was sourced exclusively from `facts.dept` and was frequently blank.
+- **CONF-UNKNOWN Resolution & Reclassification (`eval/export_to_hf.py`)**: During MongoDB enrichment, rows with `doc_id=CONF-UNKNOWN` are now resolved to real Confluence page IDs by matching body snippet or title against the `confluence_pages` collection. Rows that cannot be matched (social-interaction events mistakenly emitted a Confluence key) are reclassified as `slack` with a stable `SLACK-SOCIAL-*` ID.
+- **JIRA Comments Folded into Parent Body (`eval/export_to_hf.py`)**: `jira_comment` artifacts are now fetched from MongoDB and appended to their parent JIRA ticket body during enrichment, consolidating discussion context into a single corpus document.
+- **`POSTMORTEM` Question Routing (`eval/scorer.py`)**: Questions with a `question_id` prefixed `postmortem_` are re-routed to `PostmortemScorer` at dispatch time, overriding a stored `question_type=CAUSAL` label. `CausalScorer` also gains a fallback to `postmortem_confluence_id` when `artifact_id` is absent in the ground truth.
+- **`results/` Added to Ignore Files (`.gitignore`, `.dockerignore`)**: The `results/` directory is now excluded from both version control and Docker build context.
+- **Citation Block Added (`README.md`)**: A BibTeX citation entry for the accompanying arXiv preprint has been added to the README.
+
+### Added
+
+- **`PostmortemScorer` (`eval/scorer.py`)**: New scorer for `POSTMORTEM` question type. Awards full primary credit when the agent's `artifact_id` matches `postmortem_confluence_id` in ground truth; partial credit via evidence-chain recall.
+- **`POSTMORTEM`, `STANDUP`, `CUSTOMER_ESC` Scorer Registrations (`eval/scorer.py`)**: Three question types documented in the README but absent from `_SCORERS` are now registered. `POSTMORTEM` routes to `PostmortemScorer`, `STANDUP` to `RetrievalScorer`, and `CUSTOMER_ESC` to `CausalScorer`.
+- **Orphan Artifact Sweep (`eval/export_to_hf.py`)**: A new end-of-enrichment pass queries MongoDB `artifacts` for any Confluence, Slack thread, email, PR, or JIRA documents not yet present in the corpus and appends them, preventing artifacts that were never referenced by a `SimEvent` from being omitted entirely.
+- **`_dept_from_artifact_id` Helper (`eval/export_to_hf.py`)**: New utility that derives a department name from a Confluence artifact ID prefix (e.g. `CONF-ENG-019 → Engineering`).
+
+---
+
 ## [v1.0.1] — 2026-03-15
 
 ### Added

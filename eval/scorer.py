@@ -160,16 +160,21 @@ class _BaseScorer:
         ground_truth_chain: List[str],
         agent_retrieved: List[str],
     ) -> float:
-        """Jaccard overlap between ground-truth evidence chain and agent-retrieved IDs."""
+        """Recall of ground-truth evidence chain in agent-retrieved IDs.
+
+        Using recall (hits / |chain|) rather than Jaccard because retrievers
+        always return top-K docs — penalising for retrieving non-chain documents
+        structurally caps scores below 0.9 for short evidence chains, making
+        accuracy always 0 regardless of answer quality.
+        """
         if not ground_truth_chain:
-            return 1.0  # no evidence required → full credit by default
+            return 1.0
         gt_set = set(ground_truth_chain)
         agent_set = set(agent_retrieved or [])
         if not agent_set:
             return 0.0
-        intersection = gt_set & agent_set
-        union = gt_set | agent_set
-        return len(intersection) / len(union)
+        hits = len(gt_set & agent_set)
+        return hits / len(gt_set)
 
     def _timestamp_proximity(
         self,
@@ -241,7 +246,12 @@ class CausalScorer(_BaseScorer):
         self, question: dict, agent_answer: dict
     ) -> Tuple[float, float, Optional[str]]:
         gt = question["ground_truth"]
-        gt_id = gt.get("artifact_id", "")
+        # POSTMORTEM questions are typed CAUSAL but use postmortem_confluence_id
+        gt_id = (
+            gt.get("artifact_id")
+            or gt.get("postmortem_confluence_id")
+            or ""
+        )
         gt_etype = gt.get("event_type", "")
         agent_id = agent_answer.get("artifact_id", "")
         agent_et = agent_answer.get("event_type", "")
@@ -498,6 +508,35 @@ class EscalationScorer(_BaseScorer):
         return primary, evidence, failure
 
 
+class PostmortemScorer(_BaseScorer):
+    """
+    POSTMORTEM — "Which Confluence doc contains the postmortem for incident X?"
+
+    Ground truth uses postmortem_confluence_id (not artifact_id).
+    Full credit: artifact_id matches postmortem_confluence_id.
+    Partial credit: evidence_chain overlap (incident + confluence doc present).
+    """
+
+    def score(
+        self, question: dict, agent_answer: dict
+    ) -> Tuple[float, float, Optional[str]]:
+        gt = question["ground_truth"]
+        gt_id = gt.get("postmortem_confluence_id", "")
+        agent_id = agent_answer.get("artifact_id", "")
+
+        primary = 1.0 if agent_id == gt_id else 0.0
+        failure = (
+            None if primary == 1.0
+            else f"Expected postmortem_confluence_id={gt_id!r}, got {agent_id!r}"
+        )
+
+        evidence = self._evidence_overlap(
+            question.get("evidence_chain", []),
+            agent_answer.get("retrieved_artifact_ids", []),
+        )
+        return primary, evidence, failure
+
+
 class KnowledgeGapScorer(_BaseScorer):
     """
     KNOWLEDGE_GAP — "Which domain was undocumented during incident X?"
@@ -541,19 +580,55 @@ class KnowledgeGapScorer(_BaseScorer):
         return primary, evidence, failure
 
 
+class PostmortemScorer(_BaseScorer):
+    """
+    POSTMORTEM — "Which Confluence doc contains the postmortem for incident X?"
+
+    Ground truth key is postmortem_confluence_id, not artifact_id.
+    Full credit: agent artifact_id matches postmortem_confluence_id.
+    Partial credit: evidence_chain overlap when artifact_id is wrong.
+    """
+
+    def score(
+        self, question: dict, agent_answer: dict
+    ) -> Tuple[float, float, Optional[str]]:
+        gt = question["ground_truth"]
+        gt_id = gt.get("postmortem_confluence_id", "") or gt.get("artifact_id", "")
+        agent_id = agent_answer.get("artifact_id", "")
+
+        primary = 1.0 if agent_id == gt_id else 0.0
+        failure = (
+            None
+            if primary == 1.0
+            else f"Expected postmortem_confluence_id={gt_id!r}, got {agent_id!r}"
+        )
+
+        evidence = self._evidence_overlap(
+            question.get("evidence_chain", []),
+            agent_answer.get("retrieved_artifact_ids", []),
+        )
+        return primary, evidence, failure
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DISPATCHER
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCORERS: Dict[str, _BaseScorer] = {
-    "RETRIEVAL": RetrievalScorer(),
-    "CAUSAL": CausalScorer(),
-    "TEMPORAL": TemporalScorer(),
+    "RETRIEVAL":     RetrievalScorer(),
+    "CAUSAL":        CausalScorer(),
+    "TEMPORAL":      TemporalScorer(),
     "GAP_DETECTION": GapDetectionScorer(),
-    "ROUTING": RoutingScorer(),
-    "PLAN": PlanScorer(),
-    "ESCALATION": EscalationScorer(),
+    "ROUTING":       RoutingScorer(),
+    "PLAN":          PlanScorer(),
+    "ESCALATION":    EscalationScorer(),
     "KNOWLEDGE_GAP": KnowledgeGapScorer(),
+    # These types were defined in the README but missing from the registry.
+    # POSTMORTEM and STANDUP are single-artifact lookups — RetrievalScorer is correct.
+    # CUSTOMER_ESC involves a causal chain — CausalScorer is the closest match.
+    "POSTMORTEM":    PostmortemScorer(),
+    "STANDUP":       RetrievalScorer(),
+    "CUSTOMER_ESC":  CausalScorer(),
 }
 
 
@@ -567,6 +642,14 @@ class OrgForgeScorer:
 
     def score(self, question: dict, agent_answer: dict) -> ScorerResult:
         qtype = question.get("question_type", "UNKNOWN")
+        qid   = question.get("question_id", "")
+
+        # POSTMORTEM questions are stored with question_type=CAUSAL but use a
+        # different ground_truth schema (postmortem_confluence_id, not artifact_id).
+        # Route by question_id prefix so they get the right scorer.
+        if qid.startswith("postmortem_"):
+            qtype = "POSTMORTEM"
+
         scorer_impl = _SCORERS.get(qtype)
 
         if scorer_impl is None:
