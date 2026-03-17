@@ -348,6 +348,20 @@ orgforge/
 
 ---
 
+You can update your main **README.md** by adding a dedicated **Evaluation** section. This helps users understand that OrgForge isn't just for data generation, but also for rigorous RAG benchmarking.
+
+### 🧪 Evaluation & Benchmarking
+
+OrgForge includes a full-stack evaluation harness to measure how well AI agents retrieve and reason over the generated corporate data.
+
+- **Deterministic Ground Truth**: All answers are derived from the simulation’s state machine, not LLM hallucinations.
+- **Multi-Hop Reasoning**: Test agents on causal, temporal, and gap-detection questions.
+- **End-to-End Testing**: Use `eval_e2e.py` to run full RAG pipelines against providers like AWS Bedrock, OpenAI, and Cohere.
+
+For detailed instructions on generating eval sets, running benchmarks, and interpreting scores, see **[EVAL.md](EVAL.md)**.
+
+---
+
 ## Roadmap
 
 - [ ] Plugin architecture for community artifact types (Zoom, Zendesk, PagerDuty, Salesforce)
