@@ -374,6 +374,21 @@ Contributions are welcome. Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** be
 
 ---
 
+## Citation
+
+If you use this work, please cite:
+
+```bibtex
+@article{Flynt2026,
+  author = {Jeffrey Flynt},
+  title  = {OrgForge: A Multi-Agent Simulation Framework for Verifiable Synthetic Corporate Corpora},
+  year   = {2026},
+  url    = {https://arxiv.org/abs/2603.14997}
+}
+```
+
+---
+
 ## License
 
 MIT — see **[LICENSE](LICENSE)**.

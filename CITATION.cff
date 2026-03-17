@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Jeffrey Flynt"
+    given-names: "Jeffrey Flynt"
+title: "OrgForge: A Multi-Agent Simulation Framework for Verifiable Synthetic Corporate Corpora"
+version: 1.0.0
+date-released: 2026-03-26
+url: "https://github.com/aeriesec/orgforge"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Jeffrey Flynt"
+      given-names: "Jeffrey Flynt"
+  title: "OrgForge: A Multi-Agent Simulation Framework for Verifiable Synthetic Corporate Corpora"
+  journal: "arXiv preprint"
+  year: 2026
+  url: "https://arxiv.org/abs/2603.14997"

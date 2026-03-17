@@ -2,6 +2,7 @@
 export/
 simulation.log
 simulation_snapshot.json
+results/
 
 # ── Environments & Secrets ──
 .env
