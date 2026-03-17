@@ -348,8 +348,6 @@ orgforge/
 
 ---
 
-You can update your main **README.md** by adding a dedicated **Evaluation** section. This helps users understand that OrgForge isn't just for data generation, but also for rigorous RAG benchmarking.
-
 ### 🧪 Evaluation & Benchmarking
 
 OrgForge includes a full-stack evaluation harness to measure how well AI agents retrieve and reason over the generated corporate data.
