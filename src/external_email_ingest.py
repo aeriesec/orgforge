@@ -56,6 +56,7 @@ from causal_chain_handler import CausalChainHandler
 from config_loader import COMPANY_DESCRIPTION
 from crewai import Crew, Task
 from memory import Memory, SimEvent
+from insider_threat import _NullInjector
 
 logger = logging.getLogger("orgforge.external_email")
 
@@ -150,7 +151,8 @@ class ExternalEmailIngestor:
         org_chart: Dict[str, List[str]],
         personas: Dict[str, dict],
         registry,  # ArtifactRegistry
-        clock,  # SimClock
+        clock,
+        threat_injector=None,
     ):
         self._config = config
         self._mem = mem
@@ -171,6 +173,7 @@ class ExternalEmailIngestor:
             "company_description", f"a {self._industry} company"
         )
         self._sources: Optional[List[dict]] = None
+        self._threat = threat_injector or _NullInjector()
 
         # Index scheduled hires by day for O(1) lookup
         self._scheduled_hires: Dict[int, List[dict]] = {}
@@ -756,6 +759,26 @@ class ExternalEmailIngestor:
             direction="outbound",
         )
 
+        _exfil_path = self._threat.inject_email(
+            eml_path=str(eml_path),
+            sender=hr_lead,
+            recipients=[f"{name.lower()}@personal.email"],
+            subject_line=subject,
+            day=state.day,
+            current_date=state.current_date,
+        )
+        if _exfil_path:
+            self._mem.embed_artifact(
+                id=f"exfil_{state.day}_{hr_lead}_hr",
+                type="email",
+                title=f"Outbound email: {hr_lead} (day {state.day})",
+                content=open(_exfil_path).read(),
+                day=state.day,
+                date=date_str,
+                timestamp=hr_time.isoformat(),
+                metadata={"sender": hr_lead, "exfil": True},
+            )
+
         self._mem.embed_artifact(
             id=embed_id,
             type="email",
@@ -876,6 +899,26 @@ class ExternalEmailIngestor:
             direction="outbound",
         )
 
+        _exfil_path = self._threat.inject_email(
+            eml_path=str(eml_path),
+            sender=sales_lead,
+            recipients=[signal.source_email],
+            subject_line=subject,
+            day=state.day,
+            current_date=state.current_date,
+        )
+        if _exfil_path:
+            self._mem.embed_artifact(
+                id=f"exfil_{state.day}_{sales_lead}",
+                type="email",
+                title=f"Outbound email: {sales_lead} (day {state.day})",
+                content=open(_exfil_path).read(),
+                day=state.day,
+                date=date_str,
+                timestamp=reply_time.isoformat(),
+                metadata={"sender": sales_lead, "exfil": True},
+            )
+
         self._mem.embed_artifact(
             id=embed_id,
             type="email",
@@ -992,6 +1035,26 @@ class ExternalEmailIngestor:
             timestamp_iso=ack_time.isoformat(),
             direction="outbound",
         )
+
+        _exfil_path = self._threat.inject_email(
+            eml_path=str(eml_path),
+            sender=recipient,
+            recipients=[signal.source_email],
+            subject_line=subject,
+            day=state.day,
+            current_date=state.current_date,
+        )
+        if _exfil_path:
+            self._mem.embed_artifact(
+                id=f"exfil_{state.day}_{recipient}",
+                type="email",
+                title=f"Outbound email: {recipient} (day {state.day})",
+                content=open(_exfil_path).read(),
+                day=state.day,
+                date=date_str,
+                timestamp=ack_time.isoformat(),
+                metadata={"sender": recipient, "exfil": True},
+            )
 
         self._mem.embed_artifact(
             id=embed_id,

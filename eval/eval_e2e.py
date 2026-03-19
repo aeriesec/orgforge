@@ -64,7 +64,7 @@ logger = logging.getLogger("orgforge.eval_e2e")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-HF_DATASET_ID = "jflynt/orgforge-rag-benchmark"   # update to your HF repo
+HF_DATASET_ID = "jflynt/orgforge-rag-benchmark"  # update to your HF repo
 TOP_K = 10
 RESULTS_DIR = Path("results")
 LEADERBOARD_PATH = Path("leaderboard.json")
@@ -90,15 +90,19 @@ def _load_hf() -> Tuple[List[dict], List[dict]]:
     try:
         from datasets import load_dataset as hf_load
     except ImportError:
-        raise SystemExit(
-            "pip install datasets  (or pass --local path/to/hf_dataset)"
-        )
+        raise SystemExit("pip install datasets  (or pass --local path/to/hf_dataset)")
     logger.info(f"Loading corpus from HuggingFace: {HF_DATASET_ID}")
-    corpus_ds = hf_load(HF_DATASET_ID, data_files="corpus/corpus-00000.parquet", split="train")
-    questions_ds = hf_load(HF_DATASET_ID, data_files="questions/questions-00000.parquet", split="train")
+    corpus_ds = hf_load(
+        HF_DATASET_ID, data_files="corpus/corpus-00000.parquet", split="train"
+    )
+    questions_ds = hf_load(
+        HF_DATASET_ID, data_files="questions/questions-00000.parquet", split="train"
+    )
     corpus = [dict(r) for r in corpus_ds]
     questions = [dict(r) for r in questions_ds]
-    logger.info(f"  {len(corpus)} corpus docs, {len(questions)} questions loaded from HF")
+    logger.info(
+        f"  {len(corpus)} corpus docs, {len(questions)} questions loaded from HF"
+    )
     return corpus, questions
 
 
@@ -118,7 +122,9 @@ def _load_local(base: Path) -> Tuple[List[dict], List[dict]]:
 
     corpus = pd.read_parquet(corpus_path).to_dict("records")
     questions = pd.read_parquet(questions_path).to_dict("records")
-    logger.info(f"  {len(corpus)} corpus docs, {len(questions)} questions loaded from {base}")
+    logger.info(
+        f"  {len(corpus)} corpus docs, {len(questions)} questions loaded from {base}"
+    )
     return corpus, questions
 
 
@@ -145,6 +151,7 @@ class BM25Retriever(Retriever):
 
     def index(self, corpus: List[dict]) -> None:
         from rank_bm25 import BM25Okapi
+
         self._doc_ids = [r["doc_id"] for r in corpus]
         tokenised = [self._tokenize(r.get("body", "")) for r in corpus]
         self._bm25 = BM25Okapi(tokenised)
@@ -188,7 +195,7 @@ class CohereRetriever(Retriever):
         logger.info(f"  Embedding {len(bodies)} docs with {self._model} ...")
         embeddings = []
         for i in range(0, len(bodies), self._batch_size):
-            batch = bodies[i: i + self._batch_size]
+            batch = bodies[i : i + self._batch_size]
             resp = self._co.embed(
                 texts=batch,
                 model=self._model,
@@ -196,7 +203,9 @@ class CohereRetriever(Retriever):
                 embedding_types=["float"],
             )
             embeddings.extend(resp.embeddings.float_)
-            logger.info(f"    embedded {min(i + self._batch_size, len(bodies))}/{len(bodies)}")
+            logger.info(
+                f"    embedded {min(i + self._batch_size, len(bodies))}/{len(bodies)}"
+            )
 
         mat = np.array(embeddings, dtype=np.float32)
         # Normalise for cosine similarity via dot product
@@ -247,10 +256,12 @@ class OpenAIRetriever(Retriever):
         logger.info(f"  Embedding {len(bodies)} docs with {self._model} ...")
         embeddings = []
         for i in range(0, len(bodies), self._batch_size):
-            batch = bodies[i: i + self._batch_size]
+            batch = bodies[i : i + self._batch_size]
             resp = self._client.embeddings.create(model=self._model, input=batch)
             embeddings.extend([e.embedding for e in resp.data])
-            logger.info(f"    embedded {min(i + self._batch_size, len(bodies))}/{len(bodies)}")
+            logger.info(
+                f"    embedded {min(i + self._batch_size, len(bodies))}/{len(bodies)}"
+            )
 
         mat = np.array(embeddings, dtype=np.float32)
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
@@ -289,6 +300,7 @@ class BedrockCohereRetriever(Retriever):
         batch_size: int = 96,
     ):
         import boto3
+
         self._model = model
         self._batch_size = batch_size
         self._client = boto3.client("bedrock-runtime", region_name=region)
@@ -300,12 +312,14 @@ class BedrockCohereRetriever(Retriever):
 
         all_embeddings = []
         for i in range(0, len(texts), self._batch_size):
-            batch = texts[i: i + self._batch_size]
-            body = json.dumps({
-                "texts": batch,
-                "input_type": input_type,   # "search_document" or "search_query"
-                "embedding_types": ["float"],
-            })
+            batch = texts[i : i + self._batch_size]
+            body = json.dumps(
+                {
+                    "texts": batch,
+                    "input_type": input_type,  # "search_document" or "search_query"
+                    "embedding_types": ["float"],
+                }
+            )
             resp = self._client.invoke_model(
                 modelId=self._model,
                 body=body,
@@ -463,6 +477,7 @@ class Generator:
 
 class NullGenerator(Generator):
     """Used for retrieval-only runs (--generator none)."""
+
     name = "none"
 
     def generate(self, question: str, question_type: str, context: str) -> dict:
@@ -470,9 +485,9 @@ class NullGenerator(Generator):
 
 
 class ClaudeGenerator(Generator):
-
     def __init__(self, model: str = "claude-sonnet-4-20250514", max_tokens: int = 512):
         import anthropic
+
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise SystemExit("Set ANTHROPIC_API_KEY to use Claude generator")
@@ -497,9 +512,9 @@ class ClaudeGenerator(Generator):
 
 
 class OpenAIGenerator(Generator):
-
     def __init__(self, model: str = "gpt-4o", max_tokens: int = 512):
         from openai import OpenAI
+
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise SystemExit("Set OPENAI_API_KEY to use OpenAI generator")
@@ -527,9 +542,9 @@ class OpenAIGenerator(Generator):
 
 
 class CohereGenerator(Generator):
-
     def __init__(self, model: str = "command-r-plus", max_tokens: int = 512):
         import cohere
+
         api_key = os.environ.get("COHERE_API_KEY")
         if not api_key:
             raise SystemExit("Set COHERE_API_KEY to use Cohere generator")
@@ -582,9 +597,9 @@ class BedrockGenerator(Generator):
         model: str = "anthropic.claude-3-5-sonnet-20241022-v2:0",
         region: str = "us-east-1",
         max_tokens: int = 512,
-        call_delay: float = 1.0,       # seconds to sleep between every call
-        max_retries: int = 6,          # retries on ThrottlingException
-        retry_base_delay: float = 5.0, # initial backoff seconds (doubles each retry)
+        call_delay: float = 1.0,  # seconds to sleep between every call
+        max_retries: int = 6,  # retries on ThrottlingException
+        retry_base_delay: float = 5.0,  # initial backoff seconds (doubles each retry)
     ):
         import boto3
 
@@ -634,18 +649,26 @@ class BedrockGenerator(Generator):
                         break
                 if not text:
                     logger.warning(f"  Unexpected content blocks: {content_blocks}")
-                    return {"answer": str(content_blocks), "artifact_ids": [], "reasoning": "parse error"}
+                    return {
+                        "answer": str(content_blocks),
+                        "artifact_ids": [],
+                        "reasoning": "parse error",
+                    }
                 return _parse_json_response(text)
 
             except Exception as exc:
-                error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+                error_code = (
+                    getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+                )
                 if error_code == "ThrottlingException":
                     if attempt >= self._max_retries:
-                        logger.error(f"  Throttled after {self._max_retries} retries — giving up")
+                        logger.error(
+                            f"  Throttled after {self._max_retries} retries — giving up"
+                        )
                         raise
                     # Exponential backoff with ±20% jitter
-                    delay = self._retry_base_delay * (2 ** attempt)
-                    delay *= (0.8 + 0.4 * random.random())
+                    delay = self._retry_base_delay * (2**attempt)
+                    delay *= 0.8 + 0.4 * random.random()
                     logger.warning(
                         f"  Throttled (attempt {attempt + 1}/{self._max_retries}), "
                         f"retrying in {delay:.1f}s ..."
@@ -678,7 +701,7 @@ def _parse_json_response(text: str) -> dict:
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            candidate = text[start:end + 1]
+            candidate = text[start : end + 1]
         else:
             candidate = text.strip()
 
@@ -688,7 +711,9 @@ def _parse_json_response(text: str) -> dict:
         return {"answer": text, "artifact_ids": [], "reasoning": "parse error"}
 
 
-def build_generator(name: str, model: Optional[str], region: str = "us-east-1", call_delay: float = 1.0) -> Generator:
+def build_generator(
+    name: str, model: Optional[str], region: str = "us-east-1", call_delay: float = 1.0
+) -> Generator:
     if name == "none":
         return NullGenerator()
     if name == "claude":
@@ -703,7 +728,9 @@ def build_generator(name: str, model: Optional[str], region: str = "us-east-1", 
             region=region,
             call_delay=call_delay,
         )
-    raise ValueError(f"Unknown generator: {name!r}. Choose none | claude | openai | cohere | bedrock")
+    raise ValueError(
+        f"Unknown generator: {name!r}. Choose none | claude | openai | cohere | bedrock"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -739,9 +766,12 @@ def _load_scorer(scorer_path: Optional[str] = None):
             continue
         try:
             import sys
+
             mod = types.ModuleType("orgforge_scorer")
             mod.__file__ = str(p)
-            sys.modules["orgforge_scorer"] = mod   # must be registered before exec for @dataclass
+            sys.modules["orgforge_scorer"] = (
+                mod  # must be registered before exec for @dataclass
+            )
             SourceFileLoader("orgforge_scorer", str(p)).exec_module(mod)
             scorer = mod.OrgForgeScorer()
             logger.info(f"  scorer.py loaded from {p}")
@@ -782,21 +812,33 @@ def score_answer(
         0.0,
     )
     recall = (
-        sum(1 for d in top_k_ids if d in relevant) / len(relevant)
-        if relevant else 1.0
+        sum(1 for d in top_k_ids if d in relevant) / len(relevant) if relevant else 1.0
     )
 
     answer_score = None
-    if scorer is not None and agent_answer.get("answer") is not None or any(
-        k in agent_answer for k in (
-            "artifact_id", "had_knowledge", "was_actioned",
-            "first_recipient", "dept", "escalation_actors", "gap_areas",
+    if (
+        scorer is not None
+        and agent_answer.get("answer") is not None
+        or any(
+            k in agent_answer
+            for k in (
+                "artifact_id",
+                "had_knowledge",
+                "was_actioned",
+                "first_recipient",
+                "dept",
+                "escalation_actors",
+                "gap_areas",
+            )
         )
     ):
         try:
             # Inject retrieved IDs so evidence scoring works even if LLM omits them
             enriched = {**agent_answer}
-            if "retrieved_artifact_ids" not in enriched or not enriched["retrieved_artifact_ids"]:
+            if (
+                "retrieved_artifact_ids" not in enriched
+                or not enriched["retrieved_artifact_ids"]
+            ):
                 enriched["retrieved_artifact_ids"] = top_k_ids
             result = scorer.score(question, enriched)
             answer_score = result.score  # ScorerResult.score is always a float
@@ -839,16 +881,16 @@ def aggregate(per_question: List[dict]) -> dict:
             if r["scores"]["answer_score"] is not None
         ]
         correct_vals = [
-            r["scores"]["correct"]
-            for r in rows
-            if r["scores"]["correct"] is not None
+            r["scores"]["correct"] for r in rows if r["scores"]["correct"] is not None
         ]
         return {
             "n": len(rows),
             "mrr_at_10": _mean(mrr_vals),
             "recall_at_10": _mean(rec_vals),
             "answer_score": _mean(score_vals) if score_vals else None,
-            "accuracy": _mean([float(v) for v in correct_vals]) if correct_vals else None,
+            "accuracy": _mean([float(v) for v in correct_vals])
+            if correct_vals
+            else None,
         }
 
     return {
@@ -867,8 +909,13 @@ LEADERBOARD_CSV_PATH = Path("leaderboard.csv")
 # All question types — used to produce stable CSV columns across runs even
 # when a given run hasn't seen every type yet (cells will be empty).
 _ALL_QTYPES = [
-    "CAUSAL", "ESCALATION", "GAP_DETECTION", "PLAN",
-    "RETRIEVAL", "ROUTING", "TEMPORAL",
+    "CAUSAL",
+    "ESCALATION",
+    "GAP_DETECTION",
+    "PLAN",
+    "RETRIEVAL",
+    "ROUTING",
+    "TEMPORAL",
 ]
 
 
@@ -880,23 +927,23 @@ def _flatten_row(row: dict) -> dict:
     Tier 2 = answer_score / accuracy    (None for retrieval-only runs)
     """
     flat = {
-        "run_id":       row.get("run_id", ""),
-        "timestamp":    row.get("timestamp", ""),
-        "tier":         row.get("tier", ""),
-        "retriever":    row.get("retriever", ""),
-        "generator":    row.get("generator", ""),
-        "n":            row.get("n", ""),
+        "run_id": row.get("run_id", ""),
+        "timestamp": row.get("timestamp", ""),
+        "tier": row.get("tier", ""),
+        "retriever": row.get("retriever", ""),
+        "generator": row.get("generator", ""),
+        "n": row.get("n", ""),
         # Tier 1 overall
-        "mrr_at_10":    row.get("mrr_at_10", ""),
+        "mrr_at_10": row.get("mrr_at_10", ""),
         "recall_at_10": row.get("recall_at_10", ""),
         # Tier 2 overall (empty string for Tier 1-only runs)
         "answer_score": row.get("answer_score", ""),
-        "accuracy":     row.get("accuracy", ""),
+        "accuracy": row.get("accuracy", ""),
     }
     by_type = row.get("by_type", {})
     for qtype in _ALL_QTYPES:
         m = by_type.get(qtype, {})
-        flat[f"mrr_{qtype}"]   = m.get("mrr_at_10", "")
+        flat[f"mrr_{qtype}"] = m.get("mrr_at_10", "")
         flat[f"score_{qtype}"] = m.get("answer_score", "")
     return flat
 
@@ -925,7 +972,9 @@ def _write_leaderboard_csv(leaderboard: List[dict]) -> None:
     logger.info(f"  leaderboard CSV updated: {LEADERBOARD_CSV_PATH}")
 
 
-def update_leaderboard(run_id: str, retriever: str, generator: str, summary: dict) -> None:
+def update_leaderboard(
+    run_id: str, retriever: str, generator: str, summary: dict
+) -> None:
     leaderboard = []
     if LEADERBOARD_PATH.exists():
         leaderboard = json.loads(LEADERBOARD_PATH.read_text())
@@ -933,19 +982,19 @@ def update_leaderboard(run_id: str, retriever: str, generator: str, summary: dic
     overall = summary.get("overall", {})
     tier = "1" if generator == "none" else "1+2"
     row = {
-        "run_id":       run_id,
-        "timestamp":    datetime.now(timezone.utc).isoformat(),
-        "tier":         tier,
-        "retriever":    retriever,
-        "generator":    generator,
-        "n":            overall.get("n"),
-        "mrr_at_10":    overall.get("mrr_at_10"),
+        "run_id": run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tier": tier,
+        "retriever": retriever,
+        "generator": generator,
+        "n": overall.get("n"),
+        "mrr_at_10": overall.get("mrr_at_10"),
         "recall_at_10": overall.get("recall_at_10"),
-        "answer_score": overall.get("answer_score"),   # None for Tier 1 runs
-        "accuracy":     overall.get("accuracy"),       # None for Tier 1 runs
+        "answer_score": overall.get("answer_score"),  # None for Tier 1 runs
+        "accuracy": overall.get("accuracy"),  # None for Tier 1 runs
         "by_type": {
             qtype: {
-                "mrr_at_10":    m.get("mrr_at_10"),
+                "mrr_at_10": m.get("mrr_at_10"),
                 "answer_score": m.get("answer_score"),
             }
             for qtype, m in summary.get("by_type", {}).items()
@@ -997,7 +1046,9 @@ def run_eval(args: argparse.Namespace) -> None:
     logger.info(f"  Index built in {time.time() - t0:.1f}s")
 
     # 3. Build generator — do this before constructing run_id so we can use generator.name
-    generator = build_generator(args.generator, args.model, region=args.region, call_delay=args.call_delay)
+    generator = build_generator(
+        args.generator, args.model, region=args.region, call_delay=args.call_delay
+    )
     logger.info(f"Generator: {generator.name}")
 
     # run_id uses the full generator name (e.g. bedrock/claude-opus-4-6) not just the flag
@@ -1053,7 +1104,7 @@ def run_eval(args: argparse.Namespace) -> None:
             if scores["answer_score"] is not None
             else f"MRR {scores['retrieval_mrr']:.2f}"
         )
-        logger.info(f"  [{i+1}/{len(questions)}] {qid} ({qtype}) — {status}")
+        logger.info(f"  [{i + 1}/{len(questions)}] {qid} ({qtype}) — {status}")
 
     # 6. Aggregate
     summary = aggregate(per_question)
@@ -1075,12 +1126,14 @@ def run_eval(args: argparse.Namespace) -> None:
 
 def _print_summary(summary: dict, retriever: str, generator: str) -> None:
     overall = summary.get("overall", {})
-    print(f"\n{'='*64}")
+    print(f"\n{'=' * 64}")
     print(f"  Retriever : {retriever}")
     print(f"  Generator : {generator}")
-    print(f"{'='*64}")
-    print(f"  {'Type':<16} {'MRR@10':>8} {'Recall@10':>10} {'Score':>8} {'Acc':>6} {'N':>4}")
-    print(f"  {'-'*56}")
+    print(f"{'=' * 64}")
+    print(
+        f"  {'Type':<16} {'MRR@10':>8} {'Recall@10':>10} {'Score':>8} {'Acc':>6} {'N':>4}"
+    )
+    print(f"  {'-' * 56}")
 
     def _fmt(v):
         return f"{v:.4f}" if v is not None else "  n/a "
@@ -1093,7 +1146,7 @@ def _print_summary(summary: dict, retriever: str, generator: str) -> None:
         f"{_fmt(overall_row.get('accuracy')):>6} "
         f"{overall_row.get('n', 0):>4}"
     )
-    print(f"  {'-'*56}")
+    print(f"  {'-' * 56}")
     for qtype, m in sorted(summary.get("by_type", {}).items()):
         print(
             f"  {qtype:<16} {_fmt(m.get('mrr_at_10')):>8} "
@@ -1102,7 +1155,7 @@ def _print_summary(summary: dict, retriever: str, generator: str) -> None:
             f"{_fmt(m.get('accuracy')):>6} "
             f"{m.get('n', 0):>4}"
         )
-    print(f"{'='*64}\n")
+    print(f"{'=' * 64}\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1177,10 +1230,11 @@ def _parse_args() -> argparse.Namespace:
         default=1.0,
         metavar="SECONDS",
         help="Sleep between LLM calls to avoid throttling (default: 1.0s). "
-             "Increase to 2-3 for Opus or if you keep hitting ThrottlingException.",
+        "Increase to 2-3 for Opus or if you keep hitting ThrottlingException.",
     )
     p.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Debug logging",
     )

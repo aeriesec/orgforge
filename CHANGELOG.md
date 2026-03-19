@@ -6,6 +6,29 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.1.0] — 2026-03-19
+
+### Changed
+
+- **Non-Engineering Planner Logic (`src/day_planner.py`)**: Refined department-specific task generation for Design, Sales, HR, and QA. Non-engineering teams are now explicitly barred from code-centric activities (PR reviews, ticket progress) and steered toward department-appropriate tasks like sales playbooks, onboarding guides, and UX documentation.
+- **Causal Chain Expansion (`src/confluence_writer.py`)**: Postmortem documents are now programmatically appended to the causal chain of their parent incident. Design documents now initialize causal chains that include all JIRA tickets spawned during the architectural planning phase.
+- **Expertise Granularity (`config/config.yaml`)**: Updated lead personas (Jax, Alex) with specific skill arrays (e.g., "database reliability", "Apple platform engineering") to replace broad category tags, improving the accuracy of the `_select_domain_expert` routing logic.
+- **Default Orchestration Settings (`src/agent_factory.py`, `config/config.yaml`)**: Set agent `verbose` mode to `False` by default to reduce log noise. Shifted default AWS operations to `us-east-2` and extended the default simulation ceiling to 30 days.
+- **Codebase Formatting**: Applied consistent linting and line-wrapping across `eval/` and `src/` modules to improve readability and maintainability.
+
+### Added
+
+- **Insider Threat Simulation Framework (`src/insider_threat.py`)**: Introduced a modular system to inject anomalous behaviors into the simulation. This includes:
+- **Threat Classes**: Support for "negligent" (accidental credential leaks), "disgruntled" (sentiment drift and snooping), and "malicious" (data exfiltration) actors.
+- **Multi-Channel Injection**: Ability to inject malicious content into Slack threads, PR descriptions, and outbound emails.
+- **Security Telemetry**: New `dlp_alert` and `secret_detected` event types, with automated generation of `access_log.jsonl` and `_ground_truth.jsonl` for SOC analyst agent training.
+
+- **Morgan Persona (`config/config.yaml`)**: Added a "Systems Thinker" DevOps persona to the Engineering_Backend team, including specific typing quirks (tool-forward, precise) and infrastructure-heavy expertise.
+- **Design Doc Evaluation (`eval/eval_harness.py`)**: Added `_design_doc_threads` to the evaluation suite, enabling RAG benchmarking against complex architectural causal chains and downstream ticket spawning.
+- **Day-Based Memory Filtering (`src/memory.py`)**: Added `day` to the vector store's metadata filters, allowing agents to perform time-bound document retrieval more efficiently.
+
+---
+
 ## [v1.0.2] — 2026-03-16
 
 ### Changed

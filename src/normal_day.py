@@ -21,6 +21,7 @@ from planner_models import (
     ProposedEvent,
 )
 from causal_chain_handler import CausalChainHandler
+from insider_threat import _NullInjector
 
 logger = logging.getLogger("orgforge.normalday")
 
@@ -47,6 +48,7 @@ class NormalDayHandler:
         persona_helper,
         confluence_writer=None,
         vader=None,
+        threat_injector=None,
     ):
         self._config = config
         self._mem = mem
@@ -66,6 +68,7 @@ class NormalDayHandler:
         self._confluence = confluence_writer
         self._registry = getattr(confluence_writer, "_registry", None)
         self._vader = vader
+        self._threat = threat_injector or _NullInjector()
 
     # ─── VOICE CARD ───────────────────────────────────────────────────────────
 
@@ -2307,14 +2310,21 @@ class NormalDayHandler:
     ) -> Tuple[str, str]:
         """Write Slack messages to disk + MongoDB. Returns export path."""
         date_str = str(self._state.current_date.date())
-        # Ensure every message has the date field log_slack_messages needs
         for m in messages:
             m.setdefault("date", date_str)
 
-        slack_path, thread_id = (
-            self._mem.log_slack_messages(  # handles disk + MongoDB + path
-                channel=channel, messages=messages, export_dir=Path(self._base)
+        # [SECURITY PATCH] Only inject into human employee messages.
+        # Bot messages (is_bot: True) are never threat subjects — skip them.
+        if not all(m.get("is_bot") for m in messages):
+            messages = self._threat.inject_slack(
+                messages,
+                channel=channel,
+                day=self._state.day,
+                current_date=self._state.current_date,
             )
+
+        slack_path, thread_id = self._mem.log_slack_messages(
+            channel=channel, messages=messages, export_dir=Path(self._base)
         )
 
         if messages:

@@ -288,6 +288,35 @@ class CausalThreadBuilder:
                 }
             )
         return threads
+    
+    def _design_doc_threads(self) -> List[dict]:
+        threads = []
+        conf_events = [
+            e for e in self._events
+            if e.type == "confluence_created"
+            and e.facts.get("type") == "design_doc"
+            and e.facts.get("causal_chain")  # only after your fix
+        ]
+        for event in conf_events:
+            conf_id = event.artifact_ids.get("confluence")
+            if not conf_id:
+                continue
+            chain = event.facts.get("causal_chain", [conf_id])
+            nodes = self._build_nodes(chain, event)
+            threads.append({
+                "chain_id": f"design_doc_{conf_id}",
+                "chain_type": "design_doc",
+                "root_artifact": conf_id,
+                "root_event_type": "confluence_created",
+                "day": event.day,
+                "date": event.date,
+                "nodes": nodes,
+                "terminal_artifact": chain[-1] if chain else conf_id,
+                "complete": len(chain) > 1,
+                "author": next(iter(event.actors), None),
+                "spawned_tickets": event.facts.get("spawned_tickets", []),
+            })
+        return threads
 
     def _build_nodes(self, chain: List[str], root_event: SimEvent) -> List[dict]:
         """
@@ -382,7 +411,9 @@ class EvalQuestionGenerator:
     def _retrieval_questions(self, threads: List[dict]) -> List[dict]:
         questions = []
         incident_threads = [t for t in threads if t["chain_type"] == "incident"]
-        logger.info(f"[eval] _retrieval_questions: {len(incident_threads)} incident threads available")
+        logger.info(
+            f"[eval] _retrieval_questions: {len(incident_threads)} incident threads available"
+        )
         for thread in random.sample(incident_threads, min(12, len(incident_threads))):
             root_event = self._find_event_by_artifact(thread["root_artifact"])
             if not root_event:
@@ -431,9 +462,11 @@ class EvalQuestionGenerator:
             t
             for t in threads
             if len(t.get("nodes", [])) >= 3
-            and t["chain_type"] in ("incident", "customer_email")
+            and t["chain_type"] in ("incident", "customer_email", "design_doc")
         ]
-        logger.info(f"[eval] _causal_questions: {len(multi_hop)} multi-hop threads available")
+        logger.info(
+            f"[eval] _causal_questions: {len(multi_hop)} multi-hop threads available"
+        )
         for thread in random.sample(multi_hop, min(10, len(multi_hop))):
             nodes = thread["nodes"]
             # Ask about the transition from node 1 → node 2
@@ -548,7 +581,11 @@ class EvalQuestionGenerator:
                 # Use the first meaningful token from the root cause description.
                 # Strip common stop words so we don't get gap_domain="the" etc.
                 _stop = {"the", "a", "an", "in", "of", "on", "was", "is", "due", "to"}
-                tokens = [t for t in root_cause.split() if t.lower() not in _stop and len(t) > 4]
+                tokens = [
+                    t
+                    for t in root_cause.split()
+                    if t.lower() not in _stop and len(t) > 4
+                ]
                 gap_domain = tokens[0] if tokens else "system"
             else:
                 # Last resort: most recent departure's first domain
@@ -749,7 +786,9 @@ class EvalQuestionGenerator:
         customer_threads = [
             t for t in threads if t["chain_type"] in ("customer_email", "dropped_email")
         ]
-        logger.info(f"[eval] _routing_questions: {len(customer_threads)} customer threads available")
+        logger.info(
+            f"[eval] _routing_questions: {len(customer_threads)} customer threads available"
+        )
         for thread in random.sample(customer_threads, min(5, len(customer_threads))):
             root_node = thread["nodes"][0] if thread["nodes"] else None
             if not root_node:
@@ -928,7 +967,9 @@ class EvalQuestionGenerator:
     def _escalation_questions(self) -> List[dict]:
         questions = []
         esc_events = [e for e in self._events if e.type == "escalation_chain"]
-        logger.info(f"[eval] _escalation_questions: {len(esc_events)} escalation_chain events available")
+        logger.info(
+            f"[eval] _escalation_questions: {len(esc_events)} escalation_chain events available"
+        )
 
         for event in random.sample(esc_events, min(6, len(esc_events))):
             ticket_id = event.artifact_ids.get("jira", "")
@@ -970,8 +1011,15 @@ class EvalQuestionGenerator:
     # ── KNOWLEDGE GAP — "What domain was undocumented when X fired?" ──────────────
     def _knowledge_gap_questions(self) -> List[dict]:
         questions = []
-        gap_events = [e for e in self._events if e.type == "knowledge_gap_detected" and e.facts.get("trigger") != "centrality_vacuum"]
-        logger.info(f"[eval] _knowledge_gap_questions: {len(gap_events)} knowledge_gap_detected events available")
+        gap_events = [
+            e
+            for e in self._events
+            if e.type == "knowledge_gap_detected"
+            and e.facts.get("trigger") != "centrality_vacuum"
+        ]
+        logger.info(
+            f"[eval] _knowledge_gap_questions: {len(gap_events)} knowledge_gap_detected events available"
+        )
 
         for event in random.sample(gap_events, min(6, len(gap_events))):
             ticket_id = event.artifact_ids.get("jira", "")
@@ -1025,7 +1073,9 @@ class EvalQuestionGenerator:
         """
         questions = []
         pm_threads = [t for t in threads if t["chain_type"] == "postmortem"]
-        logger.info(f"[eval] _postmortem_questions: {len(pm_threads)} postmortem threads available")
+        logger.info(
+            f"[eval] _postmortem_questions: {len(pm_threads)} postmortem threads available"
+        )
 
         for thread in random.sample(pm_threads, min(6, len(pm_threads))):
             ticket_id = thread["root_artifact"]
@@ -1078,12 +1128,20 @@ class EvalQuestionGenerator:
         """
         questions = []
         conf_events = [e for e in self._events if e.type == "confluence_created"]
-        logger.info(f"[eval] _confluence_questions: {len(conf_events)} confluence_created events available")
+        logger.info(
+            f"[eval] _confluence_questions: {len(conf_events)} confluence_created events available"
+        )
 
         for event in random.sample(conf_events, min(8, len(conf_events))):
-            conf_id = event.artifact_ids.get("confluence") or event.artifact_ids.get("page_id")
+            conf_id = event.artifact_ids.get("confluence") or event.artifact_ids.get(
+                "page_id"
+            )
             author = next(iter(event.actors), None)
-            topic = event.facts.get("topic") or event.facts.get("title") or event.facts.get("summary", "")
+            topic = (
+                event.facts.get("topic")
+                or event.facts.get("title")
+                or event.facts.get("summary", "")
+            )
             if not conf_id or not topic:
                 continue
 
@@ -1097,7 +1155,7 @@ class EvalQuestionGenerator:
             q_text = self._generate_question_prose(
                 template=(
                     f"Generate a retrieval question asking which Confluence page "
-                    f"covers the topic: \"{topic[:80]}\". The question should sound "
+                    f'covers the topic: "{topic[:80]}". The question should sound '
                     f"like an engineer searching internal documentation. "
                     f"Output only the question text."
                 )
@@ -1127,7 +1185,9 @@ class EvalQuestionGenerator:
         """
         questions = []
         standup_events = [e for e in self._events if e.type == "standup"]
-        logger.info(f"[eval] _standup_questions: {len(standup_events)} standup events available")
+        logger.info(
+            f"[eval] _standup_questions: {len(standup_events)} standup events available"
+        )
 
         for event in random.sample(standup_events, min(8, len(standup_events))):
             if not event.actors:
@@ -1182,7 +1242,8 @@ class EvalQuestionGenerator:
         """
         questions = []
         esc_events = [
-            e for e in self._events
+            e
+            for e in self._events
             if e.type in ("customer_escalation", "customer_email_routed")
             and e.facts.get("source")  # need a named source for the question
         ]
@@ -1193,12 +1254,16 @@ class EvalQuestionGenerator:
 
         for event in random.sample(esc_events, min(6, len(esc_events))):
             source = event.facts.get("source", "a customer")
-            ticket_id = event.artifact_ids.get("jira") or event.artifact_ids.get("email", "")
+            ticket_id = event.artifact_ids.get("jira") or event.artifact_ids.get(
+                "email", ""
+            )
             handler = next(iter(event.actors), None)
             if not handler:
                 continue
 
-            causal_chain = event.facts.get("causal_chain", [ticket_id] if ticket_id else [])
+            causal_chain = event.facts.get(
+                "causal_chain", [ticket_id] if ticket_id else []
+            )
             downstream = [a for a in causal_chain if a != ticket_id]
 
             ground_truth = {
@@ -1234,7 +1299,7 @@ class EvalQuestionGenerator:
                     }
                 )
         return questions
-
+    
     # ── LLM question prose ────────────────────────────────────────────────────
 
     def _generate_question_prose(self, template: str) -> Optional[str]:

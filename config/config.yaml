@@ -47,7 +47,7 @@ model_presets:
     planner: "bedrock/openai.gpt-oss-120b-1:0"
     # Llama 3.1 8B on Bedrock — fast, cheap for high-volume worker calls
     worker: "bedrock/openai.gpt-oss-120b-1:0"
-    aws_region: "us-east-1"
+    aws_region: "us-east-2"
     embed_provider: "ollama"
     embed_model: "mxbai-embed-large"
     embed_dims: 1024
@@ -60,7 +60,7 @@ simulation:
   domain: "apexathletics.io"
   output_dir: "./export"
   db_name: "orgforge"
-  max_days: 22
+  max_days: 30
   start_date: "2026-03-02"
 
   adhoc_confluence_prob: 0.3
@@ -149,7 +149,7 @@ org_chart:
   CEO: ["John"]
   Product: ["Sarah", "Mike", "Elena", "Chris", "Jamie"]
   Engineering_Backend:
-    ["Jax", "Deepa", "Liam", "Sanjay", "Kaitlyn", "Yusuf", "Hanna"]
+    ["Jax", "Deepa", "Liam", "Sanjay", "Kaitlyn", "Yusuf", "Hanna", "Morgan"]
   Engineering_Mobile:
     ["Chloe", "Raj", "Miki", "Alex", "Jordan", "Sam", "Taylor"]
   Design: ["Priya", "Marc", "Sophie", "Desmond"]
@@ -182,7 +182,7 @@ org_lifecycle:
       documented_pct: 0.25 # only 25% written down — high gap risk
 
     - name: "Morgan"
-      day: 30
+      day: 24
       reason: "layoff"
       role: "DevOps Engineer"
       knowledge_domains:
@@ -270,7 +270,14 @@ personas:
       that makes you realize it yourself.
     pet_peeves: "over-engineering, 'urgent' pings without logs, missing documentation"
     stress: 50
-    expertise: ["backend", "TitanDB", "legacy-migration"]
+    expertise:
+      [
+        "backend engineering",
+        "Python",
+        "AWS infrastructure",
+        "database reliability",
+        "API design",
+      ]
     tenure: "5yr"
     is_lead: true
     interests:
@@ -397,7 +404,13 @@ personas:
       precise and tired of relitigating platform basics.
     pet_peeves: "web-first design thinking, Android-parity delays"
     stress: 65
-    expertise: ["mobile", "iOS", "swift-ui"]
+    expertise:
+      [
+        "iOS mobile development",
+        "Swift UI",
+        "mobile app architecture",
+        "Apple platform engineering",
+      ]
     tenure: "3yr"
     is_lead: true
     interests:
@@ -432,6 +445,43 @@ personas:
         "cross-stitching (pixel art)",
         "detective novels",
         "restoring vintage fountain pens",
+      ]
+  Morgan:
+    style: "The Systems Thinker"
+    social_role: "The Infrastructure Backbone"
+    typing_quirks: >
+      Morgan writes like someone who has been paged at 3am too many times. Messages are
+      precise and tool-forward — less 'I think we should' and more 'kubectl logs shows X,
+      terraform plan shows Y'. Morgan links to runbooks the way other people link to Slack
+      threads, and always includes the exact command that fixed the thing. Not terse for
+      the sake of it — just allergic to ambiguity.
+    anti_patterns: >
+      Never write Morgan as hand-wavy about infrastructure details. Morgan doesn't say
+      'we should probably fix the deployment pipeline' — Morgan says 'the ECS task
+      definition is pinned to an old AMI, here's the PR to bump it'. Morgan doesn't
+      catastrophize, but also doesn't sugarcoat blast radius.
+    pet_peeves: "cowboys pushing to prod, undocumented IAM policies, 'it works on my machine'"
+    expertise:
+      [
+        "AWS",
+        "S3",
+        "IAM",
+        "infrastructure",
+        "Kubernetes",
+        "Terraform",
+        "DevOps",
+        "cloud security",
+        "networking",
+      ]
+    tenure: "3yr"
+    is_lead: false
+    stress: 40
+    interests:
+      [
+        "homelab tinkering",
+        "amateur radio",
+        "ultramarathon running",
+        "sourdough bread baking",
       ]
 
 default_persona:
@@ -473,3 +523,67 @@ external_contacts:
     trigger_health_threshold: 60 # only surfaces for severe incidents
     internal_liaison: "Sales"
     summary_tone: "concerned about uptime, asking for ETA and root cause"
+
+# ── INSIDER THREAT ────────────────────────────────────────────
+
+insider_threat:
+  enabled: true
+
+  # "passive" — behaviors injected into normal artifacts (PR descriptions,
+  #             Slack messages, emails).  No extra SimEvents are emitted.
+  #             Use this when you want a realistic corpus without SIEM noise.
+  #
+  # "active"  — additionally emits dlp_alert SimEvents (with false positives
+  #             mixed in at dlp_noise_ratio).  Use this when you want to train
+  #             agents to triage SIEM alert streams.
+  mode: "passive"
+  subjects:
+    # ── Example 1: Negligent employee ────────────────────────────────────────
+    # Jordan accidentally commits a credential in a PR description.
+    # No malicious intent — the secret appears in a "test fixture" comment.
+    # Reviewers may or may not catch it (non-deterministic).
+    - name: "Jordan"
+      threat_class: "negligent"
+      onset_day: 5 # clean behavior on days 1-4; first leak possible day 5
+      behaviors:
+        - "secret_in_commit"
+
+    # ── Example 2: Disgruntled employee ──────────────────────────────────────
+    # Riley's Slack messages become progressively passive-aggressive.
+    # Riley also accesses tickets outside their department.
+    # No credential leak — detection requires sentiment + access-pattern correlation.
+    - name: "Tasha"
+      threat_class: "disgruntled"
+      onset_day: 10
+      behaviors:
+        - "sentiment_drift"
+        - "cross_dept_snooping"
+        - "unusual_hours_access"
+
+    # ── Example 3: Malicious employee ────────────────────────────────────────
+    # Jax deliberately exfiltrates data via personal email and
+    # clones repositories at anomalous volume.  Jax's Slack messages
+    # stay deliberately neutral (hiding intent — handled by sentiment_drift
+    # with threat_class: "malicious").
+    # This is the hardest case to detect: low Slack signal, high email/git signal.
+    - name: "Jax"
+      threat_class: "malicious"
+      onset_day: 18
+      behaviors:
+        - "data_exfil_email"
+        - "excessive_repo_cloning"
+        - "unusual_hours_access"
+        - "sentiment_drift" # neutral drift — Jax is hiding their intent
+
+  # Fraction of dlp_alert events that are FALSE POSITIVES for innocent employees.
+  # Only applies in mode: "active".
+  # 0.0 = every alert is real (easy for agents — not realistic)
+  # 0.4 = 40% of alerts are noise (recommended starting point)
+  # 0.8 = very noisy (trains agents to demand multi-signal correlation)
+  dlp_noise_ratio: 0.4
+
+  # Subdirectory under the simulation export dir for telemetry output.
+  # Two files are written here:
+  #   access_log.jsonl      — observable telemetry stream (no labels)
+  #   _ground_truth.jsonl   — full records with true_positive, threat_class, behavior
+  telemetry_dir: "security_telemetry"

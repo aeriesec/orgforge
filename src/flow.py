@@ -48,6 +48,7 @@ from confluence_writer import ConfluenceWriter
 from ticket_assigner import _cosine, TicketAssigner
 from token_tracker import orgforge_token_listener
 from external_email_ingest import ExternalEmailIngestor
+from insider_threat import _NullInjector, InsiderThreatInjector
 from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.table import Table
@@ -385,12 +386,20 @@ def save_eml(
 # 4. GIT SIMULATOR (NetworkX Aware)
 # ─────────────────────────────────────────────
 class GitSimulator:
-    def __init__(self, state: State, mem: Memory, social_graph: nx.Graph, worker_llm):
+    def __init__(
+        self,
+        state: State,
+        mem: Memory,
+        social_graph: nx.Graph,
+        worker_llm,
+        threat_injector=None,
+    ):
         self._state = state
         self._mem = mem
         self._graph = social_graph
         self._worker_llm = worker_llm
         self.graph_dynamics = GraphDynamics(build_social_graph(), CONFIG)
+        self._threat = threat_injector or _NullInjector()
 
     def create_pr(
         self,
@@ -481,6 +490,8 @@ class GitSimulator:
             "created_at": timestamp,
         }
 
+        pr = self._threat.inject_pr(pr, author=author, day=self._state.day)
+
         path = f"{BASE}/git/prs/{pr_id}.json"
         save_json(path, pr)
         self._mem.upsert_pr(pr)
@@ -495,6 +506,7 @@ class GitSimulator:
             metadata={"author": author, "ticket_id": ticket_id},
         )
         self._state.daily_artifacts_created += 1
+
         return pr
 
     def merge_pr(self, pr_id: str):
@@ -616,7 +628,18 @@ class Flow(Flow[State]):
         self._mem = Memory()
         self.graph_dynamics = GraphDynamics(build_social_graph(), CONFIG)
         self.social_graph = self.graph_dynamics.G
-        self._git = GitSimulator(self.state, self._mem, self.social_graph, WORKER_MODEL)
+        self._threat = InsiderThreatInjector.from_config(
+            config=CONFIG,
+            export_base=BASE,
+            all_names=ALL_NAMES,
+        )
+        self._git = GitSimulator(
+            self.state,
+            self._mem,
+            self.social_graph,
+            WORKER_MODEL,
+            threat_injector=self._threat,
+        )
         self._clock = SimClock(self.state)
         self._day_planner = DayPlannerOrchestrator(
             CONFIG, WORKER_MODEL, PLANNER_MODEL, clock=self._clock
@@ -656,6 +679,7 @@ class Flow(Flow[State]):
             personas=LIVE_PERSONAS,
             registry=self._registry,
             clock=self._clock,
+            threat_injector=self._threat,
         )
         self._normal_day = NormalDayHandler(
             config=CONFIG,
@@ -670,6 +694,7 @@ class Flow(Flow[State]):
             persona_helper=persona_backstory,
             confluence_writer=self._confluence,
             vader=vader,
+            threat_injector=self._threat,
         )
         self._recurrence_detector = RecurrenceDetector(self._mem)
         self._ticket_assigner = TicketAssigner(
@@ -893,6 +918,7 @@ class Flow(Flow[State]):
                 continue
 
             self._state.ticket_actors_today = {}  # cleared here; orchestrator re-seeds from SprintContext
+            self._threat.begin_day(self.state.day, self.state)
             self._clock.reset_to_business_start(ALL_NAMES)
             date_str = str(self.state.current_date.date())
             departures = self._lifecycle.process_departures(
@@ -969,6 +995,15 @@ class Flow(Flow[State]):
                 cursors=self.state.actor_cursors,
                 graph_data=nx.node_link_data(self.social_graph),
             )
+            for _sec_event in self._threat.end_day(
+                day=self.state.day,
+                state=self.state,
+                mem=self._mem,
+                clock=self._clock,
+                date_str=str(self.state.current_date.date()),
+            ):
+                self._mem.log_event(_sec_event)
+                self._record_daily_event("dlp_alert")
 
             self._end_of_day()
             self.state.day += 1
@@ -1132,9 +1167,7 @@ class Flow(Flow[State]):
                 expected_output=f"JSON array of {n_per_dept} ticket objects.",
                 agent=agent,
             )
-            raw = str(
-                Crew(agents=[agent], tasks=[task]).kickoff()
-            ).strip()
+            raw = str(Crew(agents=[agent], tasks=[task]).kickoff()).strip()
 
             # Parse — strip accidental fences
             raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("` \n")
@@ -1350,6 +1383,12 @@ class Flow(Flow[State]):
                 }
             )
 
+        messages = self._threat.inject_slack(
+            messages,
+            channel="standup",
+            day=self.state.day,
+            current_date=self.state.current_date,
+        )
         slack_path, thread_id = self._mem.log_slack_messages(
             "standup", messages, export_dir=EXPORT_DIR
         )
@@ -1606,7 +1645,8 @@ class Flow(Flow[State]):
         # Falls back to on_call if no peer exists in that dept.
         eng_peer = next(
             (
-                n for n in LIVE_ORG_CHART.get(dept_of(incident_lead), [])
+                n
+                for n in LIVE_ORG_CHART.get(dept_of(incident_lead), [])
                 if n != incident_lead and n != on_call
             ),
             on_call,
@@ -1648,8 +1688,6 @@ class Flow(Flow[State]):
             state=self.state,
             timestamp=incident_start_iso,
         )
-
-        
 
         # ── 3. Recurrence detection ───────────────────────────────────────────
         prior = self._recurrence_detector.find_prior_incident(
@@ -1702,7 +1740,9 @@ class Flow(Flow[State]):
 
         # ── 7. Generate ticket description — all context is available now ─────
         _rc_slug = root_cause[:80].rstrip(".,;")
-        _gap_tag = f" [{gap_areas[0]} undocumented]" if involves_gap and gap_areas else ""
+        _gap_tag = (
+            f" [{gap_areas[0]} undocumented]" if involves_gap and gap_areas else ""
+        )
         _recur_tag = f" [recurrence of {recurrence_of}]" if recurrence_of else ""
         title = f"P1 incident {ticket_id}: {_rc_slug}{_gap_tag}{_recur_tag}"
         desc_agent = make_agent(
@@ -2565,7 +2605,6 @@ class Flow(Flow[State]):
             f"{display_name} re {inc.ticket_id} in #incidents"
         )
 
-
     def _select_domain_expert(self, root_cause: str, exclude: str) -> str:
         """
         Find the active engineering team member whose expertise embedding is
@@ -2574,15 +2613,18 @@ class Flow(Flow[State]):
         Falls back to incident_commander role if embedding fails or no candidates.
         """
         rc_vec = self._mem._embed(
-            root_cause, input_type="search_query",
-            caller="incident_routing", doc_id="rc"
+            root_cause,
+            input_type="search_query",
+            caller="incident_routing",
+            doc_id="rc",
         )
         if not rc_vec:
             return resolve_role("incident_commander")
 
         _ENG_DEPTS = {"Engineering_Backend", "Engineering_Mobile"}
         candidates = [
-            n for dept, members in ORG_CHART.items()
+            n
+            for dept, members in ORG_CHART.items()
             if dept in _ENG_DEPTS
             for n in members
             if n != exclude

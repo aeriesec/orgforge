@@ -88,11 +88,7 @@ with open(Path(__file__).resolve().parent.parent / "config" / "config.yaml") as 
 
 _SIM_CFG = _CFG.get("simulation", {})
 _ORG_CFG = _CFG.get("org", {})
-_ORG_CHART = (
-    _ORG_CFG.get("org_chart")
-    or _CFG.get("org_chart")
-    or {}
-)
+_ORG_CHART = _ORG_CFG.get("org_chart") or _CFG.get("org_chart") or {}
 _ACTOR_TO_DEPT: Dict[str, str] = {}
 for _dept, _members in _ORG_CHART.items():
     if isinstance(_members, list):
@@ -140,9 +136,7 @@ try:
     import numpy as np
 
     _DENSE_AVAILABLE = True
-    _DENSE_MODEL_NAME = (
-        "Losspost/stella_en_1.5b_v5"  # or whatever your memory.py uses
-    )
+    _DENSE_MODEL_NAME = "Losspost/stella_en_1.5b_v5"  # or whatever your memory.py uses
 except ImportError:
     _DENSE_AVAILABLE = False
     logger.warning("ollama not installed — dense baseline disabled.")
@@ -160,10 +154,10 @@ def _dept_from_artifact_id(artifact_id: str) -> str:
         return ""
     code = parts[1].upper()
     return {
-        "ENG":   "Engineering",
-        "PRD":   "Product",
-        "MKT":   "Sales_Marketing",
-        "QA":    "QA_Support",
+        "ENG": "Engineering",
+        "PRD": "Product",
+        "MKT": "Sales_Marketing",
+        "QA": "QA_Support",
         "RETRO": "",
     }.get(code, "")
 
@@ -210,7 +204,9 @@ class CorpusBuilder:
         seen: Dict[str, dict] = {}
         for row in rows:
             did = row["doc_id"]
-            if did not in seen or len(row.get("body", "")) > len(seen[did].get("body", "")):
+            if did not in seen or len(row.get("body", "")) > len(
+                seen[did].get("body", "")
+            ):
                 seen[did] = row
         rows = list(seen.values())
 
@@ -240,24 +236,28 @@ class CorpusBuilder:
                     break
 
         is_incident = event_type in (
-            "incident_opened", "incident_resolved",
-            "escalation_chain", "postmortem_created",
+            "incident_opened",
+            "incident_resolved",
+            "escalation_chain",
+            "postmortem_created",
         )
         is_external = event_type in (
-            "inbound_external_email", "customer_email_routed",
-            "vendor_email_routed", "email_dropped",
+            "inbound_external_email",
+            "customer_email_routed",
+            "vendor_email_routed",
+            "email_dropped",
         )
 
         shared = {
-            "day":          int(evt.get("day", 0)),
-            "date":         str(evt.get("date", "")),
-            "timestamp":    str(evt.get("timestamp", "")),
-            "actors":       json.dumps(evt_actors),
-            "tags":         json.dumps(evt.get("tags", [])),
+            "day": int(evt.get("day", 0)),
+            "date": str(evt.get("date", "")),
+            "timestamp": str(evt.get("timestamp", "")),
+            "actors": json.dumps(evt_actors),
+            "tags": json.dumps(evt.get("tags", [])),
             "artifact_ids": json.dumps(artifact_ids),
-            "dept":         dept_val,
-            "is_incident":  is_incident,
-            "is_external":  is_external,
+            "dept": dept_val,
+            "is_incident": is_incident,
+            "is_external": is_external,
         }
 
         rows: List[dict] = []
@@ -265,43 +265,62 @@ class CorpusBuilder:
         # ── JIRA ──────────────────────────────────────────────────────────────
         jira_id = artifact_ids.get("jira", "")
         if jira_id:
-            rows.append({
-                **shared,
-                "doc_id":   jira_id,
-                "doc_type": "jira",
-                "title":    str(facts.get("title", facts.get("root_cause", jira_id)))[:512],
-                "body":     self._jira_body(facts),
-            })
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": jira_id,
+                    "doc_type": "jira",
+                    "title": str(facts.get("title", facts.get("root_cause", jira_id)))[
+                        :512
+                    ],
+                    "body": self._jira_body(facts),
+                }
+            )
 
         # ── CONFLUENCE ────────────────────────────────────────────────────────
         conf_id = artifact_ids.get("confluence", "") or next(
-            (v for v in artifact_ids.values()
-             if isinstance(v, str) and str(v).startswith("CONF-")), ""
+            (
+                v
+                for v in artifact_ids.values()
+                if isinstance(v, str) and str(v).startswith("CONF-")
+            ),
+            "",
         )
         if conf_id:
-            body = facts.get("content", facts.get("summary", "")) or evt.get("summary", "")
-            rows.append({
-                **shared,
-                "doc_id":   conf_id,
-                "doc_type": "confluence",
-                "title":    str(facts.get("title", conf_id))[:512],
-                "body":     body,
-                "dept":     dept_val or _dept_from_artifact_id(conf_id),
-            })
+            body = facts.get("content", facts.get("summary", "")) or evt.get(
+                "summary", ""
+            )
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": conf_id,
+                    "doc_type": "confluence",
+                    "title": str(facts.get("title", conf_id))[:512],
+                    "body": body,
+                    "dept": dept_val or _dept_from_artifact_id(conf_id),
+                }
+            )
 
         # ── EMAIL ─────────────────────────────────────────────────────────────
         email_id = artifact_ids.get("email", "")
         if email_id or event_type in (
-            "inbound_external_email", "hr_outbound_email",
-            "customer_email_routed", "vendor_email_routed", "email_dropped",
+            "inbound_external_email",
+            "hr_outbound_email",
+            "customer_email_routed",
+            "vendor_email_routed",
+            "email_dropped",
         ):
-            rows.append({
-                **shared,
-                "doc_id":   email_id or f"EMAIL-{evt.get('day', 0)}-{id(evt)}",
-                "doc_type": "email",
-                "title":    str(facts.get("subject", facts.get("summary", email_id)))[:512],
-                "body":     self._email_body(facts, evt),
-            })
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": email_id or f"EMAIL-{evt.get('day', 0)}-{id(evt)}",
+                    "doc_type": "email",
+                    "title": str(facts.get("subject", facts.get("summary", email_id)))[
+                        :512
+                    ],
+                    "body": self._email_body(facts, evt),
+                }
+            )
 
         # ── SLACK ─────────────────────────────────────────────────────────────
         # Only use slack_thread as the canonical ID — slack and slack_path
@@ -309,34 +328,40 @@ class CorpusBuilder:
         slack_id = artifact_ids.get("slack_thread", "")
         if slack_id:
             channel = facts.get("channel", "#general")
-            rows.append({
-                **shared,
-                "doc_id":   slack_id,
-                "doc_type": "slack",
-                "title":    str(channel + ": " + facts.get("summary", "")[:80])[:512],
-                "body":     facts.get("content", facts.get("summary", "")),
-            })
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": slack_id,
+                    "doc_type": "slack",
+                    "title": str(channel + ": " + facts.get("summary", "")[:80])[:512],
+                    "body": facts.get("content", facts.get("summary", "")),
+                }
+            )
 
         # ── PR ────────────────────────────────────────────────────────────────
         pr_id = artifact_ids.get("pr", "")
         if pr_id:
-            rows.append({
-                **shared,
-                "doc_id":   pr_id,
-                "doc_type": "pr",
-                "title":    str(facts.get("title", pr_id))[:512],
-                "body":     facts.get("description", facts.get("summary", "")),
-            })
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": pr_id,
+                    "doc_type": "pr",
+                    "title": str(facts.get("title", pr_id))[:512],
+                    "body": facts.get("description", facts.get("summary", "")),
+                }
+            )
 
         # ── FALLBACK ──────────────────────────────────────────────────────────
         if not rows:
-            rows.append({
-                **shared,
-                "doc_id":   f"EVENT-{evt.get('day', 0)}-{event_type}",
-                "doc_type": "sim_event",
-                "title":    event_type.replace("_", " ").title(),
-                "body":     evt.get("summary", ""),
-            })
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": f"EVENT-{evt.get('day', 0)}-{event_type}",
+                    "doc_type": "sim_event",
+                    "title": event_type.replace("_", " ").title(),
+                    "body": evt.get("summary", ""),
+                }
+            )
 
         # Ensure every row has a non-empty body
         for row in rows:
@@ -452,7 +477,7 @@ class CorpusBuilder:
             # Confluence pages
             # Also build a snippet index so CONF-UNKNOWN rows can be
             # re-identified by matching their thin body against MongoDB content.
-            conf_id_map: Dict[str, str] = {}   # content_snippet_or_title -> page_id
+            conf_id_map: Dict[str, str] = {}  # content_snippet_or_title -> page_id
             for page in self._mem._db["confluence_pages"].find(
                 {}, {"_id": 0, "id": 1, "content": 1, "title": 1}
             ):
@@ -469,14 +494,16 @@ class CorpusBuilder:
             comment_map: Dict[str, List[str]] = defaultdict(list)
             for comment in self._mem._db["artifacts"].find(
                 {"type": "jira_comment"},
-                {"_id": 0, "parent_id": 1, "body": 1, "author": 1}
+                {"_id": 0, "parent_id": 1, "body": 1, "author": 1},
             ):
                 parent = comment.get("parent_id", "")
                 cbody = comment.get("body", "")
                 cauthor = comment.get("author", "")
                 if parent and cbody:
                     comment_map[parent].append(
-                        f"comment ({cauthor}): {cbody}" if cauthor else f"comment: {cbody}"
+                        f"comment ({cauthor}): {cbody}"
+                        if cauthor
+                        else f"comment: {cbody}"
                     )
 
             for ticket in self._mem._db["jira_tickets"].find(
@@ -509,9 +536,8 @@ class CorpusBuilder:
                     # Try to resolve the real ID via body snippet or title match
                     body_snippet = (row.get("body") or "")[:120].strip()
                     title_key = (row.get("title") or "").strip()
-                    resolved_id = (
-                        conf_id_map.get(body_snippet)
-                        or conf_id_map.get(title_key)
+                    resolved_id = conf_id_map.get(body_snippet) or conf_id_map.get(
+                        title_key
                     )
                     if resolved_id:
                         row["doc_id"] = resolved_id
@@ -545,18 +571,29 @@ class CorpusBuilder:
             # slack = individual message fragments — excluded, same as jira_comment
             # slack_messages collection also excluded for same reason
             _TYPE_MAP = {
-                "confluence":   "confluence",
+                "confluence": "confluence",
                 "slack_thread": "slack",
-                "email":        "email",
-                "pr":           "pr",
-                "jira":         "jira",
+                "email": "email",
+                "pr": "pr",
+                "jira": "jira",
             }
             existing_ids = {row["doc_id"] for row in rows}
             for artifact in self._mem._db["artifacts"].find(
                 {"type": {"$in": list(_TYPE_MAP.keys())}},
-                {"_id": 1, "type": 1, "content": 1, "body": 1, "title": 1,
-                 "subject": 1, "day": 1, "date": 1, "timestamp": 1,
-                 "metadata": 1, "author": 1, "actors": 1}
+                {
+                    "_id": 1,
+                    "type": 1,
+                    "content": 1,
+                    "body": 1,
+                    "title": 1,
+                    "subject": 1,
+                    "day": 1,
+                    "date": 1,
+                    "timestamp": 1,
+                    "metadata": 1,
+                    "author": 1,
+                    "actors": 1,
+                },
             ):
                 art_id = str(artifact.get("_id", ""))
                 art_type = artifact.get("type", "")
@@ -574,28 +611,33 @@ class CorpusBuilder:
                     or ""
                 )
                 title = artifact.get("title") or artifact.get("subject") or art_id
-                dept = (
-                    _dept_from_artifact_id(art_id)
-                    or next(
-                        (_ACTOR_TO_DEPT.get(str(a), "") for a in actors
-                         if _ACTOR_TO_DEPT.get(str(a))), ""
-                    )
+                dept = _dept_from_artifact_id(art_id) or next(
+                    (
+                        _ACTOR_TO_DEPT.get(str(a), "")
+                        for a in actors
+                        if _ACTOR_TO_DEPT.get(str(a))
+                    ),
+                    "",
                 )
-                rows.append({
-                    "doc_id":       art_id,
-                    "doc_type":     doc_type,
-                    "title":        str(title)[:512],
-                    "body":         str(body),
-                    "day":          int(artifact.get("day", 0)),
-                    "date":         str(artifact.get("date", "")),
-                    "timestamp":    str(artifact.get("timestamp", "")),
-                    "actors":       json.dumps(actors),
-                    "tags":         json.dumps(tags),
-                    "artifact_ids": json.dumps({art_type: art_id}),
-                    "dept":         dept,
-                    "is_incident":  any(t in tags for t in ("postmortem", "incident")),
-                    "is_external":  art_type == "email",
-                })
+                rows.append(
+                    {
+                        "doc_id": art_id,
+                        "doc_type": doc_type,
+                        "title": str(title)[:512],
+                        "body": str(body),
+                        "day": int(artifact.get("day", 0)),
+                        "date": str(artifact.get("date", "")),
+                        "timestamp": str(artifact.get("timestamp", "")),
+                        "actors": json.dumps(actors),
+                        "tags": json.dumps(tags),
+                        "artifact_ids": json.dumps({art_type: art_id}),
+                        "dept": dept,
+                        "is_incident": any(
+                            t in tags for t in ("postmortem", "incident")
+                        ),
+                        "is_external": art_type == "email",
+                    }
+                )
                 logger.debug(f"  orphan artifact added: {art_id} ({doc_type})")
 
         except Exception as exc:
@@ -609,8 +651,16 @@ class CorpusBuilder:
 
 # Question types that rely on evidence retrieval (vs. boolean reasoning)
 _RETRIEVAL_TYPES = {
-    "RETRIEVAL", "CAUSAL", "ROUTING", "GAP_DETECTION", "TEMPORAL",
-    "ESCALATION", "KNOWLEDGE_GAP", "POSTMORTEM", "STANDUP", "CUSTOMER_ESC",
+    "RETRIEVAL",
+    "CAUSAL",
+    "ROUTING",
+    "GAP_DETECTION",
+    "TEMPORAL",
+    "ESCALATION",
+    "KNOWLEDGE_GAP",
+    "POSTMORTEM",
+    "STANDUP",
+    "CUSTOMER_ESC",
 }
 
 

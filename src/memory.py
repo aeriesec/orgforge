@@ -462,6 +462,7 @@ class Memory:
                 },
                 {"type": "filter", "path": "type"},
                 {"type": "filter", "path": "timestamp"},
+                {"type": "filter", "path": "day"},
             ]
         }
 
@@ -566,8 +567,6 @@ class Memory:
         if isinstance(as_of_time, str):
             return as_of_time
         return as_of_time.isoformat()
-
-    from typing import Optional, List, Dict, Any
 
     def recall(
         self,
