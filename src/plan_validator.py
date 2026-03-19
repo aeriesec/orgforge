@@ -63,6 +63,8 @@ _COOLDOWN_DAYS: Dict[str, int] = {
     "onboarding_session": 1,
     "farewell_message": 999,
     "warmup_1on1": 2,
+    "dlp_alert": 1,
+    "secret_detected": 999,
 }
 
 

@@ -46,6 +46,7 @@ import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agent_factory import make_agent
+from causal_chain_handler import CausalChainHandler
 from config_loader import COMPANY_DESCRIPTION, PERSONAS
 from crewai import Task, Crew
 from memory import Memory, SimEvent
@@ -292,6 +293,16 @@ class ConfluenceWriter:
             extra_artifact_ids={"jira": incident_id},
         )
         logger.info(f"    [green]📄 Postmortem:[/green] {conf_ids[0]}")
+
+        for inc in self._state.active_incidents:
+            if inc.ticket_id == incident_id and getattr(inc, "causal_chain", None):
+                inc.causal_chain.append(conf_ids[0])
+                logger.info(
+                    f"    [dim]🔗 Postmortem {conf_ids[0]} appended to "
+                    f"{incident_id} causal chain[/dim]"
+                )
+                break
+
         return conf_ids[0], timestamp
 
     def write_design_doc(
@@ -394,7 +405,10 @@ class ConfluenceWriter:
             new_tickets, author, participants, date_str, timestamp
         )
 
-        # Update SimEvent to include spawned tickets
+        chain = CausalChainHandler(root_id=conf_ids[0])
+        for tid in created_ticket_ids:
+            chain.append(tid)
+
         self._mem.log_event(
             SimEvent(
                 type="confluence_created",
@@ -410,12 +424,18 @@ class ConfluenceWriter:
                     "title": f"Design: {topic[:50]}",
                     "type": "design_doc",
                     "spawned_tickets": created_ticket_ids,
+                    "causal_chain": chain.snapshot(),  # ← add this
                 },
                 summary=(
                     f"{author} created {conf_ids[0]} and spawned "
                     f"{len(created_ticket_ids)} ticket(s): {', '.join(created_ticket_ids)}"
                 ),
-                tags=["confluence", "design_doc", "jira"],
+                tags=[
+                    "confluence",
+                    "design_doc",
+                    "jira",
+                    "causal_chain",
+                ],  # ← add causal_chain
             )
         )
 
@@ -528,8 +548,9 @@ class ConfluenceWriter:
                 f"Based on your expertise ({expertise_str}), propose ONE specific Confluence page title "
                 f"you would plausibly write TODAY. \n\n"
                 f"Rules:\n"
-                f"- Find a technical 'gap'. If 'Auth' is already documented, look for a sub-topic "
-                f"like 'Auth Error Handling' or 'Rotating JWT Keys'.\n"
+                f"- The topic MUST fall within your area of expertise ({expertise_str}). "
+                f"Do NOT propose engineering, infrastructure, or backend topics unless that is your expertise.\n"
+                f"- Find a specific 'gap'. If a topic is already documented, look for a sub-topic or angle not yet covered.\n"
                 f"- Be specific and realistic based on the current Org Theme.\n"
                 f"- Return ONLY the page title string. No explanation. No quotes."
             ),

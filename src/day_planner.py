@@ -102,9 +102,22 @@ class DepartmentPlanner:
     - DO write about maintaining systems, paying down tech debt, iterating on
         existing features, and routine corporate work.
 
-    4. NON-ENGINEERING TEAMS (applies if {dept} is not Engineering).
-    - Agenda items must reflect actual business functions only.
+    4. NON-ENGINEERING TEAMS (applies if {dept} is not Engineering_Backend or Engineering_Mobile).
     - Do NOT propose ticket_progress, pr_review, or code-related activities.
+    - DO use these activity types for your team:
+        * deep_work        — focused individual work (analysis, writing, planning)
+        * 1on1             — check-in with a team member
+        * async_question   — pinging another department for info or a decision
+        * design_discussion — collaborative session to align on approach
+        * mentoring        — senior helping junior
+        * confluence_page  — writing internal documentation, playbooks, runbooks,
+                            or process guides relevant to your team's expertise.
+                            Use this at least once per day per department.
+    - Examples by department:
+        * Design     → design_discussion, confluence_page (design system docs, UX guidelines)
+        * Sales      → async_question (pinging PM for roadmap), confluence_page (sales playbook)
+        * HR_Ops     → 1on1 (wellbeing check), confluence_page (onboarding guide, PTO policy)
+        * QA_Support → design_discussion (test plan), confluence_page (QA runbook)
 
     5. NO EVENT REDUNDANCY (CRITICAL TO AVOID DUPLICATES).
     - NEVER put collaborative meetings (1on1, mentoring, design_discussion, async_question) in the individual agendas of BOTH participants.
@@ -117,7 +130,10 @@ class DepartmentPlanner:
     ---
     ## YOUR TASK
 
-    1. Write a department theme for today (max 10 words).
+    1. Write a department theme for today (max 10 words) that reflects what 
+    YOUR {dept} team is specifically doing — NOT a restatement of the org 
+    theme. The org theme is context, not your theme. A Sales team theme 
+    should sound like sales work. An HR theme should sound like HR work.
     2. Provide a 1-sentence reasoning for the overall plan.
     3. For each team member, write a 1-3 item agenda (keep descriptions under 6 words).
 
@@ -157,7 +173,7 @@ class DepartmentPlanner:
     ---
     ## CONTEXT DATA
 
-    ORG THEME: {org_theme}
+    ORG THEME (context only — do NOT copy this into your dept_theme): {org_theme}
     SPRINT THEME: {sprint_theme}
     SYSTEM HEALTH: {system_health}/100
     TEAM MORALE: {morale_label}
@@ -621,15 +637,16 @@ class DepartmentPlanner:
                 f"  [{s.source_dept}] {s.event_type} (Day {s.day}): {s.summary} [{s.relevance}]"
             )
 
-        # Non-Engineering depts see a compact summary of Engineering's plan —
-        # one line per engineer (first agenda item only), no proposed_events.
         if eng_plan and not self.is_primary:
             eng_lines = [
                 f"    - {ep.name}: {ep.agenda[0].description if ep.agenda else '?'}"
                 for ep in eng_plan.engineer_plans[:3]
             ]
             if eng_lines:
-                lines.append("\n  ENGINEERING TODAY:")
+                lines.append(
+                    "\n  ENGINEERING TODAY (awareness only — do NOT mirror these topics; "
+                    "plan your own department's work in response to this context, not in parallel to it):"
+                )
                 lines.extend(eng_lines)
 
         return "\n".join(lines) if lines else "  (no cross-dept signals today)"

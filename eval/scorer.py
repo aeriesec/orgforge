@@ -247,11 +247,7 @@ class CausalScorer(_BaseScorer):
     ) -> Tuple[float, float, Optional[str]]:
         gt = question["ground_truth"]
         # POSTMORTEM questions are typed CAUSAL but use postmortem_confluence_id
-        gt_id = (
-            gt.get("artifact_id")
-            or gt.get("postmortem_confluence_id")
-            or ""
-        )
+        gt_id = gt.get("artifact_id") or gt.get("postmortem_confluence_id") or ""
         gt_etype = gt.get("event_type", "")
         agent_id = agent_answer.get("artifact_id", "")
         agent_et = agent_answer.get("event_type", "")
@@ -526,7 +522,8 @@ class PostmortemScorer(_BaseScorer):
 
         primary = 1.0 if agent_id == gt_id else 0.0
         failure = (
-            None if primary == 1.0
+            None
+            if primary == 1.0
             else f"Expected postmortem_confluence_id={gt_id!r}, got {agent_id!r}"
         )
 
@@ -615,20 +612,20 @@ class PostmortemScorer(_BaseScorer):
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SCORERS: Dict[str, _BaseScorer] = {
-    "RETRIEVAL":     RetrievalScorer(),
-    "CAUSAL":        CausalScorer(),
-    "TEMPORAL":      TemporalScorer(),
+    "RETRIEVAL": RetrievalScorer(),
+    "CAUSAL": CausalScorer(),
+    "TEMPORAL": TemporalScorer(),
     "GAP_DETECTION": GapDetectionScorer(),
-    "ROUTING":       RoutingScorer(),
-    "PLAN":          PlanScorer(),
-    "ESCALATION":    EscalationScorer(),
+    "ROUTING": RoutingScorer(),
+    "PLAN": PlanScorer(),
+    "ESCALATION": EscalationScorer(),
     "KNOWLEDGE_GAP": KnowledgeGapScorer(),
     # These types were defined in the README but missing from the registry.
     # POSTMORTEM and STANDUP are single-artifact lookups — RetrievalScorer is correct.
     # CUSTOMER_ESC involves a causal chain — CausalScorer is the closest match.
-    "POSTMORTEM":    PostmortemScorer(),
-    "STANDUP":       RetrievalScorer(),
-    "CUSTOMER_ESC":  CausalScorer(),
+    "POSTMORTEM": PostmortemScorer(),
+    "STANDUP": RetrievalScorer(),
+    "CUSTOMER_ESC": CausalScorer(),
 }
 
 
@@ -642,7 +639,7 @@ class OrgForgeScorer:
 
     def score(self, question: dict, agent_answer: dict) -> ScorerResult:
         qtype = question.get("question_type", "UNKNOWN")
-        qid   = question.get("question_id", "")
+        qid = question.get("question_id", "")
 
         # POSTMORTEM questions are stored with question_type=CAUSAL but use a
         # different ground_truth schema (postmortem_confluence_id, not artifact_id).

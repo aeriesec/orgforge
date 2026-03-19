@@ -286,4 +286,6 @@ KNOWN_EVENT_TYPES = {
     "vendor_email_routed",
     "hr_outbound_email",
     "email_dropped",
+    "dlp_alert",
+    "secret_detected",
 }
