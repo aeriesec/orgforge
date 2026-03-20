@@ -391,13 +391,13 @@ class ConfluenceWriter:
         conf_ids = self._finalise_page(
             raw_content=content,
             conf_id=conf_id,
-            title=f"Design: {topic[:50]}",
+            title=f"Design: {topic[:70]}",
             author=author,
             date_str=date_str,
             timestamp=timestamp,
             subdir="design",
             tags=["confluence", "design_doc"],
-            facts={"title": f"Design: {topic[:50]}", "type": "design_doc"},
+            facts={"title": f"Design: {topic[:80]}", "type": "design_doc"},
         )
 
         # Spawn JIRA tickets from action items
@@ -421,7 +421,7 @@ class ConfluenceWriter:
                     "spawned_tickets": json.dumps(created_ticket_ids),
                 },
                 facts={
-                    "title": f"Design: {topic[:50]}",
+                    "title": f"Design: {topic[:80]}",
                     "type": "design_doc",
                     "spawned_tickets": created_ticket_ids,
                     "causal_chain": chain.snapshot(),  # ← add this

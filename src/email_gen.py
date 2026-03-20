@@ -447,7 +447,7 @@ class EmailGen:
             inc_this_wk = [r for r in resolved if r.get("day", 0) <= week * 5]
             inc_summary = (
                 ", ".join(
-                    f"{r['artifact_ids'].get('jira', '?')} ({r['facts'].get('root_cause', '?')[:35]})"
+                    f"{r['artifact_ids'].get('jira', '?')} ({r['facts'].get('root_cause', '?')[:80]})"
                     for r in inc_this_wk[-2:]
                 )
                 if inc_this_wk

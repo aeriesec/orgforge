@@ -27,7 +27,7 @@ def smart_open(filename, mode="r", *args, **kwargs):
 def make_test_memory():
     with patch("memory.Memory._init_vector_indexes"):
         mem = Memory(mongo_client=mongomock.MongoClient())
-    mem.log_event = MagicMock()
+    mem.log_event = MagicMock(wraps=mem.log_event)
     return mem
 
 

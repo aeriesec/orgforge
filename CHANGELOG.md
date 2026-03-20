@@ -6,6 +6,29 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.1.1] — 2026-03-19
+
+### Changed
+
+- **String Truncation Limits (`src/`, `eval/`)**: Standardized and expanded summary truncation limits from 40–60 characters to **80 characters** across JIRA titles, Slack interactions, incident root causes, and PR titles to prevent critical context loss in logs and RAG retrieval.
+- **RAG Embedding Logic (`src/memory.py`)**: Enhanced `OllamaEmbedder` to support **asymmetric retrieval**. The system now prepends specific instruction prefixes for `search_query` and `search_document` to improve embedding quality for models like Stella and MXBAI.
+- **Causal Threading Fixes (`eval/eval_harness.py`)**: Refined `_design_doc_threads` to ensure design documents are only included in evaluation chains if they possess a valid `causal_chain` fact, preventing broken threads in the evaluation harness.
+- **Codebase Formatting**: Applied consistent linting and multi-line dictionary wrapping across `eval/eval_harness.py` and `src/insider_threat.py` to match project style guidelines.
+
+### Added
+
+- **LLM-Driven Sentiment Drift (`src/insider_threat.py`)**: Replaced static text templating with a **CrewAI-powered rewriting task**. Disgruntled or malicious actors now use a `worker_llm` to authentically rewrite Slack messages, with negativity intensity scaling based on the days since the threat "onset."
+- **Enhanced Vector Search Filtering (`src/memory.py`)**:
+  - Added `type_exclude` support to `recall()`, allowing the RAG pipeline to explicitly ignore specific artifact types (e.g., hiding `persona_skill` from general queries).
+  - Implemented a "causal floor" using the `since` parameter to allow bounded timestamp filtering ($gte and $lte) within MongoDB vector searches.
+- **Comprehensive Memory Testing (`tests/test_memory.py`)**: Introduced a massive expansion of the test suite (20+ new tests) covering:
+  - Ollama instruction prefix validation.
+  - Mutually exclusive filter guards in `recall()`.
+  - Upsert logic for artifacts to prevent vector index duplication.
+  - Event-type skip lists to reduce embedding noise for high-volume, low-signal events like standard Slack messages.
+
+---
+
 ## [v1.1.0] — 2026-03-19
 
 ### Changed

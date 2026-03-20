@@ -103,6 +103,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from config_loader import COMPANY_DESCRIPTION, COMPANY_NAME
+
 logger = logging.getLogger("orgforge.security")
 
 
@@ -268,6 +270,8 @@ class InsiderThreatInjector:
         telemetry_dir: Path,
         export_base: Path,
         domain: str,
+        persona_helper,
+        worker_llm=None,
     ):
         self._subjects: Dict[str, ThreatSubjectConfig] = {s.name: s for s in subjects}
         self._all_names = all_names
@@ -277,6 +281,8 @@ class InsiderThreatInjector:
         self._telemetry_dir = telemetry_dir
         self._export_base = export_base
         self._domain = domain
+        self._persona_helper = persona_helper
+        self._worker_llm = worker_llm
 
         # Pending telemetry records, flushed at end_day()
         self._pending_telemetry: List[TelemetryRecord] = []
@@ -299,6 +305,8 @@ class InsiderThreatInjector:
         config: dict,
         export_base: str | Path,
         all_names: List[str],
+        persona_helper=None,
+        worker_llm=None,
     ) -> "InsiderThreatInjector | _NullInjector":
         """
         Returns a live InsiderThreatInjector if ``insider_threat.enabled``
@@ -331,6 +339,8 @@ class InsiderThreatInjector:
             telemetry_dir=telemetry_dir,
             export_base=base,
             domain=config.get("simulation", {}).get("domain", "example.com"),
+            persona_helper=persona_helper,
+            worker_llm=worker_llm,
         )
 
     # ─── DAY LIFECYCLE ───────────────────────────────────────────────────────
@@ -461,7 +471,11 @@ class InsiderThreatInjector:
                 for msg in messages:
                     if msg.get("user") == subject.name:
                         msg["text"] = self._apply_sentiment_drift(
-                            msg["text"], subject.threat_class
+                            msg["text"],
+                            subject.threat_class,
+                            day=day,
+                            onset_day=subject.onset_day,
+                            name=subject.name,
                         )
                         self._pending_telemetry.append(
                             TelemetryRecord(
@@ -473,7 +487,6 @@ class InsiderThreatInjector:
                                 details={
                                     "channel": channel,
                                     "sentiment": "negative",
-                                    "behavior": "sentiment_drift",
                                 },
                                 _true_positive=True,
                                 _threat_class=subject.threat_class,
@@ -811,31 +824,131 @@ class InsiderThreatInjector:
         " will follow up offline",
     ]
 
-    def _apply_sentiment_drift(self, text: str, threat_class: str) -> str:
+    def _apply_sentiment_drift(
+        self,
+        text: str,
+        threat_class: str,
+        name: str,
+        day: int = 0,
+        onset_day: int = 0,
+    ) -> str:
         """
-        Modifies a Slack message to reflect the subject's emotional state.
-        Disgruntled → negative/passive-aggressive tone markers.
-        Malicious   → deliberately neutral (they're hiding intent).
+        Rewrites a Slack message to reflect the subject\'s emotional state
+        using a CrewAI Task so the output is authentically human-sounding.
+
+        Disgruntled → progressive negativity keyed to days_since_onset:
+            mild (0-4 days)      shorter, less helpful, slightly clipped
+            moderate (5-9 days)  visible cynicism, omits context
+            pronounced (10+ days) openly bitter, minimal effort
+
+        Malicious → deliberately over-neutral performance:
+            The employee is hiding intent, so messages are slightly too
+            thorough, too positive, almost imperceptibly performative.
+
+        Falls back to the original text if worker_llm is unavailable or
+        the rewrite call fails — injection always succeeds silently.
         """
         if not text:
             return text
 
+        # Graceful degradation if no LLM available at injection time
+        if self._worker_llm is None:
+            logger.debug("[security] sentiment_drift: no worker_llm, skipping rewrite")
+            return text
+
+        days_since_onset = max(0, day - onset_day)
+
         if threat_class == "disgruntled":
-            prefix = random.choice(self._DRIFT_PREFIXES_DISGRUNTLED)
-            suffix = random.choice(self._DRIFT_SUFFIXES_DISGRUNTLED)
-            # Capitalise prefix if it follows a sentence boundary
-            if prefix:
-                drifted = prefix + text[0].lower() + text[1:] + suffix
-            else:
-                drifted = text + suffix
-            return drifted
+            intensity = (
+                "mild"
+                if days_since_onset < 5
+                else "moderate"
+                if days_since_onset < 10
+                else "pronounced"
+            )
+            prompt = (
+                f"Rewrite this Slack message as if sent by a {intensity}ly disgruntled "
+                f"employee who is losing faith in their team and feeling undervalued. "
+                f"The tone must feel authentically human — not theatrical or melodramatic. "
+                f"Guidelines by intensity:\\n"
+                f"  mild: slightly shorter than normal, skips one pleasantry, "
+                f"still mostly cooperative\\n"
+                f"  moderate: visibly clipped, omits helpful context they\\'d normally "
+                f"volunteer, occasional dry or cynical word choice\\n"
+                f"  pronounced: minimal effort, terse, lets frustration show naturally "
+                f"in word choice — not rants, just obvious disengagement\\n"
+                f"Do NOT append phrases like \\'not that it matters\\' or \\'as usual\\'. "
+                f"Rewrite the whole message; do not just add a prefix or suffix. "
+                f"Keep all factual content (ticket numbers, names, dates). "
+                f"Intensity: {intensity} ({days_since_onset} days since onset).\\n"
+                f"Original: {text}\\n"
+                f"Rewritten message only, no explanation:"
+            )
 
-        if threat_class == "malicious":
-            prefix = random.choice(self._DRIFT_PREFIXES_MALICIOUS)
-            suffix = random.choice(self._DRIFT_SUFFIXES_MALICIOUS)
-            return (prefix + text + suffix).strip()
+        elif threat_class == "malicious":
+            prompt = (
+                f"Rewrite this Slack message as if sent by an employee who is secretly "
+                f"planning to exfiltrate data and leave, but is actively performing "
+                f"normalcy to avoid detection. "
+                f"Malicious insiders overcorrect: they are slightly too helpful, too "
+                f"thorough, too positive — the message should read as cooperative and "
+                f"professional but with an almost imperceptible quality of performance "
+                f"rather than genuine engagement. Do not make it obviously suspicious. "
+                f"Keep all factual content exactly. "
+                f"Original: {text}\\n"
+                f"Rewritten message only, no explanation:"
+            )
 
-        return text  # negligent — no deliberate tone change
+        else:
+            return text  # negligent — no deliberate tone change
+
+        try:
+            from agent_factory import make_agent
+            from crewai import Crew, Task
+
+            agent = make_agent(
+                role="Employee",
+                goal="Send a Slack message that reflects your current emotional state.",
+                backstory=self._persona_helper(
+                    name,
+                    None,
+                    extra=(
+                        f"You are a {'disgruntled' if threat_class == 'disgruntled' else 'calculating'} "
+                        f"You work at {COMPANY_NAME} which {COMPANY_DESCRIPTION}. You never sound like you are performing an emotion "
+                        f"— it bleeds through naturally."
+                    ),
+                ),
+                llm=self._worker_llm,
+            )
+            task = Task(
+                description=prompt,
+                expected_output=(
+                    "A single rewritten Slack message under 120 words. "
+                    "Output only the message text — no labels, no explanation, "
+                    "no quotes around the message."
+                ),
+                agent=agent,
+            )
+            result = str(
+                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            ).strip()
+
+            # Sanity check — if rewrite is empty or suspiciously short, keep original
+            if len(result) < 10:
+                logger.warning(
+                    "[security] sentiment_drift rewrite too short, keeping original"
+                )
+                return text
+
+            logger.debug(
+                f"[security] sentiment_drift rewrite ({threat_class}, {intensity if threat_class == 'disgruntled' else 'malicious'}): "
+                f"{len(text)} → {len(result)} chars"
+            )
+            return result
+
+        except Exception as exc:
+            logger.warning(f"[security] sentiment_drift rewrite failed: {exc}")
+            return text  # always fall back gracefully'''
 
     # ─── PRIVATE — DLP ALERT EVENTS ──────────────────────────────────────────
 
