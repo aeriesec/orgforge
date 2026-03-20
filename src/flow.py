@@ -632,6 +632,8 @@ class Flow(Flow[State]):
             config=CONFIG,
             export_base=BASE,
             all_names=ALL_NAMES,
+            persona_helper=persona_backstory,
+            worker_llm=WORKER_MODEL,
         )
         self._git = GitSimulator(
             self.state,
@@ -1718,7 +1720,7 @@ class Flow(Flow[State]):
 
         # ── 5. Bot alerts — capture thread ids before ticket is built ─────────
         datadog_text = (
-            f"🚨 [CRITICAL] Anomaly detected: {root_cause[:40]}... "
+            f"🚨 [CRITICAL] Anomaly detected: {root_cause[:80]}... "
             f"Error rate spiked 400%. System health dropped to {self.state.system_health}."
         )
         pagerduty_text = (
@@ -1981,7 +1983,7 @@ class Flow(Flow[State]):
                     elif ep.name == eng_peer:
                         ep.apply_incident_pressure(inc.title, hrs_lost=peer_hrs_lost)
 
-        logger.info(f"    [red]🚨 {ticket_id}:[/red] {root_cause[:65]}")
+        logger.info(f"    [red]🚨 {ticket_id}:[/red] {root_cause[:80]}")
 
     def _advance_incidents(self):
         still_active = []
@@ -2007,7 +2009,7 @@ class Flow(Flow[State]):
                 pr = self._git.create_pr(
                     author=on_call,
                     ticket_id=inc.ticket_id,
-                    title=f"[{inc.ticket_id}] Fix: {inc.root_cause[:60]}",
+                    title=f"[{inc.ticket_id}] Fix: {inc.root_cause[:80]}",
                     timestamp=cron_time_iso,
                 )
 

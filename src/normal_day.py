@@ -515,7 +515,7 @@ class NormalDayHandler:
             pr = self._git.create_pr(
                 author=assignee,
                 ticket_id=ticket_id,
-                title=f"[{ticket_id}] {ticket['title'][:50]}",
+                title=f"[{ticket_id}] {ticket['title'][:80]}",
                 timestamp=current_actor_time_iso,
             )
             spawned_pr_id = pr["pr_id"]
@@ -1483,7 +1483,7 @@ class NormalDayHandler:
                 artifact_ids=artifact_ids,
                 facts=facts,
                 summary=(
-                    f"{initiator} led design discussion on '{item.description[:50]}' "
+                    f"{initiator} led design discussion on '{item.description[:80]}' "
                     f"with {', '.join(p for p in participants if p != initiator)}."
                 ),
                 tags=["design_discussion", "slack"],
@@ -1492,7 +1492,7 @@ class NormalDayHandler:
 
         self._gd.record_slack_interaction(participants)
         logger.info(
-            f"    [dim]🏗️  Design discussion: {item.description[:40]} "
+            f"    [dim]🏗️  Design discussion: {item.description[:80]} "
             f"({len(participants)} engineers)[/dim]"
         )
         return participants
@@ -2027,7 +2027,7 @@ class NormalDayHandler:
                 actors=[name],
                 artifact_ids={},
                 facts={"name": name, "focus": item.description},
-                summary=f"{name} in deep work: {item.description[:50]}",
+                summary=f"{name} in deep work: {item.description[:80]}",
                 tags=["deep_work"],
             )
         )

@@ -535,7 +535,7 @@ class ExternalEmailIngestor:
 
         ticket = {
             "id": ticket_id,
-            "title": f"[Customer] {signal.subject[:60]}",
+            "title": f"[Customer] {signal.subject[:80]}",
             "description": description,
             "status": "To Do",
             "assignee": product_lead,
@@ -660,7 +660,7 @@ class ExternalEmailIngestor:
 
         ticket = {
             "id": ticket_id,
-            "title": f"[Vendor] {signal.subject[:60]}",
+            "title": f"[Vendor] {signal.subject[:80]}",
             "description": f"From {signal.source_name}: {signal.body_preview}",
             "status": "To Do",
             "assignee": assignee,
@@ -956,12 +956,12 @@ class ExternalEmailIngestor:
                     "causal_chain": signal.causal_chain.snapshot(),
                 },
                 summary=(
-                    f'{sales_lead} replied to {signal.source_name}: "{subject[:50]}"'
+                    f'{sales_lead} replied to {signal.source_name}: "{subject[:80]}"'
                 ),
                 tags=["email", "outbound", "customer_reply", "causal_chain"],
             )
         )
-        logger.info(f"    [cyan]📤 Reply → {signal.source_name}:[/cyan] {subject[:60]}")
+        logger.info(f"    [cyan]📤 Reply → {signal.source_name}:[/cyan] {subject[:80]}")
         return embed_id
 
     def _send_vendor_ack(
@@ -1093,12 +1093,12 @@ class ExternalEmailIngestor:
                     "causal_chain": signal.causal_chain.snapshot(),
                 },
                 summary=(
-                    f'{recipient} acknowledged {signal.source_name}: "{subject[:50]}"'
+                    f'{recipient} acknowledged {signal.source_name}: "{subject[:80]}"'
                 ),
                 tags=["email", "outbound", "vendor_ack", "causal_chain"],
             )
         )
-        logger.info(f"    [cyan]📤 Ack → {signal.source_name}:[/cyan] {subject[:60]}")
+        logger.info(f"    [cyan]📤 Ack → {signal.source_name}:[/cyan] {subject[:80]}")
         return embed_id
 
     # ─────────────────────────────────────────────────────────────────────────

@@ -288,11 +288,12 @@ class CausalThreadBuilder:
                 }
             )
         return threads
-    
+
     def _design_doc_threads(self) -> List[dict]:
         threads = []
         conf_events = [
-            e for e in self._events
+            e
+            for e in self._events
             if e.type == "confluence_created"
             and e.facts.get("type") == "design_doc"
             and e.facts.get("causal_chain")  # only after your fix
@@ -303,19 +304,21 @@ class CausalThreadBuilder:
                 continue
             chain = event.facts.get("causal_chain", [conf_id])
             nodes = self._build_nodes(chain, event)
-            threads.append({
-                "chain_id": f"design_doc_{conf_id}",
-                "chain_type": "design_doc",
-                "root_artifact": conf_id,
-                "root_event_type": "confluence_created",
-                "day": event.day,
-                "date": event.date,
-                "nodes": nodes,
-                "terminal_artifact": chain[-1] if chain else conf_id,
-                "complete": len(chain) > 1,
-                "author": next(iter(event.actors), None),
-                "spawned_tickets": event.facts.get("spawned_tickets", []),
-            })
+            threads.append(
+                {
+                    "chain_id": f"design_doc_{conf_id}",
+                    "chain_type": "design_doc",
+                    "root_artifact": conf_id,
+                    "root_event_type": "confluence_created",
+                    "day": event.day,
+                    "date": event.date,
+                    "nodes": nodes,
+                    "terminal_artifact": chain[-1] if chain else conf_id,
+                    "complete": len(chain) > 1,
+                    "author": next(iter(event.actors), None),
+                    "spawned_tickets": event.facts.get("spawned_tickets", []),
+                }
+            )
         return threads
 
     def _build_nodes(self, chain: List[str], root_event: SimEvent) -> List[dict]:
@@ -1299,7 +1302,7 @@ class EvalQuestionGenerator:
                     }
                 )
         return questions
-    
+
     # ── LLM question prose ────────────────────────────────────────────────────
 
     def _generate_question_prose(self, template: str) -> Optional[str]:

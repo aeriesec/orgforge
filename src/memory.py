@@ -177,10 +177,18 @@ class OllamaEmbedder(BaseEmbedder):
     def embed(self, text: str, input_type: str = "search_document") -> List[float]:
         if not self._ok:
             return self._fallback(text)
+
+        _INSTRUCTIONS = {
+            "search_document": "Represent this sentence for searching relevant passages: ",
+            "search_query": "Represent this query for retrieving relevant documents: ",
+        }
+        prefix = _INSTRUCTIONS.get(input_type, "")
+        prefixed_text = prefix + text
+
         try:
             r = requests.post(
                 f"{self._host}/api/embed",
-                json={"model": self._model, "input": text},
+                json={"model": self._model, "input": prefixed_text},
                 timeout=120,
             )
 
@@ -598,7 +606,7 @@ class Memory:
             query,
             input_type="search_query",
             caller="recall",
-            doc_id=query[:50],
+            doc_id=query[:75],
             doc_type="query",
         )
 
