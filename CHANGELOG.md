@@ -6,6 +6,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.1.2] — 2026-03-19
+
+### Added
+
+- **Host Data Hoarding Behavior (`src/insider_threat.py`)**: New `host_data_hoarding` threat behavior simulating a 3-phase, multi-day data staging trail (bulk file copy → compression → transfer). Available to `disgruntled` and `malicious` threat classes; requires cross-phase correlation for detection.
+- **IDP Log Simulation (`src/insider_threat.py`, `INSIDERTHREAT.md`)**: New `idp_logs` config flag (default: `true`) emitting realistic daily SSO authentication records for all employees, with anomalous IDP events (off-hours, new device, ghost logins) layered on top for threat subjects.
+- **Multi-Format Telemetry Output (`src/insider_threat.py`)**: New `log_format` config option supporting `jsonl` (default), `cef` (ArcSight/Splunk), `ecs` (Elastic SIEM), `leef` (IBM QRadar), and `all` for parallel output. Ground truth is always written as JSONL regardless of setting.
+- **Recurrence-Aware PR Reviews (`src/normal_day.py`)**: PR review agents now receive a `recurrence_hint` when the linked ticket is a repeat of a prior bug, surfacing the ancestor ticket ID, recurrence gap, and prior root cause to inform more contextually grounded review comments.
+- **Rich Ticket Context for Prompts (`src/context.py`)**: `context_for_ticket` now surfaces blocker events and prior `async_question`/`design_discussion` entries attached to a ticket, helping agents avoid rehashing settled decisions.
+
+### Changed
+
+- **Person-Scoped RAG Context (`src/normal_day.py`)**: Switched 1-on-1 meeting and mentoring session context retrieval from `context_for_prompt` (semantic search) to `context_for_person` (person-scoped lookup) for more relevant, targeted memory recall.
+- **Telemetry Surface References (`INSIDERTHREAT.md`)**: Updated behavior documentation to reference `access_log.*` instead of `access_log.jsonl` to reflect multi-format output support across `excessive_repo_cloning`, `cross_dept_snooping`, and `data_exfil_email`.
+- **Threat Class Profiles (`INSIDERTHREAT.md`)**: Updated detection difficulty descriptions for `disgruntled` (now requires IDP correlation) and `malicious` (now flags host hoarding and IDP anomalies as additional detection surfaces).
+- **Documentation Formatting (`INSIDERTHREAT.md`)**: Aligned config and subject field reference tables, added `log_format` and `idp_logs` entries, and added new IDP log and industry-standard log format sections to the table of contents.
+
+---
+
 ## [v1.1.1] — 2026-03-19
 
 ### Changed

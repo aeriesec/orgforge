@@ -704,6 +704,7 @@ class Flow(Flow[State]):
             graph_dynamics=self.graph_dynamics,
             mem=self._mem,
         )
+        self._se_followup_days: Dict[int, str] = {}
         orgforge_token_listener.attach(self._mem)
 
         stats = self._mem.stats()
@@ -985,6 +986,30 @@ class Flow(Flow[State]):
                     "adhoc_confluence_prob", 0.3
                 ):
                     self._generate_adhoc_confluence_page()
+
+                for subject_name in self._threat.active_subject_names():
+                    result = self._threat.inject_host_hoarding(
+                        actor=subject_name,
+                        day=self.state.day,
+                        current_date=self.state.current_date,
+                    )
+                    if result:
+                        logger.debug(
+                            f"[security] host hoarding phase {result['phase']} "
+                            f"fired for {subject_name}"
+                        )
+
+                if self.state.day in self._se_followup_days:
+                    self._threat.reset_behavior_cooldown("social_engineering")
+
+                se_results = self._threat.inject_social_engineering(
+                    day=self.state.day,
+                    current_date=self.state.current_date,
+                    active_names=self.state.daily_active_actors or ALL_NAMES,
+                )
+                for r in se_results:
+                    if r.get("pattern") == "trust_building":
+                        self._se_followup_days[r["followup_due_day"]] = r["target"]
 
             self._mem.save_checkpoint(
                 day=self.state.day,
@@ -1812,6 +1837,8 @@ class Flow(Flow[State]):
             "linked_prs": [],
             "dept": dept_of(on_call),
             "sprint": self.state.sprint.sprint_number,
+            "created_at": incident_start_iso,
+            "updated_at": incident_start_iso,
             # Causal chain
             "causal_chain": chain_handler.snapshot(),
             "bot_threads": [datadog_thread, pagerduty_thread],

@@ -103,6 +103,18 @@ So when Jordan leaves on Day 12, the postmortem on Day 9's incident doesn't ment
 
 ---
 
+## Insider Threat Simulation
+
+OrgForge includes an optional insider threat module that layers adversarial behavior on top of the normal simulation — without touching any of the clean simulation paths. When disabled (the default), it is completely inert: no overhead, no additional output, no altered code paths.
+
+When enabled, designated employees exhibit configurable threat behaviors across multiple surfaces: anomalous git activity, off-hours access, sentiment drift in Slack, data staging on their workstation, and IDP authentication anomalies. All threat telemetry is written to a separate `security_telemetry/` directory in industry-standard log formats (JSONL, CEF, ECS, LEEF), keeping it cleanly isolated from the normal simulation output so detection agents must work to find it.
+
+The module is designed for building and evaluating insider threat detection systems. Ground truth is always preserved in JSONL regardless of output format.
+
+👉 **[Read the full Insider Threat reference here.](INSIDER_THREAT.md)**
+
+---
+
 ## Quickstart
 
 `flow.py` is the main simulation entry point. `config/config.yaml` is the single source of truth for org structure, personas, incident triggers, and quality presets.

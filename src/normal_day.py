@@ -640,13 +640,28 @@ class NormalDayHandler:
         )
         current_actor_time = artifact_time.isoformat()
 
-        ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
+        ctx = self._mem.context_for_person(
+            name=reviewer, n=2, as_of_time=current_actor_time
+        )
         backstory = self._persona_helper(
             reviewer,
             mem=self._mem,
             graph_dynamics=self._gd,
             extra=f"You are {reviewer}, reviewing {author}'s PR: {pr_title}.",
         )
+
+        recurrence_hint = ""
+        linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
+        if linked_ticket_id:
+            ticket = self._mem.get_ticket(linked_ticket_id)
+            if ticket and ticket.get("recurrence_of"):
+                ancestor = self._mem.get_ticket(ticket["recurrence_of"])
+                ancestor_root_cause = ancestor.get("root_cause", "") if ancestor else ""
+                recurrence_hint = (
+                    f"Note: this PR fixes {linked_ticket_id}, which is a recurrence of "
+                    f"{ticket['recurrence_of']} ({ticket.get('recurrence_gap_days', '?')} days ago). "
+                    f"Prior root cause: {ancestor_root_cause[:120]}"
+                )
 
         # Generate review comment
         agent = make_agent(
@@ -662,6 +677,7 @@ class NormalDayHandler:
                 f"code patterns, potential edge cases, or ask a clarifying question. "
                 f"Your tone must reflect your current stress level (see your backstory).\n\n"
                 f"Output the comment text only. No preamble, no 'Here is my review:'.\n\n"
+                f"{recurrence_hint} "
                 f"--- CONTEXT ---\n{ctx}"
             ),
             expected_output=(
@@ -814,6 +830,19 @@ class NormalDayHandler:
         artifact_time, _ = self._clock.advance_actor(reviewer, hours=review_hrs)
         current_actor_time = artifact_time.isoformat()
 
+        recurrence_hint = ""
+        linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
+        if linked_ticket_id:
+            ticket = self._mem.get_ticket(linked_ticket_id)
+            if ticket and ticket.get("recurrence_of"):
+                ancestor = self._mem.get_ticket(ticket["recurrence_of"])
+                ancestor_root_cause = ancestor.get("root_cause", "") if ancestor else ""
+                recurrence_hint = (
+                    f"Note: this PR fixes {linked_ticket_id}, which is a recurrence of "
+                    f"{ticket['recurrence_of']} ({ticket.get('recurrence_gap_days', '?')} days ago). "
+                    f"Prior root cause: {ancestor_root_cause[:120]}"
+                )
+
         ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
         backstory = self._persona_helper(
             reviewer,
@@ -836,6 +865,7 @@ class NormalDayHandler:
                 f"review comment. Be specific — mention the fix approach, flag any edge case, "
                 f"or ask a targeted clarifying question.\n\n"
                 f"Output the comment text only. No preamble, no 'Here is my review:'.\n\n"
+                f"{recurrence_hint} "
                 f"--- CONTEXT ---\n{ctx}"
             ),
             expected_output=(
@@ -962,8 +992,8 @@ class NormalDayHandler:
         )
         meeting_time_iso = meeting_start.isoformat()
 
-        ctx = self._mem.context_for_prompt(
-            f"What has {name} been working on recently, and what are their current blockers or concerns?",
+        ctx = self._mem.context_for_person(
+            name=name,
             n=2,
             as_of_time=meeting_time_iso,
         )
@@ -1523,8 +1553,8 @@ class NormalDayHandler:
         )
         meeting_time_iso = meeting_start.isoformat()
 
-        ctx = self._mem.context_for_prompt(
-            f"What skills is {mentee} developing and what technical areas have they been involved in recently?",
+        ctx = self._mem.context_for_person(
+            name=mentee,
             n=2,
             as_of_time=meeting_time_iso,
         )
