@@ -189,7 +189,7 @@ class OllamaEmbedder(BaseEmbedder):
             r = requests.post(
                 f"{self._host}/api/embed",
                 json={"model": self._model, "input": prefixed_text},
-                timeout=120,
+                timeout=300,
             )
 
             r.raise_for_status()
@@ -209,13 +209,8 @@ class OllamaEmbedder(BaseEmbedder):
                 f"[memory] Ollama embedding HTTP error: {e.response.status_code}.{error_details}"
             )
             return []
-        except (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-        ) as e:
-            logger.warning(
-                f"[memory] Ollama embedding HTTP error: {e.response.status_code}"
-            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            logger.warning(f"[memory] Ollama connection/timeout error: {e}")
             return []
         except (KeyError, IndexError) as e:
             logger.warning(f"[memory] Ollama embedding response malformed: {e}")
@@ -786,17 +781,56 @@ class Memory:
         as_of_time: Optional[Any] = None,
     ) -> List[SimEvent]:
         """
-        Returns the n most relevant SimEvents for the query.
+        Returns the n most relevant SimEvents for the query using vector search.
+        Falls back to recency sort if the query embedding fails or returns empty.
 
         as_of_time (datetime | str | None, SimClock-sourced):
             Hard causal ceiling — only events whose timestamp is ≤ this value
-            are eligible.  Accepts a datetime or pre-formatted ISO string;
-            normalised via _to_iso() internally.
+            are eligible.
         """
-        query_filter: Dict[str, Any] = {}
-
         iso = self._to_iso(as_of_time)
-        if iso is not None:
+
+        # ── Attempt vector search ─────────────────────────────────────────────
+        query_vec = self._embed(
+            query,
+            input_type="search_query",
+            caller="recall_events",
+            doc_id=query[:75],
+            doc_type="query",
+        )
+
+        if query_vec:
+            pipeline: List[Dict[str, Any]] = [
+                {
+                    "$vectorSearch": {
+                        "index": "vector_index",
+                        "path": "embedding",
+                        "queryVector": query_vec,
+                        "numCandidates": max(n * 10, 100),
+                        "limit": n,
+                        **({"filter": {"timestamp": {"$lte": iso}}} if iso else {}),
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 0,
+                        "embedding": 0,
+                        "tags": 0,
+                        "artifacts": 0,
+                    }
+                },
+            ]
+            try:
+                results = list(self._events.aggregate(pipeline))
+                if results:
+                    return [SimEvent(**{k: v for k, v in e.items()}) for e in results]
+            except Exception as e:
+                logger.warning(f"[memory] recall_events vector search failed: {e}")
+
+        # ── Fallback: recency sort ────────────────────────────────────────────
+        logger.debug("[memory] recall_events falling back to recency sort")
+        query_filter: Dict[str, Any] = {}
+        if iso:
             query_filter["timestamp"] = {"$lte": iso}
 
         results = (
@@ -807,10 +841,6 @@ class Memory:
             .sort("timestamp", -1)
             .limit(n)
         )
-
-        # Note: If you have vector embeddings on SimEvents, you would re-rank
-        # them by the `query` text here. Otherwise, this returns the n most
-        # recent events before the actor's current cursor.
         return [SimEvent(**{k: v for k, v in e.items()}) for e in results]
 
     # ─── HELPERS ──────────────────────────────
@@ -1326,6 +1356,9 @@ class Memory:
             "assignee": name,
             "status": {"$ne": "Done"},
         }
+        if iso:
+            ticket_filter["created_at"] = {"$lte": iso}
+
         open_tickets = list(
             self._jira.find(ticket_filter, {"_id": 0}).sort("priority", 1).limit(5)
         )
@@ -1752,6 +1785,166 @@ class Memory:
     def get_inbound_email_sources(self) -> Optional[list]:
         doc = self._db["sim_config"].find_one({"_id": "inbound_email_sources"})
         return doc["sources"] if doc else None
+
+    def context_for_ticket(
+        self,
+        ticket_id: str,
+        as_of_time: Optional[Any] = None,
+    ) -> str:
+        """
+        Purpose-built context for ticket-scoped conversations — no embedding.
+
+        Intended for _handle_async_question and _handle_design_discussion where
+        participants need to understand a ticket's current state and history but
+        are not necessarily the assignee and the ticket is not necessarily an
+        incident.
+
+        Fetches:
+        - The ticket itself (title, status, assignee, description, last 3 comments)
+        - Recurrence signal if present (recurrence_of, gap_days, ancestor root cause)
+        - Recent async_question and design_discussion events linked to this ticket
+            or its participants — so the conversation doesn't rehash settled ground
+        - Any blocker events on this ticket
+
+        Use this instead of context_for_prompt(ticket_title) in
+        _handle_async_question and _handle_design_discussion.
+
+        Args:
+            ticket_id:   The JIRA ticket ID the conversation is about.
+            as_of_time:  Causal ceiling (datetime or ISO string).
+        """
+        iso = self._to_iso(as_of_time)
+        lines: List[str] = [f"=== TICKET CONTEXT: {ticket_id} ==="]
+
+        # ── The ticket document ───────────────────────────────────────────────
+        ticket = self._jira.find_one(
+            {"id": ticket_id},
+            {
+                "_id": 0,
+                "id": 1,
+                "title": 1,
+                "status": 1,
+                "assignee": 1,
+                "description": 1,
+                "story_points": 1,
+                "linked_prs": 1,
+                "root_cause": 1,
+                "recurrence_of": 1,
+                "recurrence_gap_days": 1,
+                "gap_areas": 1,
+                "comments": {"$slice": -3},
+            },
+        )
+        if not ticket:
+            lines.append(f"  Ticket {ticket_id} not found.")
+            return "\n".join(lines)
+
+        lines.append(
+            f"  [{ticket_id}] {ticket.get('title', '')} "
+            f"(status={ticket.get('status', '?')}, "
+            f"assignee={ticket.get('assignee', 'unassigned')}, "
+            f"points={ticket.get('story_points', '?')})"
+        )
+
+        description = ticket.get("description", "").strip()
+        if description:
+            lines.append(f"  Description: {description[:200]}")
+
+        if ticket.get("root_cause"):
+            lines.append(f"  Root cause: {ticket['root_cause'][:150]}")
+
+        if ticket.get("gap_areas"):
+            lines.append(f"  Knowledge gap areas: {', '.join(ticket['gap_areas'])}")
+
+        linked_prs = ticket.get("linked_prs", [])
+        if linked_prs:
+            lines.append(f"  Linked PRs: {', '.join(linked_prs)}")
+
+        comments = ticket.get("comments", [])
+        if comments:
+            lines.append("  Recent comments:")
+            for c in comments:
+                author = c.get("author", "?")
+                date = c.get("date", "")
+                text = c.get("text", "").strip().strip('"')[:150]
+                lines.append(f"    {author} ({date}): {text}")
+
+        # ── Recurrence signal — fetch ancestor root cause for full context ────
+        # Gives participants the "we saw this before" signal without them
+        # needing to look it up themselves.
+        recurrence_of = ticket.get("recurrence_of")
+        if recurrence_of:
+            gap = ticket.get("recurrence_gap_days", "?")
+            ancestor = self._jira.find_one(
+                {"id": recurrence_of},
+                {"_id": 0, "root_cause": 1, "title": 1},
+            )
+            ancestor_root_cause = (
+                ancestor.get("root_cause", "")[:120] if ancestor else ""
+            )
+            lines.append(
+                f"  Recurrence: this is a repeat of {recurrence_of} "
+                f"({gap} days ago)"
+                + (
+                    f" — prior root cause: {ancestor_root_cause}"
+                    if ancestor_root_cause
+                    else ""
+                )
+            )
+
+        # ── Blocker events on this ticket ─────────────────────────────────────
+        blocker_filter: Dict[str, Any] = {
+            "type": "blocker_flagged",
+            "artifact_ids.jira": ticket_id,
+        }
+        if iso:
+            blocker_filter["timestamp"] = {"$lte": iso}
+        blockers = list(
+            self._events.find(
+                blocker_filter,
+                {"_id": 0, "day": 1, "actors": 1, "facts.blocker_reason": 1},
+            )
+            .sort("timestamp", -1)
+            .limit(2)
+        )
+        if blockers:
+            lines.append("  Active blockers:")
+            for b in blockers:
+                reason = b.get("facts", {}).get("blocker_reason", "")[:120]
+                actor = b.get("actors", ["?"])[0]
+                lines.append(f"    Day {b.get('day', '?')} — {actor}: {reason}")
+
+        # ── Prior discussions on this ticket — dedup guard ────────────────────
+        # Surfaces what has already been decided so participants don't rehash it.
+        discussion_filter: Dict[str, Any] = {
+            "type": {"$in": ["async_question", "design_discussion"]},
+            "artifact_ids.jira": ticket_id,
+        }
+        if iso:
+            discussion_filter["timestamp"] = {"$lte": iso}
+        prior_discussions = list(
+            self._events.find(
+                discussion_filter,
+                {
+                    "_id": 0,
+                    "day": 1,
+                    "type": 1,
+                    "facts.topic": 1,
+                    "facts.asker": 1,
+                    "summary": 1,
+                },
+            )
+            .sort("timestamp", -1)
+            .limit(3)
+        )
+        if prior_discussions:
+            lines.append("  Prior discussions (do not rehash these):")
+            for d in prior_discussions:
+                label = d.get("type", "").replace("_", " ").title()
+                topic = d.get("facts", {}).get("topic") or d.get("summary", "")
+                lines.append(f"    Day {d.get('day', '?')} [{label}]: {topic[:120]}")
+
+        return "\n".join(lines)
 
     def context_for_ticket_progress(
         self,

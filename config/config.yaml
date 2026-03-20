@@ -60,7 +60,7 @@ simulation:
   domain: "apexathletics.io"
   output_dir: "./export"
   db_name: "orgforge"
-  max_days: 30
+  max_days: 60
   start_date: "2026-03-02"
 
   adhoc_confluence_prob: 0.3
@@ -195,7 +195,7 @@ org_lifecycle:
   # The DepartmentPlanner will propose warmup_1on1 and onboarding_session
   # events naturally once the roster context shows them as "still warming up".
   scheduled_hires:
-    - name: "Taylor"
+    - name: "Janice"
       day: 15
       dept: "Engineering_Backend"
       role: "Backend Engineer"
@@ -203,7 +203,7 @@ org_lifecycle:
       style: "methodical, asks lots of questions before writing code"
       social_role: "The Diligent Observer"
       typing_quirks: >
-        Taylor writes in long, grammatically perfect sentences. They use nested parentheses (like this) 
+        Janice writes in long, grammatically perfect sentences. They use nested parentheses (like this) 
         to add technical caveats mid-thought. They always end messages with "Hope that clarifies things!" 
         to soften their intense level of detail.
       tenure: "new"
@@ -224,7 +224,7 @@ org_lifecycle:
   # ── Random attrition (optional, off by default) ───────────────────────────
   # When enabled, every non-lead employee has a daily probability of leaving.
   # Useful for longer simulations (60+ days) to stress-test RAG evaluation.
-  enable_random_attrition: false
+  enable_random_attrition: true
   random_attrition_daily_prob: 0.005 # 0.5% per employee per day ≈ ~1 departure/month
 
 # ── PERSONAS ──────────────────────────────────────────────────
@@ -573,7 +573,9 @@ insider_threat:
         - "data_exfil_email"
         - "excessive_repo_cloning"
         - "unusual_hours_access"
-        - "sentiment_drift" # neutral drift — Jax is hiding their intent
+        - "sentiment_drift"
+        - "host_data_hoarding"
+        - "social_engineering"
 
   # Fraction of dlp_alert events that are FALSE POSITIVES for innocent employees.
   # Only applies in mode: "active".
@@ -587,3 +589,5 @@ insider_threat:
   #   access_log.jsonl      — observable telemetry stream (no labels)
   #   _ground_truth.jsonl   — full records with true_positive, threat_class, behavior
   telemetry_dir: "security_telemetry"
+  log_format: "all"
+  idp_logs: true
