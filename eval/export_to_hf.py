@@ -204,16 +204,23 @@ class CorpusBuilder:
         seen: Dict[str, dict] = {}
         for row in rows:
             did = row["doc_id"]
-            if did not in seen or len(row.get("body", "")) > len(
-                seen[did].get("body", "")
-            ):
+            if did not in seen or self._body_len(row) > self._body_len(seen[did]):
                 seen[did] = row
+
+        # Normalize: ensure every row has a populated body field
+        for row in seen.values():
+            if not row.get("body"):
+                row["body"] = row.get("content") or ""
+
         rows = list(seen.values())
 
         logger.info(f"  corpus: {len(rows)} documents")
         return rows
 
     # ── PRIVATE ───────────────────────────────────────────────────────────────
+
+    def _body_len(self, r: dict) -> int:
+        return len(r.get("body") or r.get("content") or "")
 
     def _sim_event_to_row(self, evt: dict) -> List[dict]:
         """
@@ -224,6 +231,10 @@ class CorpusBuilder:
         event_type = evt.get("type", "")
         artifact_ids = evt.get("artifact_ids", {})
         facts = evt.get("facts", {})
+
+        _EXCLUDED_EVENT_TYPES = {"dlp_alert", "secret_detected"}
+        if event_type in _EXCLUDED_EVENT_TYPES:
+            return []
 
         # Shared fields derived once per event
         evt_actors = evt.get("actors", [])
@@ -390,7 +401,7 @@ class CorpusBuilder:
 
     def _email_body(self, facts: dict, evt: dict) -> str:
         parts = []
-        for key in ("subject", "body", "from", "to", "summary", "source", "prospect"):
+        for key in ("subject", "content", "body", "from", "to", "summary", "source", "prospect"):
             val = facts.get(key)
             if val:
                 parts.append(f"{key}: {val}")
@@ -531,6 +542,14 @@ class CorpusBuilder:
                     parts.append(c)
                 rich_map[tid] = "\n".join(p for p in parts if p)
 
+            for artifact in self._mem._db["artifacts"].find(
+                {"type": "email"},
+                {"_id": 1, "content": 1, "title": 1}
+            ):
+                art_id = artifact.get("_id")
+                if art_id and artifact.get("content"):
+                    rich_map[art_id] = artifact["content"]
+
             for row in rows:
                 if row["doc_id"] == "CONF-UNKNOWN" and row["doc_type"] == "confluence":
                     # Try to resolve the real ID via body snippet or title match
@@ -599,6 +618,9 @@ class CorpusBuilder:
                 art_type = artifact.get("type", "")
                 doc_type = _TYPE_MAP.get(art_type, "sim_event")
                 if not art_id or art_id in existing_ids:
+                    continue
+                if any(art_id.startswith(prefix) for prefix in ("exfil_", "hoarding_", "snooping_", "dlp_")):
+                    logger.debug(f"  skipping insider threat artifact: {art_id}")
                     continue
                 meta = artifact.get("metadata", {})
                 author = artifact.get("author") or meta.get("author", "")
@@ -694,7 +716,7 @@ class BaselineRunner:
         self._questions = questions
         self._mem = mem
         self._doc_ids = [row["doc_id"] for row in corpus]
-        self._bodies = [row["body"] or "" for row in corpus]
+        self._bodies = [row.get("body") or row.get("content") or "" for row in corpus]
 
         # BM25 index
         if _BM25_AVAILABLE:
@@ -719,12 +741,14 @@ class BaselineRunner:
         if use_dense and self._mem is not None:
             # Use the same collection and pattern as Memory.recall()
             results = self._mem.recall(query=query, n=top_k)
-            # recall() returns {"id": artifact._id, ...} — _id IS the artifact doc_id
-            return [r["id"] for r in results if r.get("id")]
+            corpus_ids = set(self._doc_ids)
+            filtered = [r["id"] for r in results if r.get("id") in corpus_ids]
+            return filtered[:top_k]
         elif self._bm25 is not None:
             scores = self._bm25.get_scores(_tokenize(query))
             indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
             return [self._doc_ids[i] for i in indices[:top_k]]
+
         return []
 
     # ── PRIVATE ───────────────────────────────────────────────────────────────
@@ -859,25 +883,29 @@ class DatasetCardWriter:
         return textwrap.dedent(f"""\
         ---
         language:
-          - en
-        license: apache-2.0
+        - en
+        license: mit
+        configs:
+        - config_name: default
+            data_files:
+            - split: train
+                path: "**/*.parquet"
         task_categories:
-          - question-answering
-          - text-retrieval
+        - question-answering
+        - text-retrieval
         task_ids:
-          - extractive-qa
-          - document-retrieval
-          - multi-hop-retrieval
+        - extractive-qa
+        - document-retrieval
         tags:
-          - rag
-          - enterprise
-          - synthetic
-          - orgforge
-          - causal-reasoning
-          - temporal-reasoning
+        - rag
+        - enterprise
+        - synthetic
+        - orgforge
+        - causal-reasoning
+        - temporal-reasoning
         pretty_name: "OrgForge Enterprise RAG Benchmark"
         size_categories:
-          - 1K<n<10K
+        - 1K<n<10K
         ---
 
         # OrgForge Enterprise RAG Benchmark
@@ -954,7 +982,6 @@ class DatasetCardWriter:
         | `TEMPORAL` | Did person P have access to domain D before incident I? | Yes (cross-thread) |
         | `GAP_DETECTION` | Was email E ever actioned? | Yes (absence-of-evidence) |
         | `ROUTING` | Who was the first internal person to see an inbound email? | No |
-        | `PLAN` | What was department X focused on during Day N? | No |
         | `ESCALATION` | Who was involved in the escalation chain for incident X? | No |
         | `KNOWLEDGE_GAP` | What domain was undocumented when incident X fired? | No |
         | `POSTMORTEM` | Which Confluence doc captured the postmortem for incident X? | Yes (2-hop) |
@@ -1029,10 +1056,9 @@ class DatasetCardWriter:
         }}
         ```
 
-        ## Licence
+        ## License
 
-        Apache 2.0. The simulation engine that produced this dataset is
-        independently licensed; see the OrgForge repository for details.
+        MIT. The simulation engine that produced this dataset is independently licensed; see the OrgForge repository for details.
         """)
 
     def _table_rows(self, d: Dict[str, int]) -> str:
@@ -1183,7 +1209,10 @@ class HFExporter:
         q_data = (
             json.loads(questions_path.read_text()) if questions_path.exists() else {}
         )
-        questions = q_data.get("questions", []) if isinstance(q_data, dict) else q_data
+        raw_questions = (
+            q_data.get("questions", []) if isinstance(q_data, dict) else q_data
+        )
+        questions = [q for q in raw_questions if q.get("question_type") != "PLAN"]
 
         logger.info(
             f"  {len(threads)} causal threads, {len(questions)} eval questions loaded"

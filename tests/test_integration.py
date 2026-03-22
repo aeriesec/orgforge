@@ -2,6 +2,7 @@ import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from planner_models import OrgDayPlan, DepartmentDayPlan, EngineerDayPlan, AgendaItem
+from config_loader import ALL_NAMES  # <-- Import the real simulation roster
 
 
 @pytest.fixture
@@ -63,6 +64,10 @@ def test_5_day_deep_integration(
     integration_flow._mem.log_event = integration_flow._mem.__class__.log_event.__get__(
         integration_flow._mem
     )
+    
+    # Grab real names from the configuration so the social graph doesn't crash
+    test_actor = ALL_NAMES[0]
+    test_collab = ALL_NAMES[1] if len(ALL_NAMES) > 1 else test_actor
 
     # 3. The "Un-Mocked" Day Plan
     def dynamic_plan(*args, **kwargs):
@@ -83,7 +88,7 @@ def test_5_day_deep_integration(
 
         # 2. Handle Normal Day Branch
         # EngineerDayPlan requires: name, dept, agenda, stress_level
-        alice_agenda = [
+        test_actor_agenda = [
             AgendaItem(
                 activity_type="ticket_progress",
                 description="Working on ORG-101",
@@ -92,39 +97,35 @@ def test_5_day_deep_integration(
             AgendaItem(
                 activity_type="async_question",
                 description="Asking about API",
-                collaborator=["Bob"],
+                collaborator=[test_collab],
             ),
         ]
 
-        alice_plan = EngineerDayPlan(
-            name="Alice",
-            dept="Engineering",  # Changed from 'role' to 'dept'
-            agenda=alice_agenda,
-            stress_level=30,  # Added missing required field
+        test_actor_plan = EngineerDayPlan(
+            name=test_actor,
+            dept="Engineering",  
+            agenda=test_actor_agenda,
+            stress_level=30,  
         )
 
-        # DepartmentDayPlan requires: dept, theme, engineer_plans, proposed_events,
-        # cross_dept_signals, planner_reasoning, day, date
         dept_plan = DepartmentDayPlan(
-            dept="Engineering",  # Changed from 'dept_name'
-            theme="Standard dev work",  # Changed from 'plan_summary'
-            engineer_plans=[alice_plan],
-            proposed_events=[],  # Added missing field
-            cross_dept_signals=[],  # Added missing field
-            planner_reasoning="Test logic",  # Added missing field
-            day=current_day,  # Added missing field
-            date=date_str,  # Added missing field
+            dept="Engineering",  
+            theme="Standard dev work",  
+            engineer_plans=[test_actor_plan],
+            proposed_events=[],  
+            cross_dept_signals=[],  
+            planner_reasoning="Test logic",  
+            day=current_day,  
+            date=date_str,  
         )
 
-        # OrgDayPlan requires: org_theme, dept_plans, collision_events,
-        # coordinator_reasoning, day, date
         return OrgDayPlan(
             org_theme="normal feature work",
             dept_plans={"Engineering": dept_plan},
             collision_events=[],
-            coordinator_reasoning="Assembling test plans",  # Added missing field
-            day=current_day,  # Added missing field
-            date=date_str,  # Added missing field
+            coordinator_reasoning="Assembling test plans",  
+            day=current_day,  
+            date=date_str,  
         )
 
     with patch.object(integration_flow._day_planner, "plan", side_effect=dynamic_plan):
@@ -135,11 +136,10 @@ def test_5_day_deep_integration(
         try:
             integration_flow.daily_cycle()
         except Exception as e:
-            # This will catch any AttributeError or NameError inside normal_day.py
             pytest.fail(f"Deep Smoke Test crashed! Error: {e}")
 
     # 4. Final Verifications
     assert integration_flow.state.day == 6
-    # Verify Alice actually 'worked' - check if events were logged to mongomock
-    events = list(integration_flow._mem._events.find({"actors": "Alice"}))
-    assert len(events) > 0, "No activities were recorded for Alice in the database."
+    # Verify our dynamic actor actually 'worked' - check if events were logged to mongomock
+    events = list(integration_flow._mem._events.find({"actors": test_actor}))
+    assert len(events) > 0, f"No activities were recorded for {test_actor} in the database."

@@ -1110,13 +1110,18 @@ class ExternalEmailIngestor:
         Email artifact exists in the store but causal chain has no children.
         Eval agents should detect this gap.
         """
+
+        liaison_name = self._leads.get(
+            signal.internal_liaison, next(iter(self._leads.values()))
+        )
+
         self._mem.log_event(
             SimEvent(
                 type="email_dropped",
                 timestamp=signal.timestamp_iso,
                 day=state.day,
                 date=str(state.current_date.date()),
-                actors=[signal.source_name],
+                actors=[signal.source_name, liaison_name],
                 artifact_ids={"email": signal.embed_id},
                 facts={
                     "source": signal.source_name,

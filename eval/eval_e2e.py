@@ -64,7 +64,7 @@ logger = logging.getLogger("orgforge.eval_e2e")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-HF_DATASET_ID = "jflynt/orgforge-rag-benchmark"  # update to your HF repo
+HF_DATASET_ID = os.environ.get("HF_DATASET_ID", "INSERT_ID_HERE")
 TOP_K = 10
 RESULTS_DIR = Path("results")
 LEADERBOARD_PATH = Path("leaderboard.json")
@@ -153,7 +153,7 @@ class BM25Retriever(Retriever):
         from rank_bm25 import BM25Okapi
 
         self._doc_ids = [r["doc_id"] for r in corpus]
-        tokenised = [self._tokenize(r.get("body", "")) for r in corpus]
+        tokenised = [self._tokenize(r.get("body") or r.get("content") or "") for r in corpus]
         self._bm25 = BM25Okapi(tokenised)
         logger.info(f"  BM25 index built ({len(self._doc_ids)} docs)")
 
@@ -190,7 +190,7 @@ class CohereRetriever(Retriever):
 
         self._co = cohere.ClientV2(api_key=api_key)
         self._doc_ids = [r["doc_id"] for r in corpus]
-        bodies = [r.get("body", "") or "" for r in corpus]
+        bodies = [r.get("body") or r.get("content") or "" for r in corpus]
 
         logger.info(f"  Embedding {len(bodies)} docs with {self._model} ...")
         embeddings = []
@@ -387,7 +387,7 @@ the question type — no markdown fences, no extra keys.
 Which artifact first documented a specific fact?
 {
   "artifact_id": "<exact doc_id e.g. ORG-42 or CONF-ENG-007>",
-  "artifact_type": "<jira|confluence|slack|email|pr>",
+  "artifact_type": "<jira|confluence|slack_thread|email|pr>",
   "timestamp": "<ISO datetime if available, else omit>",
   "retrieved_artifact_ids": ["<id1>", "<id2>"]
 }

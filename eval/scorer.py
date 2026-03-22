@@ -577,36 +577,6 @@ class KnowledgeGapScorer(_BaseScorer):
         return primary, evidence, failure
 
 
-class PostmortemScorer(_BaseScorer):
-    """
-    POSTMORTEM — "Which Confluence doc contains the postmortem for incident X?"
-
-    Ground truth key is postmortem_confluence_id, not artifact_id.
-    Full credit: agent artifact_id matches postmortem_confluence_id.
-    Partial credit: evidence_chain overlap when artifact_id is wrong.
-    """
-
-    def score(
-        self, question: dict, agent_answer: dict
-    ) -> Tuple[float, float, Optional[str]]:
-        gt = question["ground_truth"]
-        gt_id = gt.get("postmortem_confluence_id", "") or gt.get("artifact_id", "")
-        agent_id = agent_answer.get("artifact_id", "")
-
-        primary = 1.0 if agent_id == gt_id else 0.0
-        failure = (
-            None
-            if primary == 1.0
-            else f"Expected postmortem_confluence_id={gt_id!r}, got {agent_id!r}"
-        )
-
-        evidence = self._evidence_overlap(
-            question.get("evidence_chain", []),
-            agent_answer.get("retrieved_artifact_ids", []),
-        )
-        return primary, evidence, failure
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # DISPATCHER
 # ─────────────────────────────────────────────────────────────────────────────
