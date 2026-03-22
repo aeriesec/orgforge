@@ -507,10 +507,40 @@ class NormalDayHandler:
         # Ensure status is at least In Progress
         if ticket["status"] == "To Do":
             ticket["status"] = "In Progress"
+            # Record the day this ticket first entered In Progress so the
+            # force-spawn logic below can measure elapsed business days.
+            if "in_progress_since" not in ticket:
+                ticket["in_progress_since"] = self._state.day
 
-        # 4. Spawning the PR!
+        # 4. Spawning the PR
+        # Normal path  : LLM signals code complete and no PR exists yet.
+        # Force-spawn  : ticket has been In Progress for 3+ sim days with no
+        #                PR and the assignee is not incident-bound.
+        #                Respects the actor's local clock — only fires when
+        #                they have remaining business-hours capacity today.
         spawned_pr_id = None
-        if is_code_complete and not linked_prs:
+        ticket_age = self._state.day - ticket.get("in_progress_since", self._state.day)
+        actor_clock_ok = self._clock.now(assignee).hour < 17
+        actor_incident_bound = any(
+            eng_plan.is_on_call and i.ticket_id != ticket_id
+            for i in self._state.active_incidents
+        )
+        # Don't force-spawn if the PR is already open awaiting author fixes.
+        open_pr_with_changes = bool(linked_prs) and any(
+            self._mem._prs.find_one(
+                {"pr_id": p, "status": "open", "changes_requested": True},
+                {"pr_id": 1},
+            )
+            for p in linked_prs
+        )
+        force_spawn = (
+            ticket_age >= 3
+            and not linked_prs
+            and not actor_incident_bound
+            and not open_pr_with_changes
+            and actor_clock_ok
+        )
+        if (is_code_complete or force_spawn) and not linked_prs:
             # Code is done, generate the PR!
             pr = self._git.create_pr(
                 author=assignee,
@@ -663,9 +693,12 @@ class NormalDayHandler:
                     f"Prior root cause: {ancestor_root_cause[:120]}"
                 )
 
-        # Generate review comment
+        # Generate review comment + structured verdict.
+        # Verdict drives ticket lifecycle — approval merges; changes_requested
+        # keeps the PR open and returns the ticket to In Progress for the author
+        # to address and push a follow-up commit to the same PR.
         agent = make_agent(
-            role=f"{reviewer}, Code Reviewer",  # name in role anchors persona
+            role=f"{reviewer}, Code Reviewer",
             goal=f"Write a PR review comment as {reviewer} would, reflecting your current stress and style.",
             backstory=backstory,
             llm=self._worker,
@@ -673,32 +706,101 @@ class NormalDayHandler:
         task = Task(
             description=(
                 f"You are {reviewer}. You are reviewing this PR by {author}: {pr_title}\n\n"
-                f"Write 1-4 sentences as a GitHub PR review comment. Be specific — mention "
-                f"code patterns, potential edge cases, or ask a clarifying question. "
-                f"Your tone must reflect your current stress level (see your backstory).\n\n"
-                f"Output the comment text only. No preamble, no 'Here is my review:'.\n\n"
-                f"{recurrence_hint} "
+                f"Write a review comment (1-4 sentences). Be specific — mention code patterns, "
+                f"potential edge cases, or required changes. Your tone must reflect your current "
+                f"stress level (see your backstory).\n\n"
+                f"Then decide: does this PR meet the bar to merge, or does it need changes?\n\n"
+                f"Respond ONLY with valid JSON. No preamble, no markdown fences.\n"
+                f"{{\n"
+                f'  "comment": "your review comment here",\n'
+                f'  "verdict": "approved" or "changes_requested"\n'
+                f"}}\n\n"
+                f"verdict must be exactly 'approved' if the code is ready to merge, "
+                f"or 'changes_requested' if the author needs to address something first.\n\n"
+                f"{recurrence_hint}"
                 f"--- CONTEXT ---\n{ctx}"
             ),
             expected_output=(
-                f"A plain review comment from {reviewer}, 1-4 sentences. "
-                f"No preamble, no labels, no quotes around the output."
+                'Valid JSON only with keys "comment" (string) and "verdict" '
+                '("approved" or "changes_requested"). No preamble, no markdown.'
             ),
             agent=agent,
         )
-        review_text = str(
+        raw_review = str(
             Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         ).strip()
+
+        # Parse structured verdict — fall back gracefully if LLM misbehaves
+        try:
+            clean_review = raw_review.replace("```json", "").replace("```", "").strip()
+            parsed_review = json.loads(clean_review)
+            review_text = parsed_review.get("comment", raw_review)
+            verdict = parsed_review.get("verdict", "approved")
+            if verdict not in ("approved", "changes_requested"):
+                verdict = "approved"
+        except (json.JSONDecodeError, AttributeError):
+            review_text = raw_review
+            verdict = "approved"
 
         pr_comment = {
             "author": reviewer,
             "date": date_str,
             "timestamp": current_actor_time,
             "text": review_text,
+            "verdict": verdict,
         }
         pr.setdefault("comments", []).append(pr_comment)
 
-        # Write back the mutated PR (comment appended) to both stores
+        # Apply verdict to PR and linked ticket
+        linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
+        linked_ticket = (
+            self._mem.get_ticket(linked_ticket_id) if linked_ticket_id else None
+        )
+
+        if verdict == "approved":
+            # Merge the PR and close out the ticket
+            pr["status"] = "merged"
+            if linked_ticket:
+                linked_ticket["status"] = "Done"
+                linked_ticket["updated_at"] = current_actor_time
+                self._mem.upsert_ticket(linked_ticket)
+                self._save_ticket(linked_ticket)
+            self._git.merge_pr(pr.get("pr_id", pr_id))
+            self._emit_bot_message(
+                "engineering",
+                "GitHub Actions",
+                f"✅ {reviewer} approved and merged {pr.get('pr_id', pr_id)}: {pr_title[:80]}",
+                current_actor_time,
+            )
+            logger.info(
+                f"    [green]✅ {pr.get('pr_id', pr_id)} merged — "
+                f"{linked_ticket_id} → Done[/green]"
+            )
+        else:
+            # Changes requested — PR stays open, ticket returns to In Progress.
+            # The author will address the feedback and push to the same PR;
+            # _handle_ticket_progress will advance it back to In Review when done.
+            pr["changes_requested"] = True
+            if linked_ticket and linked_ticket.get("status") == "In Review":
+                linked_ticket["status"] = "In Progress"
+                # Reset in_progress_since so force-spawn timer restarts from today
+                linked_ticket["in_progress_since"] = self._state.day
+                linked_ticket["updated_at"] = current_actor_time
+                self._mem.upsert_ticket(linked_ticket)
+                self._save_ticket(linked_ticket)
+            self._emit_bot_message(
+                "engineering",
+                "GitHub",
+                f"🔄 {reviewer} requested changes on {pr.get('pr_id', pr_id)}: "
+                f'"{review_text[:100]}"',
+                current_actor_time,
+            )
+            logger.info(
+                f"    [yellow]🔄 {pr.get('pr_id', pr_id)} — changes requested, "
+                f"{linked_ticket_id} → In Progress[/yellow]"
+            )
+
+        # Write back the mutated PR to both stores
         pr_path = f"{self._base}/git/prs/{pr.get('pr_id', pr_id)}.json"
         import os
         import json as _json
@@ -708,15 +810,9 @@ class NormalDayHandler:
             _json.dump(pr, f, indent=2)
         self._mem.upsert_pr(pr)
 
-        # Emit as a GitHub bot message in #engineering
-        self._emit_bot_message(
-            "engineering",
-            "GitHub",
-            f'💬 {reviewer} reviewed {pr.get("pr_id", pr_id)}: "{review_text[:120]}"',
-            current_actor_time,
-        )
-
-        if "?" in review_text:
+        # Reply thread — only fire when changes are requested, mirrors real
+        # GitHub behaviour where approvals rarely need a follow-up thread
+        if verdict == "changes_requested":
             actors, reply_thread_id = self._emit_review_reply(
                 author,
                 reviewer,
@@ -736,9 +832,7 @@ class NormalDayHandler:
         if reply_thread_id:
             artifact_ids["slack_thread"] = reply_thread_id
 
-        linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
         causal_facts: dict = {}
-
         active_inc = next(
             (
                 i
@@ -750,7 +844,6 @@ class NormalDayHandler:
         if active_inc and getattr(active_inc, "causal_chain", None):
             active_inc.causal_chain.append(pr.get("pr_id", pr_id or ""))
             causal_facts["causal_chain"] = active_inc.causal_chain.snapshot()
-
         elif linked_ticket_id:
             prior = self._mem._events.find_one(
                 {
@@ -767,9 +860,7 @@ class NormalDayHandler:
                     ticket_chain.append(artifact_id)
             ticket_chain.append(pr.get("pr_id", pr_id or ""))
             causal_facts["causal_chain"] = ticket_chain.snapshot()
-            artifact_ids["jira"] = (
-                linked_ticket_id  # ← also needed for cross-referencing
-            )
+            artifact_ids["jira"] = linked_ticket_id
 
         self._mem.log_event(
             SimEvent(
@@ -784,10 +875,13 @@ class NormalDayHandler:
                     "author": author,
                     "pr_title": pr_title,
                     "review_text": review_text,
-                    "has_question": "?" in review_text,
-                    **causal_facts,  # ← injects causal_chain when present
+                    "verdict": verdict,
+                    **causal_facts,
                 },
-                summary=f"{reviewer} reviewed {pr.get('pr_id', 'PR')} by {author}.",
+                summary=(
+                    f"{reviewer} {'approved and merged' if verdict == 'approved' else 'requested changes on'} "
+                    f"{pr.get('pr_id', 'PR')} by {author}."
+                ),
                 tags=["pr_review", "engineering"],
             )
         )
@@ -795,7 +889,9 @@ class NormalDayHandler:
         if self._vader:
             self._score_and_apply_sentiment(review_text, [reviewer], self._vader)
 
-        logger.info(f"    [dim]🔍 {reviewer} reviewed {pr.get('pr_id', 'PR')}[/dim]")
+        logger.info(
+            f"    [dim]🔍 {reviewer} reviewed {pr.get('pr_id', 'PR')} [{verdict}][/dim]"
+        )
         return actors
 
     def _handle_pr_review_for_incident(

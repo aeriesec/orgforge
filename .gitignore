@@ -3,6 +3,8 @@ export/
 simulation.log
 simulation_snapshot.json
 results/
+leaderboard.csv
+leaderboard.json
 
 # ── Environments & Secrets ──
 .env

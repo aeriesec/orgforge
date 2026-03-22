@@ -399,8 +399,6 @@ class EvalQuestionGenerator:
         questions.extend(self._temporal_questions())
         questions.extend(self._gap_detection_questions(threads))
         questions.extend(self._routing_questions(threads))
-        questions.extend(self._plan_questions())
-        # questions.extend(self._plan_execution_questions()) removed — proposed_events is future feature
         questions.extend(self._escalation_questions())
         questions.extend(self._knowledge_gap_questions())
         questions.extend(self._postmortem_questions(threads))
@@ -417,7 +415,7 @@ class EvalQuestionGenerator:
         logger.info(
             f"[eval] _retrieval_questions: {len(incident_threads)} incident threads available"
         )
-        for thread in random.sample(incident_threads, min(12, len(incident_threads))):
+        for thread in random.sample(incident_threads, min(50, len(incident_threads))):
             root_event = self._find_event_by_artifact(thread["root_artifact"])
             if not root_event:
                 continue
@@ -470,7 +468,7 @@ class EvalQuestionGenerator:
         logger.info(
             f"[eval] _causal_questions: {len(multi_hop)} multi-hop threads available"
         )
-        for thread in random.sample(multi_hop, min(10, len(multi_hop))):
+        for thread in random.sample(multi_hop, min(50, len(multi_hop))):
             nodes = thread["nodes"]
             # Ask about the transition from node 1 → node 2
             if len(nodes) < 2:
@@ -679,12 +677,12 @@ class EvalQuestionGenerator:
         # Caps raised to 8 per pool so short sim runs still yield meaningful n.
         # The (person, domain) dedup guard inside _build_temporal_question ensures
         # we don't burn all slots on the same departure-domain pair.
-        for event in random.sample(pool_a, min(8, len(pool_a))):
+        for event in random.sample(pool_a, min(50, len(pool_a))):
             q = _build_temporal_question(event)
             if q:
                 questions.append(q)
 
-        for event in random.sample(pool_b, min(8, len(pool_b))):
+        for event in random.sample(pool_b, min(50, len(pool_b))):
             q = _build_temporal_question(event)
             if q:
                 questions.append(q)
@@ -716,7 +714,7 @@ class EvalQuestionGenerator:
         )
 
         # Questions about dropped emails (answer: no action)
-        for thread in random.sample(dropped, min(5, len(dropped))):
+        for thread in random.sample(dropped, min(50, len(dropped))):
             subject = thread.get("subject", thread["root_artifact"])
             source = thread.get("source", "unknown sender")
             ground_truth = {
@@ -750,7 +748,7 @@ class EvalQuestionGenerator:
                 )
 
         # Paired questions about routed emails (answer: yes, action was taken)
-        for thread in random.sample(routed, min(2, len(routed))):
+        for thread in random.sample(routed, min(20, len(routed))):
             source = thread.get("source", "unknown")
             chain = [n["artifact_id"] for n in thread["nodes"]]
             ground_truth = {
@@ -792,7 +790,7 @@ class EvalQuestionGenerator:
         logger.info(
             f"[eval] _routing_questions: {len(customer_threads)} customer threads available"
         )
-        for thread in random.sample(customer_threads, min(5, len(customer_threads))):
+        for thread in random.sample(customer_threads, min(25, len(customer_threads))):
             root_node = thread["nodes"][0] if thread["nodes"] else None
             if not root_node:
                 continue
@@ -856,116 +854,6 @@ class EvalQuestionGenerator:
                 )
         return questions
 
-    # ── SPRINT PLANNING — "What did person X plan to work on during Day N?" ──────
-    def _plan_questions(self) -> List[dict]:
-        questions = []
-        try:
-            plans = list(self._mem._db["dept_plans"].find({}, {"_id": 0}))
-        except Exception:
-            return []
-
-        for plan in random.sample(plans, min(15, len(plans))):
-            dept = plan.get("dept", "")
-            day = plan.get("day", 0)
-            lead = plan.get("lead", "")
-            theme = plan.get("theme", "")
-            # Extract actors from nested engineer_plans
-            actors = [
-                ep["name"] for ep in plan.get("engineer_plans", []) if ep.get("name")
-            ]
-            if not dept or not theme or not actors:
-                continue
-
-            ground_truth = {
-                "dept": dept,
-                "day": day,
-                "lead": lead,
-                "theme": theme,
-                "actors": actors,
-                "artifact_id": f"PLAN-{day}-{dept}",
-                # proposed_events intentionally excluded
-            }
-
-            q_text = self._generate_question_prose(
-                template=(
-                    f"Generate a question asking what the {dept} department's "
-                    f"focus or theme was on Day {day} of the simulation. "
-                    f"The question should sound like a planning retrospective query. "
-                    f"Output only the question text."
-                )
-            )
-            if q_text:
-                questions.append(
-                    {
-                        "question_id": f"plan_{dept}_day{day}",
-                        "question_type": "PLAN",
-                        "question_text": q_text,
-                        "ground_truth": ground_truth,
-                        "evidence_chain": [f"PLAN-{day}-{dept}"],
-                        "difficulty": "easy",
-                        "requires_reasoning": False,
-                        "chain_id": f"plan_{dept}_day{day}",
-                    }
-                )
-        return questions
-
-    def _plan_execution_questions(self) -> List[dict]:
-        questions = []
-        try:
-            plans = list(self._mem._db["dept_plans"].find({}, {"_id": 0}))
-        except Exception:
-            return []
-
-        for plan in plans:
-            dept = plan.get("dept", "")
-            day = plan.get("day", 0)
-            for proposed in plan.get("proposed_events", []):
-                event_type = proposed.get("event_type", "")
-                actors = proposed.get("actors", [])
-                if not event_type or not actors:
-                    continue
-
-                # Check if a matching SimEvent was actually logged
-                executed = any(
-                    e
-                    for e in self._events
-                    if e.type == event_type
-                    and e.day == day
-                    and any(a in e.actors for a in actors)
-                )
-
-                ground_truth = {
-                    "was_executed": executed,
-                    "event_type": event_type,
-                    "dept": dept,
-                    "day": day,
-                    "proposed_actors": actors,
-                }
-
-                q_text = self._generate_question_prose(
-                    template=(
-                        f"Generate a question asking whether the proposed "
-                        f"{event_type.replace('_', ' ')} for the {dept} department "
-                        f"on Day {day} actually took place. The question should test "
-                        f"whether an agent can verify planned vs actual activity. "
-                        f"Output only the question text."
-                    )
-                )
-                if q_text:
-                    questions.append(
-                        {
-                            "question_id": f"plan_exec_{dept}_{event_type}_day{day}",
-                            "question_type": "PLAN_EXECUTION",
-                            "question_text": q_text,
-                            "ground_truth": ground_truth,
-                            "evidence_chain": [f"PLAN-{day}-{dept}"],
-                            "difficulty": "medium",
-                            "requires_reasoning": True,
-                            "chain_id": f"plan_{dept}_day{day}",
-                        }
-                    )
-        return questions
-
     # ── ESCALATION — "Who was pulled into the escalation for ticket X?" ───────────
     def _escalation_questions(self) -> List[dict]:
         questions = []
@@ -974,7 +862,7 @@ class EvalQuestionGenerator:
             f"[eval] _escalation_questions: {len(esc_events)} escalation_chain events available"
         )
 
-        for event in random.sample(esc_events, min(6, len(esc_events))):
+        for event in random.sample(esc_events, min(25, len(esc_events))):
             ticket_id = event.artifact_ids.get("jira", "")
             actors = event.facts.get("escalation_actors", [])
             narrative = event.facts.get("escalation_narrative", "")
@@ -1024,7 +912,7 @@ class EvalQuestionGenerator:
             f"[eval] _knowledge_gap_questions: {len(gap_events)} knowledge_gap_detected events available"
         )
 
-        for event in random.sample(gap_events, min(6, len(gap_events))):
+        for event in random.sample(gap_events, min(25, len(gap_events))):
             ticket_id = event.artifact_ids.get("jira", "")
             gap_areas = event.facts.get("gap_areas", [])
             actors = event.actors
@@ -1080,7 +968,7 @@ class EvalQuestionGenerator:
             f"[eval] _postmortem_questions: {len(pm_threads)} postmortem threads available"
         )
 
-        for thread in random.sample(pm_threads, min(6, len(pm_threads))):
+        for thread in random.sample(pm_threads, min(25, len(pm_threads))):
             ticket_id = thread["root_artifact"]
             conf_id = thread["confluence_id"]
             root_cause = thread.get("root_cause", "")
@@ -1135,7 +1023,7 @@ class EvalQuestionGenerator:
             f"[eval] _confluence_questions: {len(conf_events)} confluence_created events available"
         )
 
-        for event in random.sample(conf_events, min(8, len(conf_events))):
+        for event in random.sample(conf_events, min(50, len(conf_events))):
             conf_id = event.artifact_ids.get("confluence") or event.artifact_ids.get(
                 "page_id"
             )
@@ -1192,7 +1080,7 @@ class EvalQuestionGenerator:
             f"[eval] _standup_questions: {len(standup_events)} standup events available"
         )
 
-        for event in random.sample(standup_events, min(8, len(standup_events))):
+        for event in random.sample(standup_events, min(25, len(standup_events))):
             if not event.actors:
                 continue
             # Pick one actor from the standup to ask about
@@ -1203,7 +1091,7 @@ class EvalQuestionGenerator:
             ground_truth = {
                 "actor": actor,
                 "day": day,
-                "slack_thread_id": slack_thread,
+                "artifact_id": slack_thread,
                 "all_participants": event.actors,
                 "summary": event.summary,
             }
@@ -1255,7 +1143,7 @@ class EvalQuestionGenerator:
             f"customer escalation/routed events available"
         )
 
-        for event in random.sample(esc_events, min(6, len(esc_events))):
+        for event in random.sample(esc_events, min(25, len(esc_events))):
             source = event.facts.get("source", "a customer")
             ticket_id = event.artifact_ids.get("jira") or event.artifact_ids.get(
                 "email", ""

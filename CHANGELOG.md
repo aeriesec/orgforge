@@ -6,6 +6,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.1.3] — 2026-03-22
+
+### Added
+
+- **Structured PR Review Verdicts (`src/normal_day.py`)**: PR review agents now emit a structured JSON response containing both a review comment and an explicit `verdict` (`approved` or `changes_requested`), with graceful fallback if the LLM returns malformed output.
+- **Automated PR Merge & Ticket Resolution (`src/normal_day.py`)**: Approved PRs are now automatically merged via `git.merge_pr()` and their linked Jira tickets transitioned to `Done`. PRs with changes requested revert the linked ticket to `In Progress` and reset the force-spawn timer.
+
+### Changed
+
+- **Eval Question Volume (`eval/eval_harness.py`)**: Raised sampling caps for retrieval, causal, and temporal question generators from 8–12 to 50, enabling meaningful eval coverage on larger simulation runs. Removed `_plan_questions()` from the generation pipeline.
+- **BM25 & Cohere Corpus Field Fallback (`eval/eval_e2e.py`)**: Retrievers now fall back to the `content` field when `body` is absent, fixing indexing gaps for artifacts that use alternate field naming.
+- **HF Dataset ID Externalized (`eval/eval_e2e.py`)**: Hardcoded dataset ID replaced with `HF_DATASET_ID` environment variable, defaulting to a placeholder.
+- **Reply Thread Trigger (`src/normal_day.py`)**: Review reply threads now fire only on `changes_requested` verdicts rather than on any review containing a `?`, better mirroring real GitHub behavior.
+- **`slack` → `slack_thread` Artifact Type (`eval/eval_e2e.py`)**: Updated the LLM judge prompt to use `slack_thread` as the canonical artifact type label.
+
+### Removed
+
+- **`eval/diag.py`**: Deleted one-time `backfill_escalation_artifacts` migration script, no longer needed.
+- **Leaderboard outputs from version control (`.gitignore`)**: `leaderboard.csv` and `leaderboard.json` added to `.gitignore`.
+
+---
+
 ## [v1.1.2] — 2026-03-19
 
 ### Added
