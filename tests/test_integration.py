@@ -64,7 +64,7 @@ def test_5_day_deep_integration(
     integration_flow._mem.log_event = integration_flow._mem.__class__.log_event.__get__(
         integration_flow._mem
     )
-    
+
     # Grab real names from the configuration so the social graph doesn't crash
     test_actor = ALL_NAMES[0]
     test_collab = ALL_NAMES[1] if len(ALL_NAMES) > 1 else test_actor
@@ -103,29 +103,29 @@ def test_5_day_deep_integration(
 
         test_actor_plan = EngineerDayPlan(
             name=test_actor,
-            dept="Engineering",  
+            dept="Engineering",
             agenda=test_actor_agenda,
-            stress_level=30,  
+            stress_level=30,
         )
 
         dept_plan = DepartmentDayPlan(
-            dept="Engineering",  
-            theme="Standard dev work",  
+            dept="Engineering",
+            theme="Standard dev work",
             engineer_plans=[test_actor_plan],
-            proposed_events=[],  
-            cross_dept_signals=[],  
-            planner_reasoning="Test logic",  
-            day=current_day,  
-            date=date_str,  
+            proposed_events=[],
+            cross_dept_signals=[],
+            planner_reasoning="Test logic",
+            day=current_day,
+            date=date_str,
         )
 
         return OrgDayPlan(
             org_theme="normal feature work",
             dept_plans={"Engineering": dept_plan},
             collision_events=[],
-            coordinator_reasoning="Assembling test plans",  
-            day=current_day,  
-            date=date_str,  
+            coordinator_reasoning="Assembling test plans",
+            day=current_day,
+            date=date_str,
         )
 
     with patch.object(integration_flow._day_planner, "plan", side_effect=dynamic_plan):
@@ -142,4 +142,6 @@ def test_5_day_deep_integration(
     assert integration_flow.state.day == 6
     # Verify our dynamic actor actually 'worked' - check if events were logged to mongomock
     events = list(integration_flow._mem._events.find({"actors": test_actor}))
-    assert len(events) > 0, f"No activities were recorded for {test_actor} in the database."
+    assert len(events) > 0, (
+        f"No activities were recorded for {test_actor} in the database."
+    )
