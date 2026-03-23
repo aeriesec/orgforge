@@ -317,8 +317,12 @@ class TicketAssigner:
         """
         from config_loader import PERSONAS  # late import — avoids circular dep
 
-        for name, persona in PERSONAS.items():
-            self._engineer_vectors[name] = self._build_expertise_vector(name, persona)
+        for name in PERSONAS:
+            doc = self._mem._artifacts.find_one(
+                {"_id": name, "type": "persona_skills"}, {"embedding": 1}
+            )
+            if doc and doc.get("embedding"):
+                self._engineer_vectors[name] = doc["embedding"]
 
     def _expertise_vector(self, engineer: str) -> List[float]:
         """

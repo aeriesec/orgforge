@@ -19,9 +19,12 @@ Two core mechanisms:
 
 from __future__ import annotations
 
+import logging
 import random
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, List
+
+logger = logging.getLogger("orgforge.simclock")
 
 if TYPE_CHECKING:
     pass  # State imported at runtime to avoid circular imports
@@ -256,8 +259,16 @@ class SimClock:
 
         # Roll forward to next business day 09:00
         next_day = dt + timedelta(days=1)
-        while next_day.weekday() >= 5:
+        max_skip = 7
+        for _ in range(max_skip):
+            if next_day.weekday() < 5:
+                break
             next_day += timedelta(days=1)
+        else:
+            logger.error(
+                f"[SimClock] Could not find next business day from {dt} — "
+                f"falling back to Monday of next week."
+            )
 
         return next_day.replace(
             hour=DAY_START_HOUR,

@@ -50,9 +50,8 @@ import json
 import logging
 import textwrap
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import yaml
 
@@ -677,7 +676,7 @@ class InsiderThreatHFExporter:
         tp = sum(1 for r in gt_raw if r.get("true_positive"))
         fp = sum(1 for r in gt_raw if not r.get("true_positive"))
         print(f"\n{'─' * 60}")
-        print(f"  ✓  Insider threat HF export complete")
+        print("  ✓  Insider threat HF export complete")
         print(f"{'─' * 60}")
         print(f"  Output dir         : {HF_DIR}")
         print(f"  Observable records : {len(obs_rows):,}")
@@ -687,9 +686,9 @@ class InsiderThreatHFExporter:
         print(f"  Host event records : {len(host_rows):,}")
         print(f"  Leaderboard rows   : {len(leaderboard)}")
         print(f"{'─' * 60}")
-        print(f"\n  Upload to HuggingFace:")
+        print("\n  Upload to HuggingFace:")
         print(f"    cd {HF_DIR}")
-        print(f"    huggingface-cli upload <your-org>/orgforge-insider-threat .")
+        print("    huggingface-cli upload <your-org>/orgforge-insider-threat .")
         print()
 
 

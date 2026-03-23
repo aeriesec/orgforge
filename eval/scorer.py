@@ -397,7 +397,9 @@ class RoutingScorer(_BaseScorer):
             failure = None
         else:
             primary = 0.0
-            failure = f"Expected first_recipient={gt_recipient!r}, got {agent_recipient!r}"
+            failure = (
+                f"Expected first_recipient={gt_recipient!r}, got {agent_recipient!r}"
+            )
 
         evidence = self._evidence_overlap(
             question.get("evidence_chain", []),

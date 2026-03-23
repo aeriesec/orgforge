@@ -1,22 +1,20 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from memory import SimEvent
+from flow import OrgForgeSimulation
 
 from datetime import datetime
 
 
 @pytest.fixture
 def mock_flow():
-    """Fixture to initialize Flow with mocked LLMs and DB to avoid API calls."""
+    """Fixture to initialize OrgForgeSimulation with mocked LLMs and DB."""
     with patch("flow.build_llm"), patch("flow.Memory"):
-        from flow import Flow
-
-        flow = Flow()
-        # Initialize minimal state
-        flow.state.day = 1
-        flow.state.system_health = 100
-        flow._mem.log_slack_messages.return_value = ("", "")
-        return flow
+        sim = OrgForgeSimulation()
+        sim.state.day = 1
+        sim.state.system_health = 100
+        sim._mem.log_slack_messages = MagicMock(return_value=("", ""))
+        return sim
 
 
 ### --- Bug Catching Tests ---
@@ -24,17 +22,17 @@ def mock_flow():
 
 def test_embed_and_count_recursion_fix(mock_flow):
     """
-    Verifies that _embed_and_count calls the memory layer
-    instead of recursively calling itself.
+    Verifies that _embed_and_count enqueues to the embed worker
+    rather than calling embed_artifact synchronously (which would
+    previously cause recursion if wired incorrectly).
     """
-    mock_flow._mem.embed_artifact = MagicMock()
+    mock_flow._embed_worker.enqueue = MagicMock()
 
-    # This would trigger RecursionError if the bug exists
     mock_flow._embed_and_count(
         id="test", type="doc", title="T", content="C", day=1, date="2026-01-01"
     )
 
-    assert mock_flow._mem.embed_artifact.called
+    assert mock_flow._embed_worker.enqueue.called
     assert mock_flow.state.daily_artifacts_created == 1
 
 

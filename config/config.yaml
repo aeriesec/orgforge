@@ -518,7 +518,7 @@ external_contacts:
 # ── INSIDER THREAT ────────────────────────────────────────────
 
 insider_threat:
-  enabled: true
+  enabled: false
 
   # "passive" — behaviors injected into normal artifacts (PR descriptions,
   #             Slack messages, emails).  No extra SimEvents are emitted.

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from agent_factory import make_agent
 from config_loader import COMPANY_DESCRIPTION
-from crewai import Agent, Process, Task, Crew
+from crewai import Process, Task, Crew
 
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
@@ -49,6 +49,7 @@ class NormalDayHandler:
         confluence_writer=None,
         vader=None,
         threat_injector=None,
+        embed_worker=None,
     ):
         self._config = config
         self._mem = mem
@@ -69,6 +70,7 @@ class NormalDayHandler:
         self._registry = getattr(confluence_writer, "_registry", None)
         self._vader = vader
         self._threat = threat_injector or _NullInjector()
+        self._embed_worker = embed_worker
 
     # ─── VOICE CARD ───────────────────────────────────────────────────────────
 
@@ -571,31 +573,59 @@ class NormalDayHandler:
                 ],
             )
         )
-        self._mem.embed_artifact(
-            id=ticket_id,
-            type="jira",
-            title=ticket.get("title", ticket_id),
-            content=ticket_body,
-            day=self._state.day,
-            date=date_str,
-            timestamp=current_actor_time_iso,
-            metadata={
-                "assignee": ticket.get("assignee", ""),
-                "status": ticket["status"],
-            },
-        )
+        if self._embed_worker:
+            self._embed_worker.enqueue(
+                id=ticket_id,
+                type="jira",
+                title=ticket.get("title", ticket_id),
+                content=ticket_body,
+                day=self._state.day,
+                date=date_str,
+                timestamp=current_actor_time_iso,
+                metadata={
+                    "assignee": ticket.get("assignee", ""),
+                    "status": ticket["status"],
+                },
+            )
 
-        # Also embed the individual comment
-        self._mem.embed_artifact(
-            id=comment_id,
-            type="jira_comment",
-            title=f"Comment on {ticket_id}",
-            content=comment_text,
-            day=self._state.day,
-            date=date_str,
-            timestamp=current_actor_time_iso,
-            metadata={"ticket_id": ticket_id, "author": assignee},
-        )
+        else:
+            self._mem.embed_artifact(
+                id=ticket_id,
+                type="jira",
+                title=ticket.get("title", ticket_id),
+                content=ticket_body,
+                day=self._state.day,
+                date=date_str,
+                timestamp=current_actor_time_iso,
+                metadata={
+                    "assignee": ticket.get("assignee", ""),
+                    "status": ticket["status"],
+                },
+            )
+
+        if self._embed_worker:
+            self._embed_worker.enqueue(
+                id=comment_id,
+                type="jira_comment",
+                title=f"Comment on {ticket_id}",
+                content=comment_text,
+                day=self._state.day,
+                date=date_str,
+                timestamp=current_actor_time_iso,
+                metadata={"ticket_id": ticket_id, "author": assignee},
+            )
+
+        else:
+            self._mem.embed_artifact(
+                id=comment_id,
+                type="jira_comment",
+                title=f"Comment on {ticket_id}",
+                content=comment_text,
+                day=self._state.day,
+                date=date_str,
+                timestamp=current_actor_time_iso,
+                metadata={"ticket_id": ticket_id, "author": assignee},
+            )
 
         active_inc = next(
             (i for i in self._state.active_incidents if i.ticket_id == ticket_id), None
@@ -2439,8 +2469,6 @@ class NormalDayHandler:
         for m in messages:
             m.setdefault("date", date_str)
 
-        # [SECURITY PATCH] Only inject into human employee messages.
-        # Bot messages (is_bot: True) are never threat subjects — skip them.
         if not all(m.get("is_bot") for m in messages):
             messages = self._threat.inject_slack(
                 messages,
@@ -2460,21 +2488,38 @@ class NormalDayHandler:
                 "ts", self._clock.now("system").isoformat()
             )
 
-            self._mem.embed_artifact(
-                id=thread_id,
-                type="slack_thread",
-                title=f"{interaction_type.replace('_', ' ').title()} in #{channel}",
-                content=full_transcript,
-                day=self._state.day,
-                date=date_str,
-                timestamp=start_timestamp,
-                metadata={
-                    "channel": channel,
-                    "interaction_type": interaction_type,
-                    "participants": list({m["user"] for m in messages}),
-                    "message_count": len(messages),
-                },
-            )
+            if self._embed_worker:
+                self._embed_worker.enqueue(
+                    id=thread_id,
+                    type="slack_thread",
+                    title=f"{interaction_type.replace('_', ' ').title()} in #{channel}",
+                    content=full_transcript,
+                    day=self._state.day,
+                    date=date_str,
+                    timestamp=start_timestamp,
+                    metadata={
+                        "channel": channel,
+                        "interaction_type": interaction_type,
+                        "participants": list({m["user"] for m in messages}),
+                        "message_count": len(messages),
+                    },
+                )
+            else:
+                self._mem.embed_artifact(
+                    id=thread_id,
+                    type="slack_thread",
+                    title=f"{interaction_type.replace('_', ' ').title()} in #{channel}",
+                    content=full_transcript,
+                    day=self._state.day,
+                    date=date_str,
+                    timestamp=start_timestamp,
+                    metadata={
+                        "channel": channel,
+                        "interaction_type": interaction_type,
+                        "participants": list({m["user"] for m in messages}),
+                        "message_count": len(messages),
+                    },
+                )
 
         return slack_path, thread_id
 

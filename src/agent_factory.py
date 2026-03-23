@@ -7,6 +7,7 @@ AGENT_DEFAULTS = {
     "memory": False,
     "cache": False,
     "respect_context_window": False,
+    "max_retry_limit": 3,
 }
 
 

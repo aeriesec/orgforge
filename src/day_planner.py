@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 from dataclasses import asdict as _asdict
 
@@ -980,6 +982,18 @@ class DayPlannerOrchestrator:
         Full planning pass for one day.
         Returns an OrgDayPlan the day loop executes against.
         """
+
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+            logger.warning(
+                f"[planner] Running event loop detected: {loop} — parallel dept plans will serialize"
+            )
+        except RuntimeError:
+            logger.info(
+                "[planner] No running event loop — ThreadPoolExecutor parallelism should work"
+            )
         day = state.day
         date = str(state.current_date.date())
         system_time_iso = clock.now("system").isoformat()  # This will be 09:00:00
@@ -1037,32 +1051,62 @@ class DayPlannerOrchestrator:
                 f"({len(eng_plan.proposed_events)} events)"
             )
 
-        # ── Other departments react to Engineering ────────────────────────────
-        for dept, planner in self._dept_planners.items():
-            if dept == eng_key:
-                continue
-            members = self._config["org_chart"].get(dept, [])
-            if len(members) == 1 and dept.upper() == "CEO":
-                continue
-            plan = planner.plan(
-                org_theme=org_theme,
-                day=day,
-                date=date,
-                state=state,
-                mem=mem,
-                graph_dynamics=graph_dynamics,
-                cross_signals=cross_signals_by_dept.get(dept, []),
-                sprint_context=sprint_contexts.get(dept),
-                eng_plan=eng_plan,
-                lifecycle_context=lifecycle_context,
-                email_signals=email_signals,
+        # ── Other departments react to Engineering — run in parallel ─────────
+        # Each non-eng dept plan is an independent Bedrock call with no shared
+        # mutable state between departments. eng_plan is read-only at this point.
+        # graph_dynamics._stress is also read-only here (patched after each
+        # result comes in, under lock). MongoDB writes inside planner.plan()
+        # (log_dept_plan, log_event) are thread-safe via PyMongo's pool.
+        non_eng_depts = {
+            dept: planner
+            for dept, planner in self._dept_planners.items()
+            if dept != eng_key
+            and not (
+                len(self._config["org_chart"].get(dept, [])) == 1
+                and dept.upper() == "CEO"
             )
-            self._patch_stress_levels(plan, graph_dynamics)
-            dept_plans[dept] = plan
-            logger.info(
-                f"  [blue]📋 {dept} plan:[/blue] {plan.theme[:60]} "
-                f"({len(plan.proposed_events)} events)"
-            )
+        }
+
+        if non_eng_depts:
+            lock = threading.Lock()
+            with ThreadPoolExecutor(max_workers=len(non_eng_depts)) as ex:
+                futures = {
+                    ex.submit(
+                        planner.plan,
+                        org_theme=org_theme,
+                        day=day,
+                        date=date,
+                        state=state,
+                        mem=mem,
+                        graph_dynamics=graph_dynamics,
+                        cross_signals=cross_signals_by_dept.get(dept, []),
+                        sprint_context=sprint_contexts.get(dept),
+                        eng_plan=eng_plan,
+                        lifecycle_context=lifecycle_context,
+                        email_signals=email_signals,
+                    ): dept
+                    for dept, planner in non_eng_depts.items()
+                }
+                for future in as_completed(futures):
+                    dept = futures[future]
+                    try:
+                        plan = future.result()
+                        self._patch_stress_levels(plan, graph_dynamics)
+                        with lock:
+                            dept_plans[dept] = plan
+                        logger.info(
+                            f"  [blue]📋 {dept} plan:[/blue] {plan.theme[:60]} "
+                            f"({len(plan.proposed_events)} events)"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"  [red]✗ {dept} plan failed:[/red] {e} — using fallback"
+                        )
+                        # Fallback: empty plan so the rest of the day can proceed
+                        with lock:
+                            dept_plans[dept] = self._dept_planners[dept]._fallback_plan(
+                                org_theme, day, date, []
+                            )
 
         # ── OrgCoordinator finds collisions ───────────────────────────────────
         org_plan = self._coordinator.coordinate(dept_plans, state, day, date, org_theme)

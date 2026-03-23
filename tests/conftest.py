@@ -88,7 +88,6 @@ def mock_config_and_db():
         patch("memory.build_embedder", return_value=mock_embedder),
         patch("memory.Memory._init_vector_indexes"),
         patch("agent_factory.Agent"),
-        patch("normal_day.Agent"),
         patch("normal_day.Task"),
         patch("normal_day.Crew") as mock_crew_cls,
     ):

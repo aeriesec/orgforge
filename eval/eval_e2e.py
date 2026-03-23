@@ -52,13 +52,12 @@ import json
 import logging
 import os
 import re
-import sys
 import time
-import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+import numpy as np
 
 logger = logging.getLogger("orgforge.eval_e2e")
 
@@ -184,7 +183,6 @@ class CohereRetriever(Retriever):
 
     def index(self, corpus: List[dict]) -> None:
         import cohere
-        import numpy as np
 
         api_key = os.environ.get("COHERE_API_KEY")
         if not api_key:
@@ -216,7 +214,6 @@ class CohereRetriever(Retriever):
         logger.info("  Cohere index ready")
 
     def retrieve(self, query: str, top_k: int = TOP_K) -> List[str]:
-        import numpy as np
 
         resp = self._co.embed(
             texts=[query],
@@ -244,7 +241,7 @@ class OpenAIRetriever(Retriever):
         self._batch_size = batch_size
 
     def index(self, corpus: List[dict]) -> None:
-        import numpy as np
+
         from openai import OpenAI
 
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -271,7 +268,6 @@ class OpenAIRetriever(Retriever):
         logger.info("  OpenAI index ready")
 
     def retrieve(self, query: str, top_k: int = TOP_K) -> List[str]:
-        import numpy as np
 
         resp = self._client.embeddings.create(model=self._model, input=[query])
         q_vec = np.array(resp.data[0].embedding, dtype=np.float32)
@@ -310,7 +306,6 @@ class BedrockCohereRetriever(Retriever):
 
     def _embed(self, texts: List[str], input_type: str) -> "np.ndarray":
         import json
-        import numpy as np
 
         all_embeddings = []
         for i in range(0, len(texts), self._batch_size):
@@ -338,7 +333,6 @@ class BedrockCohereRetriever(Retriever):
         return np.array(all_embeddings, dtype=np.float32)
 
     def index(self, corpus: List[dict]) -> None:
-        import numpy as np
 
         self._doc_ids = [r["doc_id"] for r in corpus]
         bodies = [r.get("body", "") or "" for r in corpus]
@@ -350,7 +344,6 @@ class BedrockCohereRetriever(Retriever):
         logger.info("  Bedrock Cohere index ready")
 
     def retrieve(self, query: str, top_k: int = TOP_K) -> List[str]:
-        import numpy as np
 
         q_mat = self._embed([query], input_type="search_query")
         q_vec = q_mat[0]
@@ -1127,7 +1120,6 @@ def run_eval(args: argparse.Namespace) -> None:
 
 
 def _print_summary(summary: dict, retriever: str, generator: str) -> None:
-    overall = summary.get("overall", {})
     print(f"\n{'=' * 64}")
     print(f"  Retriever : {retriever}")
     print(f"  Generator : {generator}")

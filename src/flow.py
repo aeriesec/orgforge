@@ -34,6 +34,8 @@ import logging
 import json
 import random
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent_factory import make_agent
 import networkx as nx
 from datetime import datetime, timedelta
@@ -45,7 +47,7 @@ from day_planner import DayPlannerOrchestrator
 from normal_day import NormalDayHandler, dept_of_name
 from artifact_registry import ArtifactRegistry
 from confluence_writer import ConfluenceWriter
-from ticket_assigner import _cosine, TicketAssigner
+from ticket_assigner import TicketAssigner
 from token_tracker import orgforge_token_listener
 from external_email_ingest import ExternalEmailIngestor
 from insider_threat import _NullInjector, InsiderThreatInjector
@@ -58,7 +60,6 @@ from rich import box
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from crewai import Process, Task, Crew
-from crewai.flow.flow import Flow, listen, start
 from langchain_ollama import OllamaLLM
 
 from memory import Memory, SimEvent
@@ -75,6 +76,7 @@ from causal_chain_handler import (
     ARTIFACT_KEY_SLACK_THREAD,
     RecurrenceDetector,
 )
+from embed_worker import EmbedWorker
 
 os.makedirs("./export", exist_ok=True)
 
@@ -90,6 +92,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("orgforge.flow")
+
+logging.getLogger("pymongo").setLevel(logging.WARNING)
 
 
 def _patch_crewai_bedrock():
@@ -621,12 +625,20 @@ def score_sentiment(messages: List[Dict]) -> float:
 
 
 # ─────────────────────────────────────────────
-# 6. THE FLOW
+# 6. SIMULATION
 # ─────────────────────────────────────────────
-class Flow(Flow[State]):
+class OrgForgeSimulation:
     def __init__(self):
-        super().__init__()
+        self.state = State()
         self._mem = Memory()
+
+        # Background embed queue — decouples Stella/Ollama inference from LLM
+        # generation so both run concurrently rather than sequentially.
+        # drain() is called before any vector search and at end-of-day.
+        self._embed_worker = EmbedWorker(self._mem)
+        self._embed_worker.start()
+        self._mem.set_embed_worker(self._embed_worker)
+
         self.graph_dynamics = GraphDynamics(build_social_graph(), CONFIG)
         self.social_graph = self.graph_dynamics.G
         self._threat = InsiderThreatInjector.from_config(
@@ -728,7 +740,7 @@ class Flow(Flow[State]):
         return self.state.current_date.weekday() in (0, 2, 4)
 
     def _embed_and_count(self, **kwargs):
-        self._mem.embed_artifact(**kwargs)
+        self._embed_worker.enqueue(**kwargs)
         self.state.daily_artifacts_created += 1
 
     def _record_daily_actor(self, *names: str):
@@ -754,8 +766,12 @@ class Flow(Flow[State]):
         counts = self.state.daily_event_type_counts
         counts[event_type] = counts.get(event_type, 0) + 1
 
+    def run(self):
+        """Main entry point. Runs genesis then the daily simulation loop."""
+        self.genesis_phase()
+        self.daily_cycle()
+
     # ─── GENESIS ─────────────────────────────
-    @start()
     def genesis_phase(self):
         if self._mem.has_genesis_artifacts():
             logger.info(
@@ -792,20 +808,42 @@ class Flow(Flow[State]):
         self._confluence.generate_tech_stack()
         tech_context = self._mem.tech_stack_for_prompt()
 
-        # Generate email sources after tech stack so vendor choices are grounded
-        # in the company's actual infrastructure.
-        self._email_ingestor.generate_sources()
+        # ── Persona embedding + email source generation run in parallel ───────
+        # Persona embeds are all independent (one per employee, no ordering dep).
+        # Email source generation depends on tech_stack (done above) but is
+        # independent of personas and confluence pages.
+        persona_items = [
+            (dept, name, PERSONAS.get(name, DEFAULT_PERSONA))
+            for dept, members in ORG_CHART.items()
+            for name in members
+        ]
+        genesis_time_iso = self._clock.now("system").isoformat()
 
-        for dept, members in ORG_CHART.items():
-            for name in members:
-                persona_data = PERSONAS.get(name, DEFAULT_PERSONA)
-                self._mem.embed_persona_skills(
-                    name,
-                    persona_data,
-                    dept,
-                    day=0,
-                    timestamp_iso=self._clock.now("system").isoformat(),
-                )
+        def _embed_persona(args):
+            dept, name, persona_data = args
+            self._mem.embed_persona_skills(
+                name, persona_data, dept, day=0, timestamp_iso=genesis_time_iso
+            )
+
+        with ThreadPoolExecutor(max_workers=min(8, len(persona_items))) as ex:
+            persona_futures = {
+                ex.submit(_embed_persona, item): item[1] for item in persona_items
+            }
+            # Run email source generation concurrently with persona embedding
+            email_future = ex.submit(self._email_ingestor.generate_sources)
+
+            for future in as_completed(list(persona_futures) + [email_future]):
+                if future is email_future:
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"[genesis] Email source generation failed: {e}")
+                else:
+                    name = persona_futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"[genesis] Persona embed failed for {name}: {e}")
 
         # ── Genesis: log pre-sim employee departures from config ─────────────────
         sim_start = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
@@ -844,38 +882,45 @@ class Flow(Flow[State]):
                 f"[genesis] Logged pre-sim departure: {name} (Day {departure_day})"
             )
 
-        # Technical pages — one LLM call per page, no PAGE BREAK parsing
-        self._confluence.write_genesis_batch(
-            prefix=tech_cfg.get("id_prefix", "CONF-ENG").replace("CONF-", ""),
-            count=tech_cfg.get("count", 3),
-            prompt_tpl=(
-                "You are {author}. Write a single Confluence page with ID {id} for {company} "
-                "about {project_name} and {legacy_system}. "
-                "Existing related pages you may reference: {related_pages}. "
-                "Use only the following canonical tech stack — never invent or substitute alternatives:\n{tech_stack}\n"
-                "Output only Markdown. Do not include an author block, contributor list, "
-                "or metadata section in your output."
-            ),
-            author=eng_member,
-            subdir="archives",
-            extra_vars={"tech_stack": tech_context},
-        )
-
-        # Business pages
-        self._confluence.write_genesis_batch(
-            prefix=biz_cfg.get("id_prefix", "CONF-MKT").replace("CONF-", ""),
-            count=biz_cfg.get("count", 2),
-            prompt_tpl=(
-                "You are {author}. Write a single Confluence page with ID {id} for {company} "
-                "about {product_page} campaign planning and go-to-market strategy. "
-                "Existing related pages you may reference: {related_pages}. "
-                "Output only Markdown. Do not include an author block, contributor list, "
-                "or metadata section in your output."
-            ),
-            author=sale_member,
-            extra_vars={"product_page": PRODUCT_PAGE},
-            subdir="archives",
-            tags=["genesis"],
+        # ── Confluence genesis batches — ENG and MKT run in parallel ─────────
+        # Pages within each batch are sequential (related_pages dependency).
+        # The two batches have no cross-references so they're safe to run
+        # concurrently — each is an independent series of Bedrock calls.
+        self._confluence.write_genesis_batches_parallel(
+            [
+                {
+                    "prefix": tech_cfg.get("id_prefix", "CONF-ENG").replace(
+                        "CONF-", ""
+                    ),
+                    "count": tech_cfg.get("count", 3),
+                    "prompt_tpl": (
+                        "You are {author}. Write a single Confluence page with ID {id} for {company} "
+                        "about {project_name} and {legacy_system}. "
+                        "Existing related pages you may reference: {related_pages}. "
+                        "Use only the following canonical tech stack — never invent or substitute alternatives:\n{tech_stack}\n"
+                        "Output only Markdown. Do not include an author block, contributor list, "
+                        "or metadata section in your output."
+                    ),
+                    "author": eng_member,
+                    "subdir": "archives",
+                    "extra_vars": {"tech_stack": tech_context},
+                },
+                {
+                    "prefix": biz_cfg.get("id_prefix", "CONF-MKT").replace("CONF-", ""),
+                    "count": biz_cfg.get("count", 2),
+                    "prompt_tpl": (
+                        "You are {author}. Write a single Confluence page with ID {id} for {company} "
+                        "about {product_page} campaign planning and go-to-market strategy. "
+                        "Existing related pages you may reference: {related_pages}. "
+                        "Output only Markdown. Do not include an author block, contributor list, "
+                        "or metadata section in your output."
+                    ),
+                    "author": sale_member,
+                    "extra_vars": {"product_page": PRODUCT_PAGE},
+                    "subdir": "archives",
+                    "tags": ["genesis"],
+                },
+            ]
         )
 
         logger.info(
@@ -884,7 +929,6 @@ class Flow(Flow[State]):
         )
 
     # ─── DAILY LOOP ───────────────────────────
-    @listen(genesis_phase)
     def daily_cycle(self):
         latest = self._mem.load_latest_checkpoint()
         if latest:
@@ -898,6 +942,28 @@ class Flow(Flow[State]):
             # Restore the 'Live' state of the secondary systems
             self.graph_dynamics._stress = latest["stress"]
             self.state.actor_cursors = latest["cursors"]
+
+            self.state.active_incidents = [
+                ActiveIncident(**inc) for inc in latest.get("active_incidents", [])
+            ]
+            self.state.sprint = (
+                SprintState(**latest["sprint"])
+                if latest.get("sprint")
+                else SprintState()
+            )
+            self.state.resolved_incidents = latest.get("resolved_incidents", [])
+            self.state.morale_history = latest.get("morale_history", [])
+
+            self.state.active_incidents = []
+            for inc_data in latest.get("active_incidents", []):
+                chain_data = inc_data.pop("causal_chain", [])
+                incident = ActiveIncident(**inc_data)
+                if chain_data:
+                    handler = CausalChainHandler(incident.ticket_id)
+                    for artifact_id in chain_data:
+                        handler.append(artifact_id)
+                    incident.causal_chain = handler
+                self.state.active_incidents.append(incident)
 
             # Re-sync current_date string back to a datetime object
             self.state.current_date = datetime.strptime(
@@ -921,7 +987,7 @@ class Flow(Flow[State]):
                 self.state.current_date += timedelta(days=1)
                 continue
 
-            self._state.ticket_actors_today = {}  # cleared here; orchestrator re-seeds from SprintContext
+            self.state.ticket_actors_today = {}  # cleared here; orchestrator re-seeds from SprintContext
             self._threat.begin_day(self.state.day, self.state)
             self._clock.reset_to_business_start(ALL_NAMES)
             date_str = str(self.state.current_date.date())
@@ -943,6 +1009,9 @@ class Flow(Flow[State]):
 
             vendor_signals = self._email_ingestor.generate_pre_standup(state=self.state)
 
+            if self.state.day > 1:
+                self._embed_worker.drain()
+
             org_plan = self._day_planner.plan(
                 self.state,
                 self._mem,
@@ -953,9 +1022,11 @@ class Flow(Flow[State]):
             )
             if org_plan is None:
                 logger.error(
-                    f"[flow] Day {self.state.day}: DayPlanner returned None — skipping normal day"
+                    f"[flow] Day {self.state.day}: DayPlanner returned None — skipping to next day"
                 )
-                continue  # or raise, depending on how strict you want to be
+                self.state.day += 1
+                self.state.current_date += timedelta(days=1)
+                continue
 
             self._mem._current_day = self.state.day
             self.state.daily_theme = org_plan.org_theme
@@ -1017,6 +1088,18 @@ class Flow(Flow[State]):
                 self.state.last_incident_day = self.state.day
                 self._handle_incident()
 
+            # Drain embed queue before checkpoint so MongoDB is fully consistent.
+            self._embed_worker.drain()
+
+            serialized_incidents = []
+            for inc in self.state.active_incidents:
+                inc_dict = inc.model_dump()
+                inc_dict["causal_chain"] = (
+                    inc.causal_chain.snapshot()
+                    if getattr(inc, "causal_chain", None)
+                    else []
+                )
+                serialized_incidents.append(inc_dict)
             self._mem.save_checkpoint(
                 day=self.state.day,
                 state_vars={
@@ -1027,6 +1110,10 @@ class Flow(Flow[State]):
                 stress=self.graph_dynamics._stress,
                 cursors=self.state.actor_cursors,
                 graph_data=nx.node_link_data(self.social_graph),
+                active_incidents=serialized_incidents,
+                sprint=self.state.sprint.model_dump(),
+                resolved_incidents=self.state.resolved_incidents,
+                morale_history=self.state.morale_history,
             )
             for _sec_event in self._threat.end_day(
                 day=self.state.day,
@@ -1042,12 +1129,11 @@ class Flow(Flow[State]):
             self.state.day += 1
             self.state.current_date += timedelta(days=1)
 
+        self._embed_worker.stop()
         self._print_final_report()
 
     # ─── SPRINT PLANNING ──────────────────────
     def _handle_sprint_planning(self):
-        import threading
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         sprint_num = self.state.sprint.sprint_number
         logger.info(
@@ -2667,7 +2753,7 @@ class Flow(Flow[State]):
                 return name
 
         return resolve_role("on_call_engineer")
-    
+
     def _generate_root_cause(self) -> str:
         tech_stack = self._mem.tech_stack_for_prompt()
         recent_ctx = self._mem.previous_day_context(self.state.day)
@@ -2699,7 +2785,6 @@ class Flow(Flow[State]):
                 f"from the tech stack above. "
                 f"No preamble, no label — just the root cause."
                 f"Recent incidents (do NOT repeat these root causes):\n{recent_str}\n\n"
-
             ),
             expected_output=(
                 "A single sentence. No label. No preamble. "
@@ -2708,9 +2793,7 @@ class Flow(Flow[State]):
             ),
             agent=agent,
         )
-        return str(
-            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
-        ).strip()
+        return str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
 
 
 if __name__ == "__main__":
@@ -2724,7 +2807,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    flow = Flow()
     if args.reset:
-        flow._mem.reset(export_dir=BASE)
-    flow.kickoff()
+        mem = Memory()
+        mem.reset(export_dir=BASE)
+
+    sim = OrgForgeSimulation()
+    sim.run()

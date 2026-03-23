@@ -33,7 +33,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from email import message_from_file
 from pathlib import Path
 
@@ -307,8 +307,6 @@ def read_email_records(
 
             to_hdr = msg.get("To", "")
             subject_hdr = msg.get("Subject", "")
-            date_hdr = msg.get("Date", "")
-
             # Determine if external (to address is outside company domain)
             is_external = "@apexathletics.io" not in to_hdr.lower()
 
@@ -359,7 +357,7 @@ def print_summary(records: list[dict], cutoff_day: int, onset_days: dict) -> Non
         actors.add(r["actor"])
 
     print(f"\n{'─' * 60}")
-    print(f"  Baseline telemetry summary")
+    print("  Baseline telemetry summary")
     print(f"{'─' * 60}")
     print(f"  Cutoff: before day {cutoff_day}  (onset days: {onset_days})")
     print(f"  Total records : {len(records)}")
@@ -411,7 +409,7 @@ def main():
         else export_dir / "security_telemetry" / "baseline_telemetry.jsonl"
     )
 
-    print(f"\nOrgForge Baseline Telemetry Builder")
+    print("\nOrgForge Baseline Telemetry Builder")
     print(f"  Export dir   : {export_dir}")
     print(f"  Start date   : {start_date}")
     print(f"  Subjects     : {onset_days}")

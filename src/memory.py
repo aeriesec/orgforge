@@ -87,6 +87,8 @@ _TICKET_PROGRESS_PROJECTION = {
     "comments": {"$slice": -3},
 }
 
+_EVENT_LOG_MAX_DAYS = 7
+
 
 # ─────────────────────────────────────────────
 # SIM EVENT
@@ -378,6 +380,7 @@ class Memory:
         mongo_client=None,  # inject mongomock.MongoClient() in tests
     ):
         self._embedder = build_embedder()
+        self._embed_worker = None
         # Accept an injected client (e.g. mongomock) so tests never touch a
         # real MongoDB instance.  Production code passes nothing and gets the
         # real MongoClient as before.
@@ -508,16 +511,10 @@ class Memory:
         timestamp: str,
         metadata: Optional[Dict] = None,
     ):
-        """Upsert artifact into MongoDB with vector embedding."""
-        embed_text = f"{title}\n\n{content}"
-        vector = self._embed(
-            embed_text,
-            input_type="search_document",
-            caller="embed_artifact",
-            doc_id=id,
-            doc_type=type,
-        )
+        """Upsert artifact into MongoDB immediately. Embedding is deferred to the
+        background queue if set_embed_worker() has been called, otherwise synchronous."""
 
+        # Write document immediately with null embedding so it's queryable by ID
         doc = {
             "_id": id,
             "type": type,
@@ -526,36 +523,81 @@ class Memory:
             "day": day,
             "date": date,
             "timestamp": timestamp,
-            "embedding": vector,
+            "embedding": None,
             "metadata": metadata or {},
         }
-
         self._artifacts.update_one({"_id": id}, {"$set": doc}, upsert=True)
 
-    def log_event(self, event: SimEvent):
-        """Insert SimEvent into MongoDB."""
-        self._event_log.append(event)
-        event_id = f"EVT-{event.day}-{event.type}-{len(self._event_log)}"
-
-        if event.type not in _SKIP_EMBED_TYPES:
-            vector = self._embed(
-                event.to_embed_text(),
-                input_type="search_document",
-                caller="log_event",
-                doc_id=event_id,
-                doc_type=event.type,
+        # Embed asynchronously if worker is attached, synchronously otherwise
+        embed_text = f"{title}\n\n{content}"
+        if self._embed_worker is not None:
+            self._embed_worker.enqueue(
+                id=id,
+                type=type,
+                title=title,
+                content=embed_text,
+                day=day,
+                date=date,
+                timestamp=timestamp,
+                metadata=metadata,
+                _target="artifacts",
             )
         else:
-            logger.debug(f"[embed] skipping embed for {event_id} (artifact-backed)")
-            vector = None
+            vector = self._embed(
+                embed_text,
+                input_type="search_document",
+                caller="embed_artifact",
+                doc_id=id,
+                doc_type=type,
+            )
+            if vector:
+                self._artifacts.update_one(
+                    {"_id": id},
+                    {"$set": {"embedding": vector}},
+                )
+
+    def log_event(self, event: SimEvent):
+        """Insert SimEvent into MongoDB. Embedding is deferred to the background
+        queue if one is attached via set_embed_worker(); otherwise synchronous."""
+        self._event_log.append(event)
+
+        if len(self._event_log) % 100 == 0:  # check periodically, not every call
+            cutoff_day = (self._current_day or 0) - _EVENT_LOG_MAX_DAYS
+            if cutoff_day > 0:
+                self._event_log = [e for e in self._event_log if e.day >= cutoff_day]
+
+        event_id = f"EVT-{event.day}-{event.type}-{len(self._event_log)}"
 
         doc = event.to_dict()
         doc["_id"] = event_id
-        doc["embedding"] = vector
+        doc["embedding"] = None  # written immediately; filled in by embed worker
 
         self._events.update_one({"_id": event_id}, {"$set": doc}, upsert=True)
 
-    # ─── READ ─────────────────────────────────
+        # Embed asynchronously if a worker is attached, synchronously otherwise
+        if event.type not in _SKIP_EMBED_TYPES:
+            if self._embed_worker is not None:
+                self._embed_worker.enqueue(
+                    id=event_id,
+                    type=event.type,
+                    title=event.summary,
+                    content=event.to_embed_text(),
+                    day=event.day,
+                    date=event.date,
+                    timestamp=event.timestamp,
+                    _target="events",  # signals worker to update events, not artifacts
+                )
+            else:
+                vector = self._embed(
+                    event.to_embed_text(),
+                    input_type="search_document",
+                    caller="log_event",
+                    doc_id=event_id,
+                    doc_type=event.type,
+                )
+                self._events.update_one(
+                    {"_id": event_id}, {"$set": {"embedding": vector}}
+                )
 
     @staticmethod
     def _to_iso(as_of_time: Optional[Any]) -> Optional[str]:
@@ -1492,28 +1534,34 @@ class Memory:
         }
 
     def reset(self, export_dir: Optional[str] = None):
-        """Drop and recreate collections. Optionally wipe export directory."""
-        self._artifacts.drop()
-        self._events.drop()
-        self._jira.drop()
-        self._prs.drop()
-        self._slack.drop()
-        self._conversation_summaries.drop()
+        """Drop and recreate the entire database. Optionally wipe export directory."""
+        db_name = self._db.name
+        self._client.drop_database(db_name)
+        self._db = self._client[db_name]
+
+        # Re-bind all collection references to the fresh database
+        self._artifacts = self._db["artifacts"]
+        self._events = self._db["events"]
+        self._jira = self._db["jira_tickets"]
+        self._prs = self._db["pull_requests"]
+        self._checkpoints = self._db["checkpoints"]
+        self._slack = self._db["slack_messages"]
+        self._plans = self._db["dept_plans"]
+        self._conversation_summaries = self._db["conversation_summaries"]
+        if self._debug_tokens:
+            self._token_usage = self._db["token_usage"]
+
         self._event_log = []
         self._init_vector_indexes()
-        self._artifacts.count_documents({})
-        self._events.count_documents({})
-        logger.info("[memory] 🗑️  Collections reset.")
+        logger.info("[memory] 🗑️  Database reset.")
 
         if export_dir:
             export_path = Path(export_dir)
             if export_path.exists():
                 shutil.rmtree(export_path)
             export_path.mkdir(parents=True, exist_ok=True)
-
-            # Re-attach file handler since the log file was wiped
             log_path = export_path / "simulation.log"
-            root_logger = logging.getLogger()  # root logger, not orgforge.flow
+            root_logger = logging.getLogger()
             for handler in root_logger.handlers[:]:
                 if isinstance(handler, logging.FileHandler):
                     handler.close()
@@ -1607,7 +1655,16 @@ class Memory:
         return self._events.count_documents({"tags": "genesis"}) > 0
 
     def save_checkpoint(
-        self, day: int, state_vars: Dict, stress: Dict, cursors: Dict, graph_data: Dict
+        self,
+        day: int,
+        state_vars: Dict,
+        stress: Dict,
+        cursors: Dict,
+        graph_data: Dict,
+        active_incidents: Optional[List[Dict]] = None,
+        sprint: Optional[Dict] = None,
+        resolved_incidents: Optional[List[str]] = None,
+        morale_history: Optional[List[float]] = None,
     ):
         """Saves daily volatile state to MongoDB."""
         self._checkpoints.update_one(
@@ -1619,6 +1676,10 @@ class Memory:
                     "stress": stress,
                     "cursors": cursors,
                     "graph": graph_data,
+                    "active_incidents": active_incidents or [],
+                    "sprint": sprint or {},
+                    "resolved_incidents": resolved_incidents or [],
+                    "morale_history": morale_history or [],
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             },
@@ -2355,3 +2416,7 @@ class Memory:
         except Exception as e:
             logger.warning(f"[memory] search_events failed: {e}")
             return []
+
+    def set_embed_worker(self, worker) -> None:
+        """Attach the background embed worker. Called from OrgForgeSimulation.__init__."""
+        self._embed_worker = worker

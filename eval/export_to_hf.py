@@ -76,7 +76,7 @@ import re
 import textwrap
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import yaml
 
@@ -861,8 +861,6 @@ class DatasetCardWriter:
         cfg: dict,
     ) -> str:
         sim_cfg = cfg.get("simulation", {})
-        org_cfg = cfg.get("org", {})
-
         num_days = sim_cfg.get("num_days", "?")
         org_chart = cfg.get("org_chart", {})
         org_size = sum(len(v) for v in org_chart.values() if isinstance(v, list))

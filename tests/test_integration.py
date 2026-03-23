@@ -12,15 +12,13 @@ def integration_flow(make_test_memory):
     """
     # We patch flow.Memory to return the mongomock instance from conftest.py
     with patch("flow.build_llm"), patch("flow.Memory", return_value=make_test_memory):
-        from flow import Flow
+        from flow import OrgForgeSimulation
 
-        flow = Flow()
-        # Initialize basic state for the simulation
-        flow.state.day = 1
-        flow.state.system_health = 100
-        # Mock file I/O to prevent writing local JSON files during testing
-        flow._mem.log_slack_messages = MagicMock(return_value=("", ""))
-        return flow
+        sim = OrgForgeSimulation()
+        sim.state.day = 1
+        sim.state.system_health = 100
+        sim._mem.log_slack_messages = MagicMock(return_value=("", ""))
+        return sim
 
 
 @patch("normal_day.Crew")

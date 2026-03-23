@@ -14,6 +14,36 @@ The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, f
 
 ---
 
+## Table of Contents
+
+- [Why Does This Exist?](#why-does-this-exist)
+- [What the Output Looks Like](#what-the-output-looks-like)
+- [What Gets Generated](#what-gets-generated)
+- [Architecture & Mechanics](#architecture--mechanics)
+- [The Departure Cascade](#the-departure-cascade)
+- [Insider Threat Simulation](#insider-threat-simulation)
+- [Quickstart](#quickstart)
+  - [Setup Options](#setup-options)
+  - [Option 1 — Everything in Docker](#option-1--everything-in-docker-recommended)
+  - [Option 2 — Local Ollama, Docker for MongoDB Only](#option-2--local-ollama-docker-for-mongodb-only)
+  - [Option 3 — Cloud Preset](#option-3--cloud-preset-aws-bedrock--openai)
+  - [Running on AWS EC2](#running-on-aws-ec2)
+- [Configuration](#configuration)
+  - [Quality Presets](#quality-presets)
+  - [Key Config Fields](#key-config-fields)
+  - [Dynamic Org Lifecycle](#dynamic-org-lifecycle)
+- [How the Event Bus Works](#how-the-event-bus-works)
+- [Memory Requirements](#memory-requirements)
+- [Project Structure](#project-structure)
+- [Evaluation & Benchmarking](#-evaluation--benchmarking)
+- [Roadmap](#roadmap)
+- [Adding a New Artifact Type](#adding-a-new-artifact-type)
+- [Contributing](#contributing)
+- [Citation](#citation)
+- [License](#license)
+
+---
+
 ## Why Does This Exist?
 
 When building AI agents that reason over institutional knowledge, you need a realistic corpus to test against. The only widely-used corporate dataset is the Enron email corpus — 25 years old, legally sensitive, and covering one company in crisis.
@@ -117,7 +147,7 @@ The module is designed for building and evaluating insider threat detection syst
 
 ## Quickstart
 
-`flow.py` is the main simulation entry point. `config/config.yaml` is the single source of truth for org structure, personas, incident triggers, and quality presets.
+`flow.py` is the main simulation entry point. `config/config.yaml` is the single source of truth for org structure, personas, and quality presets.
 
 ### Setup Options
 
@@ -126,7 +156,6 @@ The module is designed for building and evaluating insider threat detection syst
 | Everything in Docker               | `docker compose up`                  | Recommended for first run                   |
 | Local Ollama + Docker for the rest | `docker compose up mongodb orgforge` | Set `OLLAMA_BASE_URL` in `.env`             |
 | Cloud preset (AWS Bedrock)         | `docker compose up mongodb orgforge` | Set credentials in `.env`, skip Ollama      |
-| Fully local, no Docker             | `python flow.py`                     | Requires MongoDB and Ollama running locally |
 
 ### Option 1 — Everything in Docker (Recommended)
 
@@ -181,20 +210,6 @@ pip install boto3 langchain-aws openai
 docker compose up mongodb orgforge
 ```
 
-### Option 4 — Fully Local, No Docker
-
-```bash
-docker run -p 27017:27017 mongodb/mongodb-atlas-local
-
-ollama pull qwen2.5:7b-instruct-q4_K_M
-ollama pull qwen2.5:1.5b-instruct
-ollama pull mxbai-embed-large
-
-pip install -r requirements.txt
-python src/flow.py
-python src/email_gen.py
-```
-
 ### Running on AWS EC2
 
 **Cheap EC2 + Bedrock/OpenAI (no GPU required)**
@@ -220,12 +235,11 @@ For `Llama 3.3 70B` entirely locally, use a `g5.2xlarge` or `g5.12xlarge` with t
 ### Quality Presets
 
 ```yaml
-quality_preset: "local_cpu" # local_cpu | local_gpu | cloud
+quality_preset: "local_gpu" # local_gpu | cloud
 ```
 
 | Preset      | Planner                     | Worker                | Embeddings             | Best For                 |
 | ----------- | --------------------------- | --------------------- | ---------------------- | ------------------------ |
-| `local_cpu` | qwen2.5:7b-instruct-q4_K_M  | qwen2.5:1.5b-instruct | mxbai-embed-large      | Local dev, no GPU        |
 | `local_gpu` | llama3.3:70b-instruct-q4_KM | llama3.1:8b-instruct  | mxbai-embed-large      | High-fidelity local runs |
 | `cloud`     | Claude Sonnet (Bedrock)     | llama3.1:8b (Bedrock) | text-embedding-3-large | Best output quality      |
 
@@ -236,7 +250,6 @@ quality_preset: "local_cpu" # local_cpu | local_gpu | cloud
 | `company_name`            | Injected into all generated prose                                               |
 | `simulation_days`         | Length of the simulation (default: 22)                                          |
 | `legacy_system`           | The unstable system referenced in incidents, tickets, and docs                  |
-| `incident_triggers`       | Keywords in the daily theme that trigger a P1 incident                          |
 | `sprint_ticket_themes`    | Pool of ticket titles drawn during sprint planning                              |
 | `adhoc_confluence_topics` | Spontaneous wiki pages generated on normal days                                 |
 | `knowledge_gaps`          | Static departed employees whose absence creates documentation gaps from day one |
@@ -326,7 +339,6 @@ This is what makes the dataset useful for RAG evaluation: you have ground truth 
 
 | Preset      | RAM Required | Notes                                    |
 | ----------- | ------------ | ---------------------------------------- |
-| `local_cpu` | ~5 GB        | Qwen 2.5 7B q4 + MongoDB + Python        |
 | `local_gpu` | ~48 GB VRAM  | Llama 3.3 70B — requires A100 or 2× A10G |
 | `cloud`     | ~500 MB      | Only MongoDB + Python run locally        |
 

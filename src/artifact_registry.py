@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -168,6 +169,12 @@ class ArtifactRegistry:
         self._confluence: Dict[str, str] = {}  # CONF-ENG-001 → title
         self._jira: Dict[str, int] = {}  # ORG-100      → 100
 
+        # Single lock for all allocation and registration operations.
+        # Acquired by next_id(), next_jira_id(), register_confluence(),
+        # and register_jira() so parallel genesis batches and sprint
+        # ticket generation can't race on the same counter.
+        self._lock = threading.Lock()
+
         self._seed_from_mongo()
 
     # ─────────────────────────────────────────────
@@ -230,18 +237,22 @@ class ArtifactRegistry:
         next_id("ENG") → "CONF-ENG-001"
         next_id("ENG") → "CONF-ENG-002"   (second call)
         next_id("MKT") → "CONF-MKT-001"   (independent sequence)
+
+        Thread-safe: the lock ensures two concurrent genesis batches
+        can't read the same high-water mark and produce duplicate IDs.
         """
         pat = f"CONF-{prefix}-"
-        new_id = self._allocate(
-            store=self._confluence,
-            existing_nums_fn=lambda s: [
-                int(k[len(pat) :])
-                for k in s
-                if k.startswith(pat) and k[len(pat) :].isdigit()
-            ],
-            make_id_fn=lambda n: f"CONF-{prefix}-{n:03d}",
-            reserve_value="__reserved__",
-        )
+        with self._lock:
+            new_id = self._allocate(
+                store=self._confluence,
+                existing_nums_fn=lambda s: [
+                    int(k[len(pat) :])
+                    for k in s
+                    if k.startswith(pat) and k[len(pat) :].isdigit()
+                ],
+                make_id_fn=lambda n: f"CONF-{prefix}-{n:03d}",
+                reserve_value="__reserved__",
+            )
         logger.debug(f"[registry] Allocated Confluence ID: {new_id}")
         return new_id
 
@@ -250,13 +261,14 @@ class ArtifactRegistry:
         Confirm a pre-allocated Confluence ID with its final title.
         Raises DuplicateArtifactError if already confirmed.
         """
-        current = self._confluence.get(conf_id)
-        if current is not None and current != "__reserved__":
-            raise DuplicateArtifactError(
-                f"[registry] Duplicate Confluence ID '{conf_id}'. "
-                f"Existing title: '{current}'."
-            )
-        self._confluence[conf_id] = title
+        with self._lock:
+            current = self._confluence.get(conf_id)
+            if current is not None and current != "__reserved__":
+                raise DuplicateArtifactError(
+                    f"[registry] Duplicate Confluence ID '{conf_id}'. "
+                    f"Existing title: '{current}'."
+                )
+            self._confluence[conf_id] = title
         logger.debug(f"[registry] Confirmed Confluence {conf_id}: {title}")
 
     # Backward-compat alias kept so old callers and chunk_into_pages don't break
@@ -279,22 +291,25 @@ class ArtifactRegistry:
 
         Starts at ORG-100 (matching the original convention) and increments
         from there. Each call pre-reserves the slot immediately.
+
+        Thread-safe: the lock prevents concurrent sprint ticket generation
+        threads from racing on the same counter.
         """
-        new_id = self._allocate(
-            store=self._jira,
-            # Parse the highest number from the keys, not the values
-            existing_nums_fn=lambda s: (
-                [
-                    int(k.replace("ORG-", ""))
-                    for k in s.keys()
-                    if k.startswith("ORG-") and k.replace("ORG-", "").isdigit()
-                ]
-                if s
-                else [99]
-            ),
-            make_id_fn=lambda n: f"ORG-{n}",
-            reserve_value=0,  # 0 = reserved sentinel; confirmed in register_jira
-        )
+        with self._lock:
+            new_id = self._allocate(
+                store=self._jira,
+                existing_nums_fn=lambda s: (
+                    [
+                        int(k.replace("ORG-", ""))
+                        for k in s.keys()
+                        if k.startswith("ORG-") and k.replace("ORG-", "").isdigit()
+                    ]
+                    if s
+                    else [99]
+                ),
+                make_id_fn=lambda n: f"ORG-{n}",
+                reserve_value=0,
+            )
         logger.debug(f"[registry] Allocated JIRA ID: {new_id}")
         return new_id
 
@@ -307,10 +322,13 @@ class ArtifactRegistry:
         if not suffix.isdigit():
             raise ValueError(f"[registry] Malformed JIRA ID: '{jira_id}'")
         n = int(suffix)
-        current = self._jira.get(jira_id)
-        if current is not None and current != 0:
-            raise DuplicateArtifactError(f"[registry] Duplicate JIRA ID '{jira_id}'.")
-        self._jira[jira_id] = n
+        with self._lock:
+            current = self._jira.get(jira_id)
+            if current is not None and current != 0:
+                raise DuplicateArtifactError(
+                    f"[registry] Duplicate JIRA ID '{jira_id}'."
+                )
+            self._jira[jira_id] = n
         logger.debug(f"[registry] Confirmed JIRA {jira_id}")
 
     def jira_exists(self, jira_id: str) -> bool:

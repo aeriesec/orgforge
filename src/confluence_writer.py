@@ -43,6 +43,8 @@ import json
 import logging
 import random
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agent_factory import make_agent
@@ -206,6 +208,70 @@ class ConfluenceWriter:
             f"{len(registered_ids)} page(s) registered."
         )
         return registered_ids
+
+    def write_genesis_batches_parallel(
+        self,
+        batches: List[Dict],
+    ) -> Dict[str, List[str]]:
+        """
+        Run multiple independent genesis batches concurrently.
+
+        Each batch is a dict with the same kwargs as write_genesis_batch():
+            prefix, count, prompt_tpl, author, extra_vars, subdir, tags
+
+        Pages WITHIN a batch remain sequential (each page references prior
+        pages in the same batch via related_pages — that dependency is
+        load-bearing and cannot be parallelised).
+
+        Pages ACROSS batches (e.g. ENG vs MKT) are completely independent
+        and safe to run in parallel.
+
+        Args:
+            batches: list of kwarg dicts, one per independent batch.
+
+        Returns:
+            Dict mapping prefix → list of registered conf_ids.
+
+        Example:
+            results = writer.write_genesis_batches_parallel([
+                {"prefix": "ENG", "count": 3, "prompt_tpl": ..., "author": eng_member,
+                 "subdir": "archives", "extra_vars": {"tech_stack": tech_context}},
+                {"prefix": "MKT", "count": 2, "prompt_tpl": ..., "author": sale_member,
+                 "subdir": "archives", "tags": ["genesis"]},
+            ])
+        """
+        prefixes = [b["prefix"] for b in batches]
+        if len(prefixes) != len(set(prefixes)):
+            raise ValueError(
+                f"[confluence] Duplicate prefixes in parallel genesis batches: {prefixes}. "
+                f"Each batch must have a unique prefix."
+            )
+        results: Dict[str, List[str]] = {}
+        lock = threading.Lock()
+
+        with ThreadPoolExecutor(max_workers=len(batches)) as ex:
+            futures = {
+                ex.submit(self.write_genesis_batch, **batch): batch["prefix"]
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                prefix = futures[future]
+                try:
+                    ids = future.result()
+                    with lock:
+                        results[prefix] = ids
+                    logger.info(
+                        f"[confluence] ✓ Parallel genesis batch done ({prefix}): "
+                        f"{len(ids)} page(s)"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[confluence] ✗ Parallel genesis batch failed ({prefix}): {e}"
+                    )
+                    with lock:
+                        results[prefix] = []
+
+        return results
 
     def write_postmortem(
         self,
@@ -662,6 +728,7 @@ class ConfluenceWriter:
 
         Returns list of all conf_ids created (parent + children).
         """
+
         # 1. Strip any CONF-* references that aren't registered yet
         clean_content = self._registry.strip_broken_references(raw_content)
 
@@ -809,6 +876,7 @@ class ConfluenceWriter:
             }
             self._mem.upsert_ticket(ticket)
             self._save_json(f"{self._base}/jira/{tid}.json", ticket)
+
             self._mem.embed_artifact(
                 id=tid,
                 type="jira",

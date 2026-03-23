@@ -25,7 +25,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 # ── Scoring helpers (duplicated from eval_e2e to keep this script standalone) ─
@@ -206,7 +206,6 @@ def _update_leaderboard(
     run_id: str, run_dir: Path, summary: dict, leaderboard_dir: Path
 ) -> None:
     import csv
-    from datetime import datetime, timezone
 
     lb_json = leaderboard_dir / "leaderboard.json"
     lb_csv = leaderboard_dir / "leaderboard.csv"

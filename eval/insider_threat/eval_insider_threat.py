@@ -91,17 +91,14 @@ import argparse
 import csv
 import json
 import logging
-import os
 import random
 import re
 import sys
 import time
-import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
-from email import message_from_file
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from botocore.config import Config as BotocoreConfig
 
 import yaml
@@ -1388,7 +1385,7 @@ def run_correlation(
             verdicts.append(verdict)
 
     # Print summary
-    print(f"\n  Verdicts:")
+    print("\n  Verdicts:")
     for v in verdicts:
         icon = (
             "🔴"
@@ -1773,7 +1770,7 @@ def print_summary(
         print(f"  PROMPT VARIANT — {variant}  [sensitivity run, not on leaderboard]")
     print("═" * 64)
 
-    print(f"\n  Triage (Tier 1)")
+    print("\n  Triage (Tier 1)")
     print(f"    {'Precision':<22} {_fmt(triage_scores['precision'])}")
     print(f"    {'Recall':<22} {_fmt(triage_scores['recall'])}")
     print(f"    {'F1':<22} {_fmt(triage_scores['f1'])}")
@@ -1788,7 +1785,7 @@ def print_summary(
     )
 
     if verdict_scores:
-        print(f"\n  Verdicts (Tier 2)")
+        print("\n  Verdicts (Tier 2)")
         print(f"    {'Precision':<22} {_fmt(verdict_scores['precision'])}")
         print(f"    {'Recall':<22} {_fmt(verdict_scores['recall'])}")
         print(f"    {'F1':<22} {_fmt(verdict_scores['f1'])}")
@@ -1806,7 +1803,7 @@ def print_summary(
         )
 
         if verdict_scores["by_class"]:
-            print(f"\n  Per threat class:")
+            print("\n  Per threat class:")
             for cls, counts in sorted(verdict_scores["by_class"].items()):
                 tp_ = counts.get("tp", 0)
                 fp_ = counts.get("fp", 0)
@@ -1818,7 +1815,7 @@ def print_summary(
                 )
 
         if verdict_scores["by_behavior"]:
-            print(f"\n  Per behavior (correctly cited):")
+            print("\n  Per behavior (correctly cited):")
             for b, counts in sorted(verdict_scores["by_behavior"].items()):
                 print(f"    {b:<30}  TP={counts['tp']}  FP={counts['fp']}")
 
@@ -1891,7 +1888,7 @@ def run_eval(args: argparse.Namespace) -> None:
     print(f"  Max days      : {max_day}")
     print(f"  Subjects      : {onset_days}")
     if sensitivity:
-        print(f"  ⚠  Leaderboard will NOT be updated for sensitivity runs.")
+        print("  ⚠  Leaderboard will NOT be updated for sensitivity runs.")
 
     access_log = load_jsonl(access_log_path)
     ground_truth = load_ground_truth(gt_path)
@@ -2078,9 +2075,9 @@ def run_eval(args: argparse.Namespace) -> None:
         print(f"  Leaderboard   → {LEADERBOARD_JSON}")
         print(f"  Leaderboard   → {LEADERBOARD_CSV}")
     elif args.correlation_only:
-        print(f"  Leaderboard      skipped (correlation-only run)")
+        print("  Leaderboard      skipped (correlation-only run)")
     else:
-        print(f"  Leaderboard      skipped (sensitivity run)")
+        print("  Leaderboard      skipped (sensitivity run)")
 
     # ── Print summary ─────────────────────────────────────────────────────────
     print_summary(
@@ -2100,13 +2097,13 @@ def _parse_args() -> argparse.Namespace:
         description="OrgForge insider threat detection leaderboard",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            f"Suggested models:\n"
+            "Suggested models:\n"
             + "\n".join(f"  {m}" for m in _SUGGESTED_MODELS)
-            + f"\n\nPrompt variants (sensitivity analysis):\n"
+            + "\n\nPrompt variants (sensitivity analysis):\n"
             + "\n".join(
                 f"  {k}  — {v['label']}" for k, v in _SENSITIVITY_VARIANTS.items()
             )
-            + f"\n\nSensitivity runs write to results/sensitivity/ and never touch the leaderboard."
+            + "\n\nSensitivity runs write to results/sensitivity/ and never touch the leaderboard."
         ),
     )
     p.add_argument(

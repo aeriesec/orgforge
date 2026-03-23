@@ -293,7 +293,6 @@ class RecurrenceDetector:
 
         Always writes one document to recurrence_matches regardless of outcome.
         """
-        import math
 
         candidates: Dict[str, Dict[str, Any]] = {}
 

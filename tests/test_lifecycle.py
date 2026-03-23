@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from flow import Flow, ActiveIncident
+from flow import OrgForgeSimulation, ActiveIncident
 from org_lifecycle import OrgLifecycleManager, patch_validator_for_lifecycle
 
 from datetime import datetime
@@ -13,15 +13,15 @@ from sim_clock import SimClock
 
 
 @pytest.fixture
-def mock_flow(make_test_memory):
+def mock_sim(make_test_memory):
     """Flow instance with mocked LLMs and a mongomock-backed Memory."""
     with patch("flow.build_llm"), patch("flow.Memory", return_value=make_test_memory):
-        flow = Flow()
-        flow.state.day = 5
-        flow.state.system_health = 80
-        flow._registry = MagicMock()
-        flow._confluence = MagicMock()
-        return flow
+        sim = OrgForgeSimulation()
+        sim.state.day = 5
+        sim.state.system_health = 80
+        sim._registry = MagicMock()
+        sim._confluence = MagicMock()
+        return sim
 
 
 @pytest.fixture
@@ -36,7 +36,7 @@ def mock_clock():
 
 
 @pytest.fixture
-def lifecycle(mock_flow):
+def lifecycle(mock_sim):
     """
     Standalone OrgLifecycleManager wired to the flow's live graph and state.
     Mirrors the setup in Flow.__init__ per the patch guide.
@@ -91,13 +91,13 @@ def lifecycle(mock_flow):
     mgr = OrgLifecycleManager(
         config=config,
         graph_dynamics=gd,
-        mem=mock_flow._mem,
+        mem=mock_sim._mem,
         org_chart=org_chart,
         personas=personas,
         all_names=all_names,
         leads=leads,
     )
-    return mgr, gd, org_chart, all_names, mock_flow.state
+    return mgr, gd, org_chart, all_names, mock_sim.state
 
 
 # ─────────────────────────────────────────────────────────────────────────────
