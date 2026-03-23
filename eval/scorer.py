@@ -17,7 +17,7 @@ Question types handled
   CAUSAL        Artifact match AND event_type match required for full credit.
   TEMPORAL      Boolean + optional departure_day agreement.
   GAP_DETECTION Boolean was_actioned + downstream artifact overlap.
-  ROUTING       first_recipient exact match + was_escalated agreement.
+  ROUTING       first_recipient exact match.
   PLAN          dept + theme match (theme uses substring matching for LLM prose).
   ESCALATION    escalation_actors set match, partial credit for overlap.
   KNOWLEDGE_GAP gap_areas set match, partial credit for overlap.
@@ -78,7 +78,6 @@ GAP_DETECTION:
 ROUTING:
     {
         "first_recipient": "Alice",
-        "was_escalated": true,
         "retrieved_artifact_ids": [...]
     }
 
@@ -379,9 +378,7 @@ class GapDetectionScorer(_BaseScorer):
 class RoutingScorer(_BaseScorer):
     """
     ROUTING — "Who was the first internal person to receive this email?"
-
-    Full credit: first_recipient matches AND was_escalated agrees.
-    Partial:     first_recipient correct but was_escalated wrong (0.7).
+    Full credit: first_recipient matches.
     """
 
     def score(
@@ -389,26 +386,18 @@ class RoutingScorer(_BaseScorer):
     ) -> Tuple[float, float, Optional[str]]:
         gt = question["ground_truth"]
         gt_recipient = gt.get("first_recipient", "")
-        gt_escalated = gt.get("was_escalated")
         agent_recipient = agent_answer.get("first_recipient", "")
-        agent_escalated = agent_answer.get("was_escalated")
 
         recipient_match = (
             agent_recipient.strip().lower() == gt_recipient.strip().lower()
         )
-        escalation_match = agent_escalated == gt_escalated
 
-        if recipient_match and escalation_match:
+        if recipient_match:
             primary = 1.0
             failure = None
-        elif recipient_match:
-            primary = 0.7
-            failure = f"Correct recipient but was_escalated expected {gt_escalated}, got {agent_escalated}"
         else:
             primary = 0.0
-            failure = (
-                f"Expected first_recipient={gt_recipient!r}, got {agent_recipient!r}"
-            )
+            failure = f"Expected first_recipient={gt_recipient!r}, got {agent_recipient!r}"
 
         evidence = self._evidence_overlap(
             question.get("evidence_chain", []),

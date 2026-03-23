@@ -401,7 +401,16 @@ class CorpusBuilder:
 
     def _email_body(self, facts: dict, evt: dict) -> str:
         parts = []
-        for key in ("subject", "content", "body", "from", "to", "summary", "source", "prospect"):
+        for key in (
+            "subject",
+            "content",
+            "body",
+            "from",
+            "to",
+            "summary",
+            "source",
+            "prospect",
+        ):
             val = facts.get(key)
             if val:
                 parts.append(f"{key}: {val}")
@@ -543,8 +552,7 @@ class CorpusBuilder:
                 rich_map[tid] = "\n".join(p for p in parts if p)
 
             for artifact in self._mem._db["artifacts"].find(
-                {"type": "email"},
-                {"_id": 1, "content": 1, "title": 1}
+                {"type": "email"}, {"_id": 1, "content": 1, "title": 1}
             ):
                 art_id = artifact.get("_id")
                 if art_id and artifact.get("content"):
@@ -619,7 +627,10 @@ class CorpusBuilder:
                 doc_type = _TYPE_MAP.get(art_type, "sim_event")
                 if not art_id or art_id in existing_ids:
                     continue
-                if any(art_id.startswith(prefix) for prefix in ("exfil_", "hoarding_", "snooping_", "dlp_")):
+                if any(
+                    art_id.startswith(prefix)
+                    for prefix in ("exfil_", "hoarding_", "snooping_", "dlp_")
+                ):
                     logger.debug(f"  skipping insider threat artifact: {art_id}")
                     continue
                 meta = artifact.get("metadata", {})

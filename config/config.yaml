@@ -71,6 +71,8 @@ simulation:
   new_hire: "Elena"
   new_hire_dept: "Product"
   sprint_length_days: 10
+  incident_base_prob: 0.15
+  incident_cooldown_days: 3
 
 # ── MORALE ────────────────────────────────────────────────────
 morale:
@@ -85,17 +87,6 @@ legacy_system:
   project_name: "Project Titan"
   description: "legacy sports-tracking system"
   aws_alert_message: "TitanDB provisioned IOPS costs remain elevated."
-
-# ── INCIDENT TRIGGERS ─────────────────────────────────────────
-incident_triggers:
-  - "crash"
-  - "fail"
-  - "error"
-  - "latency"
-  - "timeout"
-  - "outage"
-  - "down"
-  - "spike"
 
 # ── GENESIS DOCUMENTS ─────────────────────────────────────────
 genesis_docs:

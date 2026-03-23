@@ -319,6 +319,7 @@ class State(BaseModel):
     daily_incidents_resolved: int = 0
     daily_artifacts_created: int = 0
     daily_external_contacts: int = 0
+    last_incident_day: int = 0
 
     org_day_plan: Optional[Any] = None
     daily_active_actors: List[str] = []
@@ -971,45 +972,50 @@ class Flow(Flow[State]):
 
             self._advance_incidents()
 
-            theme_lower = self.state.daily_theme.lower()
-            incident_triggers = CONFIG.get(
-                "incident_triggers",
-                ["crash", "fail", "error", "latency", "timeout", "outage"],
-            )
-            if any(x in theme_lower for x in incident_triggers):
-                self._handle_incident()
-            else:
-                self._normal_day.handle(self.state.org_day_plan)
-                self._email_ingestor.generate_business_hours(state=self.state)
-                self._email_ingestor.generate_hr_outbound(state=self.state)
-                if random.random() < CONFIG["simulation"].get(
-                    "adhoc_confluence_prob", 0.3
-                ):
-                    self._generate_adhoc_confluence_page()
+            self._normal_day.handle(self.state.org_day_plan)
+            self._email_ingestor.generate_business_hours(state=self.state)
+            self._email_ingestor.generate_hr_outbound(state=self.state)
 
-                for subject_name in self._threat.active_subject_names():
-                    result = self._threat.inject_host_hoarding(
-                        actor=subject_name,
-                        day=self.state.day,
-                        current_date=self.state.current_date,
-                    )
-                    if result:
-                        logger.debug(
-                            f"[security] host hoarding phase {result['phase']} "
-                            f"fired for {subject_name}"
-                        )
+            if random.random() < CONFIG["simulation"].get("adhoc_confluence_prob", 0.3):
+                self._generate_adhoc_confluence_page()
 
-                if self.state.day in self._se_followup_days:
-                    self._threat.reset_behavior_cooldown("social_engineering")
-
-                se_results = self._threat.inject_social_engineering(
+            for subject_name in self._threat.active_subject_names():
+                result = self._threat.inject_host_hoarding(
+                    actor=subject_name,
                     day=self.state.day,
                     current_date=self.state.current_date,
-                    active_names=self.state.daily_active_actors or ALL_NAMES,
                 )
-                for r in se_results:
-                    if r.get("pattern") == "trust_building":
-                        self._se_followup_days[r["followup_due_day"]] = r["target"]
+                if result:
+                    logger.debug(
+                        f"[security] host hoarding phase {result['phase']} "
+                        f"fired for {subject_name}"
+                    )
+
+            if self.state.day in self._se_followup_days:
+                self._threat.reset_behavior_cooldown("social_engineering")
+
+            se_results = self._threat.inject_social_engineering(
+                day=self.state.day,
+                current_date=self.state.current_date,
+                active_names=self.state.daily_active_actors or ALL_NAMES,
+            )
+            for r in se_results:
+                if r.get("pattern") == "trust_building":
+                    self._se_followup_days[r["followup_due_day"]] = r["target"]
+
+            # Incident fires after normal day work, mid-day
+            _base_prob = CONFIG["simulation"].get("incident_base_prob", 0.15)
+            _health_factor = max(0.5, (100 - self.state.system_health) / 100)
+            _cooldown = CONFIG["simulation"].get("incident_cooldown_days", 3)
+            days_since_incident = self.state.day - self.state.last_incident_day
+
+            if (
+                not self.state.active_incidents
+                and days_since_incident > _cooldown
+                and random.random() < _base_prob * _health_factor
+            ):
+                self.state.last_incident_day = self.state.day
+                self._handle_incident()
 
             self._mem.save_checkpoint(
                 day=self.state.day,
@@ -1612,7 +1618,8 @@ class Flow(Flow[State]):
 
     def _handle_incident(self):
         ticket_id = next_jira_id(self.state, self._registry)
-        on_call = resolve_role("on_call_engineer")
+        root_cause = self._generate_root_cause()
+        on_call = self._select_domain_expert(root_cause, exclude="")
 
         incident_start = self._clock.tick_system(min_mins=30, max_mins=240)
         incident_start_iso = incident_start.isoformat()
@@ -2634,47 +2641,76 @@ class Flow(Flow[State]):
             f"{display_name} re {inc.ticket_id} in #incidents"
         )
 
-    def _select_domain_expert(self, root_cause: str, exclude: str) -> str:
-        """
-        Find the active engineering team member whose expertise embedding is
-        most similar to the incident root cause. Scoped to Engineering_Backend
-        and Engineering_Mobile only — never routes incidents to Sales, Design, etc.
-        Falls back to incident_commander role if embedding fails or no candidates.
-        """
-        rc_vec = self._mem._embed(
-            root_cause,
-            input_type="search_query",
-            caller="incident_routing",
-            doc_id="rc",
-        )
-        if not rc_vec:
-            return resolve_role("incident_commander")
+    def _select_domain_expert(
+        self,
+        root_cause: str,
+        exclude: str,
+        search_depts: Optional[set] = None,
+    ) -> str:
+        _SEARCH_DEPTS = search_depts or {"Engineering_Backend", "Engineering_Mobile"}
 
-        _ENG_DEPTS = {"Engineering_Backend", "Engineering_Mobile"}
-        candidates = [
-            n
-            for dept, members in ORG_CHART.items()
-            if dept in _ENG_DEPTS
-            for n in members
-            if n != exclude
-            and n in LIVE_ORG_CHART.get(dept, [])
-            and n in self._ticket_assigner._engineer_vectors
+        results = self._mem.find_expert_by_skill(root_cause, n=10)
+
+        for result in results:
+            name = result.get("name")
+            dept = result.get("dept")
+            if (
+                name
+                and name != exclude
+                and dept in _SEARCH_DEPTS
+                and name in LIVE_ORG_CHART.get(dept, [])
+            ):
+                logger.info(
+                    f"[incident] domain expert for '{root_cause[:60]}': "
+                    f"{name} (score={result.get('score', 0):.3f})"
+                )
+                return name
+
+        return resolve_role("on_call_engineer")
+    
+    def _generate_root_cause(self) -> str:
+        tech_stack = self._mem.tech_stack_for_prompt()
+        recent_ctx = self._mem.previous_day_context(self.state.day)
+
+        recent_incidents = [
+            e.facts.get("root_cause", "")
+            for e in self._mem.get_event_log()
+            if e.type == "incident_opened" and e.day >= self.state.day - 10
         ]
+        recent_str = "\n".join(f"- {rc}" for rc in recent_incidents if rc)
 
-        if not candidates:
-            return resolve_role("incident_commander")
-
-        best_name, best_score = resolve_role("incident_commander"), 0.0
-        for name in candidates:
-            score = _cosine(rc_vec, self._ticket_assigner._engineer_vectors[name])
-            if score > best_score:
-                best_score, best_name = score, name
-
-        logger.info(
-            f"[incident] domain expert for '{root_cause[:60]}': "
-            f"{best_name} (score={best_score:.3f})"
+        agent = make_agent(
+            role="Automated Monitoring System",
+            goal="Generate a root cause for a system incident.",
+            backstory=(
+                f"You are the observability platform for {COMPANY_NAME} which {COMPANY_DESCRIPTION}. "
+                f"You detect anomalies and surface root causes from system telemetry."
+            ),
+            llm=PLANNER_MODEL,
         )
-        return best_name
+        task = Task(
+            description=(
+                f"System health: {self.state.system_health}/100\n"
+                f"Sprint theme: {self.state.sprint.sprint_theme}\n"
+                f"Recent context:\n{recent_ctx}\n\n"
+                f"Tech stack:\n{tech_stack}\n\n"
+                f"Generate ONE root cause sentence for a system incident that fired "
+                f"right now. Reference a specific component, service, or dependency "
+                f"from the tech stack above. "
+                f"No preamble, no label — just the root cause."
+                f"Recent incidents (do NOT repeat these root causes):\n{recent_str}\n\n"
+
+            ),
+            expected_output=(
+                "A single sentence. No label. No preamble. "
+                "Example: 'Redis TTL misconfiguration caused auth token cache "
+                "stampede under load.'"
+            ),
+            agent=agent,
+        )
+        return str(
+            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        ).strip()
 
 
 if __name__ == "__main__":

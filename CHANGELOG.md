@@ -6,6 +6,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.0] — 2026-03-22
+
+### Added
+
+- **Probabilistic Incident Triggering (`src/flow.py`, `config/config.yaml`)**: Replaced keyword-matching on the daily theme with a probability-based model driven by `incident_base_prob` and system health. Incidents now fire after normal day work completes, placing them naturally mid-day in the artifact timeline. Configurable via `incident_base_prob` (default 0.15) and `incident_cooldown_days` (default 3) in `config.yaml`.
+- **Root Cause Generation Decoupled from Engineer (`src/flow.py`)**: Added `_generate_root_cause()` which derives incident root cause from tech stack, recent context, and sprint theme before any engineer is selected. Recent incidents (last 10 days) are injected as exclusions to prevent repeated root causes.
+- **Skill-Based On-Call Routing (`src/flow.py`)**: On-call engineer is now selected via `find_expert_by_skill()` against the generated root cause rather than always resolving to the department lead. Both `Engineering_Backend` and `Engineering_Mobile` are eligible, routing mobile incidents to mobile engineers naturally.
+- **`last_incident_day` State Field (`src/flow.py`)**: Added to `State` to track cooldown between incident firings.
+
+### Changed
+
+- **`_select_domain_expert` Dept Scope Parameter (`src/flow.py`)**: Now accepts an optional `search_depts` set, defaulting to both engineering departments. Replaced manual embedding and cosine similarity with `find_expert_by_skill()`, removing the dependency on `_ticket_assigner._engineer_vectors`.
+- **Incident Trigger Keywords Removed (`config/config.yaml`)**: `incident_triggers` config block removed entirely.
+- **All Departments Run Regardless of Incidents (`src/flow.py`)**: Normal day handler, email ingestor, threat injector, and social engineering runs are no longer gated behind an `else` branch. All activity proceeds daily; the incident fires after.
+- **`RoutingScorer` Simplified (`eval/scorer.py`)**: `was_escalated` removed from primary scoring. Correct `first_recipient` now gives full credit, matching the question text which never asks about escalation status.
+
+### Fixed
+
+- **`StateWithId` Missing `last_incident_day`**: Field added to base `State` model, resolving `AttributeError` in integration tests.
+
+---
+
 ## [v1.1.3] — 2026-03-22
 
 ### Added

@@ -153,7 +153,9 @@ class BM25Retriever(Retriever):
         from rank_bm25 import BM25Okapi
 
         self._doc_ids = [r["doc_id"] for r in corpus]
-        tokenised = [self._tokenize(r.get("body") or r.get("content") or "") for r in corpus]
+        tokenised = [
+            self._tokenize(r.get("body") or r.get("content") or "") for r in corpus
+        ]
         self._bm25 = BM25Okapi(tokenised)
         logger.info(f"  BM25 index built ({len(self._doc_ids)} docs)")
 
