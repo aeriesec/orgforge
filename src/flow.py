@@ -128,7 +128,7 @@ def build_llm(model_key: str):
     Return the correct LangChain LLM for the active quality_preset.
 
     preset provider values:
-      "ollama"  → langchain_community.llms.Ollama         (local_cpu / local_gpu)
+      "ollama"  → langchain_community.llms.Ollama          (local_gpu)
       "bedrock" → langchain_aws.ChatBedrock                (cloud — AWS Bedrock)
 
     model_key: "planner" or "worker"
@@ -161,7 +161,7 @@ def build_llm(model_key: str):
                 "Run: pip install langchain-aws"
             )
 
-    # Default: Ollama (local_cpu / local_gpu)
+    # Default: Ollama (local_gpu)
 
     # 1. Check environment variable first (injected by Docker)
     # 2. Fall back to config.yaml if no env var exists

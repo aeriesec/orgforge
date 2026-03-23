@@ -151,11 +151,11 @@ The module is designed for building and evaluating insider threat detection syst
 
 ### Setup Options
 
-| Scenario                           | Command                              | Notes                                       |
-| ---------------------------------- | ------------------------------------ | ------------------------------------------- |
-| Everything in Docker               | `docker compose up`                  | Recommended for first run                   |
-| Local Ollama + Docker for the rest | `docker compose up mongodb orgforge` | Set `OLLAMA_BASE_URL` in `.env`             |
-| Cloud preset (AWS Bedrock)         | `docker compose up mongodb orgforge` | Set credentials in `.env`, skip Ollama      |
+| Scenario                           | Command                              | Notes                                  |
+| ---------------------------------- | ------------------------------------ | -------------------------------------- |
+| Everything in Docker               | `docker compose up`                  | Recommended for first run              |
+| Local Ollama + Docker for the rest | `docker compose up mongodb orgforge` | Set `OLLAMA_BASE_URL` in `.env`        |
+| Cloud preset (AWS Bedrock)         | `docker compose up mongodb orgforge` | Set credentials in `.env`, skip Ollama |
 
 ### Option 1 — Everything in Docker (Recommended)
 
@@ -388,7 +388,6 @@ For detailed instructions on generating eval sets, running benchmarks, and inter
 
 - [ ] Plugin architecture for community artifact types (Zoom, Zendesk, PagerDuty, Salesforce)
 - [ ] Domain packs — pre-configured `config.yaml` templates for healthcare, fintech, legal
-- [ ] ONNX embedding support for faster CPU inference
 - [x] Export to HuggingFace dataset format
 - [x] Evaluation harness — benchmark RAG retrieval against SimEvent ground truth
 

@@ -7,11 +7,7 @@
 
 # ── QUALITY PRESET ────────────────────────────────────────────
 # Controls which model profile is active.
-# Options: "local_cpu" | "local_gpu" | "cloud"
-#
-#   local_cpu  — optimized for laptops / no GPU. Runs fully offline.
-#                Good for iterating on config, testing the pipeline,
-#                and quick parameter tuning. Expect slower inference.
+# Options: "local_gpu" | "cloud"
 #
 #   local_gpu  — for machines with a CUDA/Metal GPU running Ollama.
 #                Significantly faster; same offline/private guarantee.
@@ -23,15 +19,6 @@
 quality_preset: "cloud"
 
 model_presets:
-  local_cpu:
-    provider: "ollama"
-    planner: "ollama/qwen2.5:7b-instruct-q4_K_M"
-    worker: "ollama/qwen2.5:1.5b-instruct"
-    base_url: "http://localhost:11434"
-    embed_provider: "ollama"
-    embed_model: "mxbai-embed-large"
-    embed_dims: 1024
-
   local_gpu:
     provider: "ollama"
     planner: "ollama/llama3.3:70b"

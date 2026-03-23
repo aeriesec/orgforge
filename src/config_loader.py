@@ -58,7 +58,7 @@ LIVE_ORG_CHART = {dept: list(members) for dept, members in ORG_CHART.items()}
 LIVE_PERSONAS = {k: dict(v) for k, v in PERSONAS.items()}
 
 # ── Model preset ──────────────────────────────────────────────────────────────
-_PRESET_NAME = CONFIG.get("quality_preset", "local_cpu")
+_PRESET_NAME = CONFIG.get("quality_preset", "local_gpu")
 _PRESET = CONFIG["model_presets"][_PRESET_NAME]
 _PROVIDER = _PRESET.get("provider", "ollama")
 

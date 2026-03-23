@@ -44,8 +44,8 @@ def mock_config_and_db():
             "start_date": "2026-01-01",
             "max_days": 1,
         },
-        "model_presets": {"local_cpu": {"planner": "mock", "worker": "mock"}},
-        "quality_preset": "local_cpu",
+        "model_presets": {"local_gpu": {"planner": "mock", "worker": "mock"}},
+        "quality_preset": "local_gpu",
         "org_chart": {"Engineering": ["Alice"]},
         "leads": {"Engineering": "Alice"},
         "personas": {

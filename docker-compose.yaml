@@ -4,7 +4,7 @@ version: "3.9"
 # OrgForge — Docker Compose
 # ═══════════════════════════════════════════════════════════════
 #
-# LOCAL PRESET (local_cpu / local_gpu):
+# LOCAL PRESET (local_gpu):
 #   docker-compose up
 #   All three services start. Ollama pulls models on first run.
 #
@@ -56,7 +56,7 @@ services:
       - ollama_models:/root/.ollama
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     environment:
-      - QUALITY_PRESET=${QUALITY_PRESET:-local_cpu}
+      - QUALITY_PRESET=${QUALITY_PRESET:-local_gpu}
     configs:
       - source: ollama_entrypoint
         target: /entrypoint.sh
