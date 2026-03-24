@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 from typing import Dict, List
+import json as _json
 
 import numpy as np
 
@@ -80,6 +81,7 @@ class TicketAssigner:
         self._config = config
         self._gd = graph_dynamics
         self._mem = mem
+        self._base = config["simulation"].get("output_dir", "./export")
 
         # MongoDB collection for cached ticket-title embeddings.
         # Separate from jira_tickets so we never pollute the ticket docs.
@@ -134,11 +136,17 @@ class TicketAssigner:
                 ticket = self._mem.get_ticket(tid)
                 if ticket:
                     ticket["assignee"] = owner
+                    if self._base:
+                        path = f"{self._base}/jira/{ticket['id']}.json"
+                        with open(path, "w") as f:
+                            _json.dump(ticket, f, indent=2)
                     self._mem.upsert_ticket(ticket)
 
         in_progress = [
             t["id"] for t in open_tickets if t.get("status") == "In Progress"
         ]
+
+        in_review = [t["id"] for t in open_tickets if t.get("status") == "In Review"]
 
         available = [t["id"] for t in open_tickets if t["id"] not in owned]
 
@@ -153,6 +161,7 @@ class TicketAssigner:
             available_tickets=available,
             in_progress_ids=in_progress,
             capacity_by_member=capacity,
+            in_review=in_review,
         )
 
     # ── Capacity ──────────────────────────────────────────────────────────────

@@ -508,7 +508,7 @@ class ExternalEmailIngestor:
     def _product_opens_jira(
         self, signal, product_lead, state, date_str
     ) -> Optional[str]:
-        ticket_id = self._registry.next_jira_id()
+        ticket_id = self._registry.next_jira_id("PROD")
         self._registry.register_jira(ticket_id)
         jira_time, _ = self._clock.sync_and_advance([product_lead], hours=0.3)
 
@@ -548,7 +548,7 @@ class ExternalEmailIngestor:
             "created_at": jira_time.isoformat(),
             "updated_at": jira_time.isoformat(),
         }
-        self._mem.upsert_ticket(ticket)
+
         self._mem.embed_artifact(
             id=ticket_id,
             type="jira",
@@ -673,7 +673,7 @@ class ExternalEmailIngestor:
             "created_at": jira_time.isoformat(),
             "updated_at": jira_time.isoformat(),
         }
-        self._mem.upsert_ticket(ticket)
+
         self._mem.embed_artifact(
             id=ticket_id,
             type="jira",

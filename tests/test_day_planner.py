@@ -174,6 +174,7 @@ def _make_sprint_context(
         else {m: 6.0 for m in members},
         sprint_theme="Q1 reliability hardening",
         in_progress_ids=[],
+        in_review=[],
     )
 
 
@@ -333,10 +334,10 @@ class TestDepartmentPlannerParsePlan:
 
     def test_invalid_json_returns_fallback_plan(self, dept_planner):
         plan, _ = dept_planner._parse_plan(
-            "{not valid json}", "Fallback theme", 5, "2026-01-05", []
+            "This is definitely not JSON", "Fallback theme", 5, "2026-01-05", []
         )
         assert plan.dept == "Engineering"
-        assert len(plan.engineer_plans) == 2  # Alice + Bob
+        assert len(plan.engineer_plans) == 2
         assert any(e.event_type == "normal_day_slack" for e in plan.proposed_events)
         assert "Fallback" in plan.planner_reasoning
 

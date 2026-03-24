@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, List
 
@@ -53,6 +54,9 @@ class SimClock:
         self._state = state
         if not hasattr(self._state, "actor_cursors"):
             self._state.actor_cursors = {}
+        # Protects actor_cursors dict against concurrent reads/writes when
+        # agenda items are dispatched in parallel threads.
+        self._cursor_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -75,20 +79,24 @@ class SimClock:
         AMBIENT WORK: Advance an actor's horizon.
         Returns (artifact_timestamp, new_cursor_horizon).
         artifact_timestamp is randomly sampled from within the work block.
+
+        The entire read-compute-write is held under the cursor lock so two
+        threads advancing the same actor don't produce overlapping timestamps.
         """
-        current = self._get_cursor(actor)
-        delta = timedelta(hours=hours)
-        end_time = self._enforce_business_hours(current + delta)
+        with self._cursor_lock:
+            current = self._state.actor_cursors.get(actor, self._get_default_start())
+            delta = timedelta(hours=hours)
+            end_time = self._enforce_business_hours(current + delta)
 
-        # Sample a random time within the block for the actual JIRA/Confluence timestamp
-        total_seconds = int((end_time - current).total_seconds())
-        if total_seconds > 0:
-            random_offset = random.randint(0, total_seconds)
-            artifact_time = current + timedelta(seconds=random_offset)
-        else:
-            artifact_time = current
+            total_seconds = int((end_time - current).total_seconds())
+            if total_seconds > 0:
+                random_offset = random.randint(0, total_seconds)
+                artifact_time = current + timedelta(seconds=random_offset)
+            else:
+                artifact_time = current
 
-        self._set_cursor(actor, end_time)
+            self._state.actor_cursors[actor] = end_time
+
         return artifact_time, end_time
 
     def sync_and_tick(
@@ -225,23 +233,32 @@ class SimClock:
 
     def _get_cursor(self, actor: str) -> datetime:
         """Safely fetch an actor's cursor, defaulting to 09:00 today."""
-        if actor not in self._state.actor_cursors:
-            self._state.actor_cursors[actor] = self._get_default_start()
-        return self._state.actor_cursors[actor]
+        with self._cursor_lock:
+            if actor not in self._state.actor_cursors:
+                self._state.actor_cursors[actor] = self._get_default_start()
+            return self._state.actor_cursors[actor]
 
     def _set_cursor(self, actor: str, dt: datetime) -> None:
-        self._state.actor_cursors[actor] = dt
+        with self._cursor_lock:
+            self._state.actor_cursors[actor] = dt
 
     def _sync_time(self, actors: List[str]) -> datetime:
-        """Finds the latest cursor among actors and pulls everyone up to it."""
-        if not actors:
-            return self._get_cursor("system")
+        """Finds the latest cursor among actors and pulls everyone up to it.
 
-        max_time = max(self._get_cursor(a) for a in actors)
-        for a in actors:
-            self._set_cursor(a, max_time)
+        Acquires the lock for the entire read-max-write sequence so no other
+        thread can slip a cursor update between the max() scan and the writes.
+        """
+        with self._cursor_lock:
+            if not actors:
+                default = self._get_default_start()
+                return self._state.actor_cursors.get("system", default)
 
-        return max_time
+            default = self._get_default_start()
+            max_time = max(self._state.actor_cursors.get(a, default) for a in actors)
+            for a in actors:
+                self._state.actor_cursors[a] = max_time
+
+            return max_time
 
     def _enforce_business_hours(self, dt: datetime) -> datetime:
         """

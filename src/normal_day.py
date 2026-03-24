@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -11,6 +13,7 @@ from agent_factory import make_agent
 from config_loader import COMPANY_DESCRIPTION
 from crewai import Process, Task, Crew
 
+import json_repair
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
 from planner_models import (
@@ -50,6 +53,7 @@ class NormalDayHandler:
         vader=None,
         threat_injector=None,
         embed_worker=None,
+        lifecycle=None,
     ):
         self._config = config
         self._mem = mem
@@ -71,8 +75,18 @@ class NormalDayHandler:
         self._vader = vader
         self._threat = threat_injector or _NullInjector()
         self._embed_worker = embed_worker
+        # Per-ticket mutex — prevents two concurrent agenda items from
+        # corrupting the same ticket's comment list or causal chain.
+        self._ticket_locks: Dict[str, threading.Lock] = {}
+        self._ticket_locks_lock = threading.Lock()
+        self._lifecycle = lifecycle
 
-    # ─── VOICE CARD ───────────────────────────────────────────────────────────
+    def _ticket_lock(self, ticket_id: str) -> threading.Lock:
+        """Return (and lazily create) the per-ticket mutex."""
+        with self._ticket_locks_lock:
+            if ticket_id not in self._ticket_locks:
+                self._ticket_locks[ticket_id] = threading.Lock()
+            return self._ticket_locks[ticket_id]
 
     def _deduped_voice_cards(self, names: list, context: str) -> str:
         """
@@ -267,21 +281,36 @@ class NormalDayHandler:
         """
         Walk every engineer's agenda across all departments.
         Dispatch each non-deferred item to the appropriate activity handler.
-        Deferred items are logged as SimEvents so the record shows the interruption.
+
+        Threading model
+        ---------------
+        Each (engineer, agenda_item) pair that involves an LLM call is submitted
+        to a per-department ThreadPoolExecutor so all engineers in a department
+        run their agenda items concurrently.  Departments themselves are still
+        serialised (Engineering first, then others) because non-engineering depts
+        react to Engineering's day.
+
+        Thread safety is guaranteed by:
+          - SimClock._cursor_lock  — serialises all cursor reads/writes
+          - self._ticket_lock(tid) — one lock per ticket_id for the write-back
+            section of _handle_ticket_progress
+          - seen_discussions set   — only touched on the main thread before tasks
+            are submitted, so no lock needed there
         """
         all_participants: List[str] = []
         seen_discussions: set = set()
 
+        # Collect (eng_plan, item, dept_plan) tuples per dept, respecting dedup
+        dept_work: Dict[str, List] = {}
         for dept, dept_plan in org_plan.dept_plans.items():
+            items_for_dept = []
             for eng_plan in dept_plan.engineer_plans:
-                # Per-engineer-per-day gate: evaluated once, fires at most once
                 watercooler_prob = self._config["simulation"].get(
                     "watercooler_prob", 0.15
                 )
                 will_be_distracted = random.random() < watercooler_prob
                 distraction_fired = False
 
-                # Pick a random non-deferred item to attach the distraction to
                 non_deferred_indices = [
                     idx for idx, item in enumerate(eng_plan.agenda) if not item.deferred
                 ]
@@ -320,8 +349,6 @@ class NormalDayHandler:
                         participant_set = frozenset([eng_plan.name] + collaborators)
 
                         if item.activity_type == "design_discussion":
-                            # Include description so two different design discussions
-                            # between the same people on the same day both fire.
                             key = (
                                 "design_discussion",
                                 participant_set,
@@ -334,8 +361,40 @@ class NormalDayHandler:
                             continue
                         seen_discussions.add(key)
 
-                    participants = self._dispatch(eng_plan, item, dept_plan, date_str)
-                    all_participants.extend(participants)
+                    items_for_dept.append((eng_plan, item, dept_plan))
+
+            dept_work[dept] = items_for_dept
+
+        # Dispatch — engineering depts first, then others
+        ordered_depts = sorted(
+            dept_work.keys(),
+            key=lambda d: 0 if "engineering" in d.lower() else 1,
+        )
+
+        for dept in ordered_depts:
+            items = dept_work[dept]
+            if not items:
+                continue
+
+            max_workers = min(len(items), 6)  # cap threads per dept
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(self._dispatch, eng_plan, item, dept_plan, date_str): (
+                        eng_plan.name,
+                        item.activity_type,
+                    )
+                    for eng_plan, item, dept_plan in items
+                }
+                for future in as_completed(futures):
+                    name, act = futures[future]
+                    try:
+                        participants = future.result()
+                        all_participants.extend(participants)
+                    except Exception as exc:
+                        logger.error(
+                            f"[normal_day] {name}/{act} failed: {exc}",
+                            exc_info=True,
+                        )
 
         if all_participants:
             unique = list(set(all_participants))
@@ -383,8 +442,15 @@ class NormalDayHandler:
         item: AgendaItem,
         date_str: str,
     ) -> List[str]:
-        """Simulates an engineer working on a specific JIRA ticket and potentially opening a PR."""
+        """
+        Simulates a team member working on a JIRA ticket.
 
+        Engineering tickets → comment + optional PR spawn (existing behaviour).
+        Non-engineering tickets → comment + completion artifact (Confluence page,
+        email, or Slack thread). Determined by ticket["dept_type"] stamped at
+        sprint planning time. Causal chain is tracked for both paths so evals
+        work across all departments.
+        """
         assignee = eng_plan.name
         ticket_id = item.related_id
         if not ticket_id:
@@ -394,10 +460,14 @@ class NormalDayHandler:
         if not ticket:
             return [eng_plan.name]
 
+        dept_type = ticket.get("dept_type", "eng")
+        is_non_eng = dept_type == "non_eng"
+        completion_artifact = ticket.get("completion_artifact", "slack")
+
         current_actor_time, new_cursor = self._clock.advance_actor(assignee, hours=2.0)
         current_actor_time_iso = current_actor_time.isoformat()
-        # Tier 1: ticket is already in hand — use context_for_person for
-        # assignee's recent activity rather than embedding a keyword string.
+
+        # Tier 1: structured context scoped to this person — no vector search.
         ctx = self._mem.context_for_person(
             name=assignee,
             as_of_time=current_actor_time_iso,
@@ -405,13 +475,12 @@ class NormalDayHandler:
         )
         linked_prs = ticket.get("linked_prs", [])
 
-        # Build structured ticket context — title + full state in one object
+        # Build structured ticket context
         if self._registry:
             ticket_ctx = self._registry.ticket_summary(
                 ticket, self._state.day
             ).for_prompt()
         else:
-            # Graceful fallback if registry not wired yet
             ticket_ctx = (
                 f"Ticket: [{ticket_id}] {ticket.get('title', '')}\n"
                 f"Status: {ticket.get('status', 'To Do')}\n"
@@ -429,8 +498,30 @@ class NormalDayHandler:
             assignee, mem=self._mem, graph_dynamics=self._gd
         )
 
+        # Role framing differs by dept type
+        if is_non_eng:
+            persona = self._config.get("personas", {}).get(assignee, {})
+            agent_role = persona.get("role", dept_of_name(assignee, self._org_chart))
+            task_complete_field = "is_task_complete"
+            task_complete_hint = (
+                "true only if the full action item is done and ready for review"
+            )
+            completion_note = (
+                f"This is a non-engineering action item. "
+                f"Your completion artifact will be a {completion_artifact}. "
+                f"Do NOT mention code or PRs."
+            )
+        else:
+            agent_role = "Software Engineer"
+            task_complete_field = "is_code_complete"
+            task_complete_hint = (
+                "true only if the full coding phase is finished "
+                "(false on day 1 of a complex ticket)"
+            )
+            completion_note = ""
+
         agent = make_agent(
-            role="Software Engineer",
+            role=agent_role,
             backstory=backstory,
             goal="Make progress on the ticket and report status.",
             llm=self._worker,
@@ -438,13 +529,15 @@ class NormalDayHandler:
         task = Task(
             description=(
                 f"You are {assignee}. You worked on ticket [{ticket_id}] today.\n\n"
-                f"Your task today: {item.description}\n\n"
+                f"Your task today: {item.description}\n"
+                f"IMPORTANT: Your comment must be specifically about this ticket's work — "
+                f"do not describe unrelated tasks.\n"
+                f"{completion_note}\n\n"
                 f"Respond ONLY with valid JSON. No preamble, no markdown fences.\n"
                 f"{{\n"
                 f'  "comment": "string — 1-3 sentences describing what you did today, '
                 f'written as a JIRA comment in your own voice",\n'
-                f'  "is_code_complete": boolean — true only if the full coding phase '
-                f"is finished (false on day 1 of a complex ticket)\n"
+                f'  "{task_complete_field}": boolean — {task_complete_hint}\n'
                 f"}}\n\n"
                 f"--- TICKET CONTEXT ---\n"
                 f"{ticket_ctx}\n\n"
@@ -467,10 +560,13 @@ class NormalDayHandler:
             elif not isinstance(parsed_data, dict):
                 parsed_data = {}
             comment_text = parsed_data.get("comment", f"Worked on {ticket_id}.")
-            is_code_complete = parsed_data.get("is_code_complete", False)
+            is_complete = parsed_data.get(
+                task_complete_field,
+                parsed_data.get("is_code_complete", False),
+            )
         except json.JSONDecodeError:
-            comment_text = clean_json  # Fallback if LLM fails JSON
-            is_code_complete = False
+            comment_text = clean_json
+            is_complete = False
 
         BLOCKER_KEYWORDS = (
             "blocked",
@@ -494,7 +590,7 @@ class NormalDayHandler:
                 )
             )
 
-        # 3. Update the JIRA ticket
+        # Update ticket comment and status
         ticket.setdefault("comments", []).append(
             {
                 "author": assignee,
@@ -505,173 +601,333 @@ class NormalDayHandler:
                 "day": self._state.day,
             }
         )
-
-        # Ensure status is at least In Progress
         if ticket["status"] == "To Do":
             ticket["status"] = "In Progress"
-            # Record the day this ticket first entered In Progress so the
-            # force-spawn logic below can measure elapsed business days.
             if "in_progress_since" not in ticket:
                 ticket["in_progress_since"] = self._state.day
 
-        # 4. Spawning the PR
-        # Normal path  : LLM signals code complete and no PR exists yet.
-        # Force-spawn  : ticket has been In Progress for 3+ sim days with no
-        #                PR and the assignee is not incident-bound.
-        #                Respects the actor's local clock — only fires when
-        #                they have remaining business-hours capacity today.
-        spawned_pr_id = None
-        ticket_age = self._state.day - ticket.get("in_progress_since", self._state.day)
-        actor_clock_ok = self._clock.now(assignee).hour < 17
-        actor_incident_bound = any(
-            eng_plan.is_on_call and i.ticket_id != ticket_id
-            for i in self._state.active_incidents
-        )
-        # Don't force-spawn if the PR is already open awaiting author fixes.
-        open_pr_with_changes = bool(linked_prs) and any(
-            self._mem._prs.find_one(
-                {"pr_id": p, "status": "open", "changes_requested": True},
-                {"pr_id": 1},
-            )
-            for p in linked_prs
-        )
-        force_spawn = (
-            ticket_age >= 3
-            and not linked_prs
-            and not actor_incident_bound
-            and not open_pr_with_changes
-            and actor_clock_ok
-        )
-        if (is_code_complete or force_spawn) and not linked_prs:
-            # Code is done, generate the PR!
-            pr = self._git.create_pr(
-                author=assignee,
-                ticket_id=ticket_id,
-                title=f"[{ticket_id}] {ticket['title'][:80]}",
-                timestamp=current_actor_time_iso,
-            )
-            spawned_pr_id = pr["pr_id"]
-            ticket.setdefault("linked_prs", []).append(spawned_pr_id)
-            ticket["status"] = "In Review"  # Advance the status
+        # ── Initialise or extend causal chain on the ticket itself ────────────
+        # For non-eng tickets there is no ActiveIncident, so we track the chain
+        # directly on the ticket document. For eng tickets we also do this so
+        # evals can traverse the chain without needing an open incident.
+        from causal_chain_handler import CausalChainHandler
 
-        ticket["updated_at"] = current_actor_time_iso
+        existing_chain = ticket.get("causal_chain", [ticket_id])
+        chain = CausalChainHandler(existing_chain[0])
+        for artifact in existing_chain[1:]:
+            chain.append(artifact)
+
         comment_id = f"{ticket_id}_comment_{len(ticket['comments'])}"
+        chain.append(comment_id)
 
-        # 5. Save and Embed
-        self._mem.upsert_ticket(ticket)
-        self._save_ticket(ticket)
+        # ── Completion artifact — non-eng path ────────────────────────────────
+        spawned_pr_id = None
+        completion_id = None
 
-        # Embed the ticket document itself
-        ticket_body = "\n".join(
-            filter(
+        if is_non_eng:
+            ticket_age = self._state.day - ticket.get(
+                "in_progress_since", self._state.day
+            )
+            force_complete = ticket_age >= 3
+
+            if (is_complete or force_complete) and ticket["status"] != "Done":
+                if completion_artifact == "confluence" and self._confluence:
+                    # Reuse the existing design doc stub writer — it already
+                    # handles embedding and SimEvent logging via ConfluenceWriter.
+                    completion_id = self._create_design_doc_stub(
+                        author=assignee,
+                        participants=[assignee],
+                        topic=ticket.get("title", item.description),
+                        ctx=ctx,
+                        date_str=date_str,
+                        slack_transcript=[],  # no transcript — ticket-driven
+                    )
+                    if completion_id:
+                        chain.append(completion_id)
+                        logger.info(
+                            f"    [dim]📄 {assignee} completed [{ticket_id}] → {completion_id}[/dim]"
+                        )
+
+                elif completion_artifact == "email":
+                    # Generate a brief completion email and log it as a SimEvent.
+                    # Routed as internal comms — not through ExternalEmailIngestor.
+                    completion_id = self._emit_completion_email(
+                        assignee=assignee,
+                        ticket=ticket,
+                        comment_text=comment_text,
+                        date_str=date_str,
+                        timestamp=current_actor_time_iso,
+                    )
+                    if completion_id:
+                        chain.append(completion_id)
+
+                else:
+                    # Slack summary — emit a short message in the dept channel
+                    dept_channel = (
+                        dept_of_name(assignee, self._org_chart)
+                        .lower()
+                        .replace(" ", "-")
+                        .replace("_", "-")
+                    )
+                    slack_msg = {
+                        "user": assignee,
+                        "text": (
+                            f"Wrapped up [{ticket_id}] {ticket.get('title', '')}. "
+                            f"{comment_text}"
+                        ),
+                        "ts": current_actor_time_iso,
+                        "date": date_str,
+                    }
+                    _, completion_id = self._save_slack(
+                        [slack_msg], dept_channel, interaction_type="ticket_completion"
+                    )
+                    if completion_id:
+                        chain.append(completion_id)
+
+                ticket["status"] = "Done"
+                ticket["completed_at"] = current_actor_time_iso
+
+        else:
+            # ── Engineering path — PR spawn + force-merge logic ───────────────
+            ticket_age = self._state.day - ticket.get(
+                "in_progress_since", self._state.day
+            )
+            actor_clock_ok = self._clock.now(assignee).hour < 17
+            actor_incident_bound = any(
+                eng_plan.is_on_call and i.ticket_id != ticket_id
+                for i in self._state.active_incidents
+            )
+            open_pr_with_changes = bool(linked_prs) and any(
+                self._mem._prs.find_one(
+                    {"pr_id": p, "status": "open", "changes_requested": True},
+                    {"pr_id": 1},
+                )
+                for p in linked_prs
+            )
+            force_spawn = (
+                ticket_age >= 3
+                and not linked_prs
+                and not actor_incident_bound
+                and not open_pr_with_changes
+                and actor_clock_ok
+            )
+            if (is_complete or force_spawn) and not linked_prs:
+                pr = self._git.create_pr(
+                    author=assignee,
+                    ticket_id=ticket_id,
+                    title=f"[{ticket_id}] {ticket['title'][:80]}",
+                    timestamp=current_actor_time_iso,
+                )
+                spawned_pr_id = pr["pr_id"]
+                ticket.setdefault("linked_prs", []).append(spawned_pr_id)
+                ticket["status"] = "In Review"
+                chain.append(spawned_pr_id)
+
+            # ── Force-merge: sprint PR stalled in review too long ─────────────
+            # Mirrors _handle_pr_review_for_incident — same comment/verdict/
+            # SimEvent pattern, no new code paths needed.
+            force_merge = (
+                ticket_age >= 7
+                and bool(linked_prs)
+                and ticket.get("status") == "In Review"
+                and not open_pr_with_changes
+                and actor_clock_ok
+                and not spawned_pr_id  # don't force-merge a PR we just created
+            )
+            if force_merge:
+                stale_pr = next(
+                    (
+                        self._mem._prs.find_one(
+                            {"pr_id": p, "status": "open"}, {"_id": 0}
+                        )
+                        for p in linked_prs
+                        if self._mem._prs.find_one({"pr_id": p, "status": "open"})
+                    ),
+                    None,
+                )
+                if stale_pr:
+                    # Reuse incident review path — generates a real comment + verdict
+                    self._handle_pr_review_for_incident(
+                        reviewer=assignee,
+                        pr=stale_pr,
+                        date_str=date_str,
+                        timestamp=current_actor_time_iso,
+                    )
+
+                    stale_pr = (
+                        self._mem._prs.find_one(
+                            {"pr_id": stale_pr["pr_id"]}, {"_id": 0}
+                        )
+                        or stale_pr
+                    )
+                    stale_pr["status"] = "merged"
+                    import os, json as _json
+
+                    pr_path = f"{self._base}/git/prs/{stale_pr['pr_id']}.json"
+                    os.makedirs(os.path.dirname(pr_path), exist_ok=True)
+                    with open(pr_path, "w") as f:
+                        _json.dump(stale_pr, f, indent=2)
+                    self._mem.upsert_pr(stale_pr)
+                    self._git.merge_pr(stale_pr["pr_id"])
+                    ticket["status"] = "Done"
+                    ticket["completed_at"] = current_actor_time_iso
+                    chain.append(stale_pr["pr_id"])
+                    self._emit_bot_message(
+                        "engineering",
+                        "GitHub Actions",
+                        f"✅ Auto-merged {stale_pr['pr_id']} after {ticket_age} days in review: "
+                        f"{stale_pr.get('title', '')[:80]}",
+                        current_actor_time_iso,
+                    )
+                    logger.info(
+                        f"    [green]✅ Force-merged {stale_pr['pr_id']} — "
+                        f"{ticket_id} → Done (age={ticket_age}d)[/green]"
+                    )
+
+            # Also extend active incident chain if one is live
+            active_inc = next(
+                (i for i in self._state.active_incidents if i.ticket_id == ticket_id),
                 None,
-                [
-                    ticket.get("title", ""),
-                    ticket.get("description", ""),
-                    ticket.get("root_cause", ""),
-                    "\n".join(c.get("text", "") for c in ticket.get("comments", [])),
-                ],
             )
-        )
-        if self._embed_worker:
-            self._embed_worker.enqueue(
-                id=ticket_id,
-                type="jira",
-                title=ticket.get("title", ticket_id),
-                content=ticket_body,
-                day=self._state.day,
-                date=date_str,
-                timestamp=current_actor_time_iso,
-                metadata={
-                    "assignee": ticket.get("assignee", ""),
-                    "status": ticket["status"],
-                },
+            if active_inc and getattr(active_inc, "causal_chain", None):
+                active_inc.causal_chain.append(comment_id)
+                if spawned_pr_id:
+                    active_inc.causal_chain.append(spawned_pr_id)
+
+        # ── Thread-safe write-back ────────────────────────────────────────────
+        # Acquire per-ticket lock only for the mutation + persist section.
+        # The LLM call above runs freely in parallel.
+        with self._ticket_lock(ticket_id):
+            # Persist chain back onto the ticket document
+            ticket["causal_chain"] = chain.snapshot()
+            ticket["updated_at"] = current_actor_time_iso
+
+            self._save_ticket(ticket)
+
+            ticket_body = "\n".join(
+                filter(
+                    None,
+                    [
+                        ticket.get("title", ""),
+                        ticket.get("description", ""),
+                        ticket.get("root_cause", ""),
+                        "\n".join(
+                            c.get("text", "") for c in ticket.get("comments", [])
+                        ),
+                    ],
+                )
             )
+            if self._embed_worker:
+                self._embed_worker.enqueue(
+                    id=ticket_id,
+                    type="jira",
+                    title=ticket.get("title", ticket_id),
+                    content=ticket_body,
+                    day=self._state.day,
+                    date=date_str,
+                    timestamp=current_actor_time_iso,
+                    metadata={
+                        "assignee": ticket.get("assignee", ""),
+                        "status": ticket["status"],
+                        "dept_type": dept_type,
+                    },
+                )
+            else:
+                self._mem.embed_artifact(
+                    id=ticket_id,
+                    type="jira",
+                    title=ticket.get("title", ticket_id),
+                    content=ticket_body,
+                    day=self._state.day,
+                    date=date_str,
+                    timestamp=current_actor_time_iso,
+                    metadata={
+                        "assignee": ticket.get("assignee", ""),
+                        "status": ticket["status"],
+                        "dept_type": dept_type,
+                    },
+                )
 
-        else:
-            self._mem.embed_artifact(
-                id=ticket_id,
-                type="jira",
-                title=ticket.get("title", ticket_id),
-                content=ticket_body,
-                day=self._state.day,
-                date=date_str,
-                timestamp=current_actor_time_iso,
-                metadata={
-                    "assignee": ticket.get("assignee", ""),
-                    "status": ticket["status"],
-                },
-            )
+            if self._embed_worker:
+                self._embed_worker.enqueue(
+                    id=comment_id,
+                    type="jira_comment",
+                    title=f"Comment on {ticket_id}",
+                    content=comment_text,
+                    day=self._state.day,
+                    date=date_str,
+                    timestamp=current_actor_time_iso,
+                    metadata={
+                        "ticket_id": ticket_id,
+                        "author": assignee,
+                        "dept_type": dept_type,
+                    },
+                )
+            else:
+                self._mem.embed_artifact(
+                    id=comment_id,
+                    type="jira_comment",
+                    title=f"Comment on {ticket_id}",
+                    content=comment_text,
+                    day=self._state.day,
+                    date=date_str,
+                    timestamp=current_actor_time_iso,
+                    metadata={
+                        "ticket_id": ticket_id,
+                        "author": assignee,
+                        "dept_type": dept_type,
+                    },
+                )
 
-        if self._embed_worker:
-            self._embed_worker.enqueue(
-                id=comment_id,
-                type="jira_comment",
-                title=f"Comment on {ticket_id}",
-                content=comment_text,
-                day=self._state.day,
-                date=date_str,
-                timestamp=current_actor_time_iso,
-                metadata={"ticket_id": ticket_id, "author": assignee},
-            )
-
-        else:
-            self._mem.embed_artifact(
-                id=comment_id,
-                type="jira_comment",
-                title=f"Comment on {ticket_id}",
-                content=comment_text,
-                day=self._state.day,
-                date=date_str,
-                timestamp=current_actor_time_iso,
-                metadata={"ticket_id": ticket_id, "author": assignee},
-            )
-
-        active_inc = next(
-            (i for i in self._state.active_incidents if i.ticket_id == ticket_id), None
-        )
-
-        if active_inc and getattr(active_inc, "causal_chain", None):
-            active_inc.causal_chain.append(comment_id)
+            # Build artifacts dict and SimEvent facts
+            artifacts = {"jira": ticket_id, "jira_comment": comment_id}
             if spawned_pr_id:
-                active_inc.causal_chain.append(spawned_pr_id)
+                artifacts["pr"] = spawned_pr_id
+            if completion_id:
+                artifacts[completion_artifact] = completion_id
 
-        artifacts = {"jira": ticket_id, "jira_comment": comment_id}
-        if spawned_pr_id:
-            artifacts["pr"] = spawned_pr_id
+            facts = {
+                "ticket_id": ticket_id,
+                "status": ticket["status"],
+                "dept_type": dept_type,
+                "causal_chain": chain.snapshot(),
+            }
+            if spawned_pr_id:
+                facts["spawned_pr"] = spawned_pr_id
+            if completion_id:
+                facts["completion_artifact"] = completion_id
 
-        facts = {
-            "ticket_id": ticket_id,
-            "status": ticket["status"],
-            "spawned_pr": spawned_pr_id,
-        }
-        if active_inc and getattr(active_inc, "causal_chain", None):
-            facts["causal_chain"] = active_inc.causal_chain.snapshot()
+            summary = f"{assignee} worked on {ticket_id}."
+            if spawned_pr_id:
+                summary += f" Opened PR {spawned_pr_id}."
+            elif completion_id:
+                summary += f" Completed → {completion_id}."
 
-        self._mem.log_event(
-            SimEvent(
-                type="ticket_progress",
-                timestamp=current_actor_time_iso,
-                day=self._state.day,
-                date=date_str,
-                actors=[assignee],
-                artifact_ids=artifacts,
-                facts=facts,
-                summary=f"{assignee} worked on {ticket_id}. "
-                + (f"Opened PR {spawned_pr_id}!" if spawned_pr_id else ""),
-                tags=["jira", "engineering"],
+            self._mem.log_event(
+                SimEvent(
+                    type="ticket_progress",
+                    timestamp=current_actor_time_iso,
+                    day=self._state.day,
+                    date=date_str,
+                    actors=[assignee],
+                    artifact_ids=artifacts,
+                    facts=facts,
+                    summary=summary,
+                    tags=["jira", "non_eng" if is_non_eng else "engineering"],
+                )
             )
-        )
 
-        bucket = self._state.ticket_actors_today.setdefault(ticket_id, set())
-        bucket.add(assignee)
+            bucket = self._state.ticket_actors_today.setdefault(ticket_id, set())
+            bucket.add(assignee)
 
         if self._vader:
             self._score_and_apply_sentiment(comment_text, [assignee], self._vader)
 
         generated_artifacts = [ticket_id]
-        if spawned_pr_id is not None:
+        if spawned_pr_id:
             generated_artifacts.append(spawned_pr_id)
+        if completion_id:
+            generated_artifacts.append(completion_id)
 
         return generated_artifacts
 
@@ -700,9 +956,7 @@ class NormalDayHandler:
         )
         current_actor_time = artifact_time.isoformat()
 
-        ctx = self._mem.context_for_person(
-            name=reviewer, n=2, as_of_time=current_actor_time
-        )
+        ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
         backstory = self._persona_helper(
             reviewer,
             mem=self._mem,
@@ -793,7 +1047,6 @@ class NormalDayHandler:
             if linked_ticket:
                 linked_ticket["status"] = "Done"
                 linked_ticket["updated_at"] = current_actor_time
-                self._mem.upsert_ticket(linked_ticket)
                 self._save_ticket(linked_ticket)
             self._git.merge_pr(pr.get("pr_id", pr_id))
             self._emit_bot_message(
@@ -816,7 +1069,6 @@ class NormalDayHandler:
                 # Reset in_progress_since so force-spawn timer restarts from today
                 linked_ticket["in_progress_since"] = self._state.day
                 linked_ticket["updated_at"] = current_actor_time
-                self._mem.upsert_ticket(linked_ticket)
                 self._save_ticket(linked_ticket)
             self._emit_bot_message(
                 "engineering",
@@ -918,6 +1170,17 @@ class NormalDayHandler:
 
         if self._vader:
             self._score_and_apply_sentiment(review_text, [reviewer], self._vader)
+
+        if self._lifecycle:
+            pr_text = f"{pr_title} {review_text}"
+            self._lifecycle.scan_for_knowledge_gaps(
+                text=pr_text,
+                triggered_by=pr.get("pr_id", pr_id or ""),
+                day=self._state.day,
+                date_str=date_str,
+                state=self._state,
+                timestamp=current_actor_time,
+            )
 
         logger.info(
             f"    [dim]🔍 {reviewer} reviewed {pr.get('pr_id', 'PR')} [{verdict}][/dim]"
@@ -1067,7 +1330,6 @@ class NormalDayHandler:
             if t:
                 t["causal_chain"] = active_inc.causal_chain.snapshot()
                 t["updated_at"] = current_actor_time
-                self._mem.upsert_ticket(t)
                 self._save_ticket(t)
 
         self._mem.log_event(
@@ -1385,7 +1647,7 @@ class NormalDayHandler:
 
         try:
             clean = raw.replace("```json", "").replace("```", "").strip()
-            turns = json.loads(clean)
+            turns = _parse_turn_list(clean, "handle_async_question")
             if not isinstance(turns, list):
                 turns = []
         except json.JSONDecodeError:
@@ -1470,6 +1732,17 @@ class NormalDayHandler:
         if self._vader and messages:
             full_text = " ".join(m["text"] for m in messages)
             self._score_and_apply_sentiment(full_text, all_actors, self._vader)
+
+        if self._lifecycle and messages:
+            thread_text = " ".join(m["text"] for m in messages)
+            self._lifecycle.scan_for_knowledge_gaps(
+                text=f"{ticket_title} {thread_text}",
+                triggered_by=thread_id,
+                day=self._state.day,
+                date_str=date_str,
+                state=self._state,
+                timestamp=meeting_time_iso,
+            )
 
         self._gd.record_slack_interaction(all_actors)
         logger.info(f"    [dim]❓ {asker} → #{channel} ({len(messages)} msgs)[/dim]")
@@ -1557,7 +1830,7 @@ class NormalDayHandler:
 
         try:
             clean = raw.replace("```json", "").replace("```", "").strip()
-            turns = json.loads(clean)
+            turns = _parse_turn_list(clean, "handle_design_discussion")
             if not isinstance(turns, list):
                 turns = []
         except json.JSONDecodeError:
@@ -1887,7 +2160,7 @@ class NormalDayHandler:
 
         try:
             clean = raw.replace("```json", "").replace("```", "").strip()
-            turns = json.loads(clean)
+            turns = _parse_turn_list(clean, "handle_collision_event")
             if not isinstance(turns, list):
                 turns = []
         except json.JSONDecodeError:
@@ -2078,6 +2351,117 @@ class NormalDayHandler:
             )
 
         return participants
+
+    def _emit_completion_email(
+        self,
+        assignee: str,
+        ticket: dict,
+        comment_text: str,
+        date_str: str,
+        timestamp: str,
+    ) -> Optional[str]:
+        """
+        Generate a short internal completion email for a non-eng ticket.
+        Routed to the assignee's department lead as a natural work update.
+        Returns a thread/artifact ID for the causal chain, or None on failure.
+        """
+        ticket_id = ticket.get("id", "")
+        ticket_title = ticket.get("title", ticket_id)
+        dept = dept_of_name(assignee, self._org_chart)
+        lead = self._find_lead_for(assignee) or assignee
+
+        agent = make_agent(
+            role=f"{assignee}",
+            goal="Write a brief internal email updating your lead on completed work.",
+            backstory=self._persona_helper(
+                assignee, mem=self._mem, graph_dynamics=self._gd
+            ),
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"You are {assignee}. You just completed ticket [{ticket_id}]: {ticket_title}.\n\n"
+                f"Write a short internal email to {lead} (your lead) summarising what you did.\n"
+                f"What you did: {comment_text}\n\n"
+                f"Rules:\n"
+                f"- Subject line: Re: [{ticket_id}] {ticket_title[:60]}\n"
+                f"- Body: 2-3 sentences. What was done, any key decision or outcome.\n"
+                f"- Sign off with your name.\n"
+                f"- No preamble. Output subject and body only.\n\n"
+                f"Format:\nSubject: <subject>\n\n<body>"
+            ),
+            expected_output="Subject line followed by a blank line and 2-3 sentence body.",
+            agent=agent,
+        )
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+
+        # Parse subject / body
+        lines = raw.split("\n", 2)
+        subject = (
+            lines[0].replace("Subject:", "").strip() if lines else f"Re: [{ticket_id}]"
+        )
+        body = lines[2].strip() if len(lines) > 2 else raw
+
+        thread_id = f"email_{ticket_id}_{self._state.day}"
+
+        self._mem.log_event(
+            SimEvent(
+                type="ticket_completion_email",
+                timestamp=timestamp,
+                day=self._state.day,
+                date=date_str,
+                actors=[assignee, lead],
+                artifact_ids={"jira": ticket_id, "email_thread": thread_id},
+                facts={
+                    "ticket_id": ticket_id,
+                    "subject": subject,
+                    "body": body,
+                    "from": assignee,
+                    "to": lead,
+                    "dept": dept,
+                },
+                summary=f"{assignee} emailed {lead} re completion of {ticket_id}.",
+                tags=["email", "ticket_completion", "non_eng"],
+            )
+        )
+
+        if self._embed_worker:
+            self._embed_worker.enqueue(
+                id=thread_id,
+                type="email",
+                title=subject,
+                content=f"From: {assignee}\nTo: {lead}\nSubject: {subject}\n\n{body}",
+                day=self._state.day,
+                date=date_str,
+                timestamp=timestamp,
+                metadata={
+                    "ticket_id": ticket_id,
+                    "from": assignee,
+                    "to": lead,
+                    "dept": dept,
+                },
+            )
+        else:
+            self._mem.embed_artifact(
+                id=thread_id,
+                type="email",
+                title=subject,
+                content=f"From: {assignee}\nTo: {lead}\nSubject: {subject}\n\n{body}",
+                day=self._state.day,
+                date=date_str,
+                timestamp=timestamp,
+                metadata={
+                    "ticket_id": ticket_id,
+                    "from": assignee,
+                    "to": lead,
+                    "dept": dept,
+                },
+            )
+
+        logger.info(
+            f"    [dim]📧 {assignee} → {lead}: completion email for [{ticket_id}][/dim]"
+        )
+        return thread_id
 
     def _emit_review_reply(
         self,
@@ -2331,7 +2715,7 @@ class NormalDayHandler:
 
         try:
             clean = raw.replace("```json", "").replace("```", "").strip()
-            turns = json.loads(clean)
+            turns = _parse_turn_list(clean, "trigger_watercooler_chat")
             if not isinstance(turns, list):
                 turns = []
         except json.JSONDecodeError:
@@ -2737,13 +3121,31 @@ class NormalDayHandler:
             return random.randint(*default_range)  # full range
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITY — dept lookup without importing flow globals
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def dept_of_name(name: str, org_chart: Dict[str, List[str]]) -> str:
     for dept, members in org_chart.items():
         if name in members:
             return dept
     return "Unknown"
+
+
+def _parse_turn_list(raw: str, caller: str) -> list:
+    """
+    Robustly extract a JSON array of turn dicts from an LLM response.
+    Uses json_repair to handle malformed LLM output before parsing.
+    Returns a list (empty on total failure).
+    """
+    clean = raw.replace("```json", "").replace("```", "").strip()
+
+    try:
+        parsed = json_repair.loads(clean)
+        if isinstance(parsed, list):
+            return parsed
+        # Unwrap if LLM wrapped the array in an object
+        if isinstance(parsed, dict):
+            for v in parsed.values():
+                if isinstance(v, list):
+                    return v
+        return []
+    except Exception:
+        logger.warning(f"[{caller}] Failed to parse JSON turn list — empty thread.")
+        return []

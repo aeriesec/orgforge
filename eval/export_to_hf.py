@@ -57,7 +57,7 @@ BM25   — rank_bm25 (Okapi BM25) over the body field.
           returned doc_ids are compared against evidence_chain.
           MRR@10 and Recall@10 are reported per question type.
 
-Dense  — sentence-transformers "Losspost/stella_en_1.5b_v5" (1536-dim).
+Dense  — sentence-transformers "Losspost/stella_en_1.5b_v5" (1024-dim).
           Cosine similarity between question_text embedding and body embeddings.
           Same MRR@10 / Recall@10 reported for comparison.
           If sentence-transformers is not installed, this section is skipped

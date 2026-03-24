@@ -29,6 +29,7 @@ from dataclasses import asdict as _asdict
 from agent_factory import make_agent
 from crewai import Task, Crew
 
+import json_repair
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
 from planner_models import (
@@ -105,8 +106,14 @@ class DepartmentPlanner:
         existing features, and routine corporate work.
 
     4. NON-ENGINEERING TEAMS (applies if {dept} is not Engineering_Backend or Engineering_Mobile).
-    - Do NOT propose ticket_progress, pr_review, or code-related activities.
+    - Do NOT propose pr_review or any code-related activities.
+    - ticket_progress IS allowed for non-engineering teams — it means completing an
+      action item (writing a doc, sending an email, running an analysis, aligning
+      with another team). The completion artifact is NEVER a PR.
+      When using ticket_progress, set related_id from the engineer's OWNED ticket list.
     - DO use these activity types for your team:
+        * ticket_progress  — completing a non-code action item tied to an owned ticket.
+                            completion produces a confluence_page, email, or slack thread.
         * deep_work        — focused individual work (analysis, writing, planning)
         * 1on1             — check-in with a team member
         * async_question   — pinging another department for info or a decision
@@ -116,10 +123,10 @@ class DepartmentPlanner:
                             or process guides relevant to your team's expertise.
                             Use this at least once per day per department.
     - Examples by department:
-        * Design     → design_discussion, confluence_page (design system docs, UX guidelines)
-        * Sales      → async_question (pinging PM for roadmap), confluence_page (sales playbook)
-        * HR_Ops     → 1on1 (wellbeing check), confluence_page (onboarding guide, PTO policy)
-        * QA_Support → design_discussion (test plan), confluence_page (QA runbook)
+        * Design     → ticket_progress (UX spec), design_discussion, confluence_page (design system docs)
+        * Sales      → ticket_progress (sales proposal), async_question (pinging PM), confluence_page (playbook)
+        * HR_Ops     → ticket_progress (onboarding checklist), 1on1 (wellbeing check), confluence_page (PTO policy)
+        * QA_Support → ticket_progress (test plan execution), design_discussion, confluence_page (QA runbook)
 
     5. NO EVENT REDUNDANCY (CRITICAL TO AVOID DUPLICATES).
     - NEVER put collaborative meetings (1on1, mentoring, design_discussion, async_question) in the individual agendas of BOTH participants.
@@ -188,6 +195,9 @@ class DepartmentPlanner:
 
     ### AVAILABLE TICKETS — unowned, assign freely within capacity
     {available_tickets_section}
+
+    ### IN REVIEW TICKETS - owned tickets that are pending review
+    {in_review_section}
 
     ### ENGINEER CAPACITY TODAY (hours available after stress/on-call)
     {capacity_section}
@@ -278,11 +288,17 @@ class DepartmentPlanner:
                 for name, hrs in sprint_context.capacity_by_member.items()
             ]
             capacity_section = "\n".join(cap_lines)
+
+            in_review_lines = [f"  - [{tid}]" for tid in sprint_context.in_review]
+            in_review_section = (
+                "\n".join(in_review_lines) if in_review_lines else "  (none)"
+            )
         else:
             # Non-engineering depts or fallback — use the old open_tickets path
             owned_section = self._open_tickets(state, mem)
             avail_section = "  (see owned tickets above)"
             capacity_section = "  (standard 6h per engineer)"
+            in_review_section = "  (none)"
 
         open_chains = []
         for inc in state.active_incidents:
@@ -336,6 +352,7 @@ class DepartmentPlanner:
             lifecycle_context=lifecycle_context,
             sprint_theme=sprint_context.sprint_theme if sprint_context else "",
             open_chains_str=open_chains,
+            in_review_section=in_review_section,
         )
         task = Task(
             description=prompt,
@@ -404,12 +421,12 @@ class DepartmentPlanner:
         """
         # Strip any accidental markdown fences
         clean = raw.replace("```json", "").replace("```", "").strip()
+        data = json_repair.loads(clean)
 
-        try:
-            data = json.loads(clean)
-        except json.JSONDecodeError as e:
+        if not isinstance(data, dict):
             logger.warning(
-                f"[planner] {self.dept} plan JSON parse failed: {e}. Using fallback."
+                f"[planner] {self.dept} plan parse returned {type(data)} "
+                f"instead of dict. Using fallback. Content: {clean[:50]}..."
             )
             return self._fallback_plan(org_theme, day, date, cross_signals), {}
 
@@ -983,17 +1000,6 @@ class DayPlannerOrchestrator:
         Returns an OrgDayPlan the day loop executes against.
         """
 
-        import asyncio
-
-        try:
-            loop = asyncio.get_running_loop()
-            logger.warning(
-                f"[planner] Running event loop detected: {loop} — parallel dept plans will serialize"
-            )
-        except RuntimeError:
-            logger.info(
-                "[planner] No running event loop — ThreadPoolExecutor parallelism should work"
-            )
         day = state.day
         date = str(state.current_date.date())
         system_time_iso = clock.now("system").isoformat()  # This will be 09:00:00
@@ -1068,8 +1074,7 @@ class DayPlannerOrchestrator:
         }
 
         if non_eng_depts:
-            lock = threading.Lock()
-            with ThreadPoolExecutor(max_workers=len(non_eng_depts)) as ex:
+            with ThreadPoolExecutor(max_workers=min(3, len(non_eng_depts))) as ex:
                 futures = {
                     ex.submit(
                         planner.plan,
@@ -1092,8 +1097,7 @@ class DayPlannerOrchestrator:
                     try:
                         plan = future.result()
                         self._patch_stress_levels(plan, graph_dynamics)
-                        with lock:
-                            dept_plans[dept] = plan
+                        dept_plans[dept] = plan
                         logger.info(
                             f"  [blue]📋 {dept} plan:[/blue] {plan.theme[:60]} "
                             f"({len(plan.proposed_events)} events)"
@@ -1102,11 +1106,9 @@ class DayPlannerOrchestrator:
                         logger.error(
                             f"  [red]✗ {dept} plan failed:[/red] {e} — using fallback"
                         )
-                        # Fallback: empty plan so the rest of the day can proceed
-                        with lock:
-                            dept_plans[dept] = self._dept_planners[dept]._fallback_plan(
-                                org_theme, day, date, []
-                            )
+                        dept_plans[dept] = self._dept_planners[dept]._fallback_plan(
+                            org_theme, day, date, []
+                        )
 
         # ── OrgCoordinator finds collisions ───────────────────────────────────
         org_plan = self._coordinator.coordinate(dept_plans, state, day, date, org_theme)

@@ -49,6 +49,8 @@ Config schema (add to config.yaml under "org_lifecycle"):
 from __future__ import annotations
 
 import logging
+import os
+import json as _json
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -517,7 +519,11 @@ class OrgLifecycleManager:
 
             # Deterministic mutation — engine owns this, not the LLM
             jira["assignee"] = new_owner
-            self._mem.upsert_ticket(jira)  # persist — get_ticket reads from MongoDB
+            self._mem.upsert_ticket(jira)
+
+            path = f"{self._base}/jira/{jira['id']}.json"
+            with open(path, "w") as f:
+                _json.dump(jira, f, indent=2)
             record.incident_handoffs.append(inc.ticket_id)
 
             self._mem.log_event(
@@ -593,12 +599,9 @@ class OrgLifecycleManager:
                 ticket["status"] = "To Do"
             self._mem.upsert_ticket(ticket)
             if self._base:
-                import json as _json
-
-                serialisable = {k: v for k, v in ticket.items() if k != "_id"}
                 path = f"{self._base}/jira/{ticket['id']}.json"
                 with open(path, "w") as f:
-                    _json.dump(serialisable, f, indent=2)
+                    _json.dump(ticket, f, indent=2)
 
             record.reassigned_tickets.append(ticket["id"])
 

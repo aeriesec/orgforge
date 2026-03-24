@@ -146,10 +146,11 @@ class SprintContext:
                          from GraphDynamics stress + on-call status.
     """
 
-    owned_tickets: Dict[str, str]  # {ticket_id: owner_name}
-    available_tickets: List[str]  # ticket_ids with no owner yet
-    in_progress_ids: List[str]  # owned + status == "In Progress"
-    capacity_by_member: Dict[str, float]  # {name: hrs}
+    owned_tickets: Dict[str, str]
+    available_tickets: List[str]
+    in_progress_ids: List[str]
+    capacity_by_member: Dict[str, float]
+    in_review: List[str]
     sprint_theme: str = ""
 
 

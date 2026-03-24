@@ -499,7 +499,6 @@ class GitSimulator:
 
         path = f"{BASE}/git/prs/{pr_id}.json"
         save_json(path, pr)
-        self._mem.upsert_pr(pr)
         self._mem.embed_artifact(
             id=pr_id,
             type="pr",
@@ -595,23 +594,34 @@ def _fallback_stress_hint(name: str, stress: int) -> str:
     return f"{name} is burnt out — clipped and passive-aggressive, running on fumes."
 
 
-def next_jira_id(state, registry=None) -> str:
+def next_jira_id(state, registry=None, dept: str = "") -> str:
     if registry is not None:
-        return registry.next_jira_id()
+        from artifact_registry import JIRA_DEPT_PREFIX
+
+        prefix = JIRA_DEPT_PREFIX.get(dept, "ENG" if dept else "ORG")
+        return registry.next_jira_id(prefix)
     raise RuntimeError("next_jira_id()")
 
 
-def bill_gap_warning(topic: str) -> str:
-    """Scans all departed employees (not just Bill) for knowledge gap warnings."""
-    for emp_name, emp in DEPARTED_EMPLOYEES.items():
-        hits = [k for k in emp["knew_about"] if k.lower() in topic.lower()]
-        if hits:
-            return (
-                f"\n\n> ⚠️ **Knowledge Gap**: This area ({', '.join(hits)}) was owned by "
-                f"{emp_name} (ex-{emp['role']}, left {emp['left']}). "
-                f"Only ~{int(emp['documented_pct'] * 100)}% documented."
-            )
-    return ""
+# Departments that work on action-item tickets rather than code.
+# ticket_progress for these depts routes to a completion artifact, never a PR.
+_NON_ENG_DEPTS = {
+    "HR_Ops",
+    "Sales_Marketing",
+    "Design",
+    "QA_Support",
+    "Product",
+}
+
+# Maps non-eng dept to the preferred completion artifact type.
+# Used when stamping new tickets and when _handle_ticket_progress branches.
+_DEPT_COMPLETION_ARTIFACT: dict[str, str] = {
+    "HR_Ops": "confluence",
+    "Sales_Marketing": "email",
+    "Design": "confluence",
+    "QA_Support": "confluence",
+    "Product": "confluence",
+}
 
 
 def score_sentiment(messages: List[Dict]) -> float:
@@ -1228,7 +1238,25 @@ class OrgForgeSimulation:
         lock = threading.Lock()
 
         def _generate_dept_tickets(dept: str, members: list) -> list:
-            # Tier 1: structured query scoped to this dept — no embedding.
+            open_count = self._mem._jira.count_documents(
+                {
+                    "dept": dept,
+                    "status": {"$ne": "Done"},
+                }
+            )
+            dept_capacity = self._ticket_assigner._compute_capacity(members, self.state)
+            total_hrs = sum(dept_capacity.values())
+            # Rough heuristic: each ticket ~1.5hrs average (matches assigner's pts * 0.75)
+            capacity_slots = int(total_hrs / 1.5)
+            headroom = max(0, capacity_slots - open_count)
+            tickets_to_generate = min(n_per_dept, headroom)
+
+            if tickets_to_generate == 0:
+                logger.info(
+                    f"    [yellow]⏭ {dept}: backlog full "
+                    f"({open_count} open tickets, {capacity_slots} capacity slots) — skipping[/yellow]"
+                )
+                return []
             dept_ctx = self._mem.context_for_sprint_planning(
                 sprint_num=sprint_num,
                 dept=dept,
@@ -1264,7 +1292,7 @@ class OrgForgeSimulation:
                     f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                     f"Team members and their expertise:\n{expertise_str}\n"
                     f"Recent dept context:\n{dept_ctx}\n\n"
-                    f"Create exactly {n_per_dept} Jira tickets for this sprint.\n"
+                    f"Create exactly {tickets_to_generate} Jira tickets for this sprint.\n"
                     f"DOMAIN CONSTRAINT: Every ticket must be work that maps directly to "
                     f"at least one expertise tag listed above. If a ticket topic does not "
                     f"appear in any team member's expertise, it belongs to a different "
@@ -1283,7 +1311,7 @@ class OrgForgeSimulation:
                     f"]\n"
                     f"No preamble. No markdown fences. Raw JSON only."
                 ),
-                expected_output=f"JSON array of {n_per_dept} ticket objects.",
+                expected_output=f"JSON array of {tickets_to_generate} ticket objects.",
                 agent=agent,
             )
             raw = str(Crew(agents=[agent], tasks=[task]).kickoff()).strip()
@@ -1309,8 +1337,11 @@ class OrgForgeSimulation:
 
             dept_tickets = []
             with lock:
-                for proposal in proposals[:n_per_dept]:
-                    tid = self._registry.next_jira_id()
+                for proposal in proposals[:tickets_to_generate]:
+                    from artifact_registry import JIRA_DEPT_PREFIX
+
+                    prefix = JIRA_DEPT_PREFIX.get(dept, "ORG")
+                    tid = self._registry.next_jira_id(prefix)
                     self._registry.register_jira(tid)
                     ticket = {
                         "id": tid,
@@ -1319,6 +1350,10 @@ class OrgForgeSimulation:
                         "status": "To Do",
                         "assignee": None,  # TicketAssigner owns this next morning
                         "dept": dept,
+                        "dept_type": "non_eng" if dept in _NON_ENG_DEPTS else "eng",
+                        "completion_artifact": _DEPT_COMPLETION_ARTIFACT.get(
+                            dept, "slack"
+                        ),
                         "sprint": sprint_num,
                         "sprint_theme": sprint_theme,
                         "story_points": proposal.get("story_points", 2),
@@ -1326,7 +1361,7 @@ class OrgForgeSimulation:
                         "created_at": timestamp_str,
                         "updated_at": timestamp_str,
                     }
-                    self._mem.upsert_ticket(ticket)
+
                     save_json(f"{BASE}/jira/{tid}.json", ticket)
                     self.state.sprint.tickets_in_sprint.append(tid)
                     dept_tickets.append(ticket)
@@ -1703,7 +1738,7 @@ class OrgForgeSimulation:
         self.state.sprint.tickets_in_sprint = []
 
     def _handle_incident(self):
-        ticket_id = next_jira_id(self.state, self._registry)
+        ticket_id = next_jira_id(self.state, self._registry, dept="Engineering_Backend")
         root_cause = self._generate_root_cause()
         on_call = self._select_domain_expert(root_cause, exclude="")
 
@@ -1951,7 +1986,6 @@ class OrgForgeSimulation:
         self._mem.upsert_ticket(ticket)
         save_json(f"{BASE}/jira/{ticket_id}.json", ticket)
 
-        # ── 9. Embed — now maximally rich, called last ────────────────────────
         embed_content = "\n\n".join(
             filter(
                 None,

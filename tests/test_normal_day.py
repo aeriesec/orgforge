@@ -22,15 +22,12 @@ from flow import persona_backstory
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _make_real_clock(date: datetime) -> SimClock:
-    state_stub = MagicMock()
-    state_stub.current_date = date
-    state_stub.actor_cursors = {}
-    return SimClock(state_stub)
-
-
 def _make_ticket(
-    ticket_id: str, title: str, status: str = "To Do", assignee: str = "Alice"
+    ticket_id: str,
+    title: str,
+    status: str = "To Do",
+    assignee: str = "Alice",
+    dept: str = "ENG",
 ) -> dict:
     return {
         "id": ticket_id,
@@ -39,6 +36,8 @@ def _make_ticket(
         "assignee": assignee,
         "linked_prs": [],
         "comments": [],
+        "dept": dept,
+        "dept_type": "eng",
     }
 
 
@@ -267,7 +266,7 @@ def test_ticket_progress_moves_todo_to_in_progress(handler, mock_state, tmp_path
     A ticket in 'To Do' status must be set to 'In Progress' when progressed.
     """
     ticket = _make_ticket(
-        "ORG-101", "Fix retry logic", status="To Do", assignee="Alice"
+        "ORG-101", "Fix retry logic", status="To Do", assignee="Alice", dept="ENG"
     )
     handler._mem.upsert_ticket(ticket)
 
@@ -280,7 +279,7 @@ def test_ticket_progress_moves_todo_to_in_progress(handler, mock_state, tmp_path
     eng_plan = _simple_eng_plan("Alice", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    with patch.object(handler, "_save_ticket"), patch("normal_day.Crew") as mock_crew:
+    with patch("normal_day.Crew") as mock_crew:
         mock_crew.return_value.kickoff.return_value = "Made progress on retry logic."
         handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
 

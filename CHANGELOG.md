@@ -6,6 +6,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.1] — 2026-03-24
+
+### Added
+
+- **Background Embedding Queue (`src/embed_worker.py`, `src/flow.py`, `src/memory.py`)**: Introduced `EmbedWorker` to decouple LLM artifact generation from vector embeddings. Embeddings are now processed in a background thread queue, preventing inference blocking. Added `drain()` synchronization before vector searches and end-of-day checkpoints to ensure causal consistency.
+- **Parallel Genesis Execution (`src/flow.py`, `src/confluence_writer.py`)**: Genesis initialization is now parallelized using `ThreadPoolExecutor`. Persona embeddings, email source generation, and independent Confluence page batches (e.g., ENG vs. MKT) run concurrently.
+- **Parallel Day Planning (`src/day_planner.py`)**: Department-level daily plans (excluding Engineering) are now generated concurrently to speed up the daily simulation loop. Added a fallback mechanism to return an empty plan if a department's planning thread fails.
+
+### Changed
+
+- **Simulation Engine Architecture (`src/flow.py`)**: Replaced `crewai.flow.flow.Flow` dependency with a custom `OrgForgeSimulation` class. The main execution loop now runs via standard methods (`genesis_phase`, `daily_cycle`) rather than CrewAI's `@start` and `@listen` decorators.
+- **Default Quality Preset (`config/config.yaml`, `README.md`, `.env.example`)**: Promoted `local_gpu` to the default simulation preset and completely removed the `local_cpu` profile.
+- **Thread-Safe Artifact Registry (`src/artifact_registry.py`)**: Added `threading.Lock()` to `next_id()`, `register_confluence()`, `next_jira_id()`, and `register_jira()` to prevent ID collision race conditions during the newly parallelized genesis and sprint generation phases.
+- **Checkpoint Serialization (`src/memory.py`, `src/flow.py`)**: Checkpoint saves and restores now explicitly include `active_incidents` (with causal chains), `sprint`, `resolved_incidents`, and `morale_history`.
+- **Database Reset Logic (`src/memory.py`)**: `reset()` now drops the entire MongoDB database directly rather than enumerating and dropping individual collections, ensuring no orphaned collections remain.
+
+### Fixed
+
+- **Infinite Loop in Clock (`src/sim_clock.py`)**: Added a 7-day `max_skip` limit to the `skip_to_next_business_day` function to prevent potential infinite loops if a valid business day cannot be found.
+- **Ticket Assigner Vector Retrieval (`src/ticket_assigner.py`)**: Fixed `_engineer_vectors` initialization to correctly fetch pre-computed persona embeddings directly from MongoDB instead of attempting to rebuild them on the fly.
+- **Insider Threat Defaults (`config/config.yaml`)**: Set insider threat `enabled` flag to `false` by default to streamline base simulation runs.
+
+---
+
 ## [v1.2.0] — 2026-03-22
 
 ### Added

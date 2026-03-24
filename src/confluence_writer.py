@@ -59,10 +59,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("orgforge.confluence")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFLUENCE WRITER
-# ─────────────────────────────────────────────────────────────────────────────
+_CONF_PREFIX_MAP = {
+    "Engineering_Backend": "ENG",
+    "Engineering_Mobile": "ENG",
+    "Product": "PROD",
+    "Design": "DESIGN",
+    "Sales_Marketing": "SALES",
+    "HR_Ops": "HR",
+    "QA_Support": "QA",
+}
 
 
 class ConfluenceWriter:
@@ -190,7 +195,7 @@ class ConfluenceWriter:
 
             resolved_tags = tags or ["genesis", "confluence"]
 
-            conf_ids = self._finalise_page(
+            conf_ids = self._finalize_page(
                 raw_content=raw,
                 conf_id=conf_id,
                 title=self._extract_title(raw, conf_id),
@@ -346,7 +351,7 @@ class ConfluenceWriter:
             timestamp=timestamp,
         )
 
-        conf_ids = self._finalise_page(
+        conf_ids = self._finalize_page(
             raw_content=raw,
             conf_id=conf_id,
             title=f"Postmortem: {incident_title}",
@@ -451,10 +456,10 @@ class ConfluenceWriter:
                 f"[confluence] JSON parse failed for design doc: {e} — "
                 f"raw JSON attempt: {clean[:200]!r}"
             )
-            content = raw  # save the original unmodified LLM output as the doc
+            content = raw
             new_tickets = []
 
-        conf_ids = self._finalise_page(
+        conf_ids = self._finalize_page(
             raw_content=content,
             conf_id=conf_id,
             title=f"Design: {topic[:70]}",
@@ -466,7 +471,29 @@ class ConfluenceWriter:
             facts={"title": f"Design: {topic[:80]}", "type": "design_doc"},
         )
 
-        # Spawn JIRA tickets from action items
+        gaps = self._lifecycle.scan_for_knowledge_gaps(
+            text=content,
+            triggered_by=conf_ids[0],
+            day=self._state.day,
+            date_str=date_str,
+            state=self._state,
+            timestamp=timestamp,
+        )
+        if gaps:
+            gap_lines = "\n\n".join(
+                f"> ⚠️ **Knowledge Gap**: `{g.domain_hit}` was owned by "
+                f"ex-{g.departed_name} (~{int(g.documented_pct * 100)}% documented). "
+                f"Proceed with caution."
+                for g in gaps
+            )
+
+            import os, json as _json
+
+            doc_path = f"{self._base}/confluence/design/{conf_ids[0]}.md"
+            if os.path.exists(doc_path):
+                with open(doc_path, "a") as f:
+                    f.write(f"\n\n{gap_lines}")
+
         created_ticket_ids = self._spawn_tickets(
             new_tickets, author, participants, date_str, timestamp
         )
@@ -501,7 +528,7 @@ class ConfluenceWriter:
                     "design_doc",
                     "jira",
                     "causal_chain",
-                ],  # ← add causal_chain
+                ],
             )
         )
 
@@ -678,7 +705,7 @@ class ConfluenceWriter:
         raw = str(
             Crew(agents=[writer_agent], tasks=[task], verbose=False).kickoff()
         ).strip()
-        raw += self._bill_gap_warning(title)
+        raw += self._knowledge_gap_warning(title)
 
         # Lifecycle scan before chunking
         self._lifecycle.scan_for_knowledge_gaps(
@@ -690,7 +717,7 @@ class ConfluenceWriter:
             timestamp=timestamp,
         )
 
-        self._finalise_page(
+        self._finalize_page(
             raw_content=raw,
             conf_id=conf_id,
             title=title,
@@ -706,7 +733,7 @@ class ConfluenceWriter:
     # PRIVATE — PAGE FINALISATION PIPELINE
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _finalise_page(
+    def _finalize_page(
         self,
         raw_content: str,
         conf_id: str,
@@ -748,13 +775,13 @@ class ConfluenceWriter:
             # _registry.chunk_into_pages already registered IDs —
             # catch the rare race where an ID was registered externally
             logger.info(
-                f"[finalise] embedding page.id={page.id} parent={page.parent_id or 'ROOT'} content_len={len(page.content)}"
+                f"[finalize] embedding page.id={page.id} parent={page.parent_id or 'ROOT'} content_len={len(page.content)}"
             )
             try:
                 # strip broken refs one more time after chunking added headers
                 final_content = self._registry.strip_broken_references(page.content)
             except Exception as e:
-                logger.info(f"[finalise] Caught exception {e}")
+                logger.info(f"[finalize] Caught exception {e}")
                 final_content = page.content
 
             self._save_md(page.path, final_content)
@@ -788,7 +815,7 @@ class ConfluenceWriter:
 
             self._state.daily_artifacts_created += 1
 
-            logger.debug(f"[finalise] pre-facts page.id={page.id}")
+            logger.debug(f"[finalize] pre-facts page.id={page.id}")
             page_facts = dict(facts)
 
             page_facts.update(
@@ -800,15 +827,15 @@ class ConfluenceWriter:
                 }
             )
 
-            logger.info(f"[finalise] page facts {page_facts}")
-            logger.debug(f"[finalise] pre-artifact-ids page.id={page.id}")
+            logger.info(f"[finalize] page facts {page_facts}")
+            logger.debug(f"[finalize] pre-artifact-ids page.id={page.id}")
             artifact_ids = {"confluence": page.id}
             if extra_artifact_ids:
                 artifact_ids.update(extra_artifact_ids)
 
-            logger.debug(f"[finalise] pre-log-event page.id={page.id}")
+            logger.debug(f"[finalize] pre-log-event page.id={page.id}")
             logger.debug(
-                f"[finalise] SimEvent fields — "
+                f"[finalize] SimEvent fields — "
                 f"type=confluence_created "
                 f"timestamp={timestamp} "
                 f"day={self._state.day} "
@@ -834,9 +861,9 @@ class ConfluenceWriter:
                     tags=tags,
                 )
             )
-            logger.debug(f"[finalise] post-log-event page.id={page.id}")
+            logger.debug(f"[finalize] post-log-event page.id={page.id}")
 
-            logger.info(f"[confluence] _finalise_page complete: {page.id}")
+            logger.info(f"[confluence] _finalize_page complete: {page.id}")
 
             created_ids.append(page.id)
 
@@ -856,12 +883,28 @@ class ConfluenceWriter:
     ) -> List[str]:
         """Create JIRA tickets from a list of LLM-extracted action items."""
         created_ids: List[str] = []
+        from artifact_registry import JIRA_DEPT_PREFIX
+
         for tk in new_tickets:
-            tid = self._registry.next_jira_id()
-            self._registry.register_jira(tid)
             assignee = tk.get("assignee", fallback_author)
             if assignee not in self._all_names:
                 assignee = fallback_author
+
+            author_dept = next(
+                (
+                    d
+                    for d, members in self._org_chart.items()
+                    if fallback_author in members
+                ),
+                "",
+            )
+            prefix = JIRA_DEPT_PREFIX.get(
+                author_dept, "ENG" if author_dept.startswith("Engineering") else "ORG"
+            )
+            is_eng = author_dept.startswith("Engineering")
+
+            tid = self._registry.next_jira_id(prefix)
+            self._registry.register_jira(tid)
 
             ticket = {
                 "id": tid,
@@ -873,8 +916,11 @@ class ConfluenceWriter:
                 "linked_prs": [],
                 "created_at": timestamp,
                 "updated_at": timestamp,
+                "dept": author_dept,
+                "dept_type": "eng" if is_eng else "non_eng",
+                "completion_artifact": "slack" if not is_eng else None,
             }
-            self._mem.upsert_ticket(ticket)
+
             self._save_json(f"{self._base}/jira/{tid}.json", ticket)
 
             self._mem.embed_artifact(
@@ -898,6 +944,13 @@ class ConfluenceWriter:
                 return random.choice(members)
         # Fallback: any employee at all
         return random.choice(self._all_names)
+
+    def _conf_prefix_for(self, author: str) -> str:
+        dept = next(
+            (d for d, members in self._org_chart.items() if author in members),
+            None,
+        )
+        return _CONF_PREFIX_MAP.get(dept, "ENG")
 
     def generate_tech_stack(self) -> dict:
         """
@@ -994,7 +1047,7 @@ class ConfluenceWriter:
         parts = conf_id.split("-")
         return parts[1] if len(parts) >= 3 else "GEN"
 
-    def _bill_gap_warning(self, topic: str) -> str:
+    def _knowledge_gap_warning(self, topic: str) -> str:
         """Append a knowledge-gap warning if the topic touches a departed employee's domain."""
         departed = self._config.get("knowledge_gaps", [])
         for emp in departed:
