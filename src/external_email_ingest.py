@@ -548,7 +548,7 @@ class ExternalEmailIngestor:
             "created_at": jira_time.isoformat(),
             "updated_at": jira_time.isoformat(),
         }
-
+        self._mem.upsert_ticket(ticket)
         self._mem.embed_artifact(
             id=ticket_id,
             type="jira",
@@ -673,7 +673,7 @@ class ExternalEmailIngestor:
             "created_at": jira_time.isoformat(),
             "updated_at": jira_time.isoformat(),
         }
-
+        self._mem.upsert_ticket(ticket)
         self._mem.embed_artifact(
             id=ticket_id,
             type="jira",

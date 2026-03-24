@@ -1363,7 +1363,7 @@ class OrgForgeSimulation:
                         "created_at": timestamp_str,
                         "updated_at": timestamp_str,
                     }
-
+                    self._mem.upsert_ticket(ticket)
                     save_json(f"{BASE}/jira/{tid}.json", ticket)
                     self.state.sprint.tickets_in_sprint.append(tid)
                     dept_tickets.append(ticket)
