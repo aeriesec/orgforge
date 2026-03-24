@@ -483,7 +483,7 @@ class ConfluenceWriter:
                 for g in gaps
             )
 
-            import os, json as _json
+            import os
 
             doc_path = f"{self._base}/confluence/design/{conf_ids[0]}.md"
             if os.path.exists(doc_path):

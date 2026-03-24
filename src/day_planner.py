@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 from dataclasses import asdict as _asdict
@@ -1054,7 +1053,6 @@ class DayPlannerOrchestrator:
             dept_plans[eng_key] = eng_plan
             logger.info(
                 f"  [blue]📋 Eng plan:[/blue] {eng_plan.theme[:60]} "
-                f"({len(eng_plan.proposed_events)} events)"
             )
 
         # ── Other departments react to Engineering — run in parallel ─────────

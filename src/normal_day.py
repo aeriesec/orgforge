@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import random
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -75,18 +73,7 @@ class NormalDayHandler:
         self._vader = vader
         self._threat = threat_injector or _NullInjector()
         self._embed_worker = embed_worker
-        # Per-ticket mutex — prevents two concurrent agenda items from
-        # corrupting the same ticket's comment list or causal chain.
-        self._ticket_locks: Dict[str, threading.Lock] = {}
-        self._ticket_locks_lock = threading.Lock()
         self._lifecycle = lifecycle
-
-    def _ticket_lock(self, ticket_id: str) -> threading.Lock:
-        """Return (and lazily create) the per-ticket mutex."""
-        with self._ticket_locks_lock:
-            if ticket_id not in self._ticket_locks:
-                self._ticket_locks[ticket_id] = threading.Lock()
-            return self._ticket_locks[ticket_id]
 
     def _deduped_voice_cards(self, names: list, context: str) -> str:
         """
@@ -279,31 +266,20 @@ class NormalDayHandler:
 
     def _execute_agenda_items(self, org_plan: OrgDayPlan, date_str: str) -> None:
         """
-        Walk every engineer's agenda across all departments.
-        Dispatch each non-deferred item to the appropriate activity handler.
-
-        Threading model
-        ---------------
-        Each (engineer, agenda_item) pair that involves an LLM call is submitted
-        to a per-department ThreadPoolExecutor so all engineers in a department
-        run their agenda items concurrently.  Departments themselves are still
-        serialised (Engineering first, then others) because non-engineering depts
-        react to Engineering's day.
-
-        Thread safety is guaranteed by:
-          - SimClock._cursor_lock  — serialises all cursor reads/writes
-          - self._ticket_lock(tid) — one lock per ticket_id for the write-back
-            section of _handle_ticket_progress
-          - seen_discussions set   — only touched on the main thread before tasks
-            are submitted, so no lock needed there
+        Walk every engineer's agenda across all departments sequentially.
         """
         all_participants: List[str] = []
         seen_discussions: set = set()
 
-        # Collect (eng_plan, item, dept_plan) tuples per dept, respecting dedup
-        dept_work: Dict[str, List] = {}
-        for dept, dept_plan in org_plan.dept_plans.items():
-            items_for_dept = []
+        # Process Engineering first, then others
+        ordered_depts = sorted(
+            org_plan.dept_plans.keys(),
+            key=lambda d: 0 if "engineering" in d.lower() else 1,
+        )
+
+        for dept in ordered_depts:
+            dept_plan = org_plan.dept_plans[dept]
+
             for eng_plan in dept_plan.engineer_plans:
                 watercooler_prob = self._config["simulation"].get(
                     "watercooler_prob", 0.15
@@ -325,6 +301,7 @@ class NormalDayHandler:
                         self._log_deferred_item(eng_plan.name, item, date_str)
                         continue
 
+                    # The distraction now fires accurately mid-agenda!
                     if (
                         will_be_distracted
                         and not distraction_fired
@@ -336,6 +313,7 @@ class NormalDayHandler:
                         self._clock.advance_actor(eng_plan.name, penalty_hours)
                         distraction_fired = True
 
+                    # Deduplicate group conversations so they only happen once per group
                     if item.activity_type in (
                         "design_discussion",
                         "mentoring",
@@ -361,38 +339,15 @@ class NormalDayHandler:
                             continue
                         seen_discussions.add(key)
 
-                    items_for_dept.append((eng_plan, item, dept_plan))
-
-            dept_work[dept] = items_for_dept
-
-        # Dispatch — engineering depts first, then others
-        ordered_depts = sorted(
-            dept_work.keys(),
-            key=lambda d: 0 if "engineering" in d.lower() else 1,
-        )
-
-        for dept in ordered_depts:
-            items = dept_work[dept]
-            if not items:
-                continue
-
-            max_workers = min(len(items), 6)  # cap threads per dept
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {
-                    pool.submit(self._dispatch, eng_plan, item, dept_plan, date_str): (
-                        eng_plan.name,
-                        item.activity_type,
-                    )
-                    for eng_plan, item, dept_plan in items
-                }
-                for future in as_completed(futures):
-                    name, act = futures[future]
+                    # Execute the actual work sequentially
                     try:
-                        participants = future.result()
+                        participants = self._dispatch(
+                            eng_plan, item, dept_plan, date_str
+                        )
                         all_participants.extend(participants)
                     except Exception as exc:
                         logger.error(
-                            f"[normal_day] {name}/{act} failed: {exc}",
+                            f"[normal_day] {eng_plan.name}/{item.activity_type} failed: {exc}",
                             exc_info=True,
                         )
 
@@ -761,7 +716,8 @@ class NormalDayHandler:
                         or stale_pr
                     )
                     stale_pr["status"] = "merged"
-                    import os, json as _json
+                    import os
+                    import json as _json
 
                     pr_path = f"{self._base}/git/prs/{stale_pr['pr_id']}.json"
                     os.makedirs(os.path.dirname(pr_path), exist_ok=True)
@@ -794,10 +750,6 @@ class NormalDayHandler:
                 if spawned_pr_id:
                     active_inc.causal_chain.append(spawned_pr_id)
 
-        # ── Thread-safe write-back ────────────────────────────────────────────
-        # Acquire per-ticket lock only for the mutation + persist section.
-        # The LLM call above runs freely in parallel.
-        with self._ticket_lock(ticket_id):
             # Persist chain back onto the ticket document
             ticket["causal_chain"] = chain.snapshot()
             ticket["updated_at"] = current_actor_time_iso
