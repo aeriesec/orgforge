@@ -386,7 +386,7 @@ class ConfluenceWriter:
     ) -> Optional[str]:
         """
         Generate a design doc Confluence page from a Slack discussion.
-        Also spawns 1-3 JIRA tickets from the action items in the chat.
+        Also spawns 1 JIRA ticket from the action items in the chat.
 
         Returns the registered conf_id, or None on failure.
         """
@@ -395,14 +395,12 @@ class ConfluenceWriter:
         timestamp = artifact_time.isoformat()
 
         chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
-        # Tier 3: topic is a free-form Slack thread subject — HyDE rewrite
-        # produces a better embedding target than the raw topic string alone.
         ctx = self._mem.recall_with_rewrite(raw_query=topic, n=3, as_of_time=timestamp)
         related = self._registry.related_context(topic=topic, n=3)
 
         agent = make_agent(
             role="Technical Lead",
-            goal="Document technical decisions and extract actionable tickets.",
+            goal="Document technical decisions and extract an actionable ticket.",
             backstory=self._persona(
                 author,
                 mem=self._mem,
@@ -417,7 +415,7 @@ class ConfluenceWriter:
                 f"Background context: {ctx}\n"
                 f"Existing pages you may reference:\n{related}\n\n"
                 f"Write a design doc Confluence page with ID {conf_id}.\n"
-                f"Also extract 1-3 concrete next steps as JIRA ticket definitions.\n"
+                f"Also extract 1 concrete next steps as a single JIRA ticket definition.\n"
                 f"Respond ONLY with valid JSON matching this exact schema:\n"
                 f"{{\n"
                 f'  "markdown_doc": "string (full Markdown, no main # title, start directly with ## Problem Statement)",\n'
@@ -434,8 +432,6 @@ class ConfluenceWriter:
         raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
         clean = raw.replace("```json", "").replace("```", "").strip()
 
-        # Extract the JSON object robustly: find the outermost { ... } block
-        # so any leading/trailing prose from the LLM doesn't break the parse.
         try:
             brace_start = clean.index("{")
             brace_end = clean.rindex("}") + 1
@@ -553,7 +549,6 @@ class ConfluenceWriter:
 
         Falls back to a random org member only if no active actors exist yet.
         """
-        # ── 1. Pick an author from today's active workers ─────────────────────
         active_today: List[str] = list(
             dict.fromkeys(getattr(self._state, "daily_active_actors", []))
         )
@@ -563,12 +558,11 @@ class ConfluenceWriter:
             else random.choice(self._all_names)
         )
 
-        # ── 2. Determine prefix from author's department ──────────────────────
         dept = next(
             (d for d, members in self._org_chart.items() if resolved_author in members),
             "ENG",
         )
-        # Map department names to short Confluence ID prefixes
+
         _PREFIX_MAP = {
             "Engineering_Backend": "ENG",
             "Engineering_Mobile": "ENG",
@@ -1102,7 +1096,7 @@ class ConfluenceWriter:
 
         months_at_page = months_at_sim_start - months_offset
         if months_at_page <= 0:
-            return "new"  # hadn't joined yet or just started
+            return "new"
 
         if months_at_page < 12:
             return f"{months_at_page}mo"
