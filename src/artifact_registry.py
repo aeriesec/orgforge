@@ -217,7 +217,7 @@ class ArtifactRegistry:
             # Seed JIRA (from new dedicated tickets collection)
             # IDs may now be ENG-100, HR-101, SALES-102, etc.
             # Parse by splitting on the last '-' so any prefix works.
-            for doc in self._mem._jira.find({}, {"id": 1}):
+            for doc in self._mem._jira.find({}, {"_id": 0, "id": 1}):
                 jid = doc.get("id", "")
                 if not jid:
                     continue

@@ -721,7 +721,7 @@ class OrgForgeSimulation:
             vader=vader,
             threat_injector=self._threat,
             embed_worker=self._embed_worker,
-            lifecycle=self._lifecycle
+            lifecycle=self._lifecycle,
         )
         self._recurrence_detector = RecurrenceDetector(self._mem)
         self._ticket_assigner = TicketAssigner(

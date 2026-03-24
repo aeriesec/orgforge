@@ -581,7 +581,8 @@ class DepartmentPlanner:
                 {
                     "assignee": {"$in": self.members},
                     "status": {"$ne": "Done"},
-                }
+                },
+                {"_id": 0},
             )
         )
         if not tickets:
@@ -1051,9 +1052,7 @@ class DayPlannerOrchestrator:
             )
             self._patch_stress_levels(eng_plan, graph_dynamics)
             dept_plans[eng_key] = eng_plan
-            logger.info(
-                f"  [blue]📋 Eng plan:[/blue] {eng_plan.theme[:60]} "
-            )
+            logger.info(f"  [blue]📋 Eng plan:[/blue] {eng_plan.theme[:60]} ")
 
         # ── Other departments react to Engineering — run in parallel ─────────
         # Each non-eng dept plan is an independent Bedrock call with no shared

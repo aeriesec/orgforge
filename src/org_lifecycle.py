@@ -580,7 +580,8 @@ class OrgLifecycleManager:
                 {
                     "assignee": name,
                     "status": {"$ne": "Done"},
-                }
+                },
+                {"_id": 0},
             )
         )
         for ticket in open_tickets:

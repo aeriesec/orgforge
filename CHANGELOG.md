@@ -6,6 +6,14 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.2] — 2026-03-24
+
+### Fixed
+
+- **Serialization Handling**: Added {"\_id": 0} to MongoDB queries to prevent ObjectId serialization errors in LLM artifacts and API responses.
+
+---
+
 ## [v1.2.1] — 2026-03-24
 
 ### Added

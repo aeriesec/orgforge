@@ -655,7 +655,7 @@ class NormalDayHandler:
             open_pr_with_changes = bool(linked_prs) and any(
                 self._mem._prs.find_one(
                     {"pr_id": p, "status": "open", "changes_requested": True},
-                    {"pr_id": 1},
+                    {"_id": 0, "pr_id": 1},
                 )
                 for p in linked_prs
             )
@@ -696,7 +696,9 @@ class NormalDayHandler:
                             {"pr_id": p, "status": "open"}, {"_id": 0}
                         )
                         for p in linked_prs
-                        if self._mem._prs.find_one({"pr_id": p, "status": "open"})
+                        if self._mem._prs.find_one(
+                            {"pr_id": p, "status": "open"}, {"_id": 0}
+                        )
                     ),
                     None,
                 )

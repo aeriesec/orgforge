@@ -118,7 +118,8 @@ class TicketAssigner:
         # Tickets in the sprint with no assignee yet (newly created this sprint)
         unassigned = list(
             self._mem._jira.find(
-                {"assignee": None, "dept": dept_name, "status": {"$ne": "Done"}}
+                {"assignee": None, "dept": dept_name, "status": {"$ne": "Done"}},
+                {"_id": 0},
             )
         )
 
@@ -328,7 +329,7 @@ class TicketAssigner:
 
         for name in PERSONAS:
             doc = self._mem._artifacts.find_one(
-                {"_id": name, "type": "persona_skills"}, {"embedding": 1}
+                {"_id": name, "type": "persona_skills"}, {"_id": 0, "embedding": 1}
             )
             if doc and doc.get("embedding"):
                 self._engineer_vectors[name] = doc["embedding"]
@@ -448,7 +449,7 @@ class TicketAssigner:
         """
         history: Dict[str, set] = {}
         for ticket in self._mem._jira.find(
-            {"assignee": {"$exists": True}}, {"id": 1, "assignee": 1}
+            {"assignee": {"$exists": True}}, {"_id": 0, "id": 1, "assignee": 1}
         ):
             assignee = ticket.get("assignee")
             if assignee:
