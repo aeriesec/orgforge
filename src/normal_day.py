@@ -415,6 +415,9 @@ class NormalDayHandler:
         if not ticket:
             return [eng_plan.name]
 
+        if self._try_force_merge_stale_pr(ticket, assignee, date_str):
+            return [assignee]
+
         dept_type = ticket.get("dept_type", "eng")
         is_non_eng = dept_type == "non_eng"
         completion_artifact = ticket.get("completion_artifact", "slack")
@@ -422,15 +425,12 @@ class NormalDayHandler:
         current_actor_time, new_cursor = self._clock.advance_actor(assignee, hours=2.0)
         current_actor_time_iso = current_actor_time.isoformat()
 
-        # Tier 1: structured context scoped to this person — no vector search.
         ctx = self._mem.context_for_person(
             name=assignee,
             as_of_time=current_actor_time_iso,
             n=2,
         )
-        linked_prs = ticket.get("linked_prs", [])
 
-        # Build structured ticket context
         if self._registry:
             ticket_ctx = self._registry.ticket_summary(
                 ticket, self._state.day
@@ -575,83 +575,196 @@ class NormalDayHandler:
         comment_id = f"{ticket_id}_comment_{len(ticket['comments'])}"
         chain.append(comment_id)
 
-        # ── Completion artifact — non-eng path ────────────────────────────────
         spawned_pr_id = None
         completion_id = None
 
-        if is_non_eng:
-            ticket_age = self._state.day - ticket.get(
-                "in_progress_since", self._state.day
+        ticket_age = self._state.day - ticket.get("in_progress_since", self._state.day)
+        force_complete = ticket_age >= 3
+        actor_incident_bound = any(
+            eng_plan.is_on_call and i.ticket_id != ticket_id
+            for i in self._state.active_incidents
+        )
+
+        if is_complete or force_complete:
+            if is_non_eng:
+                completion_id = self._complete_non_eng_ticket(
+                    ticket,
+                    assignee,
+                    comment_text,
+                    ctx,
+                    date_str,
+                    current_actor_time.isoformat(),
+                    chain,
+                )
+            else:
+                spawned_pr_id = self._complete_eng_ticket(
+                    ticket,
+                    assignee,
+                    actor_incident_bound,
+                    date_str,
+                    current_actor_time.isoformat(),
+                    chain,
+                    is_complete,
+                )
+
+        active_inc = next(
+            (i for i in self._state.active_incidents if i.ticket_id == ticket_id),
+            None,
+        )
+        if active_inc and getattr(active_inc, "causal_chain", None):
+            active_inc.causal_chain.append(comment_id)
+            if spawned_pr_id:
+                active_inc.causal_chain.append(spawned_pr_id)
+
+        ticket["causal_chain"] = chain.snapshot()
+        ticket["updated_at"] = current_actor_time_iso
+
+        self._save_ticket(ticket)
+
+        ticket_body = "\n".join(
+            filter(
+                None,
+                [
+                    ticket.get("title", ""),
+                    ticket.get("description", ""),
+                    ticket.get("root_cause", ""),
+                    "\n".join(
+                        c.get("text", "") for c in ticket.get("comments", [])
+                    ),
+                ],
             )
-            force_complete = ticket_age >= 3
-
-            if (is_complete or force_complete) and ticket["status"] != "Done":
-                if completion_artifact == "confluence" and self._confluence:
-                    # Reuse the existing design doc stub writer — it already
-                    # handles embedding and SimEvent logging via ConfluenceWriter.
-                    completion_id = self._create_design_doc_stub(
-                        author=assignee,
-                        participants=[assignee],
-                        topic=ticket.get("title", item.description),
-                        ctx=ctx,
-                        date_str=date_str,
-                        slack_transcript=[],  # no transcript — ticket-driven
-                    )
-                    if completion_id:
-                        chain.append(completion_id)
-                        logger.info(
-                            f"    [dim]📄 {assignee} completed [{ticket_id}] → {completion_id}[/dim]"
-                        )
-
-                elif completion_artifact == "email":
-                    # Generate a brief completion email and log it as a SimEvent.
-                    # Routed as internal comms — not through ExternalEmailIngestor.
-                    completion_id = self._emit_completion_email(
-                        assignee=assignee,
-                        ticket=ticket,
-                        comment_text=comment_text,
-                        date_str=date_str,
-                        timestamp=current_actor_time_iso,
-                    )
-                    if completion_id:
-                        chain.append(completion_id)
-
-                else:
-                    # Slack summary — emit a short message in the dept channel
-                    dept_channel = (
-                        dept_of_name(assignee, self._org_chart)
-                        .lower()
-                        .replace(" ", "-")
-                        .replace("_", "-")
-                    )
-                    slack_msg = {
-                        "user": assignee,
-                        "text": (
-                            f"Wrapped up [{ticket_id}] {ticket.get('title', '')}. "
-                            f"{comment_text}"
-                        ),
-                        "ts": current_actor_time_iso,
-                        "date": date_str,
-                    }
-                    _, completion_id = self._save_slack(
-                        [slack_msg], dept_channel, interaction_type="ticket_completion"
-                    )
-                    if completion_id:
-                        chain.append(completion_id)
-
-                ticket["status"] = "Done"
-                ticket["completed_at"] = current_actor_time_iso
-
+        )
+        if self._embed_worker:
+            self._embed_worker.enqueue(
+                id=ticket_id,
+                type="jira",
+                title=ticket.get("title", ticket_id),
+                content=ticket_body,
+                day=self._state.day,
+                date=date_str,
+                timestamp=current_actor_time_iso,
+                metadata={
+                    "assignee": ticket.get("assignee", ""),
+                    "status": ticket["status"],
+                    "dept_type": dept_type,
+                },
+            )
         else:
-            # ── Engineering path — PR spawn + force-merge logic ───────────────
-            ticket_age = self._state.day - ticket.get(
-                "in_progress_since", self._state.day
+            self._mem.embed_artifact(
+                id=ticket_id,
+                type="jira",
+                title=ticket.get("title", ticket_id),
+                content=ticket_body,
+                day=self._state.day,
+                date=date_str,
+                timestamp=current_actor_time_iso,
+                metadata={
+                    "assignee": ticket.get("assignee", ""),
+                    "status": ticket["status"],
+                    "dept_type": dept_type,
+                },
+            )
+
+        if self._embed_worker:
+            self._embed_worker.enqueue(
+                id=comment_id,
+                type="jira_comment",
+                title=f"Comment on {ticket_id}",
+                content=comment_text,
+                day=self._state.day,
+                date=date_str,
+                timestamp=current_actor_time_iso,
+                metadata={
+                    "ticket_id": ticket_id,
+                    "author": assignee,
+                    "dept_type": dept_type,
+                },
+            )
+        else:
+            self._mem.embed_artifact(
+                id=comment_id,
+                type="jira_comment",
+                title=f"Comment on {ticket_id}",
+                content=comment_text,
+                day=self._state.day,
+                date=date_str,
+                timestamp=current_actor_time_iso,
+                metadata={
+                    "ticket_id": ticket_id,
+                    "author": assignee,
+                    "dept_type": dept_type,
+                },
+            )
+
+        # Build artifacts dict and SimEvent facts
+        artifacts = {"jira": ticket_id, "jira_comment": comment_id}
+        if spawned_pr_id:
+            artifacts["pr"] = spawned_pr_id
+        if completion_id:
+            artifacts[completion_artifact] = completion_id
+
+        facts = {
+            "ticket_id": ticket_id,
+            "status": ticket["status"],
+            "dept_type": dept_type,
+            "causal_chain": chain.snapshot(),
+        }
+        if spawned_pr_id:
+            facts["spawned_pr"] = spawned_pr_id
+        if completion_id:
+            facts["completion_artifact"] = completion_id
+
+        summary = f"{assignee} worked on {ticket_id}."
+        if spawned_pr_id:
+            summary += f" Opened PR {spawned_pr_id}."
+        elif completion_id:
+            summary += f" Completed → {completion_id}."
+
+        self._mem.log_event(
+            SimEvent(
+                type="ticket_progress",
+                timestamp=current_actor_time_iso,
+                day=self._state.day,
+                date=date_str,
+                actors=[assignee],
+                artifact_ids=artifacts,
+                facts=facts,
+                summary=summary,
+                tags=["jira", "engineering"],
+            )
+        )
+
+        bucket = self._state.ticket_actors_today.setdefault(ticket_id, set())
+        bucket.add(assignee)
+
+        if self._vader:
+            self._score_and_apply_sentiment(comment_text, [assignee], self._vader)
+
+        generated_artifacts = [ticket_id]
+        if spawned_pr_id:
+            generated_artifacts.append(spawned_pr_id)
+        if completion_id:
+            generated_artifacts.append(completion_id)
+
+        return generated_artifacts
+
+    def _try_force_merge_stale_pr(
+        self, ticket: dict, assignee: str, date_str: str
+    ) -> bool:
+        """
+        Evaluates if a ticket currently 'In Review' should be force-merged.
+        Returns True if the ticket was processed (merged or left idling), False otherwise.
+        """
+        if ticket.get("status") != "In Review":
+            return False
+
+        if ticket.get("status") == "In Review":
+            linked_prs = ticket.get("linked_prs", [])
+            review_age = self._state.day - ticket.get(
+                "in_review_since", ticket.get("in_progress_since", self._state.day)
             )
             actor_clock_ok = self._clock.now(assignee).hour < 17
-            actor_incident_bound = any(
-                eng_plan.is_on_call and i.ticket_id != ticket_id
-                for i in self._state.active_incidents
-            )
+
             open_pr_with_changes = bool(linked_prs) and any(
                 self._mem._prs.find_one(
                     {"pr_id": p, "status": "open", "changes_requested": True},
@@ -659,37 +772,18 @@ class NormalDayHandler:
                 )
                 for p in linked_prs
             )
-            force_spawn = (
-                ticket_age >= 3
-                and not linked_prs
-                and not actor_incident_bound
-                and not open_pr_with_changes
-                and actor_clock_ok
-            )
-            if (is_complete or force_spawn) and not linked_prs:
-                pr = self._git.create_pr(
-                    author=assignee,
-                    ticket_id=ticket_id,
-                    title=f"[{ticket_id}] {ticket['title'][:80]}",
-                    timestamp=current_actor_time_iso,
-                )
-                spawned_pr_id = pr["pr_id"]
-                ticket.setdefault("linked_prs", []).append(spawned_pr_id)
-                ticket["status"] = "In Review"
-                chain.append(spawned_pr_id)
 
-            # ── Force-merge: sprint PR stalled in review too long ─────────────
-            # Mirrors _handle_pr_review_for_incident — same comment/verdict/
-            # SimEvent pattern, no new code paths needed.
             force_merge = (
-                ticket_age >= 7
+                review_age >= 5
                 and bool(linked_prs)
-                and ticket.get("status") == "In Review"
                 and not open_pr_with_changes
                 and actor_clock_ok
-                and not spawned_pr_id  # don't force-merge a PR we just created
             )
+
             if force_merge:
+                current_actor_time, _ = self._clock.advance_actor(assignee, hours=0.2)
+                current_actor_time_iso = current_actor_time.isoformat()
+
                 stale_pr = next(
                     (
                         self._mem._prs.find_one(
@@ -702,8 +796,8 @@ class NormalDayHandler:
                     ),
                     None,
                 )
+
                 if stale_pr:
-                    # Reuse incident review path — generates a real comment + verdict
                     self._handle_pr_review_for_incident(
                         reviewer=assignee,
                         pr=stale_pr,
@@ -718,6 +812,7 @@ class NormalDayHandler:
                         or stale_pr
                     )
                     stale_pr["status"] = "merged"
+
                     import os
                     import json as _json
 
@@ -726,164 +821,145 @@ class NormalDayHandler:
                     with open(pr_path, "w") as f:
                         _json.dump(stale_pr, f, indent=2)
                     self._mem.upsert_pr(stale_pr)
+
                     self._git.merge_pr(stale_pr["pr_id"])
+
                     ticket["status"] = "Done"
                     ticket["completed_at"] = current_actor_time_iso
-                    chain.append(stale_pr["pr_id"])
+                    self._save_ticket(ticket)
+
                     self._emit_bot_message(
                         "engineering",
                         "GitHub Actions",
-                        f"✅ Auto-merged {stale_pr['pr_id']} after {ticket_age} days in review: "
+                        f"✅ Auto-merged {stale_pr['pr_id']} after {review_age} days in review: "
                         f"{stale_pr.get('title', '')[:80]}",
                         current_actor_time_iso,
                     )
                     logger.info(
                         f"    [green]✅ Force-merged {stale_pr['pr_id']} — "
-                        f"{ticket_id} → Done (age={ticket_age}d)[/green]"
+                        f"{ticket.get('id')} → Done (age={review_age}d)[/green]"
                     )
 
-            # Also extend active incident chain if one is live
-            active_inc = next(
-                (i for i in self._state.active_incidents if i.ticket_id == ticket_id),
-                None,
-            )
-            if active_inc and getattr(active_inc, "causal_chain", None):
-                active_inc.causal_chain.append(comment_id)
-                if spawned_pr_id:
-                    active_inc.causal_chain.append(spawned_pr_id)
+                return True
 
-            # Persist chain back onto the ticket document
-            ticket["causal_chain"] = chain.snapshot()
-            ticket["updated_at"] = current_actor_time_iso
+        return False
 
-            self._save_ticket(ticket)
+    def _complete_non_eng_ticket(
+        self,
+        ticket: dict,
+        assignee: str,
+        comment_text: str,
+        ctx: str,
+        date_str: str,
+        timestamp_iso: str,
+        chain: CausalChainHandler,
+    ) -> Optional[str]:
+        """Handles Confluence, Email, or Slack completion for non-eng tickets. Returns completion_id."""
 
-            ticket_body = "\n".join(
-                filter(
-                    None,
-                    [
-                        ticket.get("title", ""),
-                        ticket.get("description", ""),
-                        ticket.get("root_cause", ""),
-                        "\n".join(
-                            c.get("text", "") for c in ticket.get("comments", [])
-                        ),
-                    ],
+        completion_artifact = ticket.get("completion_artifact", "slack")
+        completion_id = None
+
+        if ticket["status"] != "Done":
+            if completion_artifact == "confluence" and self._confluence:
+                completion_id = self._create_design_doc_stub(
+                    author=assignee,
+                    participants=[assignee],
+                    topic=ticket.get("title", comment_text),
+                    ctx=ctx,
+                    date_str=date_str,
+                    slack_transcript=[],
                 )
-            )
-            if self._embed_worker:
-                self._embed_worker.enqueue(
-                    id=ticket_id,
-                    type="jira",
-                    title=ticket.get("title", ticket_id),
-                    content=ticket_body,
-                    day=self._state.day,
-                    date=date_str,
-                    timestamp=current_actor_time_iso,
-                    metadata={
-                        "assignee": ticket.get("assignee", ""),
-                        "status": ticket["status"],
-                        "dept_type": dept_type,
-                    },
+                if completion_id:
+                    chain.append(completion_id)
+                    logger.info(
+                        f"    [dim]📄 {assignee} completed [{ticket.get('id')}] → {completion_id}[/dim]"
+                    )
+
+            elif completion_artifact == "email":
+                completion_id = self._emit_completion_email(
+                    assignee=assignee,
+                    ticket=ticket,
+                    comment_text=comment_text,
+                    date_str=date_str,
+                    timestamp=timestamp_iso,
                 )
+                if completion_id:
+                    chain.append(completion_id)
+
             else:
-                self._mem.embed_artifact(
-                    id=ticket_id,
-                    type="jira",
-                    title=ticket.get("title", ticket_id),
-                    content=ticket_body,
-                    day=self._state.day,
-                    date=date_str,
-                    timestamp=current_actor_time_iso,
-                    metadata={
-                        "assignee": ticket.get("assignee", ""),
-                        "status": ticket["status"],
-                        "dept_type": dept_type,
-                    },
+                dept_channel = (
+                    dept_of_name(assignee, self._org_chart)
+                    .lower()
+                    .replace(" ", "-")
+                    .replace("_", "-")
                 )
-
-            if self._embed_worker:
-                self._embed_worker.enqueue(
-                    id=comment_id,
-                    type="jira_comment",
-                    title=f"Comment on {ticket_id}",
-                    content=comment_text,
-                    day=self._state.day,
-                    date=date_str,
-                    timestamp=current_actor_time_iso,
-                    metadata={
-                        "ticket_id": ticket_id,
-                        "author": assignee,
-                        "dept_type": dept_type,
-                    },
+                slack_msg = {
+                    "user": assignee,
+                    "text": (
+                        f"Wrapped up [{ticket.get('id')}] {ticket.get('title', '')}. "
+                        f"{comment_text}"
+                    ),
+                    "ts": timestamp_iso,
+                    "date": date_str,
+                }
+                _, completion_id = self._save_slack(
+                    [slack_msg], dept_channel, interaction_type="ticket_completion"
                 )
-            else:
-                self._mem.embed_artifact(
-                    id=comment_id,
-                    type="jira_comment",
-                    title=f"Comment on {ticket_id}",
-                    content=comment_text,
-                    day=self._state.day,
-                    date=date_str,
-                    timestamp=current_actor_time_iso,
-                    metadata={
-                        "ticket_id": ticket_id,
-                        "author": assignee,
-                        "dept_type": dept_type,
-                    },
-                )
+                if completion_id:
+                    chain.append(completion_id)
 
-            # Build artifacts dict and SimEvent facts
-            artifacts = {"jira": ticket_id, "jira_comment": comment_id}
-            if spawned_pr_id:
-                artifacts["pr"] = spawned_pr_id
-            if completion_id:
-                artifacts[completion_artifact] = completion_id
+            ticket["status"] = "Done"
+            ticket["completed_at"] = timestamp_iso
 
-            facts = {
-                "ticket_id": ticket_id,
-                "status": ticket["status"],
-                "dept_type": dept_type,
-                "causal_chain": chain.snapshot(),
-            }
-            if spawned_pr_id:
-                facts["spawned_pr"] = spawned_pr_id
-            if completion_id:
-                facts["completion_artifact"] = completion_id
+        return completion_id
 
-            summary = f"{assignee} worked on {ticket_id}."
-            if spawned_pr_id:
-                summary += f" Opened PR {spawned_pr_id}."
-            elif completion_id:
-                summary += f" Completed → {completion_id}."
-
-            self._mem.log_event(
-                SimEvent(
-                    type="ticket_progress",
-                    timestamp=current_actor_time_iso,
-                    day=self._state.day,
-                    date=date_str,
-                    actors=[assignee],
-                    artifact_ids=artifacts,
-                    facts=facts,
-                    summary=summary,
-                    tags=["jira", "non_eng" if is_non_eng else "engineering"],
-                )
+    def _complete_eng_ticket(
+        self,
+        ticket: dict,
+        assignee: str,
+        actor_incident_bound: bool,
+        date_str: str,
+        timestamp_iso: str,
+        chain: CausalChainHandler,
+        is_complete: bool,
+    ) -> Optional[str]:
+        """Spawns a PR for a completed engineering ticket. Returns pr_id."""
+        ticket_id = ticket.get("id")
+        linked_prs = ticket.get("linked_prs", [])
+        ticket_age = self._state.day - ticket.get("in_progress_since", self._state.day)
+        actor_clock_ok = self._clock.now(assignee).hour < 17
+        open_pr_with_changes = bool(linked_prs) and any(
+            self._mem._prs.find_one(
+                {"pr_id": p, "status": "open", "changes_requested": True},
+                {"_id": 0, "pr_id": 1},
             )
+            for p in linked_prs
+        )
 
-            bucket = self._state.ticket_actors_today.setdefault(ticket_id, set())
-            bucket.add(assignee)
+        spawned_pr_id = None
 
-        if self._vader:
-            self._score_and_apply_sentiment(comment_text, [assignee], self._vader)
+        force_spawn = (
+            ticket_age >= 3
+            and not linked_prs
+            and not actor_incident_bound
+            and not open_pr_with_changes
+            and actor_clock_ok
+        )
+        if force_spawn and not linked_prs:
+            pr = self._git.create_pr(
+                author=assignee,
+                ticket_id=ticket_id,
+                linked_ticket=ticket_id,
+                title=f"[{ticket_id}] {ticket['title'][:80]}",
+                timestamp=timestamp_iso,
+            )
+            spawned_pr_id = pr["pr_id"]
+            ticket.setdefault("linked_prs", []).append(spawned_pr_id)
+            ticket["status"] = "In Review"
+            ticket["in_review_since"] = self._state.day
+            chain.append(spawned_pr_id)
 
-        generated_artifacts = [ticket_id]
-        if spawned_pr_id:
-            generated_artifacts.append(spawned_pr_id)
-        if completion_id:
-            generated_artifacts.append(completion_id)
-
-        return generated_artifacts
+        return spawned_pr_id
 
     def _handle_pr_review(
         self,

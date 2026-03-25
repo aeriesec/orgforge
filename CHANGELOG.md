@@ -6,6 +6,27 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.3] — 2026-03-24
+
+### Added
+
+- **Automated PR Stale Management (`src/normal_day.py`)**: Introduced `_try_force_merge_stale_pr` to identify and resolve engineering bottlenecks. PRs idling in review for more than 5 days without requested changes are now automatically merged by "GitHub Actions," transitioning the associated JIRA ticket to "Done."
+- **Refactored Ticket Completion Logic (`src/normal_day.py`)**: Split monolithic ticket processing into `_complete_non_eng_ticket` and `_complete_eng_ticket`. This modular approach handles specialized artifacts (Confluence, Email, Slack) for non-engineering roles and PR lifecycle management for developers.
+- **PR Tracking in Memory (`src/flow.py`)**: Added `upsert_pr` calls during the initial PR creation flow to ensure the internal memory state is immediately consistent with the simulated Git state.
+
+### Changed
+
+- **Code Cleanliness and Scoping (`src/normal_day.py`)**: Significant refactoring of the `NormalDayHandler` to reduce nesting. Improved logic for "force spawning" PRs on engineering tickets that have been in progress for 3+ days to prevent sprint stagnation.
+- **Causal Chain Integration (`src/normal_day.py`)**: Enhanced tracking for incident-related tickets; any PRs or comments spawned during a ticket update are now automatically appended to the active incident's `causal_chain` for better forensic simulation.
+- **Ticket Status Metadata (`src/normal_day.py`)**: Added `in_review_since` timestamps to tickets when they transition to the review phase, allowing for more granular tracking of review cycle times.
+
+### Fixed
+
+- **Redundant Vector Search Logic (`src/normal_day.py`)**: Removed deprecated Tier 1 context comments and unused local variables (`linked_prs`) from the main loop to favor the new structured context retrieval system.
+- **Non-Engineering Event Tagging (`src/normal_day.py`)**: Corrected the `SimEvent` logging to accurately tag events as `non_eng` or `engineering` based on the ticket's department type, ensuring cleaner data for downstream sentiment analysis.
+
+---
+
 ## [v1.2.2] — 2026-03-24
 
 ### Fixed

@@ -510,6 +510,7 @@ class GitSimulator:
             metadata={"author": author, "ticket_id": ticket_id},
         )
         self._state.daily_artifacts_created += 1
+        self._mem.upsert_pr(pr)
 
         return pr
 
