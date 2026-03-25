@@ -6,6 +6,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.6] — 2026-03-25
+
+### Added
+
+- **PR-Aware Planning (`src/day_planner.py`, `src/memory.py`)**: Introduced a explicit `ROUTING RULE` in the department planner. The `in_review_section` now dynamically fetches PR IDs and reviewer lists from memory, allowing the LLM to accurately assign `pr_review` tasks to the correct engineers.
+- **Comprehensive Integration Suite (`tests/test_integration.py`, `tests/test_flow.py`)**: Added extensive integration tests covering the full daily cycle, including ticket status transitions, PR force-merging logic, and non-engineering lifecycle artifacts.
+
+### Changed
+
+- **Causal Chain Reliability (`src/normal_day.py`)**: Refined how causal chains are initialized. The system now prioritizes existing chains from active incidents over ticket-level history, ensuring continuity during high-pressure events.
+- **Codebase Hardening (`Across all files`)**: Executed a systemic removal of legacy ASCII section dividers and redundant comments to improve maintainability and reduce context window bloat.
+
+### Fixed
+
+- **PR Generation Logic (`src/normal_day.py`)**: Fixed a bug where PRs were only spawning on "forced" completions; they are now correctly triggered whenever an engineering ticket is marked as complete.
+- **Validation False Positives (`src/day_planner.py`)**: Updated `_parse_plan` to stop logging warnings for "hallucinated names" when the model correctly identifies valid external collaborators or cross-department leads.
+
+---
+
 ## [v1.2.5] — 2026-03-25
 
 ### Added

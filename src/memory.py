@@ -1735,6 +1735,9 @@ class Memory:
     def get_reviewable_prs_for(self, name: str) -> List[Dict]:
         return list(self._prs.find({"reviewers": name, "status": "open"}, {"_id": 0}))
 
+    def get_pr_by_ticket_id(self, ticket_id: str) -> Optional[Dict]:
+        return self._prs.find_one({"ticket_id": ticket_id}, {"_id": 0})
+
     def log_slack_messages(
         self, channel: str, messages: List[Dict], export_dir: Path
     ) -> Tuple[str, str]:

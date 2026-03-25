@@ -2,11 +2,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXISTING TESTS (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def test_embedder_fallback_mechanism():
     """Ensures the embedder fallback generates a deterministic vector of the correct dimension."""
     from memory import BaseEmbedder
@@ -182,14 +177,6 @@ def test_simevent_serialization():
     assert "p1" in restored_event.tags
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NEW TESTS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ── OllamaEmbedder — input_type prefix bug ────────────────────────────────────
-
-
 class TestOllamaEmbedderInputType:
     """
     Guards the fix for the silent input_type drop in OllamaEmbedder.embed().
@@ -266,9 +253,6 @@ class TestOllamaEmbedderInputType:
             "search_query and search_document produced identical Ollama payloads. "
             "input_type is being ignored — this kills asymmetric retrieval quality."
         )
-
-
-# ── recall() — mutually exclusive filter guard ────────────────────────────────
 
 
 def test_recall_raises_on_type_filter_and_type_exclude_together():
@@ -437,9 +421,6 @@ def test_log_event_appends_to_in_memory_log(make_test_memory):
     assert len(mem._event_log) == initial_len + 3
 
 
-# ── embed_artifact ────────────────────────────────────────────────────────────
-
-
 def test_embed_artifact_upserts_not_duplicates(make_test_memory):
     """
     Calling embed_artifact() twice with the same id must update the existing
@@ -497,9 +478,6 @@ def test_embed_artifact_uses_search_document_input_type(make_test_memory):
     )
 
 
-# ── _to_iso ───────────────────────────────────────────────────────────────────
-
-
 class TestToIso:
     """
     _to_iso() is the normalisation layer that lets every causal-ceiling argument
@@ -529,9 +507,6 @@ class TestToIso:
         assert isinstance(result, str)
 
 
-# ── Jira / PR helpers ─────────────────────────────────────────────────────────
-
-
 def test_upsert_and_get_ticket(make_test_memory):
     """
     upsert_ticket() + get_ticket() round-trip: a ticket written once must be
@@ -557,7 +532,6 @@ def test_upsert_and_get_ticket(make_test_memory):
         "get_ticket() must exclude _id (non-serialisable ObjectId)"
     )
 
-    # Re-upsert with updated status — must not create a second document
     mem.upsert_ticket({**ticket, "status": "Done"})
     assert mem._jira.count_documents({"id": "INC-042"}) == 1
     assert mem.get_ticket("INC-042")["status"] == "Done"
@@ -651,9 +625,6 @@ def test_get_reviewable_prs_for(make_test_memory):
     )
 
 
-# ── persona_history / events_by_type ─────────────────────────────────────────
-
-
 def test_persona_history_returns_only_actor_events(make_test_memory):
     """
     persona_history() must return only events where the named person is in
@@ -684,7 +655,6 @@ def test_persona_history_returns_only_actor_events(make_test_memory):
     history = mem.persona_history("Jax", n=4)
     assert len(history) == 4
     assert all("Jax" in e.actors for e in history)
-    # Must be the last 4 Jax events
     assert history[-1].summary == "Jax event 6"
 
 
@@ -719,9 +689,6 @@ def test_events_by_type_filters_correctly(make_test_memory):
     results = mem.events_by_type("incident_resolved")
     assert len(results) == 2
     assert all(e.type == "incident_resolved" for e in results)
-
-
-# ── context_for_incident ──────────────────────────────────────────────────────
 
 
 def test_context_for_incident_includes_ticket_and_prior(make_test_memory):
@@ -773,9 +740,6 @@ def test_context_for_incident_missing_ticket(make_test_memory):
     assert "not found" in ctx.lower() or "INC-DOESNOTEXIST" in ctx
 
 
-# ── context_for_person ────────────────────────────────────────────────────────
-
-
 def test_context_for_person_shows_open_tickets_only(make_test_memory):
     """
     context_for_person() must include open tickets assigned to the person
@@ -818,9 +782,6 @@ def test_context_for_person_no_tickets_message(make_test_memory):
     assert "no open tickets" in ctx.lower()
 
 
-# ── save / load checkpoint ────────────────────────────────────────────────────
-
-
 def test_save_and_load_checkpoint(make_test_memory):
     """
     save_checkpoint() + load_latest_checkpoint() round-trip: the latest
@@ -849,9 +810,6 @@ def test_save_and_load_checkpoint(make_test_memory):
     assert latest["state"]["system_health"] == 70
 
 
-# ── has_genesis_artifacts ─────────────────────────────────────────────────────
-
-
 def test_has_genesis_artifacts_false_when_empty(make_test_memory):
     """Returns False on a fresh sim with no events."""
     mem = make_test_memory
@@ -877,9 +835,6 @@ def test_has_genesis_artifacts_true_after_genesis_event(make_test_memory):
         )
     )
     assert mem.has_genesis_artifacts() is True
-
-
-# ── conversation summary store ────────────────────────────────────────────────
 
 
 def test_save_and_retrieve_conversation_summary(make_test_memory):
@@ -940,9 +895,6 @@ def test_conversation_summary_type_filter(make_test_memory):
     assert "sprint velocity" not in mentoring_ctx
 
 
-# ── recall_with_rewrite ───────────────────────────────────────────────────────
-
-
 def test_recall_with_rewrite_falls_back_without_llm():
     """
     recall_with_rewrite() with llm_callable=None must fall back to
@@ -998,9 +950,6 @@ def test_recall_with_rewrite_uses_rewritten_query():
     )
 
 
-# ── stats ─────────────────────────────────────────────────────────────────────
-
-
 def test_stats_reflects_artifact_and_event_counts(make_test_memory):
     """
     stats() must report accurate counts from MongoDB — not stale cached values.
@@ -1040,9 +989,6 @@ def test_stats_reflects_artifact_and_event_counts(make_test_memory):
 
     assert after["artifact_count"] == before["artifact_count"] + 1
     assert after["event_count"] == before["event_count"] + 1
-
-
-# ── reset ─────────────────────────────────────────────────────────────────────
 
 
 def test_reset_clears_all_collections_and_event_log(make_test_memory):

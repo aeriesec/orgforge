@@ -163,7 +163,7 @@ class DepartmentPlanner:
                     {{
                         "activity_type": "exactly one of: ticket_progress | pr_review | 1on1 | async_question | design_discussion | mentoring | deep_work",
                         "description": "string — max 6 words",
-                        "related_id": "string — MUST be from owned tickets or null",
+                        "related_id": "string — for ticket_progress: MUST be from owned tickets or null. For pr_review: use the PR ID (e.g. PR-107) from the IN REVIEW TICKETS section above.",
                         "collaborator": ["string"],
                         "estimated_hrs": float
                     }}
@@ -191,6 +191,11 @@ class DepartmentPlanner:
 
     ### IN REVIEW TICKETS - owned tickets that are pending review
     {in_review_section}
+
+    ROUTING RULE: For each ticket listed above, look up its linked PR's `reviewers` list.
+    Assign a `pr_review` agenda item to those reviewers — NOT to the ticket author.
+    The author should NOT receive any ticket_progress items for tickets that are already In Review.
+    For pr_review items, `related_id` should be the PR ID (e.g. PR-107), not the ticket ID.
 
     ### ENGINEER CAPACITY TODAY (hours available after stress/on-call)
     {capacity_section}
@@ -281,7 +286,17 @@ class DepartmentPlanner:
             ]
             capacity_section = "\n".join(cap_lines)
 
-            in_review_lines = [f"  - [{tid}]" for tid in sprint_context.in_review]
+            in_review_lines = []
+            for tid in sprint_context.in_review:
+                pr = mem.get_pr_by_ticket_id(tid)
+                if pr:
+                    reviewers = ", ".join(pr.get("reviewers", []))
+                    pr_id = pr.get("pr_id", "?")
+                    in_review_lines.append(
+                        f"  - [{tid}] → {pr_id} | awaiting review from: {reviewers}"
+                    )
+                else:
+                    in_review_lines.append(f"  - [{tid}] → no PR found")
             in_review_section = (
                 "\n".join(in_review_lines) if in_review_lines else "  (none)"
             )
@@ -374,8 +389,6 @@ class DepartmentPlanner:
 
         return result
 
-    # ─── Parsing ─────────────────────────────────────────────────────────────
-
     def _parse_plan(
         self,
         raw: str,
@@ -394,7 +407,7 @@ class DepartmentPlanner:
         integrity check still catches any stray violations, but does not need
         to be the primary guardrail.
         """
-        # Strip any accidental markdown fences
+
         clean = raw.replace("```json", "").replace("```", "").strip()
         data = json_repair.loads(clean)
 
@@ -405,10 +418,6 @@ class DepartmentPlanner:
             )
             return self._fallback_plan(org_theme, day, date, cross_signals), {}
 
-        # ── Build a fast-lookup set of valid (engineer → ticket) pairs ────────
-        # If SprintContext is present we can enforce ownership at parse time
-        # as a belt-and-suspenders check.  This should rarely fire now that
-        # the LLM receives the locked menu.
         owned_by: Dict[str, str] = (
             sprint_context.owned_tickets if sprint_context else {}
         )
@@ -418,15 +427,13 @@ class DepartmentPlanner:
         for ep in data.get("engineer_plans", []):
             name = ep.get("name", "")
             if name not in self.members:
-                continue  # LLM invented a name — skip silently
+                continue
 
             agenda = []
             for a in ep.get("agenda", []):
                 activity_type = a.get("activity_type", "ticket_progress")
                 related_id = a.get("related_id")
 
-                # Belt-and-suspenders ownership check — catches the rare LLM
-                # slip-through.  Logs a warning instead of silently stripping.
                 if activity_type == "ticket_progress" and related_id and sprint_context:
                     actual_owner = owner_of.get(related_id)
                     if actual_owner and actual_owner != name:
@@ -437,12 +444,10 @@ class DepartmentPlanner:
                         )
                         continue
 
-                # Get the flat list of all valid employee names
                 all_valid_names = {
                     n for members in LIVE_ORG_CHART.values() for n in members
                 }
 
-                # Coerce the raw LLM output, but strictly filter out hallucinated names
                 raw_collabs = _coerce_collaborators(a.get("collaborator"))
                 valid_collabs = [c for c in raw_collabs if c in all_valid_names]
 
@@ -456,7 +461,6 @@ class DepartmentPlanner:
                     )
                 )
 
-            # Fallback agenda if LLM returned nothing useful
             if not agenda:
                 agenda = [
                     AgendaItem(
@@ -471,12 +475,11 @@ class DepartmentPlanner:
                     name=name,
                     dept=self.dept,
                     agenda=agenda,
-                    stress_level=0,  # will be patched by orchestrator after parse
+                    stress_level=0,
                     focus_note=ep.get("focus_note", ""),
                 )
             )
 
-        # Ensure every member has a plan (even if LLM missed them)
         planned_names = {p.name for p in eng_plans}
         for name in self.members:
             if name not in planned_names:
@@ -492,18 +495,16 @@ class DepartmentPlanner:
                     "design_discussion",
                     "async_question",
                 ):
-                    # Create a normalized key of the participants
                     participants = frozenset([ep.name] + a.collaborator)
                     collab_key = (a.activity_type, participants)
 
                     if collab_key in seen_collaborations:
-                        continue  # We already kept the initiator's version of this meeting
+                        continue
                     seen_collaborations.add(collab_key)
 
                 unique_agenda.append(a)
             ep.agenda = unique_agenda
 
-        # ── Proposed events ───────────────────────────────────────────────────
         proposed: List[ProposedEvent] = []
         for pe in data.get("proposed_events", []):
             actors = [a for a in pe.get("actors", []) if a]
@@ -890,11 +891,6 @@ class OrgCoordinator:
         return "\n".join(lines) if lines else "  (no other departments)"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ORCHESTRATOR — top-level entry point for flow.py
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class DayPlannerOrchestrator:
     """
     Called once per day from flow.py's daily_cycle(), replacing _generate_theme().
@@ -919,7 +915,6 @@ class DayPlannerOrchestrator:
         self._planner_llm = planner_llm
         self._clock = clock
 
-        # Build one DepartmentPlanner per department
         self._dept_planners: Dict[str, DepartmentPlanner] = {}
         for dept, members in LIVE_ORG_CHART.items():
             is_primary = "eng" in dept.lower()
@@ -941,8 +936,8 @@ class DayPlannerOrchestrator:
             external_contact_names=external_names,
             config=config,
         )
-        # TicketAssigner is stateless per-call — one instance for the whole sim
-        self._ticket_assigner: Optional[TicketAssigner] = None  # set on first plan()
+
+        self._ticket_assigner: Optional[TicketAssigner] = None
 
     def plan(
         self,

@@ -260,7 +260,6 @@ class NormalDayHandler:
 
         backstory = get_voice_card(assignee, "async", self._gd, self._mem)
 
-        # Role framing differs by dept type
         if is_non_eng:
             persona = self._config.get("personas", {}).get(assignee, {})
             agent_role = persona.get("role", dept_of_name(assignee, self._org_chart))
@@ -368,16 +367,25 @@ class NormalDayHandler:
             if "in_progress_since" not in ticket:
                 ticket["in_progress_since"] = self._state.day
 
-        # ── Initialise or extend causal chain on the ticket itself ────────────
-        # For non-eng tickets there is no ActiveIncident, so we track the chain
-        # directly on the ticket document. For eng tickets we also do this so
-        # evals can traverse the chain without needing an open incident.
         from causal_chain_handler import CausalChainHandler
+
+        active_inc = next(
+            (i for i in self._state.active_incidents if i.ticket_id == ticket_id),
+            None,
+        )
 
         existing_chain = ticket.get("causal_chain", [ticket_id])
         chain = CausalChainHandler(existing_chain[0])
         for artifact in existing_chain[1:]:
             chain.append(artifact)
+
+        if active_inc and getattr(active_inc, "causal_chain", None):
+            chain = active_inc.causal_chain
+        else:
+            existing_chain = ticket.get("causal_chain", [ticket_id])
+            chain = CausalChainHandler(existing_chain[0])
+            for artifact in existing_chain[1:]:
+                chain.append(artifact)
 
         comment_id = f"{ticket_id}_comment_{len(ticket['comments'])}"
         chain.append(comment_id)
@@ -413,15 +421,6 @@ class NormalDayHandler:
                     chain,
                     is_complete,
                 )
-
-        active_inc = next(
-            (i for i in self._state.active_incidents if i.ticket_id == ticket_id),
-            None,
-        )
-        if active_inc and getattr(active_inc, "causal_chain", None):
-            active_inc.causal_chain.append(comment_id)
-            if spawned_pr_id:
-                active_inc.causal_chain.append(spawned_pr_id)
 
         ticket["causal_chain"] = chain.snapshot()
         ticket["updated_at"] = current_actor_time_iso
@@ -728,7 +727,6 @@ class NormalDayHandler:
         chain: CausalChainHandler,
         is_complete: bool,
     ) -> Optional[str]:
-        """Spawns a PR for a completed engineering ticket. Returns pr_id."""
         ticket_id = ticket.get("id")
         linked_prs = ticket.get("linked_prs", [])
         ticket_age = self._state.day - ticket.get("in_progress_since", self._state.day)
@@ -750,7 +748,8 @@ class NormalDayHandler:
             and not open_pr_with_changes
             and actor_clock_ok
         )
-        if force_spawn and not linked_prs:
+
+        if (force_spawn or is_complete) and not linked_prs:
             pr = self._git.create_pr(
                 author=assignee,
                 ticket_id=ticket_id,

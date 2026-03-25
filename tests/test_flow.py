@@ -1,7 +1,16 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from memory import SimEvent
-from flow import OrgForgeSimulation
+from flow import (
+    GitSimulator,
+    OrgForgeSimulation,
+    SprintState,
+    build_social_graph,
+    dept_of,
+    email_of,
+    render_template,
+    score_sentiment,
+)
 
 from datetime import datetime
 
@@ -538,3 +547,192 @@ def test_retrospective_simevent_timestamp_within_scheduled_window(
         f"retrospective timestamp {stamped} outside expected window "
         f"[{window_start}, {window_end})"
     )
+
+
+def test_render_template():
+    with (
+        patch("flow.LEGACY", {"name": "OldDB", "project_name": "ProjectX"}),
+        patch("flow.PRODUCT_PAGE", "Product1"),
+        patch("flow.COMPANY_NAME", "TestCorp"),
+        patch("flow.INDUSTRY", "Tech"),
+    ):
+        res = render_template(
+            "{legacy_system} {project_name} {product_page} {company_name} {industry}"
+        )
+        assert res == "OldDB ProjectX Product1 TestCorp Tech"
+
+
+def test_dept_of():
+    with patch(
+        "flow.ORG_CHART", {"Engineering": ["Alice", "Bob"], "Sales": ["Charlie"]}
+    ):
+        assert dept_of("Bob") == "Engineering"
+        assert dept_of("Charlie") == "Sales"
+        assert dept_of("UnknownPerson") == "Unknown"
+
+
+def test_email_of():
+    with patch("flow.COMPANY_DOMAIN", "example.com"):
+        assert email_of("Alice") == "alice@example.com"
+        assert email_of("Bob-Smith") == "bob-smith@example.com"
+
+
+def test_sprint_state_start_date():
+    sprint = SprintState(sprint_number=2)
+    start_dt = datetime(2026, 1, 1)
+    res = sprint.start_date(start_dt, 10)
+    assert res.weekday() < 5
+    assert (res - start_dt).days == 14
+
+
+def test_score_sentiment():
+    messages = [{"text": "This is terrible and I hate it!"}, {"text": "Awful."}]
+    res = score_sentiment(messages)
+    assert res < 0.5
+
+    messages_good = [
+        {"text": "This is absolutely wonderful and great!"},
+        {"text": "Fantastic."},
+    ]
+    res_good = score_sentiment(messages_good)
+    assert res_good > 0.5
+
+    assert score_sentiment([]) == 0.5
+
+
+def test_build_social_graph():
+    with (
+        patch("flow.ORG_CHART", {"Eng": ["Alice", "Bob"], "Sales": ["Charlie"]}),
+        patch("flow.LEADS", {"Eng": "Alice", "Sales": "Charlie"}),
+        patch(
+            "flow.CONFIG",
+            {"external_contacts": [{"name": "VendorA", "internal_liaison": "Eng"}]},
+        ),
+    ):
+        G = build_social_graph()
+        assert G.has_node("Alice")
+        assert G.has_node("VendorA")
+        assert G.nodes["Alice"]["is_lead"] is True
+        assert G.nodes["Bob"]["is_lead"] is False
+        assert G.nodes["VendorA"]["external"] is True
+        assert G.has_edge("VendorA", "Alice")
+        assert G["Alice"]["Bob"]["weight"] > G["Alice"]["Charlie"]["weight"]
+
+
+def test_git_simulator_merge_pr(mock_flow):
+    mock_flow._mem._prs = MagicMock()
+    git_sim = GitSimulator(
+        mock_flow.state, mock_flow._mem, mock_flow.social_graph, MagicMock()
+    )
+    with patch("os.path.exists", return_value=False):
+        git_sim.merge_pr("PR-100")
+        mock_flow._mem._prs.update_one.assert_called_with(
+            {"pr_id": "PR-100"}, {"$set": {"status": "merged"}}
+        )
+
+
+def test_is_sprint_planning_day(mock_flow):
+    with patch("flow.CONFIG", {"simulation": {"sprint_length_days": 10}}):
+        mock_flow.state.day = 1
+        assert mock_flow._is_sprint_planning_day() is True
+        mock_flow.state.day = 2
+        assert mock_flow._is_sprint_planning_day() is False
+        mock_flow.state.day = 11
+        assert mock_flow._is_sprint_planning_day() is True
+
+
+def test_is_retro_day(mock_flow):
+    with patch("flow.CONFIG", {"simulation": {"sprint_length_days": 10}}):
+        mock_flow.state.day = 9
+        assert mock_flow._is_retro_day() is True
+        mock_flow.state.day = 10
+        assert mock_flow._is_retro_day() is False
+        mock_flow.state.day = 19
+        assert mock_flow._is_retro_day() is True
+
+
+def test_is_standup_day(mock_flow):
+    with patch("flow.CONFIG", {"simulation": {"sprint_length_days": 10}}):
+        mock_flow.state.current_date = datetime(2026, 1, 5)
+        mock_flow.state.day = 2
+        assert mock_flow._is_standup_day() is True
+
+        mock_flow.state.current_date = datetime(2026, 1, 6)
+        assert mock_flow._is_standup_day() is False
+
+
+def test_record_daily_actor_and_event(mock_flow):
+    mock_flow.state.daily_active_actors = []
+    mock_flow.state.daily_event_type_counts = {}
+
+    mock_flow._record_daily_actor("Alice", "Bob")
+    mock_flow._record_daily_actor("Alice")
+    assert mock_flow.state.daily_active_actors == ["Alice", "Bob", "Alice"]
+
+    mock_flow._record_daily_event("test_event")
+    mock_flow._record_daily_event("test_event")
+    assert mock_flow.state.daily_event_type_counts["test_event"] == 2
+
+
+def test_select_domain_expert(mock_flow):
+    mock_flow._mem.find_expert_by_skill = MagicMock(
+        return_value=[
+            {"name": "Alice", "dept": "Engineering_Backend", "score": 0.9},
+            {"name": "Bob", "dept": "Engineering_Backend", "score": 0.8},
+        ]
+    )
+    with patch("flow.LIVE_ORG_CHART", {"Engineering_Backend": ["Alice", "Bob"]}):
+        res = mock_flow._select_domain_expert(
+            "DB crash", exclude="Alice", search_depts={"Engineering_Backend"}
+        )
+        assert res == "Bob"
+
+        res_no_exclude = mock_flow._select_domain_expert(
+            "DB crash", exclude="Charlie", search_depts={"Engineering_Backend"}
+        )
+        assert res_no_exclude == "Alice"
+
+
+def test_advance_incidents_state_machine(mock_flow):
+    from flow import ActiveIncident
+
+    inc = ActiveIncident(ticket_id="INC-1", title="Test", day_started=1)
+    mock_flow.state.active_incidents = [inc]
+    mock_flow._git.create_pr = MagicMock(
+        return_value={"pr_id": "PR-1", "reviewers": ["Bob"]}
+    )
+    mock_flow._emit_bot_message = MagicMock()
+    mock_flow._mem.get_ticket = MagicMock(return_value={})
+
+    mock_flow._advance_incidents()
+    assert inc.stage == "investigating"
+
+    mock_flow._advance_incidents()
+    assert inc.stage == "fix_in_progress"
+    assert inc.pr_id == "PR-1"
+
+    mock_flow._mem._prs.find_one = MagicMock(return_value={"reviewers": ["Bob"]})
+    mock_flow._normal_day._handle_pr_review_for_incident = MagicMock()
+    mock_flow._advance_incidents()
+    assert inc.stage == "review_pending"
+    mock_flow._normal_day._handle_pr_review_for_incident.assert_called()
+
+    mock_flow._git.merge_pr = MagicMock()
+    mock_flow._write_postmortem = MagicMock()
+    mock_flow._advance_incidents()
+    assert inc.stage == "resolved"
+    assert "INC-1" in mock_flow.state.resolved_incidents
+
+
+def test_build_llm_ollama_branch():
+    with (
+        patch("flow._PROVIDER", "ollama"),
+        patch("flow._PRESET", {"planner": "mock-planner"}),
+        patch("flow.OllamaLLM") as MockOllama,
+    ):
+        from flow import build_llm
+
+        build_llm("planner")
+        MockOllama.assert_called_with(
+            model="mock-planner", base_url="http://localhost:11434"
+        )

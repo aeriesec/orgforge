@@ -37,10 +37,6 @@ from day_planner import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED CONSTANTS & HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
 ORG_CHART = {
     "Engineering": ["Alice", "Bob"],
     "Sales": ["Dave"],
@@ -220,11 +216,6 @@ def _make_dept_plan(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIXTURES
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 @pytest.fixture
 def mock_llm():
     return MagicMock()
@@ -259,11 +250,6 @@ def mock_mem(make_test_memory):
     return mem
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. _coerce_collaborators utility
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class TestCoerceCollaborators:
     def test_none_returns_empty_list(self):
         assert _coerce_collaborators(None) == []
@@ -279,11 +265,6 @@ class TestCoerceCollaborators:
 
     def test_empty_list_returns_empty(self):
         assert _coerce_collaborators([]) == []
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. DepartmentPlanner._parse_plan — JSON parsing & model construction
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class TestDepartmentPlannerParsePlan:
@@ -665,13 +646,8 @@ class TestExtractCrossSignals:
         )
         mock_mem.get_event_log.return_value = [event]
         signals = orch._extract_cross_signals(mock_mem, day=5)
-        # Engineering is the source; it should NOT see its own signal
+
         assert "Engineering" not in signals
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. DepartmentPlanner._patch_stress_levels (via Orchestrator)
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class TestPatchStressLevels:
@@ -696,11 +672,6 @@ class TestPatchStressLevels:
         orch._patch_stress_levels(plan, mock_graph_dynamics)
         for ep in plan.engineer_plans:
             assert ep.stress_level == 30
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. OrgCoordinator.coordinate — JSON parsing & collision events
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class TestOrgCoordinatorCoordinate:
@@ -793,11 +764,6 @@ class TestOrgCoordinatorCoordinate:
                 dept_plans, state, 5, "2026-01-05", "My Org Theme"
             )
         assert org_plan.org_theme == "My Org Theme"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. DepartmentPlanner.plan — LLM path integration (Crew patched)
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class TestDepartmentPlannerPlan:
@@ -1028,11 +994,6 @@ class TestDayPlannerOrchestratorInit:
         assert "VendorPat" in ext_names
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 11. DayPlannerOrchestrator.plan — high-level wiring
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class TestDayPlannerOrchestratorPlan:
     """
     These tests patch out every LLM call and verify that the orchestrator
@@ -1077,17 +1038,14 @@ class TestDayPlannerOrchestratorPlan:
         ):
             orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
 
-            # Set up TicketAssigner stub
             mock_ta = MagicMock()
             mock_ta.build.return_value = _make_sprint_context()
             mock_ta_cls.return_value = mock_ta
 
-            # Set up dept planners to return canned plans
             for dept, planner in orch._dept_planners.items():
                 members = CONFIG["org_chart"][dept]
                 planner.plan = MagicMock(return_value=_make_dept_plan(dept, members))
 
-            # OrgCoordinator
             eng_plan = _make_dept_plan("Engineering")
             sales_plan = _make_dept_plan("Sales", members=["Dave"])
             org_plan = OrgDayPlan(
@@ -1100,7 +1058,6 @@ class TestDayPlannerOrchestratorPlan:
             )
             mock_coord_cls.return_value.coordinate.return_value = org_plan
 
-            # PlanValidator
             orch._validator.validate_plan.return_value = []
             orch._validator.rejected.return_value = []
             orch._validator.drain_novel_log.return_value = []
@@ -1317,7 +1274,7 @@ class TestDayPlannerOrchestratorPlan:
 
     def test_ceo_is_excluded_from_sprint_contexts(self, mock_mem, mock_graph_dynamics):
         """Departments missing from LEADS (like CEO) must be skipped during ticket assignment."""
-        # 1. Mock the charts to include a CEO who is NOT in LEADS
+
         mock_org_chart = {"Engineering": ["Alice"], "CEO": ["John"]}
         mock_leads = {"Engineering": "Alice"}
 
@@ -1343,12 +1300,10 @@ class TestDayPlannerOrchestratorPlan:
             mock_ta.build.return_value = _make_sprint_context()
             mock_ta_cls.return_value = mock_ta
 
-            # Stub the individual department planners
             for dept, planner in orch._dept_planners.items():
                 members = CONFIG["org_chart"].get(dept, ["Alice"])
                 planner.plan = MagicMock(return_value=_make_dept_plan(dept, members))
 
-            # Stub the org coordinator
             mock_coord_cls.return_value.coordinate.return_value = OrgDayPlan(
                 org_theme="Theme",
                 dept_plans={},
@@ -1366,12 +1321,381 @@ class TestDayPlannerOrchestratorPlan:
                 clock=self._make_clock(state),
             )
 
-            # 2. Extract the department names TicketAssigner was asked to build
             called_depts = [
                 call.kwargs.get("dept_name") or call.args[2]
                 for call in mock_ta.build.call_args_list
             ]
 
-            # 3. Assert Engineering got tickets, but CEO was completely skipped
             assert "Engineering" in called_depts
             assert "CEO" not in called_depts
+
+
+class TestDepartmentPlannerSecondaryContext:
+    def test_open_tickets_no_tickets(self, dept_planner, mock_mem):
+        mock_mem._jira.find = MagicMock(return_value=[])
+        result = dept_planner._open_tickets(MagicMock(), mock_mem)
+        assert "no open tickets assigned" in result
+
+    def test_open_tickets_formats_correctly(self, dept_planner, mock_mem):
+        mock_tickets = [
+            {"id": "ENG-101", "title": "Fix the DB", "assignee": "Alice"},
+            {"id": "ENG-102", "title": "Update React", "assignee": "Bob"},
+        ]
+        mock_mem._jira.find = MagicMock(return_value=mock_tickets)
+        result = dept_planner._open_tickets(MagicMock(), mock_mem)
+        assert "ENG-101" in result
+        assert "Fix the DB" in result
+        assert "Alice" in result
+        assert "ENG-102" in result
+
+    def test_format_email_signals_ignores_irrelevant_or_dropped(self, dept_planner):
+        class MockEmailSignal:
+            def __init__(self, dropped, category, liaison):
+                self.dropped = dropped
+                self.category = category
+                self.internal_liaison = liaison
+                self.source_name = "Vendor"
+                self.source_org = "SaaS Co"
+                self.subject = "Invoice"
+                self.body_preview = "Please pay"
+
+        signals = [
+            MockEmailSignal(dropped=True, category="vendor", liaison="Engineering"),
+            MockEmailSignal(dropped=False, category="spam", liaison="Engineering"),
+            MockEmailSignal(dropped=False, category="vendor", liaison="Sales"),
+        ]
+
+        result = dept_planner._format_email_signals(signals, liaison_dept="Engineering")
+        assert result == ""
+
+    def test_format_email_signals_includes_relevant_vendor_emails(self, dept_planner):
+        class MockEmailSignal:
+            def __init__(self):
+                self.dropped = False
+                self.category = "vendor"
+                self.internal_liaison = "Engineering"
+                self.source_name = "CloudProvider"
+                self.source_org = "AWS"
+                self.subject = "Urgent: Maintenance"
+                self.body_preview = "Rebooting instances."
+
+        signals = [MockEmailSignal()]
+        result = dept_planner._format_email_signals(signals, liaison_dept="Engineering")
+        assert "CloudProvider" in result
+        assert "Urgent: Maintenance" in result
+
+
+class TestOrgCoordinatorFormatOtherPlans:
+    def test_format_other_plans_omits_eng_key(self):
+        coord = OrgCoordinator(CONFIG, MagicMock())
+        dept_plans = {
+            "Engineering": _make_dept_plan("Engineering"),
+            "Sales": _make_dept_plan("Sales", members=["Dave"]),
+        }
+
+        result = coord._format_other_plans(dept_plans, eng_key="Engineering")
+        assert "Sales" in result
+        assert "Dave" in result
+        assert "Engineering" not in result
+
+    def test_format_other_plans_empty(self):
+        coord = OrgCoordinator(CONFIG, MagicMock())
+        result = coord._format_other_plans(
+            {"Engineering": _make_dept_plan("Engineering")}, eng_key="Engineering"
+        )
+        assert "(no other departments)" in result
+
+
+class TestDayPlannerOrchestratorSecondaryFeatures:
+    def _make_orch(self):
+        with patch("day_planner.PlanValidator"), patch("day_planner.OrgCoordinator"):
+            return DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
+
+    def test_generate_org_theme(self, mock_mem):
+        orch = self._make_orch()
+        mock_mem.previous_day_context = MagicMock(return_value="Yesterday was tough.")
+
+        with patch("day_planner.Task"), patch("day_planner.Crew") as mock_crew:
+            mock_crew.return_value.kickoff.return_value = (
+                "We must ship the auth refactor."
+            )
+            state = _make_mock_state()
+            state.persona_stress = {"Alice": 50}
+
+            theme = orch._generate_org_theme(state, mock_mem, MagicMock())
+            assert theme == "We must ship the auth refactor."
+
+    def test_recent_day_summaries(self, mock_mem):
+        orch = self._make_orch()
+        mock_mem.get_recent_day_summaries = MagicMock(return_value=[{"day": 4}])
+
+        result = orch._recent_day_summaries(mock_mem, day=5)
+        assert len(result) == 1
+        assert result[0]["day"] == 4
+
+    def test_plan_thread_exception_falls_back_gracefully(
+        self, mock_mem, mock_graph_dynamics
+    ):
+        """If a non-engineering department's planner completely fails, it should use a fallback plan, not crash."""
+        with (
+            patch("day_planner.PlanValidator"),
+            patch("day_planner.LIVE_ORG_CHART", ORG_CHART),
+            patch("day_planner.OrgCoordinator") as mock_coord_cls,
+            patch("day_planner.TicketAssigner") as mock_ta_cls,
+            patch.object(
+                DayPlannerOrchestrator, "_generate_org_theme", return_value="Theme"
+            ),
+            patch.object(
+                DayPlannerOrchestrator, "_extract_cross_signals", return_value={}
+            ),
+            patch.object(
+                DayPlannerOrchestrator, "_recent_day_summaries", return_value=[]
+            ),
+        ):
+            orch = DayPlannerOrchestrator(CONFIG, MagicMock(), MagicMock(), MagicMock())
+
+            mock_ta = MagicMock()
+            mock_ta.build.return_value = _make_sprint_context()
+            mock_ta_cls.return_value = mock_ta
+
+            for dept, planner in orch._dept_planners.items():
+                if dept == "Engineering":
+                    planner.plan = MagicMock(
+                        return_value=_make_dept_plan("Engineering")
+                    )
+                else:
+                    planner.plan = MagicMock(
+                        side_effect=Exception("Bedrock timeout API Error")
+                    )
+
+            mock_coord_cls.return_value.coordinate.side_effect = (
+                lambda plans, *args, **kwargs: OrgDayPlan(
+                    org_theme="Theme",
+                    dept_plans=plans,
+                    collision_events=[],
+                    coordinator_reasoning="",
+                    day=5,
+                    date="2026-01-05",
+                )
+            )
+
+            state = _make_mock_state()
+            clock = MagicMock()
+            clock.now.return_value = datetime(2026, 1, 5, 9, 0, 0)
+
+            org_plan = orch.plan(
+                state=state,
+                mem=mock_mem,
+                graph_dynamics=mock_graph_dynamics,
+                clock=clock,
+            )
+
+            assert "Sales" in org_plan.dept_plans
+            sales_plan = org_plan.dept_plans["Sales"]
+
+            assert "Fallback plan" in sales_plan.planner_reasoning
+
+
+class TestOrgCoordinatorParsingEdgeCases:
+    def _make_coordinator(self):
+        from day_planner import OrgCoordinator
+
+        return OrgCoordinator(CONFIG, MagicMock())
+
+    def test_coordinator_handles_list_response(self):
+        coord = self._make_coordinator()
+        raw = json.dumps(
+            [
+                {
+                    "collision": {
+                        "event_type": "list_parsed_event",
+                        "actors": ["Alice", "Dave"],
+                        "rationale": "Testing list unwrapping",
+                        "facts_hint": {},
+                        "priority": 1,
+                    }
+                }
+            ]
+        )
+        state = _make_mock_state()
+        dept_plans = {"Engineering": _make_dept_plan("Engineering")}
+
+        with (
+            patch("agent_factory.Agent"),
+            patch("day_planner.Task"),
+            patch("day_planner.Crew") as mock_crew,
+        ):
+            mock_crew.return_value.kickoff.return_value = raw
+            org_plan = coord.coordinate(dept_plans, state, 5, "2026-01-05", "Theme")
+
+        assert len(org_plan.collision_events) == 1
+        assert org_plan.collision_events[0].event_type == "list_parsed_event"
+
+    def test_coordinator_handles_jsondecodeerror(self):
+        coord = self._make_coordinator()
+        state = _make_mock_state()
+        dept_plans = {"Engineering": _make_dept_plan("Engineering")}
+
+        with (
+            patch("agent_factory.Agent"),
+            patch("day_planner.Task"),
+            patch("day_planner.Crew") as mock_crew,
+        ):
+            mock_crew.return_value.kickoff.return_value = "{"
+            org_plan = coord.coordinate(dept_plans, state, 5, "2026-01-05", "Theme")
+
+        assert len(org_plan.collision_events) == 0
+        assert org_plan.coordinator_reasoning == ""
+
+    def test_coordinator_handles_missing_lead_stress_fallback(self):
+        coord = self._make_coordinator()
+        state = _make_mock_state()
+        state.persona_stress = {}
+        dept_plans = {"Engineering": _make_dept_plan("Engineering")}
+
+        with (
+            patch("agent_factory.Agent"),
+            patch("day_planner.Task"),
+            patch("day_planner.Crew") as mock_crew,
+        ):
+            mock_crew.return_value.kickoff.return_value = json.dumps(
+                {"collision": None}
+            )
+            coord.coordinate(dept_plans, state, 5, "2026-01-05", "Theme")
+
+        task_desc = (
+            mock_crew.call_args.kwargs.get("tasks", [MagicMock()])[0].description
+            if mock_crew.call_args
+            else ""
+        )
+        if not task_desc:
+            task_desc = (
+                mock_crew.call_args[1].get("tasks", [MagicMock()])[0].description
+                if len(mock_crew.call_args) > 1
+                else ""
+            )
+
+        assert task_desc is not None
+
+
+class TestDepartmentPlannerContextFormatting:
+    def test_plan_formats_active_incidents(
+        self, dept_planner, mock_graph_dynamics, mock_mem
+    ):
+        state = _make_mock_state()
+        mock_incident = MagicMock()
+        mock_incident.causal_chain = True
+        mock_incident.ticket_id = "INC-999"
+        mock_incident.stage = "investigating"
+        mock_incident.root_cause = "Database went down"
+        mock_incident.on_call = "Alice"
+        mock_incident.days_active = 2
+        state.active_incidents = [mock_incident]
+
+        with (
+            patch("agent_factory.Agent"),
+            patch("day_planner.Task") as mock_task_cls,
+            patch("day_planner.Crew") as mock_crew,
+        ):
+            mock_crew.return_value.kickoff.return_value = json.dumps(VALID_PLAN_JSON)
+            dept_planner.plan(
+                "Theme", 5, "2026-01-05", state, mock_mem, mock_graph_dynamics, []
+            )
+
+        call_args = mock_task_cls.call_args
+        description = call_args.kwargs.get("description") if call_args else ""
+        assert "INC-999" in description
+        assert "investigating" in description
+        assert "Database went down" in description
+
+    def test_plan_formats_lifecycle_context(
+        self, dept_planner, mock_graph_dynamics, mock_mem
+    ):
+        state = _make_mock_state()
+        lifecycle_str = "Dave joined the team yesterday."
+
+        with (
+            patch("agent_factory.Agent"),
+            patch("day_planner.Task") as mock_task_cls,
+            patch("day_planner.Crew") as mock_crew,
+        ):
+            mock_crew.return_value.kickoff.return_value = json.dumps(VALID_PLAN_JSON)
+            dept_planner.plan(
+                "Theme",
+                5,
+                "2026-01-05",
+                state,
+                mock_mem,
+                mock_graph_dynamics,
+                [],
+                lifecycle_context=lifecycle_str,
+            )
+
+        call_args = mock_task_cls.call_args
+        description = call_args.kwargs.get("description") if call_args else ""
+        assert "ROSTER CHANGES" in description
+        assert "Dave joined the team yesterday." in description
+
+    def test_plan_without_sprint_context_uses_fallback_formatting(
+        self, dept_planner, mock_graph_dynamics, mock_mem
+    ):
+        state = _make_mock_state()
+        dept_planner._open_tickets = MagicMock(return_value="Mocked open tickets")
+
+        with (
+            patch("agent_factory.Agent"),
+            patch("day_planner.Task") as mock_task_cls,
+            patch("day_planner.Crew") as mock_crew,
+        ):
+            mock_crew.return_value.kickoff.return_value = json.dumps(VALID_PLAN_JSON)
+            dept_planner.plan(
+                "Theme",
+                5,
+                "2026-01-05",
+                state,
+                mock_mem,
+                mock_graph_dynamics,
+                [],
+                sprint_context=None,
+            )
+
+        call_args = mock_task_cls.call_args
+        description = call_args.kwargs.get("description") if call_args else ""
+        assert "Mocked open tickets" in description
+        assert "standard 6h per engineer" in description
+        assert "(none)" in description
+
+    def test_plan_with_empty_sprint_context_data(
+        self, dept_planner, mock_graph_dynamics, mock_mem
+    ):
+        state = _make_mock_state()
+        empty_ctx = SprintContext(
+            owned_tickets={},
+            available_tickets=[],
+            capacity_by_member={},
+            sprint_theme="Theme",
+            in_progress_ids=[],
+            in_review=[],
+        )
+
+        with (
+            patch("agent_factory.Agent"),
+            patch("day_planner.Task") as mock_task_cls,
+            patch("day_planner.Crew") as mock_crew,
+        ):
+            mock_crew.return_value.kickoff.return_value = json.dumps(VALID_PLAN_JSON)
+            dept_planner.plan(
+                "Theme",
+                5,
+                "2026-01-05",
+                state,
+                mock_mem,
+                mock_graph_dynamics,
+                [],
+                sprint_context=empty_ctx,
+            )
+
+        call_args = mock_task_cls.call_args
+        description = call_args.kwargs.get("description") if call_args else ""
+        assert "(none — all tickets unassigned)" in description
+        assert "(none available)" in description

@@ -7,11 +7,6 @@ from datetime import datetime
 from sim_clock import SimClock
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIXTURES
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 @pytest.fixture
 def mock_sim(make_test_memory):
     """Flow instance with mocked LLMs and a mongomock-backed Memory."""
@@ -65,7 +60,6 @@ def lifecycle(mock_sim):
     all_names = ["Alice", "Bob", "Carol"]
     leads = {"Engineering": "Alice"}
 
-    # Build a fresh graph that matches the org_chart above
     import networkx as nx
     from graph_dynamics import GraphDynamics
 
@@ -98,11 +92,6 @@ def lifecycle(mock_sim):
         leads=leads,
     )
     return mgr, gd, org_chart, all_names, mock_sim.state
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. JIRA TICKET REASSIGNMENT
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_departure_reassigns_open_tickets(lifecycle, mock_clock):
@@ -591,7 +580,7 @@ def test_knowledge_gap_scan_deduplicates(lifecycle, mock_clock):
         for call in mgr._mem.log_event.call_args_list
         if call.args[0].type == "knowledge_gap_detected"
     ]
-    assert len(gap_events) == 2  # second scan must be a no-op
+    assert len(gap_events) == 2
 
 
 def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):
@@ -766,11 +755,6 @@ def test_new_hire_record_stored_on_state(lifecycle, mock_clock):
     assert state.new_hires["Taylor"]["role"] == "Backend Engineer"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. VALIDATOR PATCH
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def test_patch_validator_removes_departed_actor(lifecycle, mock_clock):
     """
     After a departure, patch_validator_for_lifecycle must remove the departed
@@ -837,11 +821,6 @@ def test_patch_validator_adds_new_hire(lifecycle, mock_clock):
     assert "Taylor" in validator._valid_actors
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. ROSTER CONTEXT
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def test_get_roster_context_reflects_departure_and_hire(lifecycle, mock_clock):
     """
     get_roster_context must surface both a recent departure and a recent hire
@@ -880,11 +859,6 @@ def test_get_roster_context_reflects_departure_and_hire(lifecycle, mock_clock):
     assert "redis-cache" in context
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED HELPER — real SimClock wired to a minimal state stub
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def _make_real_clock(date: datetime) -> SimClock:
     """
     Returns a real SimClock backed by a minimal state stub.
@@ -894,11 +868,6 @@ def _make_real_clock(date: datetime) -> SimClock:
     state_stub.current_date = date
     state_stub.actor_cursors = {}
     return SimClock(state_stub)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. DEPARTURE CLOCK — timestamp correctness
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_departure_simevent_timestamp_is_early_morning(lifecycle):
@@ -1035,11 +1004,6 @@ def test_departure_and_hire_same_day_timestamps_are_in_business_hours(lifecycle)
         assert (ts.hour, ts.minute) <= (17, 30), f"{label} timestamp after 17:30: {ts}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. HIRE CLOCK — timestamp correctness
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
     """
     _execute_hire post-corrects the hire timestamp to be ≥ 09:30 when
@@ -1118,28 +1082,12 @@ def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 11. CENTRALITY VACUUM — timestamp field correctness
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
     """
     _apply_centrality_vacuum receives `timestamp_iso` (a pre-formatted string)
     via a parameter misleadingly named `clock`. The resulting SimEvent's
     timestamp field must be a parseable ISO-8601 string, not a raw clock
     object or None.
-
-    Topology: Bob bridges a left triangle (Alice–Carol–Dave) to a right pair
-    (Eve–Frank), with a single thin back-channel Dave–Frank that keeps the
-    graph connected after Bob is removed. Dave and Frank then become the sole
-    path between the two sides, so their betweenness centrality increases
-    and stress_hit clears the int(delta * multiplier) floor.
-
-    A simple linear chain does NOT work here: when the bridge node is removed
-    from a chain, the graph splits into disconnected components, all remaining
-    nodes drop to zero betweenness, and no positive delta is produced. The
-    graph must stay connected after the departure for the vacuum to fire.
     """
     import networkx as nx
     from graph_dynamics import GraphDynamics
@@ -1149,20 +1097,19 @@ def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
     G = nx.Graph()
     for n in nodes:
         G.add_node(n, dept="Engineering", is_lead=(n == "Alice"), external=False)
-    # Left triangle — stays intact after Bob leaves
+
     G.add_edge("Alice", "Carol", weight=8.0)
     G.add_edge("Alice", "Dave", weight=8.0)
     G.add_edge("Carol", "Dave", weight=8.0)
-    # Right pair
+
     G.add_edge("Eve", "Frank", weight=8.0)
-    # Bob is the primary bridge left↔right
+
     G.add_edge("Bob", "Alice", weight=8.0)
     G.add_edge("Bob", "Eve", weight=8.0)
-    # Thin back-channel — keeps graph connected so Dave/Frank gain centrality
+
     G.add_edge("Dave", "Frank", weight=0.1)
 
     config = {
-        # High multiplier ensures int(delta * multiplier) >= 1 even for small deltas
         "org_lifecycle": {"centrality_vacuum_stress_multiplier": 1000},
         "graph_dynamics": {},
         "personas": {
