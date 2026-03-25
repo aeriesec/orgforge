@@ -22,28 +22,6 @@ Three departure side-effects handled deterministically (no LLM involvement):
   3. Active incident handoff — if the departing engineer is the named
      responder on any live incident, ownership is forcibly transferred to the
      next person in the Dijkstra escalation chain before the node is removed.
-
-Config schema (add to config.yaml under "org_lifecycle"):
-  org_lifecycle:
-    scheduled_departures:
-      - name: "Jordan"
-        day: 15
-        reason: "voluntary"          # voluntary | layoff | performance
-        role: "Senior Backend Engineer"
-        knowledge_domains: ["auth-service", "redis-cache"]
-        documented_pct: 0.30
-    scheduled_hires:
-      - name: "Taylor"
-        day: 18
-        dept: "Engineering"
-        role: "Backend Engineer"
-        expertise: ["Python", "Kafka"]
-        style: "methodical, asks lots of questions"
-        tenure: "new"
-    enable_random_attrition: false
-    random_attrition_daily_prob: 0.01
-    # Stress points applied per unit of centrality gained after a departure
-    centrality_vacuum_stress_multiplier: 40
 """
 
 from __future__ import annotations
@@ -62,11 +40,6 @@ from graph_dynamics import GraphDynamics
 logger = logging.getLogger("orgforge.lifecycle")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA TYPES
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 @dataclass
 class DepartureRecord:
     """Immutable record of an engineer who has left the organisation."""
@@ -75,13 +48,12 @@ class DepartureRecord:
     dept: str
     role: str
     day: int
-    reason: str  # voluntary | layoff | performance
+    reason: str
     knowledge_domains: List[str]
     documented_pct: float
     peak_stress: int
-    edge_snapshot: Dict[str, float]  # {neighbour: weight} before removal
+    edge_snapshot: Dict[str, float]
     centrality_at_departure: float = 0.0
-    # Populated by the departure engine's side-effect methods
     reassigned_tickets: List[str] = field(default_factory=list)
     incident_handoffs: List[str] = field(default_factory=list)
 
@@ -97,7 +69,7 @@ class HireRecord:
     expertise: List[str]
     style: str
     tenure: str = "new"
-    warmup_threshold: float = 2.0  # edges below this = "not yet collaborating"
+    warmup_threshold: float = 2.0
 
 
 @dataclass
@@ -107,11 +79,6 @@ class KnowledgeGapEvent:
     triggered_by: str
     triggered_on_day: int
     documented_pct: float
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MANAGER
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class OrgLifecycleManager:
@@ -732,12 +699,10 @@ class OrgLifecycleManager:
             "expertise": expertise,
             "tenure": tenure,
             "stress": 20,
-            "social_role": hire_cfg.get(
-                "social_role", "The Reliable Contributor"
-            ),  # Capture from config
+            "social_role": hire_cfg.get("social_role", "The Reliable Contributor"),
             "typing_quirks": hire_cfg.get(
                 "typing_quirks", "Standard professional grammar."
-            ),  # Capture from config
+            ),
         }
 
         persona_data = self._personas.get(name, {})
@@ -801,7 +766,7 @@ class OrgLifecycleManager:
         hire_time = clock.schedule_meeting(
             [name], min_hour=9, max_hour=10, duration_mins=30
         )
-        # Ensure it doesn't roll back before 09:30
+
         if hire_time.minute < 30 and hire_time.hour == 9:
             hire_time = hire_time.replace(minute=random.randint(30, 59))
 
@@ -847,12 +812,10 @@ class OrgLifecycleManager:
         """
         backfill_cfg = self._cfg.get("backfill", {})
 
-        # Which departure reasons trigger a backfill attempt
         reasons_that_backfill = backfill_cfg.get("trigger_reasons", ["voluntary"])
         if record.reason not in reasons_that_backfill:
             return
 
-        # Layoffs explicitly blocked from backfill
         if record.reason == "layoff":
             return
 
@@ -863,7 +826,6 @@ class OrgLifecycleManager:
         if name is None:
             return
 
-        # Build a minimal hire config from the departing person's persona
         departed_persona = self._personas.get(record.name, {})
         backfill_hire = {
             "name": backfill_cfg.get("name_prefix", "NewHire") + f"_{hire_day}",
@@ -873,7 +835,7 @@ class OrgLifecycleManager:
             "style": "still ramping up, asks frequent questions",
             "tenure": "new",
             "day": hire_day,
-            "_backfill_for": record.name,  # metadata only — for SimEvent logging
+            "_backfill_for": record.name,
         }
 
         self._scheduled_hires.setdefault(hire_day, []).append(backfill_hire)
@@ -922,7 +884,6 @@ class OrgLifecycleManager:
                     Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
                 ).strip()
 
-                # Strip any punctuation the LLM smuggled in
                 name = " ".join(raw.split())
                 name = "".join(c for c in name if c.isalpha() or c == " ").strip()
 
@@ -947,8 +908,6 @@ class OrgLifecycleManager:
         )
         return None
 
-    # ─── Private helpers ──────────────────────────────────────────────────────
-
     def _count_warm_edges(self, hire: HireRecord) -> int:
         G = self._gd.G
         if not G.has_node(hire.name):
@@ -958,11 +917,6 @@ class OrgLifecycleManager:
             for nb in G.neighbors(hire.name)
             if G[hire.name][nb].get("weight", 0) >= hire.warmup_threshold
         )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS — called from flow.py
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def patch_validator_for_lifecycle(

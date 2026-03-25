@@ -12,11 +12,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENGINEER-LEVEL AGENDA
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 @dataclass
 class AgendaItem:
     """
@@ -24,15 +19,13 @@ class AgendaItem:
     These are intentions, not guarantees — incidents can compress or defer them.
     """
 
-    activity_type: str  # "ticket_progress", "pr_review", "design_doc",
-    # "1on1", "async_question", "mentoring", "deep_work"
-    description: str  # human-readable, e.g. "Continue ORG-101 retry logic"
-    related_id: Optional[str] = None  # ticket ID, PR ID, or Confluence ID if applicable
-    collaborator: List[str] = field(
-        default_factory=list
-    )  # engineers this touches (drives Slack)
-    estimated_hrs: float = 2.0  # rough time weight — used to detect overload
-    deferred: bool = False  # set True by incident pressure at runtime
+    activity_type: str
+
+    description: str
+    related_id: Optional[str] = None
+    collaborator: List[str] = field(default_factory=list)
+    estimated_hrs: float = 2.0
+    deferred: bool = False
     defer_reason: Optional[str] = None
 
 
@@ -46,11 +39,9 @@ class EngineerDayPlan:
     name: str
     dept: str
     agenda: List[AgendaItem]
-    stress_level: int  # from graph_dynamics._stress at plan time
+    stress_level: int
     is_on_call: bool = False
-    focus_note: str = (
-        ""  # one-sentence LLM colour — e.g. "Jax is in heads-down mode today"
-    )
+    focus_note: str = ""
 
     @property
     def capacity_hrs(self) -> float:
@@ -74,7 +65,7 @@ class EngineerDayPlan:
         Defers low-priority items until capacity is restored.
         """
         freed = 0.0
-        # Defer in reverse-priority order: deep_work and design_doc first
+
         defer_order = [
             "deep_work",
             "design_doc",
@@ -96,11 +87,6 @@ class EngineerDayPlan:
                         break
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DEPARTMENT-LEVEL PLAN
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 @dataclass
 class CrossDeptSignal:
     """
@@ -112,7 +98,7 @@ class CrossDeptSignal:
     event_type: str
     summary: str
     day: int
-    relevance: str  # "direct" | "indirect" — how strongly it shapes today
+    relevance: str
 
 
 @dataclass
@@ -123,9 +109,9 @@ class LifecycleContext:
     can propose onboarding_session or warmup_1on1 events naturally.
     """
 
-    recent_departures: List[Dict[str, Any]]  # [{name, dept, day, domains}]
-    recent_hires: List[Dict[str, Any]]  # [{name, dept, day, role}]
-    active_gaps: List[str]  # knowledge domain strings still unresolved
+    recent_departures: List[Dict[str, Any]]
+    recent_hires: List[Dict[str, Any]]
+    active_gaps: List[str]
 
 
 @dataclass
@@ -161,15 +147,13 @@ class ProposedEvent:
     Must pass PlanValidator before execution.
     """
 
-    event_type: str  # known type OR novel proposal
-    actors: List[str]  # must match real names in org_chart/external_contacts
-    rationale: str  # one sentence — why now
-    facts_hint: Dict[str, Any]  # seed facts for the executor — NOT invented by LLM
-    priority: int  # 1=must fire, 2=fire if capacity, 3=opportunistic
-    is_novel: bool = (
-        False  # True if LLM proposed an event type not in KNOWN_EVENT_TYPES
-    )
-    artifact_hint: Optional[str] = None  # e.g. "slack", "jira", "confluence", "email"
+    event_type: str
+    actors: List[str]
+    rationale: str
+    facts_hint: Dict[str, Any]
+    priority: int
+    is_novel: bool = False
+    artifact_hint: Optional[str] = None
 
 
 @dataclass
@@ -180,19 +164,14 @@ class DepartmentDayPlan:
     """
 
     dept: str
-    theme: str  # dept-specific theme (not org theme)
-    engineer_plans: List[EngineerDayPlan]  # one per dept member
-    proposed_events: List[ProposedEvent]  # ordered by priority
-    cross_dept_signals: List[CrossDeptSignal]  # what influenced this plan
-    planner_reasoning: str  # LLM chain-of-thought — for researchers
+    theme: str
+    engineer_plans: List[EngineerDayPlan]
+    proposed_events: List[ProposedEvent]
+    cross_dept_signals: List[CrossDeptSignal]
+    planner_reasoning: str
     day: int
     date: str
-    sprint_context: Optional["SprintContext"] = None  # populated by TicketAssigner
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ORG-LEVEL PLAN
-# ─────────────────────────────────────────────────────────────────────────────
+    sprint_context: Optional["SprintContext"] = None
 
 
 @dataclass
@@ -203,8 +182,8 @@ class OrgDayPlan:
     """
 
     org_theme: str
-    dept_plans: Dict[str, DepartmentDayPlan]  # keyed by dept name
-    collision_events: List[ProposedEvent]  # cross-dept interactions
+    dept_plans: Dict[str, DepartmentDayPlan]
+    collision_events: List[ProposedEvent]
     coordinator_reasoning: str
     day: int
     date: str
@@ -213,17 +192,12 @@ class OrgDayPlan:
     def all_events_by_priority(self) -> List[ProposedEvent]:
         """Flat list of all events across departments, sorted priority → dept (Eng first)."""
         all_events = list(self.collision_events)
-        # Engineering fires first — it's the primary driver
+
         for dept in sorted(
             self.dept_plans.keys(), key=lambda d: 0 if "eng" in d.lower() else 1
         ):
             all_events.extend(self.dept_plans[dept].proposed_events)
         return sorted(all_events, key=lambda e: e.priority)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VALIDATION RESULT
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -234,21 +208,13 @@ class ValidationResult:
     was_novel: bool = False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KNOWN EVENT TYPES
-# The validator uses this to flag novel proposals vs known ones.
-# Add to this list as the engine gains new capabilities.
-# ─────────────────────────────────────────────────────────────────────────────
-
 KNOWN_EVENT_TYPES = {
-    # Engineering — operational
     "incident_opened",
     "incident_resolved",
     "escalation_chain",
     "fix_in_progress",
     "postmortem_created",
     "knowledge_gap_detected",
-    # Engineering — routine
     "standup",
     "pr_review",
     "ticket_progress",
@@ -256,22 +222,18 @@ KNOWN_EVENT_TYPES = {
     "async_question",
     "code_review_comment",
     "deep_work_session",
-    # Sprint
     "sprint_planned",
     "retrospective",
     "sprint_goal_updated",
-    # Cross-dept
     "leadership_sync",
     "feature_request_from_sales",
     "stability_update_to_sales",
     "hr_checkin",
     "morale_intervention",
     "1on1_scheduled",
-    # External
     "external_contact_summarized",
     "vendor_meeting",
     "customer_escalation",
-    # Org
     "normal_day_slack",
     "confluence_created",
     "day_summary",

@@ -51,7 +51,7 @@ from typing import Any, Dict
 
 logger = logging.getLogger("orgforge.embed_worker")
 
-_SENTINEL = None  # signals the consumer thread to exit cleanly
+_SENTINEL = None
 
 
 class EmbedWorker:
@@ -75,11 +75,9 @@ class EmbedWorker:
         self._thread = threading.Thread(
             target=self._consume,
             name="embed-worker",
-            daemon=True,  # exits automatically if main thread dies
+            daemon=True,
         )
-        self._errors: list[Exception] = []  # accumulated — surfaced at drain()
-
-    # ── Lifecycle ──────────────────────────────────────────────────────────────
+        self._errors: list[Exception] = []
 
     def start(self) -> None:
         """Start the background consumer thread. Call once from Flow.__init__."""
@@ -98,8 +96,6 @@ class EmbedWorker:
             logger.warning("[embed_worker] Consumer thread did not exit within 60s.")
         else:
             logger.info("[embed_worker] Background embed queue stopped cleanly.")
-
-    # ── Public API ─────────────────────────────────────────────────────────────
 
     def enqueue(self, **kwargs) -> None:
         """
@@ -122,14 +118,12 @@ class EmbedWorker:
         After drain() returns, MongoDB is consistent with all enqueued artifacts.
         Any errors accumulated during background processing are logged here.
         """
-        self._queue.join()  # blocks until task_done() called for every item
+        self._queue.join()
 
         if self._errors:
             for err in self._errors:
                 logger.error(f"[embed_worker] Background embed error: {err}")
             self._errors.clear()
-
-    # ── Consumer ───────────────────────────────────────────────────────────────
 
     def _consume(self) -> None:
         """

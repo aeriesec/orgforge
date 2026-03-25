@@ -11,7 +11,7 @@ from agent_factory import make_agent
 from config_loader import COMPANY_DESCRIPTION
 from crewai import Process, Task, Crew
 
-import json_repair
+from json_repair import json_repair, repair_json
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
 from planner_models import (
@@ -23,15 +23,9 @@ from planner_models import (
 )
 from causal_chain_handler import CausalChainHandler
 from insider_threat import _NullInjector
+from utils.persona_utils import get_voice_card
 
 logger = logging.getLogger("orgforge.normalday")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ACTIVITY HANDLERS
-# One method per agenda item activity_type.
-# Each returns a list of artifacts written and actors involved.
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class NormalDayHandler:
@@ -75,194 +69,18 @@ class NormalDayHandler:
         self._embed_worker = embed_worker
         self._lifecycle = lifecycle
 
-    def _deduped_voice_cards(self, names: list, context: str) -> str:
-        """
-        Build a joined voice card string for a list of participants,
-        merging cards that are identical (e.g. multiple default-persona users).
-
-        Participants with the same card body (everything below the header line)
-        are collapsed into a single card with a combined header:
-            "Raj / Miki / Taylor | Role: Contributor | Expertise: general engineering"
-
-        This saves tokens when several engineers share the same default persona
-        and mood, which is common for un-configured org members.
-        """
-        card_body_to_names: dict[str, list[str]] = {}
-        card_body_to_first_card: dict[str, str] = {}
-
-        for name in names:
-            card = self._voice_card(name, context)
-            lines = card.split("\n")
-            # Body = everything after the header line
-            body = "\n".join(lines[1:])
-            if body not in card_body_to_names:
-                card_body_to_names[body] = []
-                card_body_to_first_card[body] = card
-            card_body_to_names[body].append(name)
-
-        parts = []
-        for body, group_names in card_body_to_names.items():
-            if len(group_names) == 1:
-                parts.append(card_body_to_first_card[body])
-            else:
-                # Merge: replace first name in header with "Name1 / Name2 / ..."
-                first_card = card_body_to_first_card[body]
-                header = first_card.split("\n")[0]
-                merged_header = header.replace(
-                    group_names[0], " / ".join(group_names), 1
-                )
-                parts.append(merged_header + "\n" + body)
-
-        return "\n\n".join(parts)
-
-    def _voice_card(self, name: str, context: str = "general") -> str:
-        """
-        Returns a concise persona card for injection into LLM prompts.
-
-        context controls which fields are included and how mood is worded:
-          "one_on_one"   — tenure, style, typing, mood
-          "async"        — tenure, dept, expertise, style, typing, mood, anti_patterns
-          "design"       — social_role, expertise, style, typing, mood, anti_patterns, pet_peeves
-          "mentoring"    — tenure, expertise, style, typing, mood
-          "collision"    — dept, social_role, style, typing, mood, anti_patterns, pet_peeves
-          "dm"           — style, typing, mood, anti_patterns
-          "watercooler"  — tenure, social_role, interests, typing, mood
-          "general"      — tenure, style, typing, mood (fallback)
-
-        Fields included per context:
-          style         — all contexts except watercooler (casual, label adds friction)
-          anti_patterns — async, design, collision, dm (where generic voice drifts most)
-          pet_peeves    — design, collision only (situational trigger, noise elsewhere)
-          interests     — watercooler only
-        """
-        p = self._config.get("personas", {}).get(name, {})
-        stress = self._gd._stress.get(name, 30)
-        quirks = p.get("typing_quirks", "standard professional grammar")
-        tenure = p.get("tenure", "mid")
-        expertise = (
-            ", ".join(str(e) for e in p.get("expertise", [])[:3])
-            or "general engineering"
-        )
-        social_role = p.get("social_role", "Contributor")
-        dept = dept_of_name(name, self._org_chart)
-        interests = (
-            ", ".join(
-                str(i) for i in (p.get("interests") or p.get("expertise", []))[:3]
-            )
-            or "general topics"
-        )
-        style = p.get("style", "")
-        anti_patterns = p.get("anti_patterns", "")
-        pet_peeves = p.get("pet_peeves", "")
-
-        # Mood strings tuned per interaction context
-        _moods: Dict[str, tuple] = {
-            "one_on_one": (
-                "drained, short replies",
-                "a bit distracted",
-                "relaxed and present",
-            ),
-            "async": (
-                "visibly stressed, terse replies, wants to resolve this fast",
-                "somewhat distracted but trying to help",
-                "engaged and happy to dig in",
-            ),
-            "design": (
-                "terse, wants to decide fast and move on",
-                "engaged but watching the clock",
-                "thinking carefully, happy to explore trade-offs",
-            ),
-            "mentoring": (
-                "drained, keeping answers short",
-                "patient but distracted",
-                "engaged and generous with their time",
-            ),
-            "collision": (
-                "visibly stressed, terse, wants this resolved immediately",
-                "frustrated but trying to stay professional",
-                "measured and collegial",
-            ),
-            "dm": (
-                "stressed and frustrated, wants this unblocked now",
-                "concerned but calm",
-                "helpful and focused",
-            ),
-            "watercooler": (
-                "visibly drained, short replies, clearly wants this to be over quickly",
-                "a bit distracted, somewhat engaged but mind is elsewhere",
-                "relaxed and happy to take a break",
-            ),
-            "general": (
-                "drained, short replies",
-                "a bit distracted",
-                "relaxed and present",
-            ),
-        }
-        high, mid, low = _moods.get(context, _moods["general"])
-        mood = high if stress > 80 else mid if stress > 60 else low
-
-        # ── Header: identity fields per context ───────────────────────────────
-        if context == "one_on_one":
-            header = f"{name} | Tenure: {tenure}"
-        elif context == "async":
-            header = f"{name} | Tenure: {tenure} | Dept: {dept}"
-        elif context == "design":
-            header = f"{name} | Role: {social_role} | Expertise: {expertise}"
-        elif context == "mentoring":
-            header = f"{name} | Tenure: {tenure} | Expertise: {expertise}"
-        elif context == "collision":
-            header = f"{name} | Dept: {dept} | Role: {social_role}"
-        elif context == "dm":
-            header = f"{name}"
-        elif context == "watercooler":
-            header = f"{name} | Tenure: {tenure} | Role: {social_role}"
-        else:
-            header = f"{name} | Tenure: {tenure}"
-
-        if style and context != "watercooler":
-            header += f" | Style: {style}"
-
-        # ── Body: fixed fields always present ─────────────────────────────────
-        lines = [header, f"  Typing style: {quirks}", f"  Current mood: {mood}"]
-
-        # ── Optional inserts by context ───────────────────────────────────────
-        if context == "async":
-            lines.insert(2, f"  Expertise: {expertise}")
-        elif context == "watercooler":
-            lines.insert(2, f"  Personal interests: {interests}")
-
-        # anti_patterns: keeps LLM from drifting to generic corporate voice
-        # most valuable where task pressure is highest
-        _anti_pattern_contexts = {"async", "design", "collision", "dm"}
-        if anti_patterns and context in _anti_pattern_contexts:
-            lines.append(f"  Never write {name} as: {anti_patterns.strip()}")
-
-        # pet_peeves: situational trigger — only where friction is already the point
-        _pet_peeve_contexts = {"design", "collision"}
-        if pet_peeves and context in _pet_peeve_contexts:
-            lines.append(f"  Pet peeves (will react if triggered): {pet_peeves}")
-
-        return "\n".join(lines)
-
-    # ─── PUBLIC ENTRY POINT ───────────────────────────────────────────────────
-
     def handle(self, org_plan: OrgDayPlan) -> None:
         """Processes both planned agenda items and unplanned org collisions."""
         logger.info("  [bold blue]💬 Normal Day Activity[/bold blue]")
         date_str = str(self._state.current_date.date())
 
-        # 1. Execute the planned daily work
         self._execute_agenda_items(org_plan, date_str)
 
-        # 2. Execute the unplanned cross-dept collisions (Synergy or Friction)
         for event in org_plan.collision_events:
             self._handle_collision_event(event, date_str)
 
-        # These fire regardless — they're ambient signals, not agenda-driven
         self._maybe_bot_alerts()
         self._maybe_adhoc_confluence()
-
-    # ─── AGENDA EXECUTION ─────────────────────────────────────────────────────
 
     def _execute_agenda_items(self, org_plan: OrgDayPlan, date_str: str) -> None:
         """
@@ -271,7 +89,6 @@ class NormalDayHandler:
         all_participants: List[str] = []
         seen_discussions: set = set()
 
-        # Process Engineering first, then others
         ordered_depts = sorted(
             org_plan.dept_plans.keys(),
             key=lambda d: 0 if "engineering" in d.lower() else 1,
@@ -301,7 +118,6 @@ class NormalDayHandler:
                         self._log_deferred_item(eng_plan.name, item, date_str)
                         continue
 
-                    # The distraction now fires accurately mid-agenda!
                     if (
                         will_be_distracted
                         and not distraction_fired
@@ -313,7 +129,6 @@ class NormalDayHandler:
                         self._clock.advance_actor(eng_plan.name, penalty_hours)
                         distraction_fired = True
 
-                    # Deduplicate group conversations so they only happen once per group
                     if item.activity_type in (
                         "design_discussion",
                         "mentoring",
@@ -339,7 +154,6 @@ class NormalDayHandler:
                             continue
                         seen_discussions.add(key)
 
-                    # Execute the actual work sequentially
                     try:
                         participants = self._dispatch(
                             eng_plan, item, dept_plan, date_str
@@ -379,17 +193,12 @@ class NormalDayHandler:
         elif t == "mentoring":
             return self._handle_mentoring(eng_plan, item, date_str)
         elif t == "deep_work":
-            # Deep work is intentionally silent — no artifact, no Slack
-            # But we log a SimEvent so the day_summary knows who was heads-down
             self._log_deep_work(eng_plan.name, item, date_str)
             return [eng_plan.name]
         elif t == "code_review_comment":
             return self._handle_pr_review(eng_plan, item, date_str)
         else:
-            # Unknown activity type — generate a generic Slack message
             return self._handle_generic_activity(eng_plan, item, date_str)
-
-    # ─── ACTIVITY HANDLERS ───────────────────────────────────────────────────
 
     def _handle_ticket_progress(
         self,
@@ -449,9 +258,7 @@ class NormalDayHandler:
                 )
             )
 
-        backstory = self._persona_helper(
-            assignee, mem=self._mem, graph_dynamics=self._gd
-        )
+        backstory = get_voice_card(assignee, "async", self._gd, self._mem)
 
         # Role framing differs by dept type
         if is_non_eng:
@@ -476,7 +283,7 @@ class NormalDayHandler:
             completion_note = ""
 
         agent = make_agent(
-            role=agent_role,
+            role=f"{assignee} — {agent_role}",
             backstory=backstory,
             goal="Make progress on the ticket and report status.",
             llm=self._worker,
@@ -628,9 +435,7 @@ class NormalDayHandler:
                     ticket.get("title", ""),
                     ticket.get("description", ""),
                     ticket.get("root_cause", ""),
-                    "\n".join(
-                        c.get("text", "") for c in ticket.get("comments", [])
-                    ),
+                    "\n".join(c.get("text", "") for c in ticket.get("comments", [])),
                 ],
             )
         )
@@ -973,7 +778,6 @@ class NormalDayHandler:
         reviewer = eng_plan.name
         pr_id = item.related_id
 
-        # Find the PR — if no specific ID, pick an open one the reviewer is on
         pr = self._find_pr(pr_id) or self._find_reviewable_pr(reviewer)
         if not pr:
             return [reviewer]
@@ -986,12 +790,8 @@ class NormalDayHandler:
         current_actor_time = artifact_time.isoformat()
 
         ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
-        backstory = self._persona_helper(
-            reviewer,
-            mem=self._mem,
-            graph_dynamics=self._gd,
-            extra=f"You are {reviewer}, reviewing {author}'s PR: {pr_title}.",
-        )
+        backstory = get_voice_card(reviewer, "async", self._gd, self._mem)
+        p = self._config.get("personas", {}).get(reviewer, {})
 
         recurrence_hint = ""
         linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
@@ -1006,12 +806,8 @@ class NormalDayHandler:
                     f"Prior root cause: {ancestor_root_cause[:120]}"
                 )
 
-        # Generate review comment + structured verdict.
-        # Verdict drives ticket lifecycle — approval merges; changes_requested
-        # keeps the PR open and returns the ticket to In Progress for the author
-        # to address and push a follow-up commit to the same PR.
         agent = make_agent(
-            role=f"{reviewer}, Code Reviewer",
+            role=f"{reviewer} — {p.get('social_role', 'Code Reviewer')}",
             goal=f"Write a PR review comment as {reviewer} would, reflecting your current stress and style.",
             backstory=backstory,
             llm=self._worker,
@@ -1043,7 +839,6 @@ class NormalDayHandler:
             Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         ).strip()
 
-        # Parse structured verdict — fall back gracefully if LLM misbehaves
         try:
             clean_review = raw_review.replace("```json", "").replace("```", "").strip()
             parsed_review = json.loads(clean_review)
@@ -1064,14 +859,12 @@ class NormalDayHandler:
         }
         pr.setdefault("comments", []).append(pr_comment)
 
-        # Apply verdict to PR and linked ticket
         linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
         linked_ticket = (
             self._mem.get_ticket(linked_ticket_id) if linked_ticket_id else None
         )
 
         if verdict == "approved":
-            # Merge the PR and close out the ticket
             pr["status"] = "merged"
             if linked_ticket:
                 linked_ticket["status"] = "Done"
@@ -1089,13 +882,10 @@ class NormalDayHandler:
                 f"{linked_ticket_id} → Done[/green]"
             )
         else:
-            # Changes requested — PR stays open, ticket returns to In Progress.
-            # The author will address the feedback and push to the same PR;
-            # _handle_ticket_progress will advance it back to In Review when done.
             pr["changes_requested"] = True
             if linked_ticket and linked_ticket.get("status") == "In Review":
                 linked_ticket["status"] = "In Progress"
-                # Reset in_progress_since so force-spawn timer restarts from today
+
                 linked_ticket["in_progress_since"] = self._state.day
                 linked_ticket["updated_at"] = current_actor_time
                 self._save_ticket(linked_ticket)
@@ -1111,7 +901,6 @@ class NormalDayHandler:
                 f"{linked_ticket_id} → In Progress[/yellow]"
             )
 
-        # Write back the mutated PR to both stores
         pr_path = f"{self._base}/git/prs/{pr.get('pr_id', pr_id)}.json"
         import os
         import json as _json
@@ -1121,8 +910,6 @@ class NormalDayHandler:
             _json.dump(pr, f, indent=2)
         self._mem.upsert_pr(pr)
 
-        # Reply thread — only fire when changes are requested, mirrors real
-        # GitHub behaviour where approvals rarely need a follow-up thread
         if verdict == "changes_requested":
             actors, reply_thread_id = self._emit_review_reply(
                 author,
@@ -1136,7 +923,6 @@ class NormalDayHandler:
             actors = [reviewer, author]
             reply_thread_id = None
 
-        # Boost PR review edge
         self._gd.record_pr_review(author, [reviewer])
 
         artifact_ids = {"pr": pr.get("pr_id", pr_id or "")}
@@ -1243,7 +1029,6 @@ class NormalDayHandler:
         author = pr.get("author", reviewer)
         pr_title = pr.get("title", "Unknown PR")
 
-        # Advance reviewer's clock by a short review block (30–60 min)
         review_hrs = 0.5
         artifact_time, _ = self._clock.advance_actor(reviewer, hours=review_hrs)
         current_actor_time = artifact_time.isoformat()
@@ -1262,15 +1047,11 @@ class NormalDayHandler:
                 )
 
         ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
-        backstory = self._persona_helper(
-            reviewer,
-            mem=self._mem,
-            graph_dynamics=self._gd,
-            extra=f"You are {reviewer}, reviewing an incident fix PR by {author}: {pr_title}.",
-        )
+        backstory = get_voice_card(reviewer, "async", self._gd, self._mem)
+        p = self._config.get("personas", {}).get(reviewer, {})
 
         agent = make_agent(
-            role=f"{reviewer}, Code Reviewer",
+            role=f"{reviewer} — {p.get('social_role', 'Code Reviewer')}",
             goal=f"Write a PR review comment as {reviewer} would, reflecting your current stress and style.",
             backstory=backstory,
             llm=self._worker,
@@ -1296,7 +1077,6 @@ class NormalDayHandler:
             Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         ).strip()
 
-        # Append comment to PR document and persist to both stores
         pr_comment = {
             "author": reviewer,
             "date": date_str,
@@ -1311,7 +1091,6 @@ class NormalDayHandler:
             _json.dump(pr, f, indent=2)
         self._mem.upsert_pr(pr)
 
-        # Emit GitHub bot message in #engineering
         self._emit_bot_message(
             "engineering",
             "GitHub",
@@ -1319,7 +1098,6 @@ class NormalDayHandler:
             current_actor_time,
         )
 
-        # If the comment is a question, generate an author reply
         reply_thread_id = None
         if "?" in review_text:
             actors, reply_thread_id = self._emit_review_reply(
@@ -1333,14 +1111,12 @@ class NormalDayHandler:
         else:
             actors = [reviewer, author]
 
-        # Boost the review relationship in the social graph
         self._gd.record_pr_review(author, [reviewer])
 
         artifact_ids: dict = {"pr": pr_id}
         if reply_thread_id:
             artifact_ids["slack_thread"] = reply_thread_id
 
-        # Attach to the incident's causal chain if one is live
         linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
         causal_facts: dict = {}
         active_inc = next(
@@ -1354,7 +1130,7 @@ class NormalDayHandler:
         if active_inc and getattr(active_inc, "causal_chain", None):
             active_inc.causal_chain.append(pr_id)
             causal_facts["causal_chain"] = active_inc.causal_chain.snapshot()
-            # Persist updated chain to the ticket document
+
             t = self._mem.get_ticket(linked_ticket_id)
             if t:
                 t["causal_chain"] = active_inc.causal_chain.snapshot()
@@ -1415,7 +1191,9 @@ class NormalDayHandler:
             as_of_time=meeting_time_iso,
         )
 
-        voice_cards = f"{self._voice_card(name, 'one_on_one')}\n\n{self._voice_card(collaborator, 'one_on_one')}"
+        backstory = get_voice_card(
+            [name, collaborator], "one_on_one", self._gd, self._mem
+        )
 
         past_convs = self._mem.context_for_person_conversations(
             name=name,
@@ -1434,9 +1212,6 @@ class NormalDayHandler:
             is_last = i == len(turn_speakers) - 1
             other = collaborator if speaker == name else name
             p = self._config.get("personas", {}).get(speaker, {})
-            backstory = self._persona_helper(
-                speaker, mem=self._mem, graph_dynamics=self._gd
-            )
 
             agent = make_agent(
                 role=f"{speaker} — {p.get('role', 'Engineer')}",
@@ -1448,7 +1223,6 @@ class NormalDayHandler:
             if i == 0:
                 base_desc = (
                     f"You are {speaker}. You are in a private Slack DM with {other}.\n\n"
-                    f"Both of you:\n{voice_cards}\n\n"
                     f"Context: {ctx}\n\n"
                     f"Open the conversation. Topics might include workload, sprint decisions, "
                     f"or something personal-professional. Use your typing quirks. "
@@ -1574,7 +1348,6 @@ class NormalDayHandler:
         ticket = self._find_ticket(ticket_id)
         ticket_title = ticket["title"] if ticket else item.description
 
-        # Pick the channel — same dept = dept channel, cross-dept = digital-hq
         initial_participants = [asker]
         if collaborator:
             initial_participants.append(collaborator)
@@ -1632,21 +1405,23 @@ class NormalDayHandler:
         )
         design_hint = self._mem.format_design_discussions_hint(discussions)
 
-        voice_cards = "\n\n".join(self._voice_card(n, "async") for n in all_actors)
+        backstory = get_voice_card(all_actors, "async", self._gd, self._mem)
 
-        # Build a natural speaker sequence for the JSON prompt
         responders = [a for a in all_actors if a != asker]
         turn_speakers = [asker] + responders
         if random.random() > 0.5 and responders:
-            turn_speakers.append(asker)  # Asker sometimes follows up
+            turn_speakers.append(asker)
         speaker_sequence = ", ".join(turn_speakers)
 
         combined_hint = f"{doc_hint}\n\n{design_hint}" if design_hint else doc_hint
 
         agent = make_agent(
             role="Slack Conversation Simulator",
-            goal="Write a realistic casual Slack Q&A thread between coworkers.",
-            backstory="You write authentic workplace Slack conversations that reflect each person's distinct voice, typing quirks, and current mood.",
+            goal=(
+                "Write a realistic casual Slack Q&A thread between coworkers. "
+                "Treat the provided backstory as character reference sheets for the actors you are writing for."
+            ),
+            backstory=backstory,
             llm=self._worker,
         )
 
@@ -1655,7 +1430,6 @@ class NormalDayHandler:
                 f"COMPANY CONTEXT: {self._company} which {COMPANY_DESCRIPTION}\n"
                 f"Write a full Slack thread where a colleague asks a question.\n\n"
                 f"Topic: {ticket_title}\n"
-                f"Participants (Voice Cards):\n{voice_cards}\n\n"
                 f"Relevant context: {ctx}\n"
                 f"{combined_hint}\n\n"
                 f"Turn order: {speaker_sequence}\n\n"
@@ -1672,16 +1446,13 @@ class NormalDayHandler:
             agent=agent,
         )
 
-        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
 
-        try:
-            clean = raw.replace("```json", "").replace("```", "").strip()
-            turns = _parse_turn_list(clean, "handle_async_question")
-            if not isinstance(turns, list):
-                turns = []
-        except json.JSONDecodeError:
+        turns = _parse_turn_list(raw, "handle_async_question")
+
+        if not turns:
             logger.warning(
-                "[async_question] Failed to parse JSON, falling back to empty thread."
+                "[async_question] Parsed turns are empty, falling back to empty thread."
             )
             turns = []
 
@@ -1819,9 +1590,8 @@ class NormalDayHandler:
             item.description, n=3, as_of_time=meeting_time_iso
         )
 
-        voice_cards = "\n\n".join(self._voice_card(p, "design") for p in participants)
+        backstory = get_voice_card(participants, "async", self._gd, self._mem)
 
-        # Build turn sequence (5-8 turns total)
         turn_speakers = [initiator] + [
             participants[i % len(participants)] for i in range(1, random.randint(5, 8))
         ]
@@ -1829,8 +1599,11 @@ class NormalDayHandler:
 
         agent = make_agent(
             role="Slack Conversation Simulator",
-            goal="Write a realistic multi-turn Slack technical design discussion.",
-            backstory="You write authentic workplace Slack threads where engineers debate technical trade-offs based on their distinct personas.",
+            goal=(
+                "Write a realistic multi-turn Slack technical design discussion."
+                "Treat the provided backstory as character reference sheets for the actors you are writing for."
+            ),
+            backstory=backstory,
             llm=self._planner,
         )
 
@@ -1839,7 +1612,6 @@ class NormalDayHandler:
                 f"COMPANY CONTEXT: {self._company} which {COMPANY_DESCRIPTION}\n"
                 f"Write a full Slack thread for a design discussion.\n\n"
                 f"Topic: {item.description}\n"
-                f"Participants (Voice Cards):\n{voice_cards}\n\n"
                 f"Relevant context: {ctx}\n\n"
                 f"Turn order: {speaker_sequence}\n\n"
                 f"Rules:\n"
@@ -1855,16 +1627,13 @@ class NormalDayHandler:
             agent=agent,
         )
 
-        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
 
-        try:
-            clean = raw.replace("```json", "").replace("```", "").strip()
-            turns = _parse_turn_list(clean, "handle_design_discussion")
-            if not isinstance(turns, list):
-                turns = []
-        except json.JSONDecodeError:
+        turns = _parse_turn_list(raw, "handle_async_question")
+
+        if not turns:
             logger.warning(
-                "[design_discussion] Failed to parse JSON, falling back to empty thread."
+                "[design_discussion] Parsed turns are empty, falling back to empty thread."
             )
             turns = []
 
@@ -1987,22 +1756,22 @@ class NormalDayHandler:
             as_of_time=meeting_time_iso,
         )
 
-        voice_cards = f"MENTOR:\n{self._voice_card(mentor, 'mentoring')}\n\nMENTEE:\n{self._voice_card(mentee, 'mentoring')}"
+        backstory = get_voice_card([mentor, mentee], "mentoring", self._gd, self._mem)
 
         agents, tasks, prev_task = [], [], None
         n_turns = self._turn_count([mentor, mentee], (3, 6))
-        speakers = [mentor, mentee, mentor, mentee, mentor, mentee]
+        speakers = ([mentor, mentee] * ((n_turns // 2) + 1))[:n_turns]
+        shared_goal = "Treat the provided backstory as character reference sheets for the actor you are writing for."
         for i, speaker in enumerate(speakers[:n_turns]):
-            backstory = self._persona_helper(
-                speaker, mem=self._mem, graph_dynamics=self._gd
-            )
+            is_last = i == n_turns - 1
             is_mentor = speaker == mentor
+
             agent = make_agent(
                 role=f"{speaker} — {'Mentor' if is_mentor else 'Mentee'}",
                 goal=(
-                    f"Guide {mentee} thoughtfully as an experienced engineer."
+                    f"Guide {mentee} thoughtfully as an experienced engineer. {shared_goal}"
                     if is_mentor
-                    else "Ask genuine questions and absorb guidance as someone still learning."
+                    else f"Ask genuine questions and absorb guidance as someone still learning. {shared_goal}"
                 ),
                 backstory=backstory,
                 llm=self._worker,
@@ -2010,7 +1779,6 @@ class NormalDayHandler:
             if i == 0:
                 desc = (
                     f"You are {mentor}, opening a mentoring DM with {mentee}.\n\n"
-                    f"{voice_cards}\n\n"
                     f"Context: {ctx}\n\n"
                     f"Start the session — check in, then move toward a topic: career growth, "
                     f"a technical concept, recent work feedback, or navigating a situation. "
@@ -2028,9 +1796,18 @@ class NormalDayHandler:
                     f"Ask a follow-up, show you're thinking it through, or push back gently "
                     f"if something doesn't make sense. Format: {mentee}: [message]"
                 )
+
+            if is_last:
+                desc += "\n\nCRITICAL: Since this is the final message, output a JSON object containing 'message' (your response) and 'summary' (a 1-sentence recap of what was discussed)."
+                expected_out = "JSON with 'message' and 'summary' keys."
+            else:
+                expected_out = (
+                    f"One message from {speaker} in format: {speaker}: [message]"
+                )
+
             task = Task(
                 description=desc,
-                expected_output=f"One message from {speaker} in format: {speaker}: [message]",
+                expected_output=expected_out,
                 agent=agent,
                 context=[prev_task] if prev_task else [],
             )
@@ -2043,9 +1820,17 @@ class NormalDayHandler:
         ).kickoff()
 
         messages = []
+        conversation_summary = None
         current_msg_time = datetime.fromisoformat(meeting_time_iso)
-        for speaker, task in zip(speakers[:n_turns], tasks):
-            text = (task.output.raw or "").strip() if task.output else ""
+        for idx, (speaker, task) in enumerate(zip(speakers[:n_turns], tasks)):
+            is_last = idx == len(tasks) - 1
+            raw = (task.output.raw or "").strip() if task.output else ""
+
+            if is_last:
+                text, conversation_summary = self._extract_last_turn(raw, speaker)
+            else:
+                text = raw
+
             if text.lower().startswith(f"{speaker.lower()}:"):
                 text = text[len(speaker) + 1 :].strip()
             if text:
@@ -2062,6 +1847,20 @@ class NormalDayHandler:
         slack_path, thread_id = self._save_slack(
             messages, channel, interaction_type="mentoring"
         )
+
+        if conversation_summary:
+            self._mem.save_conversation_summary(
+                conv_type="mentoring",
+                participants=[mentor, mentee],
+                summary=conversation_summary,
+                day=self._state.day,
+                date=date_str,
+                timestamp=meeting_time_iso,
+                slack_thread_id=thread_id,
+                extra_facts={"related_ticket": item.related_id}
+                if item.related_id
+                else {},
+            )
 
         # Mentoring is a strong relationship signal
         self._gd.record_slack_interaction([mentor, mentee])
@@ -2126,12 +1925,8 @@ class NormalDayHandler:
             event.rationale, n=2, as_of_time=thread_start_iso
         )
 
-        voice_cards = self._deduped_voice_cards(participants, "collision")
+        voice_cards = get_voice_card(participants, "collision", self._gd, self._mem)
 
-        # Tension-driven turn structure:
-        # high   → initiator opens hard, others react defensively, more turns
-        # medium → back-and-forth negotiation
-        # low    → collaborative, resolves quickly
         n_turns = {
             "high": random.randint(5, 8),
             "medium": random.randint(4, 6),
@@ -2161,7 +1956,7 @@ class NormalDayHandler:
 
         agent = make_agent(
             role="Slack Conversation Simulator",
-            goal="Write a realistic multi-turn Slack exchange between coworkers.",
+            goal="Write a realistic multi-turn Slack exchange between coworkers. Treat the provided backstory as character reference sheets.",
             backstory="You write authentic workplace Slack conversations that reflect each person's distinct voice and the emotional arc of the situation.",
             llm=self._planner,
         )
@@ -2187,16 +1982,11 @@ class NormalDayHandler:
         )
         raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
 
-        try:
-            clean = raw.replace("```json", "").replace("```", "").strip()
-            turns = _parse_turn_list(clean, "handle_collision_event")
-            if not isinstance(turns, list):
-                turns = []
-        except json.JSONDecodeError:
+        turns = _parse_turn_list(raw, "handle_collision_event")
+        if not turns:
             logger.warning(
                 "[collision] Failed to parse JSON, falling back to empty thread."
             )
-            turns = []
 
         messages = []
         current_msg_time = datetime.fromisoformat(thread_start_iso)
@@ -2238,7 +2028,8 @@ class NormalDayHandler:
         date_str: str,
         timestamp: str,
     ) -> List[str]:
-        """Short Slack exchange when an engineer is blocked.
+        """
+        Short Slack exchange when an engineer is blocked.
         Each participant speaks in their own voice via a dedicated Agent.
         """
         from causal_chain_handler import CausalChainHandler
@@ -2247,77 +2038,53 @@ class NormalDayHandler:
         channel = asker_dept.lower().replace(" ", "-")
         participants = [asker, collaborator]
 
-        voice_cards = (
-            f"{self._voice_card(asker, 'dm')}\n\n{self._voice_card(collaborator, 'dm')}"
+        backstory = get_voice_card(participants, "dm", self._gd, self._mem)
+
+        asker_role = (
+            self._config.get("personas", {})
+            .get(asker, {})
+            .get("social_role", "Engineer")
+        )
+        collab_role = (
+            self._config.get("personas", {})
+            .get(collaborator, {})
+            .get("social_role", "Engineer")
         )
 
-        agents, tasks = [], []
-
-        # Turn 1 — asker announces the blocker
-        asker_backstory = self._persona_helper(
-            asker, mem=self._mem, graph_dynamics=self._gd
-        )
-        asker_p = self._config.get("personas", {}).get(asker, {})
-        asker_agent = make_agent(
-            role=f"{asker} — {asker_p.get('social_role', 'Engineer')}",
-            goal="Let your team know you're blocked and need help.",
-            backstory=asker_backstory,
+        agent = make_agent(
+            role="Slack Conversation Simulator",
+            goal="Write a realistic 2-message Slack DM thread where a colleague asks for help with a blocker.",
+            backstory=backstory,
             llm=self._worker,
         )
-        asker_task = Task(
+
+        task = Task(
             description=(
-                f"You are {asker}. You are blocked on [{ticket_id}]: {ticket_title}.\n\n"
-                f"Both of you:\n{voice_cards}\n\n"
-                f"Blocker: {blocker_text[:120]}\n\n"
-                f"Post a Slack message to {collaborator} explaining the blocker. "
-                f"Use your typing quirks and reflect your stress. "
-                f"1-2 sentences. Format: {asker}: [message]"
+                f"Write a 2-message Slack DM exchange between {asker} ({asker_role}) and {collaborator} ({collab_role}).\n\n"
+                f"Context: {asker} is blocked on [{ticket_id}]: {ticket_title}.\n"
+                f"Blocker details: {blocker_text[:120]}\n\n"
+                f"Rules:\n"
+                f"- Turn 1: {asker} reaches out to {collaborator} explaining the blocker. They should sound appropriately stressed/blocked.\n"
+                f"- Turn 2: {collaborator} replies naturally—acknowledging, offering help, asking a clarifying question, or redirecting them.\n"
+                f"- Treat the provided backstory as strict character reference sheets. They MUST sound like different people and use their typing quirks.\n"
+                f"- Each message 1-2 sentences max. No narration.\n\n"
+                f"CRITICAL: Respond ONLY with a JSON array containing the two messages. No markdown fences.\n"
+                f'[{{"speaker": "Name", "message": "text"}}, {{"speaker": "Name", "message": "text"}}]'
             ),
-            expected_output=f"One Slack message from {asker} in format: {asker}: [message]",
-            agent=asker_agent,
-            context=[],
+            expected_output='A JSON array with "speaker" and "message" keys.',
+            agent=agent,
         )
-        agents.append(asker_agent)
-        tasks.append(asker_task)
 
-        collab_backstory = self._persona_helper(
-            collaborator, mem=self._mem, graph_dynamics=self._gd
-        )
-        collab_p = self._config.get("personas", {}).get(collaborator, {})
-        collab_agent = make_agent(
-            role=f"{collaborator} — {collab_p.get('social_role', 'Engineer')}",
-            goal="Respond to a blocked colleague and help unblock them.",
-            backstory=collab_backstory,
-            llm=self._worker,
-        )
-        collab_task = Task(
-            description=(
-                f"You are {collaborator}. {asker} just messaged you about being "
-                f"blocked on [{ticket_id}]: {ticket_title}.\n\n"
-                f"Both of you:\n{voice_cards}\n\n"
-                f"Reply naturally — acknowledge the blocker, offer to help, "
-                f"ask a clarifying question, or suggest who can unblock them. "
-                f"Use your typing quirks. 1-2 sentences. "
-                f"Format: {collaborator}: [message]"
-            ),
-            expected_output=f"One Slack message from {collaborator} in format: {collaborator}: [message]",
-            agent=collab_agent,
-            context=[asker_task],
-        )
-        agents.append(collab_agent)
-        tasks.append(collab_task)
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
 
-        Crew(
-            agents=agents, tasks=tasks, process=Process.sequential, verbose=False
-        ).kickoff()
+        turns = _parse_turn_list(raw, "handle_blocker")
 
-        blocker_speakers = [asker, collaborator]
         messages = []
         current_msg_time = datetime.fromisoformat(timestamp)
-        for speaker, task in zip(blocker_speakers, tasks):
-            text = (task.output.raw or "").strip() if task.output else ""
-            if text.lower().startswith(f"{speaker.lower()}:"):
-                text = text[len(speaker) + 1 :].strip()
+
+        for turn in turns:
+            speaker = turn.get("speaker")
+            text = turn.get("message", "").strip()
             if text:
                 messages.append(
                     {"user": speaker, "text": text, "ts": current_msg_time.isoformat()}
@@ -2379,6 +2146,11 @@ class NormalDayHandler:
                 )
             )
 
+        logger.info(
+            f"    [dim]🚧 Blocker reported: {blocker_text[:80]}... "
+            f"({asker} pinged {collaborator})[/dim]"
+        )
+
         return participants
 
     def _emit_completion_email(
@@ -2399,37 +2171,51 @@ class NormalDayHandler:
         dept = dept_of_name(assignee, self._org_chart)
         lead = self._find_lead_for(assignee) or assignee
 
+        backstory = get_voice_card(assignee, "async", self._gd, self._mem)
+
+        p = self._config.get("personas", {}).get(assignee, {})
+
         agent = make_agent(
-            role=f"{assignee}",
+            role=f"{assignee} — {p.get('social_role', 'Engineer')}",
             goal="Write a brief internal email updating your lead on completed work.",
-            backstory=self._persona_helper(
-                assignee, mem=self._mem, graph_dynamics=self._gd
-            ),
+            backstory=backstory,
             llm=self._worker,
         )
+
         task = Task(
             description=(
                 f"You are {assignee}. You just completed ticket [{ticket_id}]: {ticket_title}.\n\n"
                 f"Write a short internal email to {lead} (your lead) summarising what you did.\n"
                 f"What you did: {comment_text}\n\n"
                 f"Rules:\n"
-                f"- Subject line: Re: [{ticket_id}] {ticket_title[:60]}\n"
+                f"- Subject line must include the ticket ID.\n"
                 f"- Body: 2-3 sentences. What was done, any key decision or outcome.\n"
                 f"- Sign off with your name.\n"
-                f"- No preamble. Output subject and body only.\n\n"
-                f"Format:\nSubject: <subject>\n\n<body>"
+                f"- Use your typing quirks and current mood.\n\n"
+                f"CRITICAL: Respond ONLY with a JSON object containing 'subject' and 'body' keys. No markdown fences, no preamble.\n"
+                f"- CRITICAL: Keep the tone accessible. Avoid deep technical jargon, as the recipient may be non-technical.\n"
+                f'{{\n  "subject": "Re: [{ticket_id}] ...",\n  "body": "..."\n}}'
             ),
-            expected_output="Subject line followed by a blank line and 2-3 sentence body.",
+            expected_output='A JSON object with "subject" and "body" keys.',
             agent=agent,
         )
-        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
 
-        # Parse subject / body
-        lines = raw.split("\n", 2)
-        subject = (
-            lines[0].replace("Subject:", "").strip() if lines else f"Re: [{ticket_id}]"
-        )
-        body = lines[2].strip() if len(lines) > 2 else raw
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+
+        clean = raw.replace("```json", "").replace("```", "").strip()
+
+        try:
+            email_data = json_repair.loads(clean)
+
+            subject = email_data.get(
+                "subject", f"Re: [{ticket_id}] {ticket_title[:60]}"
+            )
+            body = email_data.get("body", clean)
+
+        except Exception as e:
+            logger.warning(f"[email_generation] Failed to parse JSON email: {e}")
+            subject = f"Re: [{ticket_id}] Update"
+            body = clean
 
         thread_id = f"email_{ticket_id}_{self._state.day}"
 
@@ -2454,38 +2240,21 @@ class NormalDayHandler:
             )
         )
 
-        if self._embed_worker:
-            self._embed_worker.enqueue(
-                id=thread_id,
-                type="email",
-                title=subject,
-                content=f"From: {assignee}\nTo: {lead}\nSubject: {subject}\n\n{body}",
-                day=self._state.day,
-                date=date_str,
-                timestamp=timestamp,
-                metadata={
-                    "ticket_id": ticket_id,
-                    "from": assignee,
-                    "to": lead,
-                    "dept": dept,
-                },
-            )
-        else:
-            self._mem.embed_artifact(
-                id=thread_id,
-                type="email",
-                title=subject,
-                content=f"From: {assignee}\nTo: {lead}\nSubject: {subject}\n\n{body}",
-                day=self._state.day,
-                date=date_str,
-                timestamp=timestamp,
-                metadata={
-                    "ticket_id": ticket_id,
-                    "from": assignee,
-                    "to": lead,
-                    "dept": dept,
-                },
-            )
+        self._mem.embed_artifact(
+            id=thread_id,
+            type="email",
+            title=subject,
+            content=f"From: {assignee}\nTo: {lead}\nSubject: {subject}\n\n{body}",
+            day=self._state.day,
+            date=date_str,
+            timestamp=timestamp,
+            metadata={
+                "ticket_id": ticket_id,
+                "from": assignee,
+                "to": lead,
+                "dept": dept,
+            },
+        )
 
         logger.info(
             f"    [dim]📧 {assignee} → {lead}: completion email for [{ticket_id}][/dim]"
@@ -2502,10 +2271,14 @@ class NormalDayHandler:
         timestamp: str,
     ) -> Tuple[List[str], str]:
         """Author replies to a review question in #engineering."""
+
+        backstory = get_voice_card(author, "async", self._gd, self._mem)
+        p = self._config.get("personas", {}).get(author, {})
+
         agent = make_agent(
-            role="PR Author",
-            goal="Reply to a code review question.",
-            backstory=f"You are {author}. {self._gd.stress_tone_hint(author)}",
+            role=f"{author} — {p.get('social_role', 'Engineer')}",
+            goal="Reply to a code review question naturally in your own voice.",
+            backstory=backstory,
             llm=self._worker,
         )
         task = Task(
@@ -2514,7 +2287,7 @@ class NormalDayHandler:
                 f"Output format: {author}: [your reply]\n"
                 f"Length: 1-2 sentences only. No preamble.\n\n"
                 f"Their comment: {review_text[:120]}\n\n"
-                f"Answer their question, clarify your intent, or push back if you disagree."
+                f"Answer their question, clarify your intent, or push back if you disagree. Use your typing quirks."
             ),
             expected_output=(
                 f"One line only: '{author}: [reply]'. No preamble, no extra lines."
@@ -2709,17 +2482,15 @@ class NormalDayHandler:
             Crew(agents=[topic_agent], tasks=[topic_task], verbose=False).kickoff()
         ).strip()
 
-        # ── Build rich per-person voice cards from personas ───────────────────
-        voice_cards = self._deduped_voice_cards(participants, "watercooler")
+        voice_cards = get_voice_card(participants, "watercooler", self._gd, self._mem)
 
-        # ── One-shot full conversation generation ────────────────────────────
         speaker_sequence = ", ".join(
             participants[i % len(participants)] for i in range(len(participants) + 1)
         )
 
         agent = make_agent(
             role="Slack Conversation Simulator",
-            goal="Write a realistic casual Slack conversation between coworkers.",
+            goal="Write a realistic casual Slack conversation between coworkers. Treat the provided backstory as character reference sheets.",
             backstory="You write authentic workplace small-talk that reflects each person's distinct personality and current mood.",
             llm=self._worker,
         )
@@ -2742,16 +2513,11 @@ class NormalDayHandler:
         )
         raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
 
-        try:
-            clean = raw.replace("```json", "").replace("```", "").strip()
-            turns = _parse_turn_list(clean, "trigger_watercooler_chat")
-            if not isinstance(turns, list):
-                turns = []
-        except json.JSONDecodeError:
+        turns = _parse_turn_list(raw, "trigger_watercooler_chat")
+        if not turns:
             logger.warning(
                 "[watercooler] Failed to parse JSON, falling back to empty thread."
             )
-            turns = []
 
         messages = []
         current_msg_time = datetime.fromisoformat(thread_start_iso)
@@ -2770,9 +2536,6 @@ class NormalDayHandler:
                 current_msg_time += timedelta(minutes=random.randint(1, 4))
 
         if messages:
-            # 2 people     → dm_alice_bob
-            # 3-4 people   → dm_alice_bob_carol  (small group DM, still personal)
-            # 5+ people    → random              (large enough to be channel-like)
             n = len(participants)
             if n >= 5:
                 channel = "random"
@@ -3157,24 +2920,38 @@ def dept_of_name(name: str, org_chart: Dict[str, List[str]]) -> str:
     return "Unknown"
 
 
+TURN_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {"speaker": {"type": "string"}, "message": {"type": "string"}},
+        "required": ["speaker", "message"],
+    },
+}
+
+
 def _parse_turn_list(raw: str, caller: str) -> list:
     """
-    Robustly extract a JSON array of turn dicts from an LLM response.
-    Uses json_repair to handle malformed LLM output before parsing.
-    Returns a list (empty on total failure).
+    Robustly extract a JSON array of turn dicts from an LLM response
+    using schema-guided repair.
     """
     clean = raw.replace("```json", "").replace("```", "").strip()
 
     try:
-        parsed = json_repair.loads(clean)
+        parsed = json_repair.loads(
+            clean, schema=TURN_SCHEMA, schema_repair_mode="salvage"
+        )
+
         if isinstance(parsed, list):
             return parsed
-        # Unwrap if LLM wrapped the array in an object
-        if isinstance(parsed, dict):
-            for v in parsed.values():
-                if isinstance(v, list):
-                    return v
+
         return []
-    except Exception:
-        logger.warning(f"[{caller}] Failed to parse JSON turn list — empty thread.")
+
+    except ValueError as e:
+        logger.warning(
+            f"[{caller}] LLM output completely failed schema validation: {e}"
+        )
+        return []
+    except Exception as e:
+        logger.warning(f"[{caller}] Unexpected parsing failure: {e}")
         return []

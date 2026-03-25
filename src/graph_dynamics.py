@@ -15,46 +15,35 @@ from typing import Dict, List, Optional, Tuple
 import networkx as nx
 
 
-# ── Defaults (override via config["graph_dynamics"]) ─────────────────────────
-
 DEFAULT_CFG = {
-    # Propagation
     "stress_bleed_rate": 0.25,  # fraction of key-player excess that bleeds
     "burnout_threshold": 72,  # stress score that triggers propagation
     "incident_stress_hit": 20,  # raw stress added per P1 involvement
     "stress_daily_recovery": 3,  # flat recovery applied to everyone EOD
     "key_player_multiplier": 2.0,  # top-N% by betweenness = key players
-    # Edge dynamics
     "edge_decay_rate": 0.97,  # multiplicative daily decay
     "slack_boost": 1.5,  # weight added per shared Slack thread
     "pr_review_boost": 3.0,  # weight added per PR review pair
     "incident_boost": 4.0,  # weight added per shared incident
     "edge_weight_floor": 0.5,  # decay never goes below this
-    # Escalation
     "escalation_max_hops": 6,
 }
 
 
-# ── Return types ──────────────────────────────────────────────────────────────
-
-
 @dataclass
 class PropagationResult:
-    affected: List[str]  # names whose stress changed due to bleed
-    stress_snapshot: Dict[str, int]  # full {name: stress} map after tick
-    burnt_out: List[str]  # names at or above burnout_threshold
-    key_players: List[str]  # high-centrality nodes this tick
+    affected: List[str]
+    stress_snapshot: Dict[str, int]
+    burnt_out: List[str]
+    key_players: List[str]
 
 
 @dataclass
 class EscalationChain:
-    chain: List[Tuple[str, str]]  # [(name, role_label), ...]
+    chain: List[Tuple[str, str]]
     path_length: int
     reached_lead: bool
-    raw_path: List[str]  # raw nx path for logging
-
-
-# ── Main class ────────────────────────────────────────────────────────────────
+    raw_path: List[str]
 
 
 class GraphDynamics:
@@ -80,8 +69,6 @@ class GraphDynamics:
         self._org_chart: Dict[str, List[str]] = config.get("org_chart", {})
         self._leads: Dict[str, str] = config.get("leads", {})
         self._departed_names: set = set()
-
-    # ── 1. STRESS / BURNOUT PROPAGATION ──────────────────────────────────────
 
     def apply_incident_stress(
         self, actors: List[str], hit: Optional[int] = None
@@ -128,7 +115,6 @@ class GraphDynamics:
                     self._stress[nb] = min(100, self._stress.get(nb, 30) + bleed)
                     affected.add(nb)
 
-        # Daily recovery
         recovery = self.cfg["stress_daily_recovery"]
         for name in self._stress:
             self._stress[name] = max(0, self._stress[name] - recovery)
@@ -168,8 +154,6 @@ class GraphDynamics:
             f"{name} is burnt out -- messages are clipped and passive-aggressive; "
             "they are running on fumes and feel unsupported."
         )
-
-    # ── 2. TEMPORAL EDGE-WEIGHT DYNAMICS ─────────────────────────────────────
 
     def record_slack_interaction(self, participants: List[str]) -> None:
         """Boost edges for all pairs in a Slack thread. Call end of _handle_normal_day()."""
@@ -231,8 +215,6 @@ class GraphDynamics:
             if d.get("weight", floor) <= cutoff
         ]
         return sorted(pairs, key=lambda x: x[2])
-
-    # ── 3. SHORTEST-PATH ESCALATION ───────────────────────────────────────────
 
     def build_escalation_chain(
         self,
@@ -323,7 +305,6 @@ class GraphDynamics:
         acute one like an incident. Max nudge is +5 per artifact.
         """
         if vader_compound > 0.3:
-            # Positive content slightly accelerates recovery
             bonus = 1
             for name in actors:
                 if name in self._stress:
@@ -334,8 +315,6 @@ class GraphDynamics:
             for name in actors:
                 if name in self._stress:
                     self._stress[name] = min(100, self._stress[name] + hit)
-
-    # ── Private helpers ───────────────────────────────────────────────────────
 
     def _get_centrality(self) -> Dict[str, float]:
         if self._centrality_dirty or self._centrality_cache is None:

@@ -75,7 +75,7 @@ class ConfluenceWriter:
         self,
         mem: Memory,
         registry: ArtifactRegistry,
-        state,  # flow.State — avoid circular import
+        state,
         config: Dict,
         worker_llm,
         planner_llm,
@@ -102,10 +102,6 @@ class ConfluenceWriter:
         self._legacy = config.get("legacy_system", {})
         self._all_names = [n for dept in config["org_chart"].values() for n in dept]
         self._org_chart = config["org_chart"]
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PUBLIC API
-    # ─────────────────────────────────────────────────────────────────────────
 
     def write_genesis_batch(
         self,
@@ -139,7 +135,7 @@ class ConfluenceWriter:
         Returns:
             List of registered conf_ids in generation order.
         """
-        # 1. Allocate all IDs before any LLM call
+
         genesis_time = self._clock.now("system").isoformat()
         queue = [self._registry.next_id(prefix) for _ in range(count)]
         registered_ids: List[str] = []
@@ -863,10 +859,6 @@ class ConfluenceWriter:
 
         return created_ids
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PRIVATE — JIRA TICKET SPAWNING
-    # ─────────────────────────────────────────────────────────────────────────
-
     def _spawn_tickets(
         self,
         new_tickets: List[Dict],
@@ -952,7 +944,7 @@ class ConfluenceWriter:
         Persists to MongoDB immediately so every subsequent LLM call can reference it.
         Returns the stack as a dict.
         """
-        # Check if already generated (warm restart guard)
+
         existing = self._mem.get_tech_stack()
         if existing:
             logger.info("[confluence] Tech stack already exists — skipping generation.")
@@ -1003,10 +995,6 @@ class ConfluenceWriter:
         logger.info(f"[confluence] ✓ Tech stack established: {list(stack.keys())}")
         return stack
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PRIVATE — UTILITIES
-    # ─────────────────────────────────────────────────────────────────────────
-
     @staticmethod
     def _render(template: str, vars_: Dict[str, str]) -> str:
         for key, value in vars_.items():
@@ -1024,7 +1012,7 @@ class ConfluenceWriter:
 
     @staticmethod
     def _extract_title(content: str, fallback: str) -> str:
-        # Strip code blocks before searching for headings
+
         clean = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
 
         m = re.search(r"^#\s+(.+)", clean, re.MULTILINE)
@@ -1085,12 +1073,11 @@ class ConfluenceWriter:
 
         m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(yr|mo)", tenure_str.strip())
         if not m:
-            return tenure_str  # "new" or anything non-standard — leave as-is
+            return tenure_str
 
         value, unit = float(m.group(1)), m.group(2)
         months_at_sim_start = int(value * 12) if unit == "yr" else int(value)
 
-        # How many months before sim_start is this page?
         delta = relativedelta(sim_start, page_date)
         months_offset = delta.years * 12 + delta.months
 

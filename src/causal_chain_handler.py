@@ -51,37 +51,22 @@ from memory import Memory, SimEvent
 
 logger = logging.getLogger("orgforge.causal_chain")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Reciprocal Rank Fusion damping constant — 60 is the standard value from
-# the original RRF paper. Higher = less aggressive rank boosting.
 _RRF_K = 60
 
-# Default fusion weights — vector wins for semantic similarity since our
-# Ollama embedding model is local and essentially free to call
 _TEXT_WEIGHT = 0.35
 _VECTOR_WEIGHT = 0.65
 
-# Minimum scores to accept a match — tune these after reviewing
-# the recurrence_matches collection after a sim run
+
 _MIN_VECTOR_SCORE = 0.72
 _MIN_TEXT_SCORE = 0.40
 
-# How many candidates to retrieve from each source before fusion
+
 _RETRIEVAL_LIMIT = 10
 
 ARTIFACT_KEY_JIRA = "jira"
 ARTIFACT_KEY_CONFLUENCE = "confluence"
 ARTIFACT_KEY_SLACK = "slack"
 ARTIFACT_KEY_SLACK_THREAD = "slack_thread"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CAUSAL CHAIN HANDLER
-# Tracks the growing set of artifact IDs that causally produced an incident.
-# Lives on an ActiveIncident — one instance per open incident.
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class CausalChainHandler:
@@ -127,14 +112,6 @@ class CausalChainHandler:
 
     def __repr__(self) -> str:
         return f"CausalChainHandler(root={self.root}, length={len(self)})"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RECURRENCE MATCH STORE
-# Persists every detection decision to MongoDB regardless of outcome.
-# Negative examples (rejected matches) are as valuable as positives for
-# threshold calibration.
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class RecurrenceMatchStore:
@@ -194,11 +171,9 @@ class RecurrenceMatchStore:
         threshold_gate: Dict[str, float],
     ) -> None:
         doc: Dict[str, Any] = {
-            # Query
             "query_root_cause": query_root_cause,
             "current_ticket_id": current_ticket_id,
             "current_day": current_day,
-            # Match result
             "matched": matched_event is not None,
             "matched_ticket_id": matched_event.artifact_ids.get("jira")
             if matched_event
@@ -210,7 +185,6 @@ class RecurrenceMatchStore:
             "recurrence_gap_days": (
                 current_day - matched_event.day if matched_event else None
             ),
-            # Scores
             "text_score": round(text_score, 4),
             "vector_score": round(vector_score, 4),
             "fused_score": round(fused_score, 4),
@@ -219,7 +193,6 @@ class RecurrenceMatchStore:
             "confidence": confidence,
             "candidates_evaluated": candidates_evaluated,
             "threshold_gate": threshold_gate,
-            # Metadata
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "sim_day": current_day,
         }
@@ -227,13 +200,6 @@ class RecurrenceMatchStore:
             self._coll.insert_one(doc)
         except Exception as e:
             logger.warning(f"[causal_chain] recurrence_match insert failed: {e}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RECURRENCE DETECTOR
-# Hybrid retrieval: fuses MongoDB text search + vector search to identify
-# whether a new incident root cause has occurred before.
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class RecurrenceDetector:
@@ -273,10 +239,7 @@ class RecurrenceDetector:
         self._min_text = min_text
         self._store = RecurrenceMatchStore(mem)
 
-        # Ensure text index exists on the events collection
         self._ensure_text_index()
-
-    # ── Public ────────────────────────────────────────────────────────────────
 
     def find_prior_incident(
         self,
@@ -296,11 +259,8 @@ class RecurrenceDetector:
 
         candidates: Dict[str, Dict[str, Any]] = {}
 
-        # ── Stage 1: MongoDB text search ──────────────────────────────────────
         text_results = self._text_search(root_cause, current_day)
 
-        # Fixed normalisation: use a corpus-calibrated ceiling rather than
-        # result-set max, so rank-1 doesn't always get 1.0
         _TEXT_CEILING = 8.0
         for rank, result in enumerate(text_results):
             event = SimEvent.from_dict(result)
@@ -311,7 +271,6 @@ class RecurrenceDetector:
             candidates[key]["text_score"] = normalised
             candidates[key]["text_rrf"] = 1 / (rank + 1 + _RRF_K)
 
-        # ── Stage 2: Vector search ─────────────────────────────────────────────
         vector_results = self._vector_search(root_cause, current_day)
 
         for rank, (event, vscore) in enumerate(vector_results):
@@ -337,7 +296,6 @@ class RecurrenceDetector:
             )
             return None
 
-        # ── Fusion ────────────────────────────────────────────────────────────
         both_returned = bool(text_results) and bool(vector_results)
         fusion_strategy = (
             "rrf" if both_returned else ("text_only" if text_results else "vector_only")
@@ -352,7 +310,6 @@ class RecurrenceDetector:
         sort_key = "rrf_score" if both_returned else "fused_score"
         ranked = sorted(candidates.values(), key=lambda c: c[sort_key], reverse=True)
 
-        # ── Threshold gate — collect ALL passing candidates ───────────────────
         accepted = [
             c
             for c in ranked
@@ -383,8 +340,6 @@ class RecurrenceDetector:
             )
             return None
 
-        # Anti-daisy-chain: among all passing candidates, pick the EARLIEST
-        # so ORG-164 links to ORG-140, not ORG-161
         best = min(accepted, key=lambda c: c["event"].day)
 
         confidence = (
@@ -464,16 +419,14 @@ class RecurrenceDetector:
             chain.extend(events)
 
             for event in events:
-                # Queue causal parents
                 for parent in event.facts.get("causal_chain", []):
                     if parent not in visited:
                         queue.append(parent)
-                # Queue prior incident in recurrence chain
+
                 prior = event.facts.get("recurrence_of")
                 if prior and prior not in visited:
                     queue.append(prior)
 
-        # Deduplicate (same event may appear via multiple paths)
         seen_ids: set = set()
         unique: List[SimEvent] = []
         for e in chain:
@@ -495,8 +448,6 @@ class RecurrenceDetector:
             if e.facts.get("recurrence_of") == ticket_id
             or ticket_id in e.facts.get("causal_chain", [])
         ]
-
-    # ── Private ───────────────────────────────────────────────────────────────
 
     def _text_search(self, root_cause: str, current_day: int) -> List[Dict[str, Any]]:
         """MongoDB $text search — returns results with normalised scores."""
@@ -520,21 +471,13 @@ class RecurrenceDetector:
         if not results:
             return []
 
-        # Normalise against the MAX score in this result set, not rank-1.
-        # This means rank-1 still gets 1.0, but rank-2 gets a real relative score
-        # rather than everyone below rank-1 getting arbitrary lower values.
-        # More importantly, when there's only ONE candidate it still gets 1.0 —
-        # the threshold check (min_text=0.4) then does actual filtering work
-        # because a weak single match will have a low raw score.
         raw_scores = [r.get("score", 0.0) for r in results]
         max_score = max(raw_scores) if raw_scores else 1.0
 
-        # Use log-normalisation so weak matches don't cluster near 1.0
         import math
 
         normalised = []
         for r, raw in zip(results, raw_scores):
-            # log1p normalisation preserves ordering, spreads out the range
             norm_score = (
                 math.log1p(raw) / math.log1p(max_score) if max_score > 0 else 0.0
             )
@@ -591,14 +534,6 @@ class RecurrenceDetector:
             "min_vector": self._min_vector,
             "min_text": self._min_text,
         }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MEMORY EXTENSION — search_events()
-# Add this method to memory.py Memory class.
-# Reproduced here as a standalone function so it can be monkey-patched in
-# or copy-pasted into Memory directly.
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def search_events(

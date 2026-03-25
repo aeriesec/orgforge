@@ -6,6 +6,26 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.5] — 2026-03-25
+
+### Added
+
+- **Global Voice Card System (`utils/persona_utils.py`, `src/normal_day.py`)**: Migrated individual persona logic to a centralized `get_voice_card` utility. This provides context-aware character sheets (e.g., `async`, `design`, `collision`) that inject tenure, expertise, mood, and "anti-patterns" into LLM backstories to prevent generic corporate drift.
+- **Robust JSON Recovery (`requirements.txt`, `src/flow.py`, `src/normal_day.py`)**: Integrated `json-repair` across the simulation pipeline. This allows the engine to "salvage" malformed LLM responses in ticket generation and Slack conversations, significantly reducing "failed to parse" fallbacks.
+
+### Changed
+
+- **Persona History Filtering (`src/memory.py`)**: Enhanced `persona_history` to filter out "noisy" macro-events (like sprint planning summaries or standups). This ensures agents focus on personal agency and direct interactions when building their local context.
+- **Incident Recurrence Logic (`src/causal_chain_handler.py`)**: Refined the `RecurrenceDetector` to prioritize the earliest incident in a chain (anti-daisy-chaining). This ensures new incidents link back to the original root cause rather than just the most recent duplicate.
+- **Streamlined codebase (`Across all files`)**: Conducted a major cleanup of legacy comments, "ASCII art" section dividers, and redundant docstrings to improve readability and reduce token overhead during development.
+
+### Fixed
+
+- **PR Causal Linking (`src/flow.py`)**: Fixed a bug where PR IDs were missing from the persistent ticket record. PRs are now immediately appended to the `CausalChainHandler` and saved to MongoDB upon creation.
+- **Department Signal Noise (`src/day_planner.py`)**: Non-engineering departments (Sales, HR) now only receive "direct" relevance signals, preventing them from being overwhelmed by technical incident data that doesn't impact their planning.
+
+---
+
 ## [v1.2.4] — 2026-03-25
 
 ### Added

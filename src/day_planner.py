@@ -52,6 +52,7 @@ from config_loader import (
     COMPANY_DESCRIPTION,
     resolve_role,
 )
+from utils.persona_utils import get_voice_card
 
 logger = logging.getLogger("orgforge.planner")
 
@@ -61,11 +62,6 @@ def _coerce_collaborators(raw) -> List[str]:
     if not raw:
         return []
     return raw if isinstance(raw, list) else [raw]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DEPARTMENT PLANNER
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class DepartmentPlanner:
@@ -239,7 +235,7 @@ class DepartmentPlanner:
         graph_dynamics: GraphDynamics,
         cross_signals: List[CrossDeptSignal],
         sprint_context: Optional[SprintContext] = None,
-        eng_plan: Optional[DepartmentDayPlan] = None,  # None for Engineering itself
+        eng_plan: Optional[DepartmentDayPlan] = None,
         lifecycle_context: str = "",
         email_signals: Optional[List["ExternalEmailSignal"]] = None,
     ) -> DepartmentDayPlan:
@@ -269,7 +265,6 @@ class DepartmentPlanner:
             else ""
         )
 
-        # ── Render SprintContext sections ──────────────────────────────────────
         if sprint_context:
             owned_lines = [
                 f"  - [{tid}] → {owner}"
@@ -293,7 +288,6 @@ class DepartmentPlanner:
                 "\n".join(in_review_lines) if in_review_lines else "  (none)"
             )
         else:
-            # Non-engineering depts or fallback — use the old open_tickets path
             owned_section = self._open_tickets(state, mem)
             avail_section = "  (see owned tickets above)"
             capacity_section = "  (standard 6h per engineer)"
@@ -308,27 +302,11 @@ class DepartmentPlanner:
                 )
 
         lead_name = self.config.get("leads", {}).get(self.dept, "")
-        lead_persona = PERSONAS.get(lead_name, DEFAULT_PERSONA)
-        lead_stress = state.persona_stress.get(lead_name, 30)
-        lead_style = lead_persona.get("style", "pragmatic and direct")
-        lead_expertise = ", ".join(lead_persona.get("expertise", []))
-        on_call_name = self.config.get("on_call_engineer", "")
-
-        lead_context = (
-            f"You are {lead_name}, lead of {self.dept} at "
-            f"{self.config['simulation']['company_name']} which {COMPANY_DESCRIPTION}. "
-            f"Your current stress is {lead_stress}/100"
-            + (" — you are on-call today." if lead_name == on_call_name else ".")
-            + f" Your style: {lead_style}. "
-            f"Your expertise: {lead_expertise}. "
-            f"You plan your team's day from lived experience, not abstraction. "
-            f"You know who is struggling, what is mid-flight, and what can wait."
-        )
 
         agent = make_agent(
             role=f"{lead_name}, {self.dept} Lead",
             goal="Plan your team's day honestly, given your stress, their capacity, and what is actually on fire.",
-            backstory=lead_context,
+            backstory=get_voice_card(lead_name, "design", graph_dynamics, mem),
             llm=self._llm,
         )
 
@@ -557,19 +535,15 @@ class DepartmentPlanner:
             sprint_context=sprint_context,
         ), data
 
-    # ─── Context builders ─────────────────────────────────────────────────────
-
     def _build_roster(self, graph_dynamics: GraphDynamics) -> str:
         lines = []
         for name in self.members:
             stress = graph_dynamics._stress.get(name, 30)
             tone = graph_dynamics.stress_tone_hint(name)
 
-            # Fetch expertise from the persona config
             persona = self.config.get("personas", {}).get(name, {})
             expertise = ", ".join(persona.get("expertise", ["general operations"]))
 
-            # Inject expertise into the LLM's view of the roster
             lines.append(
                 f"  - {name} (Expertise: [{expertise}]): stress={stress}/100. {tone}"
             )
@@ -630,15 +604,9 @@ class DepartmentPlanner:
     ) -> str:
         lines = []
 
-        # Non-engineering departments only receive [direct] signals — indirect
-        # signals (e.g. older incidents from other teams) are noise for Sales,
-        # Design, QA etc. and waste tokens without changing planning decisions.
-        # Engineering (is_primary) still sees all signals ranked by priority.
         if not self.is_primary:
             signals = [s for s in signals if s.relevance == "direct"]
 
-        # Prioritize high-signal events and cap at 2 for non-engineering,
-        # 4 for engineering (primary driver needs fuller picture).
         priority_ranking = {
             "incident_opened": 0,
             "customer_escalation": 1,
@@ -675,8 +643,7 @@ class DepartmentPlanner:
         signals: List[ExternalEmailSignal],
         liaison_dept: str,
     ) -> str:
-        # Only vendor signals reach planner prompts;
-        # customer signals carry forward as CrossDeptSignals tomorrow.
+
         relevant = [
             s
             for s in signals
@@ -694,8 +661,6 @@ class DepartmentPlanner:
                 f"  Preview: {s.body_preview}"
             )
         return "\n".join(lines)
-
-    # ─── Fallbacks ────────────────────────────────────────────────────────────
 
     def _fallback_plan(
         self,
@@ -738,11 +703,6 @@ class DepartmentPlanner:
             stress_level=30,
             focus_note="",
         )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ORG COORDINATOR
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class OrgCoordinator:
@@ -832,7 +792,7 @@ class OrgCoordinator:
         date: str,
         org_theme: str,
     ) -> OrgDayPlan:
-        # Build a richer summary of other plans that includes lead stress and member names
+
         other_plans_str = ""
         for dept, plan in dept_plans.items():
             lead_name = self._config.get("leads", {}).get(dept)
@@ -1002,11 +962,8 @@ class DayPlannerOrchestrator:
 
         day = state.day
         date = str(state.current_date.date())
-        system_time_iso = clock.now("system").isoformat()  # This will be 09:00:00
+        system_time_iso = clock.now("system").isoformat()
 
-        # ── Pass 1: deterministic ticket assignment (Option C) ────────────────
-        # Build SprintContext for every dept before any LLM call so the LLM
-        # only ever sees the tickets it is legally allowed to plan against.
         if self._ticket_assigner is None:
             self._ticket_assigner = TicketAssigner(self._config, graph_dynamics, mem)
 
@@ -1018,20 +975,15 @@ class DayPlannerOrchestrator:
                 state, members, dept_name=dept
             )
 
-        # Seed ticket_actors_today from the locked assignments so the validator
-        # has a populated map from the very start of the day.
         state.ticket_actors_today = {}
         for dept, ctx in sprint_contexts.items():
             for tid, owner in ctx.owned_tickets.items():
                 state.ticket_actors_today.setdefault(tid, set()).add(owner)
 
-        # ── Generate org theme (lightweight — replaces _generate_theme()) ─────
         org_theme = self._generate_org_theme(state, mem, clock)
 
-        # ── Build cross-dept signals from recent SimEvents ────────────────────
         cross_signals_by_dept = self._extract_cross_signals(mem, day)
 
-        # ── Engineering plans first — it drives everyone else ─────────────────
         eng_key = next((k for k in self._dept_planners if "eng" in k.lower()), None)
         eng_plan = None
 
@@ -1054,12 +1006,6 @@ class DayPlannerOrchestrator:
             dept_plans[eng_key] = eng_plan
             logger.info(f"  [blue]📋 Eng plan:[/blue] {eng_plan.theme[:60]} ")
 
-        # ── Other departments react to Engineering — run in parallel ─────────
-        # Each non-eng dept plan is an independent Bedrock call with no shared
-        # mutable state between departments. eng_plan is read-only at this point.
-        # graph_dynamics._stress is also read-only here (patched after each
-        # result comes in, under lock). MongoDB writes inside planner.plan()
-        # (log_dept_plan, log_event) are thread-safe via PyMongo's pool.
         non_eng_depts = {
             dept: planner
             for dept, planner in self._dept_planners.items()
@@ -1107,15 +1053,12 @@ class DayPlannerOrchestrator:
                             org_theme, day, date, []
                         )
 
-        # ── OrgCoordinator finds collisions ───────────────────────────────────
         org_plan = self._coordinator.coordinate(dept_plans, state, day, date, org_theme)
 
-        # ── Validate all proposed events ──────────────────────────────────────
         recent_summaries = self._recent_day_summaries(mem, day)
         all_proposed = org_plan.all_events_by_priority()
         results = self._validator.validate_plan(all_proposed, state, recent_summaries)
 
-        # Log rejections as SimEvents so researchers can see what was blocked
         for r in self._validator.rejected(results):
             mem.log_event(
                 SimEvent(
@@ -1136,7 +1079,6 @@ class DayPlannerOrchestrator:
                 )
             )
 
-        # Log novel events the community could implement
         for novel in self._validator.drain_novel_log():
             mem.log_event(
                 SimEvent(
@@ -1157,7 +1099,6 @@ class DayPlannerOrchestrator:
                 )
             )
 
-        # Rebuild dept_plans with only approved events
         approved_set = {id(e) for e in self._validator.approved(results)}
         for dept, dplan in org_plan.dept_plans.items():
             dplan.proposed_events = [
@@ -1171,12 +1112,9 @@ class DayPlannerOrchestrator:
 
         return org_plan
 
-    # ─── Helpers ─────────────────────────────────────────────────────────────
-
     def _generate_org_theme(self, state, mem: Memory, clock) -> str:
         ctx = mem.previous_day_context(state.day)
 
-        # ── Resolve CEO persona ────────────────────────────────────────────
         from flow import PERSONAS, DEFAULT_PERSONA
 
         ceo_name = resolve_role("ceo")
@@ -1247,7 +1185,6 @@ class DayPlannerOrchestrator:
         ]
 
         for event in recent:
-            # Determine source dept from actors
             for actor in event.actors:
                 source_dept = next(
                     (d for d, members in config_chart.items() if actor in members),
@@ -1264,11 +1201,10 @@ class DayPlannerOrchestrator:
                     relevance="direct" if day - event.day <= 2 else "indirect",
                 )
 
-                # Push signal to all OTHER departments
                 for dept in config_chart:
                     if dept != source_dept:
                         signals.setdefault(dept, []).append(signal)
-                break  # one signal per event
+                break
 
         return signals
 

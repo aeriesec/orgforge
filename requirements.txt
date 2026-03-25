@@ -11,4 +11,4 @@ rich>=13.0.0
 ollama>=0.1.7
 boto3==1.42.63
 scipy>=1.17.1
-json-repair>=0.25.3
+json-repair>=0.58.6

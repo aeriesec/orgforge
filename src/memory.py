@@ -887,8 +887,29 @@ class Memory:
 
     # ─── HELPERS ──────────────────────────────
 
+    _NOISY_PERSONAL_EVENTS = {
+        "sprint_planned",
+        "retrospective",
+        "sprint_goal_updated",
+        "day_summary",
+        "leadership_sync",
+        "normal_day_slack",
+        "watercooler_chat",
+        "standup",
+        "onboarding_session",
+    }
+
     def persona_history(self, name: str, n: int = 4) -> List[SimEvent]:
-        relevant = [e for e in self._event_log if name in e.actors]
+        """
+        Retrieves the n most recent events for a person, filtering out
+        macro-level or noisy events where the person's individual agency
+        is diluted (e.g., being tagged in a 24-ticket sprint planning summary).
+        """
+        relevant = [
+            e
+            for e in self._event_log
+            if name in e.actors and e.type not in self._NOISY_PERSONAL_EVENTS
+        ]
         return relevant[-n:]
 
     def get_event_log(self, from_db: bool = False) -> List[SimEvent]:

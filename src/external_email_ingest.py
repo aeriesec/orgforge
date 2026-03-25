@@ -439,10 +439,16 @@ class ExternalEmailIngestor:
         participants = [sales_lead, product_lead]
         ping_time, _ = self._clock.sync_and_advance(participants, hours=0.25)
 
+        # ✨ NEW: Global voice card and role anchoring
+        backstory = get_voice_card(
+            sales_lead, "async", graph_dynamics=None, mem=self._mem
+        )
+        p = self._personas.get(sales_lead, {})
+
         agent = make_agent(
-            role=f"{sales_lead}, Sales Lead",
-            goal="Summarise a customer email for Product on Slack.",
-            backstory=self._persona_hint(sales_lead),
+            role=f"{sales_lead} — {p.get('social_role', 'Sales Lead')}",
+            goal="Summarise a customer email for Product on Slack naturally in your own voice.",
+            backstory=backstory,
             llm=self._worker_llm,
         )
         task = Task(
@@ -453,7 +459,7 @@ class ExternalEmailIngestor:
                 f"1. Summarises what {signal.source_name} is asking (2 sentences)\n"
                 f"2. States urgency: high / medium / low\n"
                 f"3. Ends with a concrete ask for {product_lead}\n"
-                f"Under 80 words. No bullets. Write as {sales_lead}."
+                f"Under 80 words. No bullets. Write as {sales_lead} using your typing quirks."
             ),
             expected_output="Slack message under 80 words.",
             agent=agent,
@@ -512,10 +518,16 @@ class ExternalEmailIngestor:
         self._registry.register_jira(ticket_id)
         jira_time, _ = self._clock.sync_and_advance([product_lead], hours=0.3)
 
+        # ✨ NEW: Global voice card and role anchoring
+        backstory = get_voice_card(
+            product_lead, "async", graph_dynamics=None, mem=self._mem
+        )
+        p = self._personas.get(product_lead, {})
+
         agent = make_agent(
-            role=f"{product_lead}, Product Manager",
+            role=f"{product_lead} — {p.get('social_role', 'Product Manager')}",
             goal="Write a JIRA ticket from a customer complaint.",
-            backstory=self._persona_hint(product_lead),
+            backstory=backstory,
             llm=self._worker_llm,
         )
         task = Task(
@@ -708,10 +720,6 @@ class ExternalEmailIngestor:
         )
         return ticket_id
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # HR OUTBOUND
-    # ─────────────────────────────────────────────────────────────────────────
-
     def _send_hr_outbound(self, hire, hr_lead, days_until, state, date_str) -> None:
         name = hire["name"]
         role = hire.get("role", "team member")
@@ -727,10 +735,14 @@ class ExternalEmailIngestor:
 
         hr_time, _ = self._clock.sync_and_advance([hr_lead], hours=0.5)
 
+        # ✨ NEW: Global voice card and role anchoring
+        backstory = get_voice_card(hr_lead, "async", graph_dynamics=None, mem=self._mem)
+        p = self._personas.get(hr_lead, {})
+
         agent = make_agent(
-            role=f"{hr_lead}, HR Lead",
+            role=f"{hr_lead} — {p.get('social_role', 'HR Lead')}",
             goal=f"Write a {email_type.replace('_', ' ')} to {name}.",
-            backstory=self._persona_hint(hr_lead),
+            backstory=backstory,
             llm=self._worker_llm,
         )
         task = Task(
@@ -738,7 +750,7 @@ class ExternalEmailIngestor:
                 f"You are {hr_lead} at {self._company_name}. Write a "
                 f"{'warm offer letter' if email_type == 'offer_letter' else 'friendly onboarding prep email'} "
                 f"to {name}, joining as {role} in {dept} in {days_until} day(s).\n"
-                f"Under 120 words. Warm, professional. No [PLACEHOLDER] tokens. "
+                f"Under 120 words. Warm, professional. Use your typing quirks. No [PLACEHOLDER] tokens. "
                 f"Output body only."
             ),
             expected_output="Email body under 120 words.",
@@ -798,7 +810,6 @@ class ExternalEmailIngestor:
             },
         )
 
-        # Store so employee_hired can link this into its causal chain
         hire["_hr_email_embed_id"] = embed_id
 
         self._mem.log_event(
@@ -829,10 +840,6 @@ class ExternalEmailIngestor:
             f"({days_until}d before Day {hire['day']})"
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # OUTBOUND REPLIES
-    # ─────────────────────────────────────────────────────────────────────────
-
     def _send_customer_reply(
         self,
         signal: ExternalEmailSignal,
@@ -856,10 +863,16 @@ class ExternalEmailIngestor:
             else "This is routine — thank them, confirm receipt, and say the team will be in touch."
         )
 
+        # ✨ NEW: Global voice card and role anchoring
+        backstory = get_voice_card(
+            sales_lead, "async", graph_dynamics=None, mem=self._mem
+        )
+        p = self._personas.get(sales_lead, {})
+
         agent = make_agent(
-            role=f"{sales_lead}, Sales Lead",
+            role=f"{sales_lead} — {p.get('social_role', 'Sales Lead')}",
             goal=f"Reply to a customer email on behalf of {self._company_name}.",
-            backstory=self._persona_hint(sales_lead),
+            backstory=backstory,
             llm=self._worker_llm,
         )
         task = Task(
@@ -868,7 +881,7 @@ class ExternalEmailIngestor:
                 f"You received this email from {signal.source_name}:\n"
                 f"Subject: {signal.subject}\n{signal.full_body}\n\n"
                 f"{urgency_hint}\n"
-                f"Under 80 words. Professional, warm. No [PLACEHOLDER] tokens. "
+                f"Under 80 words. Professional, warm. Use your typing quirks. No [PLACEHOLDER] tokens. "
                 f"Output body only — no subject line."
             ),
             expected_output="Email reply body under 80 words.",
@@ -993,10 +1006,16 @@ class ExternalEmailIngestor:
             else "No ticket number yet — just say it is being investigated."
         )
 
+        # ✨ NEW: Global voice card and role anchoring
+        backstory = get_voice_card(
+            recipient, "async", graph_dynamics=None, mem=self._mem
+        )
+        p = self._personas.get(recipient, {})
+
         agent = make_agent(
-            role=f"{recipient}, Engineer",
+            role=f"{recipient} — {p.get('social_role', 'Engineer')}",
             goal=f"Acknowledge a vendor alert email on behalf of {self._company_name}.",
-            backstory=self._persona_hint(recipient),
+            backstory=backstory,
             llm=self._worker_llm,
         )
         task = Task(
@@ -1006,7 +1025,7 @@ class ExternalEmailIngestor:
                 f"Subject: {signal.subject}\n{signal.full_body}\n\n"
                 f"Write a short acknowledgment email. Confirm receipt, state "
                 f"you are investigating. {jira_hint}\n"
-                f"Under 60 words. Technical, professional. Output body only."
+                f"Under 60 words. Technical, professional. Use your typing quirks. Output body only."
             ),
             expected_output="Acknowledgment email body under 60 words.",
             agent=agent,
@@ -1100,10 +1119,6 @@ class ExternalEmailIngestor:
         )
         logger.info(f"    [cyan]📤 Ack → {signal.source_name}:[/cyan] {subject[:80]}")
         return embed_id
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # DROPPED EMAIL
-    # ─────────────────────────────────────────────────────────────────────────
 
     def _log_dropped_email(self, signal: ExternalEmailSignal, state) -> None:
         """

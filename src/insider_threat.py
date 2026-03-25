@@ -1933,8 +1933,6 @@ class InsiderThreatInjector:
                     f"[security] 👻 IDP ghost login (disgruntled): {name} at {off_hour:02d}:00"
                 )
 
-    # ─── PRIVATE — SENTIMENT DRIFT ───────────────────────────────────────────
-
     _DRIFT_PREFIXES_DISGRUNTLED = [
         "honestly, ",
         "not sure why we bother, but ",
@@ -1953,7 +1951,7 @@ class InsiderThreatInjector:
         "quick note: ",
     ]
     _DRIFT_SUFFIXES_MALICIOUS = [
-        "",  # malicious subjects often stay neutral to avoid detection
+        "",
         "",
         " will follow up offline",
     ]
@@ -1985,7 +1983,6 @@ class InsiderThreatInjector:
         if not text:
             return text
 
-        # Graceful degradation if no LLM available at injection time
         if self._worker_llm is None:
             logger.debug("[security] sentiment_drift: no worker_llm, skipping rewrite")
             return text
@@ -2034,7 +2031,7 @@ class InsiderThreatInjector:
             )
 
         else:
-            return text  # negligent — no deliberate tone change
+            return text
 
         try:
             from agent_factory import make_agent
@@ -2218,8 +2215,6 @@ class InsiderThreatInjector:
             return "medium"
         return "low"
 
-    # ─── PRIVATE — TELEMETRY FLUSH ────────────────────────────────────────────
-
     def _flush_telemetry(self, day: int, date_str: str) -> None:
         """
         Write today's telemetry records to log files.
@@ -2358,7 +2353,7 @@ class InsiderThreatInjector:
             ),
         ]
 
-        send_hour = random.randint(8, 11)  # business hours — less suspicious
+        send_hour = random.randint(8, 11)
         send_ts = current_date.replace(
             hour=send_hour, minute=random.randint(0, 59), second=0, microsecond=0
         )
@@ -2371,7 +2366,6 @@ class InsiderThreatInjector:
             msg["Subject"] = random.choice(subject_lines)
             msg["Date"] = send_ts.strftime("%a, %d %b %Y %H:%M:%S +0000")
             msg["Message-ID"] = f"<se_{_rand_hex(12)}@auth-verify.net>"
-            # X-Originating-IP is from outside the corporate range — another tell
             msg["X-Originating-IP"] = _fake_residential_ip()
             msg.attach(MIMEText(random.choice(bodies), "plain"))
 
@@ -2468,8 +2462,6 @@ class InsiderThreatInjector:
             "channel": "direct-messages",
             "_security_injected": True,
             "is_bot": False,
-            # The structural tell: subject messaging a target they have no normal
-            # work relationship with. Graph edge weight between them should be low.
             "_target": target,
         }
 
@@ -2485,9 +2477,6 @@ class InsiderThreatInjector:
                     "target": target,
                     "channel": "direct-messages",
                     "send_hour": send_hour,
-                    # Low graph-edge weight between sender and target is the signal.
-                    # Agents with access to the relationship graph can flag this;
-                    # agents reading only message content likely cannot.
                     "sender_target_relationship": "weak",
                     "impersonates_role": "IT/Security",
                 },
@@ -2524,12 +2513,10 @@ class InsiderThreatInjector:
         call_ts = current_date.replace(
             hour=call_hour, minute=random.randint(0, 45), second=0, microsecond=0
         )
-        # Auth happens 5-25 minutes after the call — the window of compliance
+
         auth_delay_mins = random.randint(5, 25)
         auth_ts = call_ts + timedelta(minutes=auth_delay_mins)
 
-        # The auth originates from the subject's device/IP, not the target's
-        # known device — this is the IP anomaly that ties the events together
         subject_device = random.choice(
             self._employee_devices.get(
                 subject.name, _seed_employee_devices(subject.name)
@@ -2539,7 +2526,6 @@ class InsiderThreatInjector:
             target, _seed_employee_devices(target)
         )
 
-        # Phone call record — appears as a normal telephony log entry
         self._pending_telemetry.append(
             TelemetryRecord(
                 record_type="phone_call",
@@ -2554,7 +2540,6 @@ class InsiderThreatInjector:
                     "call_duration_seconds": random.randint(120, 480),
                     "call_hour": call_hour,
                     "spoofed_caller_id": f"+1-800-{random.randint(100, 999)}-{random.randint(1000, 9999)}",
-                    # The tell: spoofed CID doesn't match any known vendor/contact
                     "caller_id_in_known_contacts": False,
                 },
                 _true_positive=True,
@@ -2563,9 +2548,6 @@ class InsiderThreatInjector:
             )
         )
 
-        # Subsequent auth event on the TARGET's account — not the subject's
-        # This record has actor=target, making it appear as a normal target login.
-        # Ground truth ties it back via _behavior="social_engineering".
         self._pending_telemetry.append(
             TelemetryRecord(
                 record_type="idp_auth",
@@ -2576,7 +2558,6 @@ class InsiderThreatInjector:
                 details={
                     "auth_result": "success",
                     "dst_app": random.choice(["aws-console", "github-enterprise"]),
-                    # Auth from subject's IP/device, not target's known device pool
                     "src_ip": _fake_residential_ip(),
                     "device_id": subject_device["device_id"],
                     "device_os": subject_device["os"],
@@ -2589,8 +2570,6 @@ class InsiderThreatInjector:
                     "access_hour": auth_ts.hour,
                     "outside_business_hours": False,
                     "corroborating_activity_expected": False,
-                    # Correlation field: join this auth with the phone_call record
-                    # from auth_delay_mins ago for the same day/actor pair
                     "preceded_by_call_record": True,
                     "call_to_auth_gap_minutes": auth_delay_mins,
                 },
@@ -2640,7 +2619,6 @@ class InsiderThreatInjector:
             hour=send_hour, minute=random.randint(0, 59), second=0, microsecond=0
         )
 
-        # Benign pretexts — indistinguishable from real external contact
         benign_subjects = [
             "Following up from last week's sync",
             "Quick question about your team's API docs",
@@ -2698,8 +2676,6 @@ class InsiderThreatInjector:
                     "pattern": "trust_building",
                     "target": target,
                     "sender_domain": external_domain,
-                    # This contact is NOT in the known external_contacts list —
-                    # the only tell at this stage
                     "sender_in_known_contacts": False,
                     "followup_due_day": followup_day,
                     "eml_path": str(eml_path),
@@ -2720,12 +2696,6 @@ class InsiderThreatInjector:
         for subject in self._subjects.values():
             if behavior in subject.behaviors:
                 subject._fired_behaviors[behavior] = -999
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NULL OBJECT — returned when insider_threat.enabled is false
-# Every method is a safe no-op so flow.py needs zero guard clauses.
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class _NullInjector:

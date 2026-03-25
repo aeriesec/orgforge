@@ -27,19 +27,19 @@ from typing import TYPE_CHECKING, List
 logger = logging.getLogger("orgforge.simclock")
 
 if TYPE_CHECKING:
-    pass  # State imported at runtime to avoid circular imports
+    pass
 
-# ── Business hours config ─────────────────────────────────────────────────────
+
 DAY_START_HOUR = 9
 DAY_START_MINUTE = 0
 DAY_END_HOUR = 17
 DAY_END_MINUTE = 30
 
-# ── Per-cadence reply spacing (minutes) ──────────────────────────────────────
+
 CADENCE_RANGES = {
-    "incident": (1, 4),  # urgent — tight back-and-forth
-    "normal": (3, 12),  # standard conversation pace
-    "async": (10, 35),  # heads-down work, slow replies
+    "incident": (1, 4),
+    "normal": (3, 12),
+    "async": (10, 35),
 }
 
 
@@ -54,8 +54,6 @@ class SimClock:
         if not hasattr(self._state, "actor_cursors"):
             self._state.actor_cursors = {}
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def reset_to_business_start(self, all_actors: List[str]) -> None:
         """
         Call at the top of each day in daily_cycle().
@@ -64,10 +62,8 @@ class SimClock:
         """
         base = self._get_default_start()
 
-        # Reset all human actors
         self._state.actor_cursors = {a: base for a in all_actors}
 
-        # Reset a dedicated system cursor for independent bot alerts
         self._state.actor_cursors["system"] = base
 
     def advance_actor(self, actor: str, hours: float) -> tuple[datetime, datetime]:
@@ -104,17 +100,15 @@ class SimClock:
         start until the busiest person is free), moves everyone to that time,
         and advances by a random delta.
         """
-        # 1. Sync everyone to the maximum cursor
+
         synced_time = self._sync_time(actors)
 
-        # 2. Tick forward from the synced time
         delta = timedelta(minutes=random.randint(min_mins, max_mins))
         candidate = synced_time + delta
 
         if not allow_after_hours:
             candidate = self._enforce_business_hours(candidate)
 
-        # 3. Update all participants
         for a in actors:
             self._set_cursor(a, candidate)
 
@@ -152,12 +146,9 @@ class SimClock:
         meeting_end = meeting_start + timedelta(minutes=duration_mins)
 
         for a in actors:
-            # Only advance people who are behind the meeting's end time.
-            # If someone is already past it, they "missed" it, but we don't time-travel them back.
             if self._get_cursor(a) < meeting_end:
                 self._set_cursor(a, meeting_end)
 
-        # The artifact itself is stamped exactly when scheduled
         return meeting_start
 
     def now(self, actor: str) -> datetime:
@@ -171,8 +162,6 @@ class SimClock:
         """
         sys_time = self._get_cursor("system")
         for a in actors:
-            # If they are behind the system alert, pull them forward to it.
-            # If they are somehow ahead, the incident interrupts their future task.
             if self._get_cursor(a) < sys_time:
                 self._set_cursor(a, sys_time)
         return sys_time
@@ -184,11 +173,10 @@ class SimClock:
         Schedules a ceremony within a specific window and syncs all participants to it.
         Example: schedule_meeting(leads, 9, 11) for Sprint Planning.
         """
-        # Pick a random top-of-the-hour or half-hour slot in the window
+
         hour = random.randint(min_hour, max(min_hour, max_hour - 1))
         minute = random.choice([0, 15, 30, 45])
 
-        # Use the at() method we defined earlier to pin the actors
         return self.at(actors, hour, minute, duration_mins)
 
     def sync_and_advance(
@@ -199,20 +187,16 @@ class SimClock:
         then advances all of them by the specified hours.
         Returns (meeting_start_time, new_cursor_horizon).
         """
-        # 1. Find the latest time among all participants
+
         start_time = self._sync_time(actors)
 
-        # 2. Calculate the end time based on the agenda item's duration
         delta = timedelta(hours=hours)
         end_time = self._enforce_business_hours(start_time + delta)
 
-        # 3. Fast-forward everyone to the end of the meeting
         for a in actors:
             self._set_cursor(a, end_time)
 
         return start_time, end_time
-
-    # ── Private ───────────────────────────────────────────────────────────────
 
     def _get_default_start(self) -> datetime:
         """Returns 09:00 on the current State date."""
@@ -259,7 +243,6 @@ class SimClock:
         if dt <= end_of_day and dt.weekday() < 5:
             return dt
 
-        # Roll forward to next business day 09:00
         next_day = dt + timedelta(days=1)
         max_skip = 7
         for _ in range(max_skip):

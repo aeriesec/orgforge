@@ -37,6 +37,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent_factory import make_agent
+from json_repair import json_repair
 import networkx as nx
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Optional
@@ -48,7 +49,6 @@ from normal_day import NormalDayHandler, dept_of_name
 from artifact_registry import ArtifactRegistry
 from confluence_writer import ConfluenceWriter
 from ticket_assigner import TicketAssigner
-from token_tracker import orgforge_token_listener
 from external_email_ingest import ExternalEmailIngestor
 from insider_threat import _NullInjector, InsiderThreatInjector
 from pydantic import BaseModel, Field
@@ -57,6 +57,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.logging import RichHandler
 from rich import box
+from utils.persona_utils import get_voice_card
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from crewai import Process, Task, Crew
@@ -161,11 +162,6 @@ def build_llm(model_key: str):
                 "Run: pip install langchain-aws"
             )
 
-    # Default: Ollama (local_gpu)
-
-    # 1. Check environment variable first (injected by Docker)
-    # 2. Fall back to config.yaml if no env var exists
-    # 3. Fall back to localhost if neither exists
     env_base_url = os.environ.get("OLLAMA_BASE_URL")
     config_base_url = _PRESET.get("base_url", "http://localhost:11434")
 
@@ -178,7 +174,6 @@ def build_llm(model_key: str):
 PLANNER_MODEL = build_llm("planner")
 WORKER_MODEL = build_llm("worker")
 
-# Propagate embedding config to memory via environment
 os.environ.setdefault("EMBED_PROVIDER", _PRESET.get("embed_provider", "ollama"))
 os.environ.setdefault("EMBED_MODEL", _PRESET.get("embed_model", "mxbai-embed-large"))
 os.environ.setdefault("EMBED_DIMS", str(_PRESET.get("embed_dims", 1024)))
@@ -217,7 +212,6 @@ def build_social_graph() -> nx.Graph:
     """Builds a weighted social graph of employees and external contacts."""
     G = nx.Graph()
 
-    # Internal nodes (unchanged)
     for dept, members in ORG_CHART.items():
         for member in members:
             G.add_node(
@@ -238,7 +232,6 @@ def build_social_graph() -> nx.Graph:
                 weight += 5.0
             G.add_edge(n1, n2, weight=weight)
 
-    # External nodes — cold edges to their liaison department
     for contact in CONFIG.get("external_contacts", []):
         node_id = contact["name"]
         liaison_dept = contact.get("internal_liaison", list(LEADS.keys())[0])
@@ -254,15 +247,11 @@ def build_social_graph() -> nx.Graph:
             external=True,
         )
 
-        # Cold starting edge to liaison lead only — warms up via incidents
         G.add_edge(node_id, liaison_lead, weight=0.5)
 
     return G
 
 
-# ─────────────────────────────────────────────
-# 2. STATE
-# ─────────────────────────────────────────────
 class ActiveIncident(BaseModel):
     ticket_id: str
     title: str
@@ -335,9 +324,6 @@ class State(BaseModel):
     ticket_actors_today: Dict[str, List[str]] = Field(default_factory=dict)
 
 
-# ─────────────────────────────────────────────
-# 3. FILE I/O
-# ─────────────────────────────────────────────
 def _mkdir(path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -387,9 +373,6 @@ def save_eml(
         f.write(msg.as_string())
 
 
-# ─────────────────────────────────────────────
-# 4. GIT SIMULATOR (NetworkX Aware)
-# ─────────────────────────────────────────────
 class GitSimulator:
     def __init__(
         self,
@@ -449,8 +432,8 @@ class GitSimulator:
             agent = make_agent(
                 role=f"{author}, Software Engineer",
                 goal=f"Write a PR description for your own code as {author} would.",
-                backstory=persona_backstory(
-                    author, self._mem, graph_dynamics=self.graph_dynamics
+                backstory=get_voice_card(
+                    author, "async", self.graph_dynamics, self._mem
                 ),
                 llm=self._worker_llm,
             )
@@ -524,9 +507,6 @@ class GitSimulator:
             save_json(path, data)
 
 
-# ─────────────────────────────────────────────
-# 5. HELPERS
-# ─────────────────────────────────────────────
 def persona_backstory(
     name: str,
     mem: Optional[Memory] = None,
@@ -731,7 +711,6 @@ class OrgForgeSimulation:
             mem=self._mem,
         )
         self._se_followup_days: Dict[int, str] = {}
-        orgforge_token_listener.attach(self._mem)
 
         stats = self._mem.stats()
         logger.info(
@@ -1172,20 +1151,22 @@ class OrgForgeSimulation:
         # sprint_theme omitted intentionally; it hasn't been decided yet.
         ctx = self._mem.context_for_sprint_planning(
             sprint_num=sprint_num,
-            dept="",  # all depts for the theme step
+            dept="",
             as_of_time=timestamp_str,
         )
         product_dept = next((d for d in LEADS if "product" in d.lower()), None)
         product_lead = LEADS.get(product_dept, LEADS[next(iter(LEADS))])
 
+        p_persona = PERSONAS.get(product_lead, {})
         product_agent = make_agent(
-            role="Product Manager",
+            role=f"{product_lead} — {p_persona.get('social_role', 'Product Manager')}",
             goal="Propose a sprint theme grounded in business priorities.",
-            backstory=persona_backstory(
-                product_lead, self._mem, graph_dynamics=self.graph_dynamics
+            backstory=get_voice_card(
+                product_lead, "design", self.graph_dynamics, self._mem
             ),
             llm=PLANNER_MODEL,
         )
+
         product_task = Task(
             description=(
                 f"It's Sprint #{sprint_num} planning at {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
@@ -1201,12 +1182,13 @@ class OrgForgeSimulation:
 
         eng_dept = next((d for d in LEADS if "eng" in d.lower()), None)
         eng_lead = LEADS.get(eng_dept, LEADS[next(iter(LEADS))])
+        e_persona = PERSONAS.get(eng_lead, {})
 
         eng_agent = make_agent(
-            role="Engineering Lead",
+            role=f"{eng_lead} — {e_persona.get('social_role', 'Engineering Lead')}",
             goal="Ratify or amend the sprint theme based on technical reality.",
-            backstory=persona_backstory(
-                eng_lead, self._mem, graph_dynamics=self.graph_dynamics
+            backstory=get_voice_card(
+                eng_lead, "design", self.graph_dynamics, self._mem
             ),
             llm=PLANNER_MODEL,
         )
@@ -1235,7 +1217,6 @@ class OrgForgeSimulation:
 
         self.state.sprint.sprint_theme = sprint_theme
 
-        # ── Step 2: Per-dept ticket generation in parallel ─────────────────────
         n_per_dept = CONFIG["simulation"].get("sprint_tickets_per_planning", 4)
         all_new_tickets: list = []
         lock = threading.Lock()
@@ -1249,7 +1230,6 @@ class OrgForgeSimulation:
             )
             dept_capacity = self._ticket_assigner._compute_capacity(members, self.state)
             total_hrs = sum(dept_capacity.values())
-            # Rough heuristic: each ticket ~1.5hrs average (matches assigner's pts * 0.75)
             capacity_slots = int(total_hrs / 1.5)
             headroom = max(0, capacity_slots - open_count)
             tickets_to_generate = min(n_per_dept, headroom)
@@ -1270,12 +1250,12 @@ class OrgForgeSimulation:
             agent = make_agent(
                 role=f"{dept} Lead",
                 goal=f"Create realistic sprint tickets for the {dept} team.",
-                backstory=persona_backstory(
-                    lead_name, self._mem, graph_dynamics=self.graph_dynamics
+                backstory=get_voice_card(
+                    lead_name, "design", self.graph_dynamics, self._mem
                 ),
                 llm=WORKER_MODEL,
             )
-            # Before building the task, collect the dept's expertise tags
+
             member_expertise = {}
             for name in members:
                 persona = CONFIG.get("personas", {}).get(name, {})
@@ -1319,22 +1299,27 @@ class OrgForgeSimulation:
             )
             raw = str(Crew(agents=[agent], tasks=[task]).kickoff()).strip()
 
-            # Parse — strip accidental fences
-            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("` \n")
             try:
-                proposals = json.loads(raw)
+                proposals = json_repair.loads(raw)
+
                 if not isinstance(proposals, list):
-                    raise ValueError("Not a list")
+                    logger.warning(
+                        f"[sprint] {dept} LLM returned dict instead of list, wrapping it."
+                    )
+                    proposals = [proposals] if isinstance(proposals, dict) else []
+
             except Exception as e:
                 logger.warning(
                     f"[sprint] {dept} ticket parse failed: {e}. Raw: {raw[:200]}"
                 )
-                # Graceful fallback: one generic ticket so the sprint isn't empty
+                proposals = []
+
+            if not proposals:
                 proposals = [
                     {
                         "title": f"{sprint_theme} — {dept} work",
                         "story_points": 2,
-                        "description": "",
+                        "description": "General planned work for the sprint.",
                     }
                 ]
 
@@ -1351,7 +1336,7 @@ class OrgForgeSimulation:
                         "title": proposal.get("title", f"{sprint_theme} — {dept}"),
                         "description": proposal.get("description", ""),
                         "status": "To Do",
-                        "assignee": None,  # TicketAssigner owns this next morning
+                        "assignee": None,
                         "dept": dept,
                         "dept_type": "non_eng" if dept in _NON_ENG_DEPTS else "eng",
                         "completion_artifact": _DEPT_COMPLETION_ARTIFACT.get(
@@ -1458,7 +1443,6 @@ class OrgForgeSimulation:
     def _handle_standup(self):
         logger.info("  [bold blue]☕ Multi-Agent Standup[/bold blue]")
 
-        # Deriving all_names from the config provided in your files
         all_names = [n for dept in CONFIG["org_chart"].values() for n in dept]
         attendees = random.sample(all_names, min(8, len(all_names)))
 
@@ -1470,18 +1454,14 @@ class OrgForgeSimulation:
 
         messages = []
         for name in attendees:
-            backstory = persona_backstory(
-                name, mem=self._mem, graph_dynamics=self.graph_dynamics
-            )
+            backstory = get_voice_card(name, "async", self.graph_dynamics, self._mem)
 
-            # Tier 1: structured per-person query — no embedding.
             personal_ctx = self._mem.context_for_person(
                 name=name,
                 as_of_time=meeting_time_iso,
                 n=3,
             )
 
-            # Pull this engineer's owned tickets from SprintContext
             dept = dept_of_name(name, CONFIG["org_chart"])
             sprint_ctx = self.state.org_day_plan.sprint_contexts.get(dept)
             owned = (
@@ -1671,8 +1651,8 @@ class OrgForgeSimulation:
             agent = make_agent(
                 role=role_label,
                 goal=f"Contribute authentically to the Sprint #{sprint_num} retrospective.",
-                backstory=persona_backstory(
-                    name, self._mem, graph_dynamics=self.graph_dynamics
+                backstory=get_voice_card(
+                    name, "design", self.graph_dynamics, self._mem
                 ),
                 llm=PLANNER_MODEL,
             )
@@ -1751,12 +1731,11 @@ class OrgForgeSimulation:
 
         self._clock.sync_to_system([on_call])
 
-        # ── 1. Root cause ─────────────────────────────────────────────────────
         rc_agent = make_agent(
             role=f"{on_call}, Senior On-Call Engineer",
             goal=f"Diagnose the root cause of today's incident as {on_call}, given what you know about this system.",
-            backstory=persona_backstory(
-                on_call, self._mem, graph_dynamics=self.graph_dynamics
+            backstory=get_voice_card(
+                on_call, "collision", self.graph_dynamics, self._mem
             ),
             llm=PLANNER_MODEL,
         )
@@ -1796,11 +1775,8 @@ class OrgForgeSimulation:
             Crew(agents=[rc_agent], tasks=[rc_task], verbose=False).kickoff()
         ).strip()
 
-        # ── 2. Domain-routed incident lead ────────────────────────────────────
         incident_lead = self._select_domain_expert(root_cause, exclude=on_call)
 
-        # eng_peer: a different active engineer from incident_lead's department.
-        # Falls back to on_call if no peer exists in that dept.
         eng_peer = next(
             (
                 n
@@ -1810,14 +1786,12 @@ class OrgForgeSimulation:
             on_call,
         )
 
-        # ── 2. Knowledge gap detection ────────────────────────────────────────
         involves_gap = any(
             k.lower() in root_cause.lower()
             for emp in DEPARTED_EMPLOYEES.values()
             for k in emp["knew_about"]
         )
 
-        # Build detailed gap context for description + embedding
         gap_areas: List[str] = []
         gap_context_str: str = ""
         if involves_gap:
@@ -1847,7 +1821,6 @@ class OrgForgeSimulation:
             timestamp=incident_start_iso,
         )
 
-        # ── 3. Recurrence detection ───────────────────────────────────────────
         prior = self._recurrence_detector.find_prior_incident(
             root_cause, self.state.day, ticket_id
         )
@@ -1865,7 +1838,6 @@ class OrgForgeSimulation:
             else "First occurrence of this issue."
         )
 
-        # ── 4. Escalation chain ───────────────────────────────────────────────
         gap_kw = [k for emp in DEPARTED_EMPLOYEES.values() for k in emp["knew_about"]]
         chain = self.graph_dynamics.build_escalation_chain(
             first_responder=on_call,
@@ -1874,7 +1846,6 @@ class OrgForgeSimulation:
         escalation_narrative = self.graph_dynamics.escalation_narrative(chain)
         escalation_actors = [n for n, _ in chain.chain]
 
-        # ── 5. Bot alerts — capture thread ids before ticket is built ─────────
         datadog_text = (
             f"🚨 [CRITICAL] Anomaly detected: {root_cause[:80]}... "
             f"Error rate spiked 400%. System health dropped to {self.state.system_health}."
@@ -1891,12 +1862,10 @@ class OrgForgeSimulation:
 
         self.state.system_health = max(0, self.state.system_health - 15)
 
-        # ── 6. Causal chain — start it now, append as artifacts are created ───
         chain_handler = CausalChainHandler(ticket_id)
         chain_handler.append(datadog_thread)
         chain_handler.append(pagerduty_thread)
 
-        # ── 7. Generate ticket description — all context is available now ─────
         _rc_slug = root_cause[:80].rstrip(".,;")
         _gap_tag = (
             f" [{gap_areas[0]} undocumented]" if involves_gap and gap_areas else ""
@@ -1906,9 +1875,7 @@ class OrgForgeSimulation:
         desc_agent = make_agent(
             role="Senior Engineer",
             goal="Write a concise Jira ticket description for an incident.",
-            backstory=persona_backstory(
-                on_call, self._mem, graph_dynamics=self.graph_dynamics
-            ),
+            backstory=get_voice_card(on_call, "design", self.graph_dynamics, self._mem),
             llm=WORKER_MODEL,
         )
         desc_task = Task(
@@ -1957,7 +1924,6 @@ class OrgForgeSimulation:
             else:
                 break
 
-        # ── 8. Build ticket with full context ─────────────────────────────────
         ticket = {
             "id": ticket_id,
             "title": title,
@@ -1970,18 +1936,14 @@ class OrgForgeSimulation:
             "sprint": self.state.sprint.sprint_number,
             "created_at": incident_start_iso,
             "updated_at": incident_start_iso,
-            # Causal chain
             "causal_chain": chain_handler.snapshot(),
             "bot_threads": [datadog_thread, pagerduty_thread],
-            # Recurrence
             "recurrence_of": recurrence_of,
             "recurrence_gap_days": recurrence_gap,
             "recurrence_chain_root": _chain_root,
             "recurrence_chain_depth": len(_chain_visited) + 1 if recurrence_of else 0,
             "prior_postmortem": prior_postmortem,
-            # Knowledge gap
             "gap_areas": gap_areas,
-            # Escalation
             "escalation_actors": escalation_actors,
             "escalation_narrative": escalation_narrative,
         }
@@ -2023,7 +1985,6 @@ class OrgForgeSimulation:
             },
         )
 
-        # ── 10. Activate incident — chain_handler travels with it ─────────────
         inc = ActiveIncident(
             ticket_id=ticket_id,
             title=title,
@@ -2037,7 +1998,6 @@ class OrgForgeSimulation:
         self.state.active_incidents.append(inc)
         self.state.daily_incidents_opened += 1
 
-        # ── 11. External contacts ─────────────────────────────────────────────
         triggered_contacts = self.graph_dynamics.relevant_external_contacts(
             event_type="incident_opened",
             system_health=self.state.system_health,
@@ -2046,7 +2006,6 @@ class OrgForgeSimulation:
         for contact in triggered_contacts:
             self._handle_external_contact(inc, contact)
 
-        # ── 12. SimEvents ─────────────────────────────────────────────────────
         self._mem.log_event(
             SimEvent(
                 type="incident_opened",
@@ -2117,13 +2076,11 @@ class OrgForgeSimulation:
                 )
             )
 
-        # ── 13. Graph dynamics ────────────────────────────────────────────────
         self._record_daily_actor(on_call, incident_lead)
         self._record_daily_event("incident_opened")
         self.graph_dynamics.apply_incident_stress([on_call, incident_lead])
         self.graph_dynamics.record_incident_collaboration([on_call, incident_lead])
 
-        # ── 14. Dept plan pressure ────────────────────────────────────────────
         if self.state.org_day_plan:
             eng_key = next(
                 (k for k in self.state.org_day_plan.dept_plans if "eng" in k.lower()),
@@ -2187,8 +2144,6 @@ class OrgForgeSimulation:
                 inc.pr_id = pr["pr_id"]
                 if getattr(inc, "causal_chain", None):
                     inc.causal_chain.append(pr["pr_id"])
-                    # Persist the updated causal chain back to the ticket so it
-                    # reflects the PR link immediately (fixes missing PR in chain).
                     t = self._mem.get_ticket(inc.ticket_id)
                     if t:
                         t["causal_chain"] = inc.causal_chain.snapshot()
@@ -2201,7 +2156,6 @@ class OrgForgeSimulation:
                 )
                 still_active.append(inc)
 
-                # Check whether any external contacts should be triggered
                 triggered_contacts = self.graph_dynamics.relevant_external_contacts(
                     event_type="fix_in_progress",
                     system_health=self.state.system_health,
@@ -2211,9 +2165,6 @@ class OrgForgeSimulation:
                     self._handle_external_contact(inc, contact)
 
             elif inc.stage == "fix_in_progress":
-                # Trigger PR review — reviewers leave comments before merge.
-                # This produces genuine review activity on incident PRs, not
-                # just a silent open→merge status flip.
                 inc.stage = "review_pending"
                 if inc.pr_id:
                     pr_doc = self._mem._prs.find_one({"pr_id": inc.pr_id}, {"_id": 0})
@@ -2275,10 +2226,8 @@ class OrgForgeSimulation:
                     )
                 )
                 logger.info(f"[green]✅ {inc.ticket_id} resolved.[/green]")
-                # Resolved — intentionally not appended to still_active
 
             else:
-                # Unknown stage — keep active to avoid silent data loss
                 still_active.append(inc)
 
         self.state.active_incidents = still_active
@@ -2663,10 +2612,8 @@ class OrgForgeSimulation:
         agent = make_agent(
             role="Employee",
             goal="Summarize an external conversation for your team on Slack.",
-            backstory=persona_backstory(
-                liaison_name,
-                self._mem,
-                extra=self.graph_dynamics.stress_tone_hint(liaison_name),
+            backstory=get_voice_card(
+                liaison_name, "dm", self.graph_dynamics, self._mem
             ),
             llm=WORKER_MODEL,
         )

@@ -30,13 +30,7 @@ logger = logging.getLogger("orgforge.validator")
 
 _DEPARTED_NAMES: set = set()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PLAUSIBILITY RULES
-# Each rule is a (condition, rejection_reason) pair.
-# Rules are evaluated in order — first failure rejects the event.
-# ─────────────────────────────────────────────────────────────────────────────
 
-# Events that are inappropriate when system health is critically low
 _BLOCKED_WHEN_CRITICAL = {
     "team_celebration",
     "hackathon",
@@ -44,7 +38,7 @@ _BLOCKED_WHEN_CRITICAL = {
     "deep_work_session",
 }
 
-# Events that require at least one incident to have occurred recently
+
 _REQUIRES_PRIOR_INCIDENT = {
     "postmortem_created",
     "escalation_chain",
@@ -52,7 +46,7 @@ _REQUIRES_PRIOR_INCIDENT = {
     "customer_escalation",
 }
 
-# Minimum days between repeated firings of the same event type
+
 _COOLDOWN_DAYS: Dict[str, int] = {
     "retrospective": 9,
     "sprint_planned": 9,
@@ -89,26 +83,21 @@ class PlanValidator:
     ):
         self._valid_actors: Set[str] = set(all_names) | set(external_contact_names)
         self._config = config
-        self._novel_log: List[ProposedEvent] = []  # accumulates for SimEvent logging
-
-    # ─── PUBLIC ──────────────────────────────────────────────────────────────
+        self._novel_log: List[ProposedEvent] = []
 
     def validate_plan(
         self,
         proposed: List[ProposedEvent],
-        state,  # flow.State — avoids circular import
-        recent_events: List[dict],  # last N day_summary facts dicts
+        state,
+        recent_events: List[dict],
     ) -> List[ValidationResult]:
         """
         Validate every ProposedEvent in the plan.
         Returns ValidationResult for each — caller logs rejections as SimEvents.
         """
-        # Build cooldown tracker from recent events
+
         recent_event_types = self._recent_event_types(recent_events)
         recent_incident_count = sum(e.get("incidents_opened", 0) for e in recent_events)
-        # Live per-ticket actor tracking for today — read from state, not summaries.
-        # state.ticket_actors_today is populated by flow.py as ticket_progress
-        # events execute, and reset to {} at the top of each daily_cycle().
         ticket_actors_today = self._ticket_actors_today(state)
 
         results: List[ValidationResult] = []
@@ -144,20 +133,15 @@ class PlanValidator:
         self._novel_log.clear()
         return novel
 
-    # ─── PRIVATE ─────────────────────────────────────────────────────────────
-
     def _validate_one(
         self,
         event: ProposedEvent,
         state,
-        recent_event_types: Dict[str, int],  # {event_type: days_since_last}
+        recent_event_types: Dict[str, int],
         recent_incident_count: int,
-        ticket_actors_today: Dict[
-            str, set
-        ],  # {ticket_id: {actors who touched it today}}
+        ticket_actors_today: Dict[str, set],
     ) -> ValidationResult:
 
-        # ── 1. Actor integrity ────────────────────────────────────────────────
         unknown_actors = [a for a in event.actors if a not in self._valid_actors]
         if unknown_actors:
             return ValidationResult(
@@ -167,9 +151,6 @@ class PlanValidator:
                 f"LLM invented names not in org_chart.",
             )
 
-        # ── 1b. Departed-actor guard ──────────────────────────────────────────
-        # patch_validator_for_lifecycle() keeps _valid_actors pruned,
-        # but this explicit check gives a clearer rejection message.
         departed_actors = [a for a in event.actors if a in _DEPARTED_NAMES]
         if departed_actors:
             return ValidationResult(
@@ -181,11 +162,7 @@ class PlanValidator:
                 ),
             )
 
-        # ── 2. Novel event type ───────────────────────────────────────────────
         if event.event_type not in KNOWN_EVENT_TYPES:
-            # Novel events are approved if they name a known artifact type.
-            # This allows the engine to generate something even without
-            # a bespoke handler — it falls back to a Slack summary.
             if event.artifact_hint in {"slack", "jira", "confluence", "email"}:
                 logger.info(
                     f"  [cyan]✨ Novel event approved (fallback artifact):[/cyan] "
@@ -203,7 +180,6 @@ class PlanValidator:
                     ),
                 )
 
-        # ── 3. State plausibility ─────────────────────────────────────────────
         if event.event_type in _BLOCKED_WHEN_CRITICAL and state.system_health < 40:
             return ValidationResult(
                 approved=False,
@@ -224,7 +200,6 @@ class PlanValidator:
                 ),
             )
 
-        # ── 4. Cooldown window ────────────────────────────────────────────────
         cooldown = _COOLDOWN_DAYS.get(event.event_type)
         if cooldown:
             days_since = recent_event_types.get(event.event_type, 999)
@@ -238,7 +213,6 @@ class PlanValidator:
                     ),
                 )
 
-        # ── 5. Morale-gated events ────────────────────────────────────────────
         if event.event_type == "morale_intervention" and state.team_morale > 0.6:
             return ValidationResult(
                 approved=False,
@@ -249,10 +223,6 @@ class PlanValidator:
                 ),
             )
 
-        # ── 6. Ticket dedup ───────────────────────────────────────────────────
-        # Prevents multiple agents independently logging progress on the same
-        # ticket on the same day. ticket_id is sourced from facts_hint, not
-        # related_id (which lives on AgendaItem, not ProposedEvent).
         if event.event_type == "ticket_progress":
             ticket_id = (event.facts_hint or {}).get("ticket_id")
             if ticket_id:
@@ -268,7 +238,6 @@ class PlanValidator:
                         ),
                     )
 
-        # ── All checks passed ─────────────────────────────────────────────────
         return ValidationResult(approved=True, event=event)
 
     def _recent_event_types(self, recent_summaries: List[dict]) -> Dict[str, int]:
@@ -278,11 +247,10 @@ class PlanValidator:
         """
         days_since: Dict[str, int] = {}
         for i, summary in enumerate(reversed(recent_summaries)):
-            # dominant_event is the richest single signal per day
             dominant = summary.get("dominant_event")
             if dominant and dominant not in days_since:
                 days_since[dominant] = i + 1
-            # event_type_counts gives the full picture
+
             for etype in summary.get("event_type_counts", {}).keys():
                 if etype not in days_since:
                     days_since[etype] = i + 1

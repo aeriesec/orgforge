@@ -17,11 +17,6 @@ from memory import SimEvent
 from flow import persona_backstory
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SHARED HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def _make_ticket(
     ticket_id: str,
     title: str,
@@ -40,10 +35,6 @@ def _make_ticket(
         "dept_type": "eng",
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FIXTURES
-# ─────────────────────────────────────────────────────────────────────────────
 
 ORG_CHART = {
     "Engineering": ["Alice", "Bob", "Carol"],
@@ -79,7 +70,7 @@ CONFIG = {
         "company_name": "TestCorp",
         "domain": "testcorp.com",
         "output_dir": "/tmp/orgforge_test",
-        "watercooler_prob": 0.0,  # disable by default; opt-in per test
+        "watercooler_prob": 0.0,
         "aws_alert_prob": 0.0,
         "snyk_alert_prob": 0.0,
         "adhoc_confluence_prob": 0.0,
@@ -186,11 +177,6 @@ def _simple_org_plan(dept_plans: dict) -> OrgDayPlan:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. DISPATCH ROUTING
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def test_dispatch_deep_work_returns_actor_only(handler, mock_state):
     """
     deep_work items must not produce Slack/JIRA artifacts.
@@ -251,14 +237,8 @@ def test_dispatch_unknown_activity_type_does_not_raise(handler, mock_state):
     eng_plan = _simple_eng_plan("Alice", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
-    # Should not raise
     actors = handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
     assert "Alice" in actors
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. TICKET PROGRESS
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_ticket_progress_moves_todo_to_in_progress(handler, mock_state, tmp_path):
@@ -321,7 +301,6 @@ def test_ticket_progress_no_op_for_missing_ticket(handler, mock_state):
     When the ticket_id does not exist in state.jira_tickets, the handler
     must return gracefully without emitting a SimEvent or crashing.
     """
-    # No ticket seeded — get_ticket("ORG-GHOST") returns None from mongomock
 
     item = AgendaItem(
         activity_type="ticket_progress",
@@ -368,7 +347,6 @@ def test_ticket_progress_blocker_emits_blocker_flagged(handler, mock_state):
         patch.object(handler, "_save_slack", return_value=("", "")),
         patch("normal_day.Crew") as mock_crew,
     ):
-        # First call: ticket comment (contains "blocked"); second call: blocker Slack
         mock_crew.return_value.kickoff.side_effect = [
             "I'm blocked waiting on the infra team to open the port.",
             "Alice: On it, I'll check now.",
@@ -377,11 +355,6 @@ def test_ticket_progress_blocker_emits_blocker_flagged(handler, mock_state):
 
     logged_types = [c.args[0].type for c in handler._mem.log_event.call_args_list]
     assert "blocker_flagged" in logged_types
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. 1:1 HANDLING
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_one_on_one_emits_simevent_with_both_actors(handler, mock_state):
@@ -462,7 +435,7 @@ def test_one_on_one_skipped_when_collaborator_is_self(handler, mock_state):
     item = AgendaItem(
         activity_type="1on1",
         description="Self 1:1 (invalid)",
-        collaborator=["Alice"],  # Alice is also the eng_plan name below
+        collaborator=["Alice"],
         estimated_hrs=0.5,
     )
     eng_plan = _simple_eng_plan("Alice", [item])
@@ -475,11 +448,6 @@ def test_one_on_one_skipped_when_collaborator_is_self(handler, mock_state):
         c for c in handler._mem.log_event.call_args_list if c.args[0].type == "1on1"
     ]
     assert len(events) == 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. ASYNC QUESTION
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_async_question_emits_simevent(handler, mock_state):
@@ -635,7 +603,7 @@ def test_design_discussion_confluence_stub_created_sometimes(handler, mock_state
         patch.object(handler, "_save_md"),
         patch("normal_day.Crew") as mock_crew,
         patch("random.random", return_value=0.10),
-    ):  # trigger Confluence path
+    ):
         mock_crew.return_value.kickoff.return_value = (
             '[{"speaker": "Alice", "message": "We need a clear retry policy."}, '
             '{"speaker": "Bob", "message": "Exponential back-off seems right."}]'
@@ -644,11 +612,6 @@ def test_design_discussion_confluence_stub_created_sometimes(handler, mock_state
 
     logged_types = [c.args[0].type for c in handler._mem.log_event.call_args_list]
     assert "confluence_created" in logged_types
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. MENTORING
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_mentoring_double_boosts_graph_edge(handler, graph_and_gd):
@@ -670,16 +633,22 @@ def test_mentoring_double_boosts_graph_edge(handler, graph_and_gd):
     eng_plan = _simple_eng_plan("Alice", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
+    def make_task_mock(*args, **kwargs):
+        m = MagicMock()
+        # Mocking a JSON string satisfies the _extract_last_turn logic
+        m.output.raw = (
+            '{"message": "Alice: Let\'s chat async.", "summary": "Discussed patterns."}'
+        )
+        return m
+
     with (
         patch.object(handler, "_save_slack", return_value=("", "")),
         patch("normal_day.Crew") as mock_crew,
+        patch("normal_day.Task", side_effect=make_task_mock),  # Local patch for Task
     ):
-        mock_crew.return_value.kickoff.return_value = (
-            "Alice: Let's talk about async/await.\nCarol: I've been struggling with it."
-        )
+        mock_crew.return_value.kickoff.return_value = ""
         handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
 
-    # Double boost: weight should have grown by at least 2 × slack_boost
     assert G["Alice"]["Carol"]["weight"] >= weight_before + (2 * boost)
 
 
@@ -697,14 +666,19 @@ def test_mentoring_emits_simevent(handler, mock_state):
     eng_plan = _simple_eng_plan("Alice", [item])
     dept_plan = _simple_dept_plan([eng_plan])
 
+    def make_task_mock(*args, **kwargs):
+        m = MagicMock()
+        m.output.raw = (
+            '{"message": "Alice: How is the workload?", "summary": "Growth check-in."}'
+        )
+        return m
+
     with (
         patch.object(handler, "_save_slack", return_value=("", "")),
         patch("normal_day.Crew") as mock_crew,
+        patch("normal_day.Task", side_effect=make_task_mock),
     ):
-        mock_crew.return_value.kickoff.return_value = (
-            "Alice: How are you finding the new ticket workload?\n"
-            "Carol: It's a lot, but I'm managing."
-        )
+        mock_crew.return_value.kickoff.return_value = ""
         handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
 
     events = [
@@ -725,10 +699,10 @@ def test_mentoring_skipped_when_no_junior_found(handler, mock_state):
     item = AgendaItem(
         activity_type="mentoring",
         description="Mentoring session",
-        collaborator=[],  # no explicit collaborator
+        collaborator=[],
         estimated_hrs=1.0,
     )
-    # Dave is in Sales and is senior — no juniors exist for him in his dept
+
     eng_plan = EngineerDayPlan(
         name="Dave",
         dept="Sales",
@@ -754,11 +728,6 @@ def test_mentoring_skipped_when_no_junior_found(handler, mock_state):
         if c.args[0].type == "mentoring"
     ]
     assert len(events) == 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. CLOCK INTEGRATION — cursors advance correctly
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_deep_work_advances_actor_cursor(handler, clock, mock_state):
@@ -790,7 +759,7 @@ def test_one_on_one_syncs_both_cursors(handler, clock, mock_state):
     After a 1:1, both participants' cursors must be at or beyond the
     session end time (i.e. they were both consumed by the meeting).
     """
-    # Give Bob a head start so we can verify sync
+
     clock._set_cursor("Bob", datetime(2026, 1, 5, 10, 0))
     clock._set_cursor("Alice", datetime(2026, 1, 5, 9, 0))
 
@@ -816,14 +785,8 @@ def test_one_on_one_syncs_both_cursors(handler, clock, mock_state):
         mock_crew.return_value.kickoff.return_value = ""
         handler._dispatch(eng_plan, item, dept_plan, "2026-01-05")
 
-    # Both cursors must be past the original later cursor (Bob at 10:00)
     assert clock.now("Bob") >= datetime(2026, 1, 5, 10, 0)
     assert clock.now("Alice") >= datetime(2026, 1, 5, 10, 0)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. _execute_agenda_items — distraction gate
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_distraction_fires_at_most_once_per_engineer(handler, mock_state, graph_and_gd):
@@ -831,7 +794,7 @@ def test_distraction_fires_at_most_once_per_engineer(handler, mock_state, graph_
     With watercooler_prob=1.0, each engineer must be distracted at most once
     regardless of how many agenda items they have.
     """
-    # Override config to always trigger
+
     handler._config["simulation"]["watercooler_prob"] = 1.0
 
     items = [
@@ -903,7 +866,6 @@ def test_distraction_index_varies_across_runs(handler, mock_state):
     ):
         handler._execute_agenda_items(org_plan, "2026-01-05")
 
-    # random.choice must have been called with the full list of non-deferred indices
     choice_calls = [
         c
         for c in mock_choice.call_args_list
@@ -914,11 +876,6 @@ def test_distraction_index_varies_across_runs(handler, mock_state):
     assert passed_indices == [0, 1, 2, 3], (
         f"Expected all 4 indices passed to random.choice, got {passed_indices}"
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. GRAPH DYNAMICS INTEGRATION
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_execute_agenda_items_calls_graph_dynamics_record(handler, mock_state):
@@ -940,9 +897,8 @@ def test_execute_agenda_items_calls_graph_dynamics_record(handler, mock_state):
         patch.object(handler, "_save_slack", return_value=("", "")),
         patch.object(handler, "graph_dynamics_record") as mock_gdr,
         patch("normal_day.Crew") as mock_crew,
-        patch("normal_day.Task") as mock_task,  # <-- Add Task patch
+        patch("normal_day.Task") as mock_task,
     ):
-        # Configure the Task mock to return a string, satisfying JSON serialization
         mock_task_instance = MagicMock()
         mock_task_instance.output.raw = "mocked message"
         mock_task.return_value = mock_task_instance
@@ -950,13 +906,7 @@ def test_execute_agenda_items_calls_graph_dynamics_record(handler, mock_state):
         mock_crew.return_value.kickoff.return_value = "Bob: Hey Alice.\nAlice: Hey Bob."
         handler._execute_agenda_items(org_plan, "2026-01-05")
 
-        # (Keep your existing assertions here)
         mock_gdr.assert_called()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. UTILITY FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_dept_of_name_returns_correct_dept():
@@ -973,7 +923,7 @@ def test_closest_colleague_returns_highest_weight_neighbour(handler, graph_and_g
     _closest_colleague must return the neighbour with the highest edge weight.
     """
     G, gd = graph_and_gd
-    # Give Bob a very strong edge to Carol and weak edge to Alice
+
     G["Bob"]["Carol"]["weight"] = 20.0
     G["Bob"]["Alice"]["weight"] = 1.0
 
@@ -995,8 +945,8 @@ def test_dept_of_name_returns_first_match_when_name_in_multiple_depts():
     """
     ambiguous_chart = {
         "Engineering": ["Alice", "Bob"],
-        "Platform": ["Alice", "Carol"],  # Alice appears twice
+        "Platform": ["Alice", "Carol"],
     }
     result = dept_of_name("Alice", ambiguous_chart)
-    # Must return one of the two valid depts, not crash or return "Unknown"
+
     assert result in ("Engineering", "Platform")

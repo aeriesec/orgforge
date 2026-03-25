@@ -83,18 +83,11 @@ class TicketAssigner:
         self._mem = mem
         self._base = config["simulation"].get("output_dir", "./export")
 
-        # MongoDB collection for cached ticket-title embeddings.
-        # Separate from jira_tickets so we never pollute the ticket docs.
         self._skill_embed_cache = mem._db["ticket_skill_embeddings"]
         self._skill_embed_cache.create_index([("ticket_id", 1)], unique=True)
 
-        # Engineer expertise vectors — computed once, reused every sprint.
-        # Keys added lazily in _expertise_vector() so new-hire personas that
-        # arrive mid-sim (org_lifecycle.scheduled_hires) are handled naturally.
         self._engineer_vectors: Dict[str, List[float]] = {}
         self._precompute_engineer_vectors()
-
-    # ── Public ────────────────────────────────────────────────────────────────
 
     def build(
         self, state, dept_members: List[str], dept_name: str = ""
@@ -110,12 +103,10 @@ class TicketAssigner:
         """
         capacity = self._compute_capacity(dept_members, state)
 
-        # Tickets assigned to this department but not yet done
         open_tickets = self._mem.get_open_tickets_for_dept(
             dept_members, dept_name=dept_name
         )
 
-        # Tickets in the sprint with no assignee yet (newly created this sprint)
         unassigned = list(
             self._mem._jira.find(
                 {"assignee": None, "dept": dept_name, "status": {"$ne": "Done"}},
@@ -123,7 +114,6 @@ class TicketAssigner:
             )
         )
 
-        # Already-owned tickets stay owned — we only re-assign unassigned ones
         owned: Dict[str, str] = {
             t["id"]: t["assignee"]
             for t in open_tickets
@@ -165,8 +155,6 @@ class TicketAssigner:
             in_review=in_review,
         )
 
-    # ── Capacity ──────────────────────────────────────────────────────────────
-
     def _compute_capacity(self, members: List[str], state) -> Dict[str, float]:
         """
         Available hours per engineer, mirroring EngineerDayPlan.capacity_hrs
@@ -185,8 +173,6 @@ class TicketAssigner:
                 base -= 1.0
             capacity[name] = max(base, 1.5)
         return capacity
-
-    # ── Assignment ────────────────────────────────────────────────────────────
 
     def _assign(
         self,
@@ -235,13 +221,13 @@ class TicketAssigner:
             stress = self._gd._stress.get(eng, 30)
             stress_score = 1.0 - (stress / 100)
             cent = centrality.get(eng, 0.0)
-            cent_factor = 1.0 - (cent * 0.3)  # key players penalised 0–30%
+            cent_factor = 1.0 - (cent * 0.3)
 
             for j, ticket in enumerate(tickets):
                 skill = self._skill_score(eng, ticket)
                 recency = 1.2 if ticket["id"] in ticket_history.get(eng, set()) else 1.0
                 score = skill * stress_score * cent_factor * recency
-                cost[i][j] = -score  # negate → minimise
+                cost[i][j] = -score
 
         row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -252,13 +238,12 @@ class TicketAssigner:
             eng = members[i]
             tkt = tickets[j]
             pts = tkt.get("story_points", 2)
-            est_hrs = pts * 0.75  # rough 0.75 hr/point heuristic
+            est_hrs = pts * 0.75
 
             if assigned_eng_load[eng] + est_hrs <= capacity[eng]:
                 result[tkt["id"]] = eng
                 assigned_eng_load[eng] += est_hrs
             else:
-                # Over capacity — leave ticket unassigned this day
                 logger.debug(f"[assigner] {eng} over capacity, skipping {tkt['id']}")
 
         return result
@@ -278,7 +263,7 @@ class TicketAssigner:
         for ticket in tickets:
             pts = ticket.get("story_points", 2)
             est_hrs = pts * 0.75
-            # Try each member starting from current round-robin position
+
             for offset in range(len(members)):
                 eng = members[(idx + offset) % len(members)]
                 if load[eng] + est_hrs <= capacity[eng]:
@@ -287,8 +272,6 @@ class TicketAssigner:
                     idx = (idx + 1) % len(members)
                     break
         return result
-
-    # ── Skill scoring (embedding-based) ──────────────────────────────────────
 
     def _skill_score(self, engineer: str, ticket: dict) -> float:
         """
@@ -309,14 +292,14 @@ class TicketAssigner:
         """
         eng_vec = self._expertise_vector(engineer)
         if not eng_vec:
-            return 1.0  # no expertise info — treat as neutral
+            return 1.0
 
         tkt_vec = self._ticket_title_vector(ticket)
         if not tkt_vec:
-            return 1.0  # un-embeddable title — treat as neutral
+            return 1.0
 
-        similarity = _cosine(eng_vec, tkt_vec)  # [-1.0 … 1.0]
-        # Map [-1, 1] → [0.5, 1.5]  (similarity=1 → 1.5, similarity=-1 → 0.5)
+        similarity = _cosine(eng_vec, tkt_vec)
+
         return 0.5 + (similarity + 1.0) / 2.0
 
     def _precompute_engineer_vectors(self) -> None:
@@ -325,7 +308,7 @@ class TicketAssigner:
         Called once in __init__; new-hire personas picked up lazily via
         _expertise_vector() during the sim.
         """
-        from config_loader import PERSONAS  # late import — avoids circular dep
+        from config_loader import PERSONAS
 
         for name in PERSONAS:
             doc = self._mem._artifacts.find_one(
@@ -340,7 +323,7 @@ class TicketAssigner:
         Handles mid-sim hires whose persona wasn't present at __init__ time.
         """
         if engineer not in self._engineer_vectors:
-            from config_loader import PERSONAS, DEFAULT_PERSONA  # late import
+            from config_loader import PERSONAS, DEFAULT_PERSONA
 
             persona = PERSONAS.get(engineer, DEFAULT_PERSONA)
             self._engineer_vectors[engineer] = self._build_expertise_vector(
@@ -396,14 +379,12 @@ class TicketAssigner:
         if not title:
             return []
 
-        # ── Cache read ────────────────────────────────────────────────────────
         cached = self._skill_embed_cache.find_one(
             {"ticket_id": ticket_id}, {"embedding": 1, "_id": 0}
         )
         if cached and cached.get("embedding"):
             return cached["embedding"]
 
-        # ── Cache miss: embed and persist ────────────────────────────────────
         try:
             vector = self._mem._embed(
                 title,
@@ -432,14 +413,11 @@ class TicketAssigner:
                     upsert=True,
                 )
             except Exception as exc:
-                # Non-fatal — we still return the vector for this call
                 logger.warning(
                     f"[assigner] ticket embed cache write failed for {ticket_id!r}: {exc}"
                 )
 
         return vector
-
-    # ── History ───────────────────────────────────────────────────────────────
 
     def _ticket_history(self, state) -> Dict[str, set]:
         """
