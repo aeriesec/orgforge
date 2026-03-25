@@ -47,8 +47,6 @@ from external_email_ingest import ExternalEmailSignal
 from config_loader import (
     LEADS,
     LIVE_ORG_CHART,
-    PERSONAS,
-    DEFAULT_PERSONA,
     COMPANY_DESCRIPTION,
     resolve_role,
 )

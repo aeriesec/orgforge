@@ -1,5 +1,3 @@
-from typing import Dict, List
-
 from config_loader import LIVE_ORG_CHART
 
 

@@ -33,7 +33,6 @@ import os
 import logging
 import json
 import random
-import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent_factory import make_agent

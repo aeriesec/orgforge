@@ -11,7 +11,7 @@ from agent_factory import make_agent
 from config_loader import COMPANY_DESCRIPTION
 from crewai import Process, Task, Crew
 
-from json_repair import json_repair, repair_json
+from json_repair import json_repair
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
 from planner_models import (
