@@ -2235,10 +2235,16 @@ class OrgForgeSimulation:
                 still_active.append(inc)
 
             elif inc.stage == "review_pending":
-                # Resolve: merge PR, write postmortem, log event — do NOT append to still_active
                 inc.stage = "resolved"
                 if inc.pr_id:
                     self._git.merge_pr(inc.pr_id)
+                    linked_ticket = self._mem.get_ticket(inc.ticket_id)
+                    if linked_ticket:
+                        linked_ticket["status"] = "Done"
+                        linked_ticket["updated_at"] = cron_time_iso
+                        self._mem.upsert_ticket(linked_ticket)
+                        save_json(f"{BASE}/jira/{inc.ticket_id}.json", linked_ticket)
+
                 self._emit_bot_message(
                     "engineering",
                     "GitHub Actions",
@@ -2268,7 +2274,7 @@ class OrgForgeSimulation:
                         tags=["incident_resolved"],
                     )
                 )
-                logger.info(f"    [green]✅ {inc.ticket_id} resolved.[/green]")
+                logger.info(f"[green]✅ {inc.ticket_id} resolved.[/green]")
                 # Resolved — intentionally not appended to still_active
 
             else:

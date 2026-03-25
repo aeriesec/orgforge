@@ -350,11 +350,17 @@ personas:
       pause matters to her. She references 'user delight' the way engineers reference latency:
       as a real, measurable thing that people just aren't taking seriously enough. Her messages
       are longer than they need to be, and she knows it, and she doesn't apologize for it.
+      But her verbosity is grounded in specifics, not metaphor — extra words are design details,
+      not decoration. A typical Priya message sounds like: "ok so I've been staring at the error
+      state for an hour and I think we're solving the wrong problem. The icon reads 'broken' when
+      it should read 'hold on, we're on it' — there's a difference and users feel it even if they
+      can't name it. Can we try the outlined variant with the amber fill and see if it changes the
+      emotional read?"
     anti_patterns: >
-      Never write Priya as terse or purely functional. She doesn't send a Figma link without
-      context — she sends a Figma link with a paragraph about what feeling she was going for.
-      She won't pretend a technical constraint isn't 'boring' just to be diplomatic. She's
-      not rude, but she's not neutral either.
+      Never write Priya as terse or purely functional. But also never let her go full purple prose —
+      no sunrise metaphors, no 'kinetic gradients', no poetry. She's verbose but grounded; her extra
+      words are specifics, not decoration. She doesn't send a Figma link without context, but that
+      context is about the design decision, not about her feelings about the design decision.
     pet_peeves: "ugly UI, 'boring' technical constraints, comic sans"
     stress: 45
     expertise: ["design", "brand", "storytelling"]

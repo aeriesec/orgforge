@@ -6,6 +6,23 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.4] — 2026-03-25
+
+### Added
+
+- **Automated Ticket Resolution on PR Merge (`src/flow.py`)**: Enhanced the `review_pending` stage to automatically transition linked JIRA tickets to "Done" upon a successful PR merge. This includes updating the `updated_at` timestamp and persisting the state to both internal memory and local JSON storage.
+
+### Changed
+
+- **Priya Persona Refinement (`config/config.yaml`)**: Updated the Design persona to emphasize grounded, technical specificity over abstract or "purple" prose. Her verbosity is now explicitly defined as being rooted in design details (e.g., UI variants, emotional reads of icons) rather than metaphorical or poetic language.
+- **Logging Clarity (`src/flow.py`)**: Cleaned up the resolution log output by removing unnecessary indentation, ensuring more consistent formatting in the terminal during simulation runs.
+
+### Fixed
+
+- **Redundant PR Metadata (`src/normal_day.py`)**: Removed a duplicate `linked_ticket` argument in the `create_pr` call within `NormalDayHandler` to align with the underlying Git utility signature and reduce redundant parameter passing.
+
+---
+
 ## [v1.2.3] — 2026-03-24
 
 ### Added

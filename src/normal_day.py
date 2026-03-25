@@ -949,7 +949,6 @@ class NormalDayHandler:
             pr = self._git.create_pr(
                 author=assignee,
                 ticket_id=ticket_id,
-                linked_ticket=ticket_id,
                 title=f"[{ticket_id}] {ticket['title'][:80]}",
                 timestamp=timestamp_iso,
             )
