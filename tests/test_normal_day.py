@@ -950,3 +950,111 @@ def test_dept_of_name_returns_first_match_when_name_in_multiple_depts():
     result = dept_of_name("Alice", ambiguous_chart)
 
     assert result in ("Engineering", "Platform")
+
+
+def test_try_force_merge_skips_pr_with_changes_requested(handler, mock_state):
+    """
+    _try_force_merge_stale_pr must return False (no merge) when the linked PR
+    has changes_requested=True, even if review_age >= 5.
+    This is the unit-level regression for the infinite-loop bug.
+    """
+    ticket = _make_ticket(
+        "ORG-200", "Stuck ticket", status="In Review", assignee="Alice"
+    )
+    ticket["linked_prs"] = ["PR-200"]
+    ticket["in_review_since"] = mock_state.day - 6  # age = 6, over threshold
+
+    handler._mem.get_ticket = MagicMock(return_value=ticket)
+    # Simulate PR with changes_requested set
+    handler._mem._prs.find_one = MagicMock(
+        return_value={"pr_id": "PR-200", "status": "open", "changes_requested": True}
+    )
+    mock_state.active_incidents = []
+
+    result = handler._try_force_merge_stale_pr(ticket, "Alice", "2026-01-05")
+
+    assert result is False, (
+        "_try_force_merge_stale_pr must not merge a PR that still has "
+        "changes_requested — the author needs to address the feedback first"
+    )
+
+
+def test_try_force_merge_clears_when_changes_addressed(handler, mock_state, clock):
+    """
+    When the PR's changes_requested flag has been cleared (author pushed a fix),
+    _try_force_merge_stale_pr must proceed to merge after the age threshold.
+    """
+
+    mock_state.current_date = datetime(2026, 1, 5)
+    mock_state.actor_cursors = {}
+    clock._set_cursor("Alice", datetime(2026, 1, 5, 9, 0))
+
+    ticket = _make_ticket(
+        "ORG-201", "Fixed ticket", status="In Review", assignee="Alice"
+    )
+    ticket["linked_prs"] = ["PR-201"]
+    ticket["in_review_since"] = mock_state.day - 5
+
+    pr_doc = {
+        "pr_id": "PR-201",
+        "title": "Fix something",
+        "status": "open",
+        "changes_requested": False,
+        "author": "Alice",
+        "linked_ticket": "ORG-201",
+    }
+
+    def find_one_side_effect(query, *args, **kwargs):
+        if query.get("changes_requested") is True:
+            return None
+        return pr_doc
+
+    handler._mem._prs.find_one = MagicMock(side_effect=find_one_side_effect)
+    handler._mem.upsert_pr = MagicMock()
+    handler._git.merge_pr = MagicMock()
+    mock_state.active_incidents = []
+
+    with (
+        patch.object(handler, "_handle_pr_review_for_incident"),
+        patch.object(handler, "_emit_bot_message"),
+        patch.object(handler, "_save_ticket"),
+    ):
+        result = handler._try_force_merge_stale_pr(ticket, "Alice", "2026-01-05")
+
+    assert result is True
+    handler._git.merge_pr.assert_called_once_with("PR-201")
+
+
+def test_complete_eng_ticket_does_not_spawn_pr_when_changes_requested(
+    handler, mock_state
+):
+    """
+    _complete_eng_ticket must not spawn a new PR when the existing linked PR
+    still has changes_requested=True. The assignee should address the existing
+    review, not open a duplicate PR.
+    """
+    ticket = _make_ticket(
+        "ORG-202", "In-flight ticket", status="In Review", assignee="Bob"
+    )
+    ticket["linked_prs"] = ["PR-202"]
+    ticket["in_progress_since"] = mock_state.day - 4
+
+    handler._mem._prs.find_one = MagicMock(
+        return_value={"pr_id": "PR-202", "status": "open", "changes_requested": True}
+    )
+
+    with patch.object(handler._git, "create_pr") as mock_create_pr:
+        handler._complete_eng_ticket(
+            ticket=ticket,
+            assignee="Bob",
+            actor_incident_bound=False,
+            date_str="2026-01-05",
+            timestamp_iso="2026-01-05T10:00:00",
+            chain=MagicMock(),
+            is_complete=True,
+        )
+
+    (
+        mock_create_pr.assert_not_called(),
+        ("Must not open a new PR when an existing one already has changes_requested"),
+    )

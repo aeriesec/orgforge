@@ -350,8 +350,6 @@ class NormalDayHandler:
                     tags=["jira", "blocker"],
                 )
             )
-
-        # Update ticket comment and status
         ticket.setdefault("comments", []).append(
             {
                 "author": assignee,
@@ -427,6 +425,14 @@ class NormalDayHandler:
 
         self._save_ticket(ticket)
 
+        for pr_id in ticket.get("linked_prs", []):
+            pr = self._mem._prs.find_one({"pr_id": pr_id, "status": "open"}, {"_id": 0})
+            if pr and pr.get("changes_requested"):
+                pr["changes_requested"] = False
+                ticket["status"] = "In Review"
+                ticket["in_review_since"] = self._state.day
+                self._mem.upsert_pr(pr)
+
         ticket_body = "\n".join(
             filter(
                 None,
@@ -438,69 +444,37 @@ class NormalDayHandler:
                 ],
             )
         )
-        if self._embed_worker:
-            self._embed_worker.enqueue(
-                id=ticket_id,
-                type="jira",
-                title=ticket.get("title", ticket_id),
-                content=ticket_body,
-                day=self._state.day,
-                date=date_str,
-                timestamp=current_actor_time_iso,
-                metadata={
-                    "assignee": ticket.get("assignee", ""),
-                    "status": ticket["status"],
-                    "dept_type": dept_type,
-                },
-            )
-        else:
-            self._mem.embed_artifact(
-                id=ticket_id,
-                type="jira",
-                title=ticket.get("title", ticket_id),
-                content=ticket_body,
-                day=self._state.day,
-                date=date_str,
-                timestamp=current_actor_time_iso,
-                metadata={
-                    "assignee": ticket.get("assignee", ""),
-                    "status": ticket["status"],
-                    "dept_type": dept_type,
-                },
-            )
 
-        if self._embed_worker:
-            self._embed_worker.enqueue(
-                id=comment_id,
-                type="jira_comment",
-                title=f"Comment on {ticket_id}",
-                content=comment_text,
-                day=self._state.day,
-                date=date_str,
-                timestamp=current_actor_time_iso,
-                metadata={
-                    "ticket_id": ticket_id,
-                    "author": assignee,
-                    "dept_type": dept_type,
-                },
-            )
-        else:
-            self._mem.embed_artifact(
-                id=comment_id,
-                type="jira_comment",
-                title=f"Comment on {ticket_id}",
-                content=comment_text,
-                day=self._state.day,
-                date=date_str,
-                timestamp=current_actor_time_iso,
-                metadata={
-                    "ticket_id": ticket_id,
-                    "author": assignee,
-                    "dept_type": dept_type,
-                },
-            )
+        self._mem.embed_artifact(
+            id=ticket_id,
+            type="jira",
+            title=ticket.get("title", ticket_id),
+            content=ticket_body,
+            day=self._state.day,
+            date=date_str,
+            timestamp=current_actor_time_iso,
+            metadata={
+                "assignee": ticket.get("assignee", ""),
+                "status": ticket["status"],
+                "dept_type": dept_type,
+            },
+        )
 
-        # Build artifacts dict and SimEvent facts
+        self._mem.embed_artifact(
+            id=comment_id,
+            type="jira_comment",
+            title=f"Comment on {ticket_id}",
+            content=comment_text,
+            day=self._state.day,
+            date=date_str,
+            timestamp=current_actor_time_iso,
+            metadata={
+                "ticket_id": ticket_id,
+                "author": assignee,
+                "dept_type": dept_type,
+            },
+        )
+
         artifacts = {"jira": ticket_id, "jira_comment": comment_id}
         if spawned_pr_id:
             artifacts["pr"] = spawned_pr_id
@@ -580,8 +554,8 @@ class NormalDayHandler:
             force_merge = (
                 review_age >= 5
                 and bool(linked_prs)
-                and not open_pr_with_changes
                 and actor_clock_ok
+                and (not open_pr_with_changes or review_age >= 7)
             )
 
             if force_merge:
@@ -590,13 +564,14 @@ class NormalDayHandler:
 
                 stale_pr = next(
                     (
-                        self._mem._prs.find_one(
-                            {"pr_id": p, "status": "open"}, {"_id": 0}
-                        )
+                        doc
                         for p in linked_prs
-                        if self._mem._prs.find_one(
-                            {"pr_id": p, "status": "open"}, {"_id": 0}
-                        )
+                        for doc in [
+                            self._mem._prs.find_one(
+                                {"pr_id": p, "status": "open"}, {"_id": 0}
+                            )
+                        ]
+                        if doc
                     ),
                     None,
                 )
