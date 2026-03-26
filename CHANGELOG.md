@@ -6,6 +6,26 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.7] — 2026-03-25
+
+### Added
+
+- **Stale PR Escape Hatch (`src/normal_day.py`, `tests/test_integration.py`)**: Introduced a time-based override for blocked Pull Requests. PRs that have been stuck with "changes requested" for 7 or more days are now eligible for force-merging, preventing deadlocks when reviewers become unresponsive.
+- **Feedback Regression Suite (`tests/test_integration.py`, `tests/test_normal_day.py`)**: Added targeted test cases to ensure PRs with active feedback are not prematurely merged and that addressing feedback correctly resets the review lifecycle.
+
+### Changed
+
+- **PR Lifecycle Automation (`src/normal_day.py`)**: Refined the `_complete_eng_ticket` logic to automatically clear the `changes_requested` flag and revert ticket status to "In Review" when an assignee pushes updates, streamlining the re-review process.
+- **Memory Operations Efficiency (`src/normal_day.py`)**: Optimized the `_try_force_merge_stale_pr` method by replacing redundant database lookups with a more efficient list comprehension and conditional check for open PRs.
+
+### Fixed
+
+- **Duplicate PR Prevention (`src/normal_day.py`)**: Fixed a bug where the system could attempt to spawn a new PR for a ticket that already had an open PR with requested changes.
+- **Worker Redundancy (`src/normal_day.py`)**: Standardized artifact embedding by removing conditional checks for `_embed_worker`, consolidating all Jira and comment embedding directly through `_mem.embed_artifact` to reduce logic branching.
+- **Logic Guard for Requested Changes (`src/normal_day.py`)**: Corrected a flaw in the force-merge logic that previously ignored the `changes_requested` state, ensuring authors must address feedback before the 5-day automated merge threshold applies.
+
+---
+
 ## [v1.2.6] — 2026-03-25
 
 ### Added
