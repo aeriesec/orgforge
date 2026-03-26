@@ -465,6 +465,9 @@ class TestPRReviewRouting:
             "PR stale for >= 5 days with no changes_requested must be force-merged"
         )
 
+        ticket = sim._mem.get_ticket("ENG-103")
+        assert ticket["status"] == "Done", "Ticket must be marked Done when PR is force-merged."
+
     @patch("normal_day.Crew")
     @patch("normal_day.Task")
     @patch("agent_factory.Agent")
@@ -573,16 +576,13 @@ class TestPRReviewRouting:
     @patch("normal_day.Crew")
     @patch("normal_day.Task")
     @patch("agent_factory.Agent")
-    def test_assignee_progress_clears_changes_requested_flag(
+    def test_assignee_progress_clears_changes_requested_flag_and_updates_ticket(
         self, mock_agent, mock_task, mock_crew, sim
     ):
-        """
-        After the assignee works on a ticket that has a PR with changes_requested,
-        that flag must be cleared so the PR becomes eligible for force-merge again.
-        """
         author = ALL_NAMES[0]
+
         _seed_ticket(
-            sim._mem, "ENG-111", author, status="In Review", linked_prs=["PR-111"]
+            sim._mem, "ENG-111", author, status="In Progress", linked_prs=["PR-111"]
         )
         _seed_pr(sim._mem, "PR-111", "ENG-111", author, [ALL_NAMES[1]])
         sim._mem._prs.update_one(
@@ -615,66 +615,13 @@ class TestPRReviewRouting:
 
         pr = sim._mem._prs.find_one({"pr_id": "PR-111"}, {"_id": 0})
         assert not pr.get("changes_requested"), (
-            "Assignee addressing feedback must clear changes_requested "
-            "so the PR can re-enter the review/force-merge cycle"
+            "PR changes_requested flag should be cleared."
         )
 
-    @patch("normal_day.Crew")
-    @patch("normal_day.Task")
-    @patch("agent_factory.Agent")
-    def test_stale_pr_with_changes_requested_force_merges_after_escape_hatch(
-        self, mock_agent, mock_task, mock_crew, sim
-    ):
-        """
-        A PR stuck with changes_requested for >= 7 days must eventually be
-        force-merged via the time-based escape hatch (review_age >= 7 overrides
-        the changes_requested guard). Without this, a PR whose reviewer goes
-        silent is blocked forever.
-        """
-        author = ALL_NAMES[0]
-        _seed_ticket(
-            sim._mem, "ENG-112", author, status="In Review", linked_prs=["PR-112"]
+        ticket = sim._mem.get_ticket("ENG-111")
+        assert ticket["status"] == "In Review", (
+            "Ticket status should be advanced back to 'In Review'."
         )
-        _seed_pr(sim._mem, "PR-112", "ENG-112", author, [ALL_NAMES[1]])
-        sim._mem._prs.update_one(
-            {"pr_id": "PR-112"}, {"$set": {"changes_requested": True}}
-        )
-
-        sim._mem._jira.update_one(
-            {"id": "ENG-112"}, {"$set": {"in_review_since": sim.state.day - 8}}
-        )
-        mock_crew.return_value = _make_pr_review_crew()
-
-        org_plan = _make_org_plan(
-            sim,
-            {
-                "Engineering_Mobile": [
-                    EngineerDayPlan(
-                        name=author,
-                        dept="Engineering_Mobile",
-                        agenda=[
-                            AgendaItem(
-                                activity_type="ticket_progress",
-                                description="Force merge after reviewer silence",
-                                related_id="ENG-112",
-                                estimated_hrs=0.5,
-                            )
-                        ],
-                        stress_level=20,
-                    )
-                ]
-            },
-        )
-
-        sim._normal_day.handle(org_plan)
-
-        pr = sim._mem._prs.find_one({"pr_id": "PR-112"}, {"_id": 0})
-        assert pr["status"] == "merged", (
-            "PR stuck with changes_requested for >= 7 days must be force-merged "
-            "via the time-based escape hatch"
-        )
-        ticket = sim._mem.get_ticket("ENG-112")
-        assert ticket["status"] == "Done"
 
 
 class TestPlannerInReviewSection:

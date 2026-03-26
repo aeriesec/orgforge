@@ -423,8 +423,6 @@ class NormalDayHandler:
         ticket["causal_chain"] = chain.snapshot()
         ticket["updated_at"] = current_actor_time_iso
 
-        self._save_ticket(ticket)
-
         for pr_id in ticket.get("linked_prs", []):
             pr = self._mem._prs.find_one({"pr_id": pr_id, "status": "open"}, {"_id": 0})
             if pr and pr.get("changes_requested"):
@@ -432,6 +430,8 @@ class NormalDayHandler:
                 ticket["status"] = "In Review"
                 ticket["in_review_since"] = self._state.day
                 self._mem.upsert_pr(pr)
+
+        self._save_ticket(ticket)
 
         ticket_body = "\n".join(
             filter(
@@ -555,7 +555,7 @@ class NormalDayHandler:
                 review_age >= 5
                 and bool(linked_prs)
                 and actor_clock_ok
-                and (not open_pr_with_changes or review_age >= 7)
+                and not open_pr_with_changes
             )
 
             if force_merge:
