@@ -154,17 +154,11 @@ class ExternalEmailIngestor:
         )
         self._threat = threat_injector or _NullInjector()
         self._crm = crm or NullCRMSystem()
+        self._sources = None
 
         self._scheduled_hires: Dict[int, List[dict]] = {}
         for hire in config.get("org_lifecycle", {}).get("scheduled_hires", []):
             self._scheduled_hires.setdefault(hire["day"], []).append(hire)
-
-        @property
-        def _sources(self):
-            """Lazy lookup: pull sources from MongoDB only when needed."""
-            doc = self._mem._db["sim_config"].find_one({"_id": "inbound_email_sources"})
-            return doc.get("sources", []) if doc else []
-
 
     def generate_pre_standup(self, state) -> List[ExternalEmailSignal]:
         """
@@ -1230,10 +1224,6 @@ class ExternalEmailIngestor:
             causal_chain=CausalChainHandler(root_id=embed_id),
             facts={"subject": subject, "topic": topic, "org": source_org},
         )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # HELPERS
-    # ─────────────────────────────────────────────────────────────────────────
 
     def _ensure_sources_loaded(self) -> None:
         if self._sources is None:

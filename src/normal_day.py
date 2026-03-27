@@ -11,6 +11,7 @@ from agent_factory import make_agent
 from config_loader import COMPANY_DESCRIPTION
 from crewai import Process, Task, Crew
 
+from crm_system import NullCRMSystem
 from json_repair import json_repair
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
@@ -46,6 +47,7 @@ class NormalDayHandler:
         threat_injector=None,
         embed_worker=None,
         lifecycle=None,
+        crm=None,
     ):
         self._config = config
         self._mem = mem
@@ -68,6 +70,7 @@ class NormalDayHandler:
         self._threat = threat_injector or _NullInjector()
         self._embed_worker = embed_worker
         self._lifecycle = lifecycle
+        self._crm = crm or NullCRMSystem()
 
     def handle(self, org_plan: OrgDayPlan) -> None:
         """Processes both planned agenda items and unplanned org collisions."""
@@ -78,6 +81,8 @@ class NormalDayHandler:
 
         for event in org_plan.collision_events:
             self._handle_collision_event(event, date_str)
+
+        self._fire_sales_outreach(date_str)
 
         self._maybe_bot_alerts()
         self._maybe_adhoc_confluence()
@@ -655,13 +660,25 @@ class NormalDayHandler:
                     )
 
             elif completion_artifact == "email":
-                completion_id = self._emit_completion_email(
-                    assignee=assignee,
-                    ticket=ticket,
-                    comment_text=comment_text,
-                    date_str=date_str,
-                    timestamp=timestamp_iso,
-                )
+                dept = dept_of_name(assignee, self._org_chart)
+                is_sales = "sales" in dept.lower()
+                if is_sales and self._crm:
+                    completion_id = self._emit_sales_outbound_email(
+                        assignee=assignee,
+                        ticket=ticket,
+                        comment_text=comment_text,
+                        date_str=date_str,
+                        timestamp=timestamp_iso,
+                        chain=chain,
+                    )
+                else:
+                    completion_id = self._emit_completion_email(
+                        assignee=assignee,
+                        ticket=ticket,
+                        comment_text=comment_text,
+                        date_str=date_str,
+                        timestamp=timestamp_iso,
+                    )
                 if completion_id:
                     chain.append(completion_id)
 
@@ -2194,6 +2211,318 @@ class NormalDayHandler:
             f"    [dim]📧 {assignee} → {lead}: completion email for [{ticket_id}][/dim]"
         )
         return thread_id
+
+    def _emit_sales_outbound_email(
+        self,
+        assignee: str,
+        ticket: dict,
+        comment_text: str,
+        date_str: str,
+        timestamp: str,
+        chain: "CausalChainHandler",
+        opportunity_id: Optional[str] = None,
+        account_name: Optional[str] = None,
+        contact_name: Optional[str] = None,
+        contact_email: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Generate a customer-facing outbound email for a Sales ticket completion
+        or a planner-proposed proactive outreach event.
+
+        Looks up the best matching open SF opportunity for the assignee's account
+        if one isn't provided directly. Writes a real .eml, embeds it, calls
+        crm.process_outbound_email() to advance the SF opportunity, and logs a
+        SimEvent so the causal chain is complete.
+
+        Returns the embed_id (thread_id) or None on failure.
+        """
+        ticket_id = ticket.get("id", "")
+        ticket_title = ticket.get("title", ticket_id)
+
+        if not (account_name and contact_name and contact_email):
+            opp = self._crm.get_best_open_opportunity(owner=assignee)
+            if opp:
+                opportunity_id = opp.get("opportunity_id", opportunity_id)
+                account_name = opp.get("account_name", account_name or "the customer")
+                contact_name = opp.get("primary_contact", contact_name or account_name)
+                contact_email = opp.get(
+                    "primary_contact_email",
+                    f"{contact_name.lower().replace(' ', '.')}@{account_name.lower().replace(' ', '')}.com",
+                )
+            else:
+                logger.debug(
+                    f"[normal_day] No open SF opp for {assignee} — "
+                    f"falling back to internal completion email for {ticket_id}"
+                )
+                return self._emit_completion_email(
+                    assignee=assignee,
+                    ticket=ticket,
+                    comment_text=comment_text,
+                    date_str=date_str,
+                    timestamp=timestamp,
+                )
+
+        p = self._config.get("personas", {}).get(assignee, {})
+        backstory = get_voice_card(assignee, "async", self._gd, self._mem)
+        stage = opportunity_id and self._crm._sf_o.find_one(
+            {"opportunity_id": opportunity_id}, {"stage": 1, "_id": 0}
+        )
+        stage_label = (
+            (stage or {}).get("stage", "active discussion")
+            if stage
+            else "active discussion"
+        )
+
+        agent = make_agent(
+            role=f"{assignee} — {p.get('social_role', 'Account Executive')}",
+            goal=f"Write a professional outbound email to a customer at {account_name}.",
+            backstory=backstory,
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"You are {assignee} at {self._company}. You have just completed work on "
+                f"ticket [{ticket_id}]: {ticket_title}.\n\n"
+                f"What you did: {comment_text}\n\n"
+                f"Write a short, professional outbound email to {contact_name} at {account_name}. "
+                f"The deal is currently at stage: {stage_label}.\n\n"
+                f"The email should naturally reflect the ticket work — e.g. attaching a proposal, "
+                f"confirming a renewal quote, following up on a demo, or sharing an update. "
+                f"Do NOT mention internal ticket IDs or internal tooling.\n\n"
+                f"Rules:\n"
+                f"- Subject: relevant, professional, no ticket IDs\n"
+                f"- Body: 3-5 sentences. Warm but professional. Sign off with your name and title.\n"
+                f"- Match your typing quirks from your backstory.\n\n"
+                f"CRITICAL: Respond ONLY with a JSON object with 'subject' and 'body' keys. "
+                f"No markdown fences, no preamble.\n"
+                f'{{"subject": "...", "body": "..."}}'
+            ),
+            expected_output='A JSON object with "subject" and "body" keys.',
+            agent=agent,
+        )
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+        clean = raw.replace("```json", "").replace("```", "").strip()
+
+        try:
+            email_data = json_repair.loads(clean)
+            subject = email_data.get("subject", f"Following up — {account_name}")
+            body = email_data.get("body", clean)
+            new_stage = email_data.get("crm_stage", stage_label)
+        except Exception as exc:
+            logger.warning(f"[sales_email] JSON parse failed for {ticket_id}: {exc}")
+            subject = f"Following up — {account_name}"
+            body = clean
+
+        sender_addr = f"{assignee.lower().replace(' ', '.')}@{self._domain}"
+        out_dir = Path(self._base) / "emails" / "outbound" / date_str
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_sender = assignee.lower().replace(" ", "_")
+        safe_org = account_name.lower().replace(" ", "_")
+        eml_path = out_dir / f"{safe_sender}_to_{safe_org}_{ticket_id}.eml"
+
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        msg = MIMEMultipart("alternative")
+        msg["From"] = f"{assignee} <{sender_addr}>"
+        msg["To"] = f"{contact_name} <{contact_email}>"
+        msg["Subject"] = subject
+        msg["Date"] = timestamp
+        msg["X-OrgForge-Direction"] = "outbound"
+        msg.attach(MIMEText(body, "plain"))
+        with open(eml_path, "w") as fh:
+            fh.write(msg.as_string())
+
+        self._crm.process_outbound_email(
+            email_data={
+                "sender": assignee,
+                "recipient": contact_name,
+                "sender_org": self._company,
+                "recipient_org": account_name,
+                "subject": subject,
+                "stage": new_stage,
+            },
+            timestamp=timestamp,
+            date_str=date_str,
+            day=self._state.day,
+        )
+
+        thread_id = f"sales_email_{ticket_id}_{self._state.day}"
+
+        chain.append(thread_id)
+
+        self._mem.embed_artifact(
+            id=thread_id,
+            type="email",
+            title=subject,
+            content=f"From: {assignee}\nTo: {contact_name} ({account_name})\nSubject: {subject}\n\n{body}",
+            day=self._state.day,
+            date=date_str,
+            timestamp=timestamp,
+            metadata={
+                "ticket_id": ticket_id,
+                "from": assignee,
+                "to": contact_name,
+                "account": account_name,
+                "opportunity_id": opportunity_id,
+                "direction": "outbound",
+            },
+        )
+
+        self._mem.log_event(
+            SimEvent(
+                type="sales_outbound_email",
+                timestamp=timestamp,
+                day=self._state.day,
+                date=date_str,
+                actors=[assignee, contact_name],
+                artifact_ids={
+                    "jira": ticket_id,
+                    "email_thread": thread_id,
+                    "eml_path": str(eml_path),
+                    "sf_opp": opportunity_id or "",
+                },
+                facts={
+                    "ticket_id": ticket_id,
+                    "subject": subject,
+                    "from": assignee,
+                    "to": contact_name,
+                    "account": account_name,
+                    "opportunity_id": opportunity_id,
+                    "stage": stage_label,
+                    "direction": "outbound",
+                    "causal_chain": chain.snapshot(),
+                },
+                summary=f'{assignee} sent outbound email to {contact_name} ({account_name}): "{subject[:80]}"',
+                tags=["email", "outbound", "sales", "customer"],
+            )
+        )
+
+        logger.info(
+            f"    [cyan]📤 {assignee} → {contact_name} ({account_name}):[/cyan] {subject[:70]}"
+        )
+        return thread_id
+
+    def _fire_sales_outreach(self, date_str: str) -> None:
+        """
+        Deterministic proactive outreach — called once per day after agenda items.
+
+        For each Sales team member, finds their highest-priority open SF opportunity
+        that hasn't already been touched by a ticket completion email today, and sends
+        one outbound customer email. Fires with ~60% probability per member to avoid
+        saturating the corpus every single day.
+
+        No-op if CRM is disabled or the org has no Sales department.
+        """
+        if not self._crm:
+            return
+
+        _OUTREACH_PROB = 0.6
+
+        sales_members = [
+            name
+            for dept, members in self._org_chart.items()
+            if "sales" in dept.lower()
+            for name in members
+        ]
+        if not sales_members:
+            return
+
+        already_touched: set = set()
+        cooldown_days = 4
+
+        for events in self._mem.get_event_log():
+            event_day = getattr(events, "day", -1)
+            if (self._state.day - event_day) <= cooldown_days and getattr(
+                events, "type", None
+            ) == "sales_outbound_email":
+                acct = (events.facts or {}).get("account")
+                if acct:
+                    already_touched.add(acct)
+
+        for sender in sales_members:
+            if random.random() > _OUTREACH_PROB:
+                continue
+
+            opp = self._crm.get_best_open_opportunity(owner=sender)
+            if not opp:
+                continue
+
+            account_name = opp.get("account_name", "")
+            if account_name in already_touched:
+                continue
+
+            acc = self._crm._sf_a.find_one(
+                {"name": account_name}, {"_id": 0, "_seq": 0}
+            )
+            contact_name = (acc or {}).get("primary_contact", account_name)
+            contact_email = (acc or {}).get(
+                "primary_contact_email",
+                f"{contact_name.lower().replace(' ', '.')}@{account_name.lower().replace(' ', '')}.com",
+            )
+
+            synthetic_ticket = {
+                "id": f"OUTREACH-{self._state.day}-{sender.split()[0].lower()}",
+                "title": f"Proactive outreach to {account_name}",
+                "status": "Done",
+                "completion_artifact": "email",
+            }
+
+            from causal_chain_handler import CausalChainHandler
+
+            chain = CausalChainHandler(root_id=synthetic_ticket["id"])
+
+            opp_updated_str = opp.get("updated_at")
+            actor_time = self._clock.now(sender)
+
+            if opp_updated_str:
+                opp_updated_time = datetime.fromisoformat(
+                    opp_updated_str.replace("Z", "+00:00")
+                )
+
+                if actor_time < opp_updated_time:
+                    diff_hours = (
+                        opp_updated_time - actor_time
+                    ).total_seconds() / 3600.0
+                    self._clock.advance_actor(sender, hours=(diff_hours + 0.25))
+                else:
+                    self._clock.advance_actor(sender, hours=0.25)
+            else:
+                self._clock.advance_actor(sender, hours=0.25)
+
+            timestamp = self._clock.now(sender).isoformat()
+
+            self._emit_sales_outbound_email(
+                assignee=sender,
+                ticket=synthetic_ticket,
+                comment_text=f"Proactive follow-up on open opportunity with {account_name}.",
+                date_str=date_str,
+                timestamp=timestamp,
+                chain=chain,
+                opportunity_id=opp.get("opportunity_id"),
+                account_name=account_name,
+                contact_name=contact_name,
+                contact_email=contact_email,
+            )
+            already_touched.add(account_name)
+
+            self._mem.log_event(
+                SimEvent(
+                    type="proactive_outreach_initiated",
+                    timestamp=self._clock.now(sender).isoformat(),
+                    day=self._state.day,
+                    date=date_str,
+                    actors=[sender],
+                    artifact_ids={"synthetic_ticket": synthetic_ticket["id"]},
+                    facts={
+                        "account": account_name,
+                        "opportunity_id": opp.get("opportunity_id"),
+                        "causal_chain": chain.snapshot(),
+                    },
+                    summary=f"{sender} initiated proactive outreach to {account_name}.",
+                    tags=["sales", "outreach", "proactive"],
+                )
+            )
 
     def _emit_review_reply(
         self,

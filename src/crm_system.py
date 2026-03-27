@@ -158,6 +158,9 @@ class NullCRMSystem:
     ) -> None:
         pass
 
+    def get_best_open_opportunity(self, owner: str) -> Optional[Dict]:
+        return None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LIVE SYSTEM
@@ -225,8 +228,6 @@ class CRMSystem:
             f"ZD={'on' if self._zd_on else 'off'}"
         )
 
-    # ── Factory ──────────────────────────────────────────────────────────────
-
     @classmethod
     def from_config(
         cls, config: Dict, export_base: Path, mem, planner_llm=None
@@ -241,8 +242,6 @@ class CRMSystem:
         if sf_on or zd_on:
             return cls(config, export_base, mem, planner_llm)
         return NullCRMSystem()
-
-
 
     def _ensure_dirs(self):
         for sub in [
@@ -271,7 +270,6 @@ class CRMSystem:
         timestamp: str,
         metadata: Optional[Dict] = None,
     ) -> None:
-        """Enqueue an embedding so the artifact is searchable by the DayPlanner."""
         self._mem.embed_artifact(
             id=id,
             type=artifact_type,
@@ -855,7 +853,7 @@ class CRMSystem:
             try:
                 ts_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             except ValueError:
-                ts_dt = datetime.utcnow()
+                ts_dt = datetime.strptime(date_str, "%Y-%m-%d")
             close_date = (ts_dt + timedelta(days=random.randint(30, 90))).strftime(
                 "%Y-%m-%d"
             )
@@ -891,7 +889,6 @@ class CRMSystem:
                 {k: v for k, v in opp.items() if k not in ("_id", "_seq")},
             )
 
-       
             self._embed(
                 id=oid,
                 artifact_type="sf_opportunity",
@@ -935,6 +932,64 @@ class CRMSystem:
 
         return touchpoint_facts
 
+    def get_best_open_opportunity(self, owner: str) -> Optional[Dict]:
+        """
+        Return the highest-priority open SF opportunity for a given owner,
+        with the primary_contact and primary_contact_email resolved from
+        sf_accounts. Priority order: Negotiation/Review → Proposal/Price Quote
+        → Value Proposition → Prospecting.
+
+        Returns None if SF is disabled or no open opp exists for this owner.
+        """
+        if not self._sf_on:
+            return None
+
+        stage_rank = {
+            "Negotiation/Review": 0,
+            "Proposal/Price Quote": 1,
+            "Value Proposition": 2,
+            "Prospecting": 3,
+        }
+
+        opps = list(
+            self._sf_o.find(
+                {
+                    "owner": owner,
+                    "stage": {"$nin": ["Closed Won", "Closed Lost"]},
+                },
+                {"_id": 0, "_seq": 0},
+            )
+        )
+        if not opps:
+            # Fall back to any open opp — useful when owner field is stale
+            opps = list(
+                self._sf_o.find(
+                    {"stage": {"$nin": ["Closed Won", "Closed Lost"]}},
+                    {"_id": 0, "_seq": 0},
+                )
+                .sort("_seq", -1)
+                .limit(5)
+            )
+
+        if not opps:
+            return None
+
+        best = min(opps, key=lambda o: stage_rank.get(o.get("stage", ""), 99))
+
+        acc = self._sf_a.find_one({"name": best["account_name"]}, {"_id": 0, "_seq": 0})
+        if acc:
+            best["primary_contact"] = acc.get("primary_contact", best["account_name"])
+
+            best["primary_contact_email"] = acc.get(
+                "primary_contact_email",
+                (
+                    f"{acc.get('primary_contact', best['account_name']).lower().replace(' ', '.')}"
+                    f"@{best['account_name'].lower().replace(' ', '')}.com"
+                ),
+            )
+
+        return best
+
     def handle_employee_departure(
         self,
         employee_name: str,
@@ -959,7 +1014,6 @@ class CRMSystem:
         reassigned_accounts = []
         reassigned_opps = []
 
-        # Accounts
         for acc in self._sf_a.find({"owner": employee_name}, {"_id": 0}):
             aid = acc["account_id"]
             self._sf_a.update_one(
@@ -996,7 +1050,7 @@ class CRMSystem:
             reassigned_opps.append(oid)
 
         if reassigned_accounts or reassigned_opps:
-            ts = datetime.utcnow().isoformat()
+            ts = f"{date_str}T09:00:00+00:00"
             self._emit(
                 SimEvent(
                     type="sf_ownership_lapsed",

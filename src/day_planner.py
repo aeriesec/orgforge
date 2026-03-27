@@ -1052,6 +1052,7 @@ class DayPlannerOrchestrator:
                         eng_plan=eng_plan,
                         lifecycle_context=lifecycle_context,
                         email_signals=email_signals,
+                        crm_summary=crm_summary,
                     ): dept
                     for dept, planner in non_eng_depts.items()
                 }

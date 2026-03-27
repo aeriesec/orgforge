@@ -296,7 +296,9 @@ class ConfluenceWriter:
         artifact_time, _ = self._clock.advance_actor(on_call, hours=pm_hours)
         timestamp = artifact_time.isoformat()
 
-        backstory = get_voice_card(on_call, "design", mem=self._mem, graph_dynamics=self._gd)
+        backstory = get_voice_card(
+            on_call, "design", mem=self._mem, graph_dynamics=self._gd
+        )
         related = self._registry.related_context(topic=root_cause, n=3)
         _qa_lead = next(
             (name for name, p in PERSONAS.items() if "QA" in p.get("expertise", [])),
@@ -394,7 +396,9 @@ class ConfluenceWriter:
         chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
         ctx = self._mem.recall_with_rewrite(raw_query=topic, n=3, as_of_time=timestamp)
         related = self._registry.related_context(topic=topic, n=3)
-        backstory = get_voice_card(author, "design", mem=self._mem, graph_dynamics=self._gd)
+        backstory = get_voice_card(
+            author, "design", mem=self._mem, graph_dynamics=self._gd
+        )
 
         agent = make_agent(
             role="Technical Lead",
@@ -598,7 +602,9 @@ class ConfluenceWriter:
             n=3,
             as_of_time=self._clock.now(resolved_author).isoformat(),
         )
-        backstory = get_voice_card(resolved_author, "design", mem=self._mem, graph_dynamics=self._gd)
+        backstory = get_voice_card(
+            resolved_author, "design", mem=self._mem, graph_dynamics=self._gd
+        )
 
         topic_agent = make_agent(
             role="Content Planner",
@@ -648,7 +654,9 @@ class ConfluenceWriter:
 
         ctx = self._mem.context_for_prompt(title, n=3, as_of_time=timestamp)
         related = self._registry.related_context(topic=title, n=4)
-        backstory = get_voice_card(resolved_author, "design", mem=self._mem, graph_dynamics=self._gd)
+        backstory = get_voice_card(
+            resolved_author, "design", mem=self._mem, graph_dynamics=self._gd
+        )
 
         writer_agent = make_agent(
             role="Corporate Writer",

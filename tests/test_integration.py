@@ -74,11 +74,16 @@ def sim(make_test_memory):
     s._mem.log_slack_messages = MagicMock(return_value=("slack/path", "thread-001"))
     s._mem.has_genesis_artifacts = MagicMock(return_value=True)
     s._mem.load_latest_checkpoint = MagicMock(return_value=None)
-    sources = [{"name": "Vendor", "trigger_on": ["incident"], "internal_liaison": "Engineering"}]
-    s._mem._db["sim_config"].insert_one({
-        "_id": "inbound_email_sources",
-        "sources": sources
-    })
+    sources = [
+        {
+            "name": "Vendor",
+            "trigger_on": ["incident"],
+            "internal_liaison": "Engineering",
+        }
+    ]
+    s._mem._db["sim_config"].insert_one(
+        {"_id": "inbound_email_sources", "sources": sources}
+    )
     s._email_ingestor._sources = sources
 
     s._normal_day._confluence = MagicMock()
@@ -1153,6 +1158,19 @@ class TestCRMSimulationIntegration:
                 ]
             },
         )
+
+        live_crm_sim._mem._db["sf_opps"].insert_one(
+            {
+                "opportunity_id": "OPP-999",
+                "account_name": "Stark Ind",
+                "stage": "Prospecting",
+                "owner": rep_name,  # "Alice"
+                "primary_contact": "Tony Stark",
+                "primary_contact_email": "tony@stark.com",
+                "touchpoints": [],
+            }
+        )
+
         live_crm_sim._normal_day.handle(org_plan)
 
         ticket = live_crm_sim._mem.get_ticket("MKT-100")

@@ -109,7 +109,6 @@ def test_partial_enablement_does_not_crash(tmp_path, make_test_memory):
     assert make_test_memory._db["zd_tickets"].count_documents({}) == 0
 
 
-
 def test_process_outbound_email_never_downgrades_stage(crm, make_test_memory):
     """
     If an account is in 'Negotiation', a new 'Prospecting' email shouldn't
@@ -118,15 +117,15 @@ def test_process_outbound_email_never_downgrades_stage(crm, make_test_memory):
 
     crm.process_outbound_email(
         {"recipient_org": "Acme", "stage": "Negotiation/Review", "subject": "Contract"},
-        "T0",
-        "D0",
+        "2026-03-08T10:00:00Z",
+        "2026-03-08",
         1,
     )
 
     crm.process_outbound_email(
         {"recipient_org": "Acme", "stage": "Prospecting", "subject": "Checking in"},
-        "T1",
-        "D0",
+        "2026-03-08T10:00:00Z",
+        "2026-03-08",
         1,
     )
 

@@ -487,27 +487,6 @@ default_persona:
     opinions. Do not let it develop a strong voice or override the tone of named personas
     in the same scene.
 
-# ── EXTERNAL PERSONAS ─────────────────────────────────────────
-
-external_contacts:
-  - name: "AWS_Support"
-    display_name: "AWS Support"
-    org: "AWS"
-    role: "Support Engineer"
-    trigger_events: ["incident_opened", "fix_in_progress"]
-    trigger_health_threshold: 70 # only contacts AWS if system_health drops below this
-    internal_liaison: "Engineering" # which dept's lead gets the summary
-    summary_tone: "technical and reassuring, but noncommittal about SLA"
-
-  - name: "CustomerSuccess_Acme"
-    display_name: "Acme Corp (Customer)"
-    org: "Acme Corp"
-    role: "IT Director"
-    trigger_events: ["incident_opened"]
-    trigger_health_threshold: 60 # only surfaces for severe incidents
-    internal_liaison: "Sales"
-    summary_tone: "concerned about uptime, asking for ETA and root cause"
-
 # ── CRM ───────────────────────────────────────────────────────
 
 crm:

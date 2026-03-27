@@ -253,4 +253,6 @@ KNOWN_EVENT_TYPES = {
     "dlp_alert",
     "secret_detected",
     "zoom_meeting",
+    "sales_outbound_email",
+    "proactive_outreach_initiated"
 }

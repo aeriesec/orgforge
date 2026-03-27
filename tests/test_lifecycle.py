@@ -285,8 +285,6 @@ def test_handoff_emits_escalation_chain_simevent(lifecycle, mock_clock):
     assert escalation_event.facts["departed"] == "Carol"
 
 
-
-
 def test_centrality_vacuum_stresses_neighbors(lifecycle, mock_clock, mock_sim):
     """
     Removing a bridge shortcut node should increase stress on remaining nodes

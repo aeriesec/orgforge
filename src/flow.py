@@ -713,6 +713,7 @@ class OrgForgeSimulation:
             threat_injector=self._threat,
             embed_worker=self._embed_worker,
             lifecycle=self._lifecycle,
+            crm=self._crm,
         )
         self._recurrence_detector = RecurrenceDetector(self._mem)
         self._ticket_assigner = TicketAssigner(
@@ -824,7 +825,6 @@ class OrgForgeSimulation:
                     future.result()
                 except Exception as e:
                     logger.error(f"[genesis] Persona embed failed for {name}: {e}")
-
 
         sim_start = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
         for gap in CONFIG.get("knowledge_gaps", []):
