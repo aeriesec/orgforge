@@ -81,9 +81,27 @@ class PlanValidator:
         external_contact_names: List[str],
         config: dict,
     ):
-        self._valid_actors: Set[str] = set(all_names) | set(external_contact_names)
+        self._internal_names: Set[str] = set(all_names)
+        self._external_names: Set[str] = set(external_contact_names)
+
+        self._valid_actors: Set[str] = self._internal_names | self._external_names
         self._config = config
         self._novel_log: List[ProposedEvent] = []
+
+    @property
+    def external_contact_names(self) -> List[str]:
+        """Returns the current list of valid external names."""
+        return list(self._external_names)
+
+    @external_contact_names.setter
+    def external_contact_names(self, names: List[str]):
+        """
+        Refresh the whitelist of valid external actors.
+        Called daily by the DayPlannerOrchestrator.
+        """
+        self._external_names = set(names)
+        # Recalculate the union set used by _validate_one
+        self._valid_actors = self._internal_names | self._external_names
 
     def validate_plan(
         self,

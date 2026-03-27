@@ -47,10 +47,10 @@ simulation:
   domain: "apexathletics.io"
   output_dir: "./export"
   db_name: "orgforge"
-  max_days: 60
+  max_days: 30
   start_date: "2026-03-02"
 
-  adhoc_confluence_prob: 0.3
+  adhoc_confluence_prob: 0.2
   aws_alert_prob: 0.4
   snyk_alert_prob: 0.2
   sprint_tickets_per_planning: 4
@@ -174,7 +174,7 @@ org_lifecycle:
   # events naturally once the roster context shows them as "still warming up".
   scheduled_hires:
     - name: "Janice"
-      day: 15
+      day: 7
       dept: "Engineering_Backend"
       role: "Backend Engineer"
       expertise: ["Python", "FastAPI", "PostgreSQL", "TitanDB"]
@@ -187,7 +187,7 @@ org_lifecycle:
       tenure: "new"
 
     - name: "Reese"
-      day: 35
+      day: 20
       dept: "Engineering_Backend"
       role: "DevOps Engineer"
       expertise: ["Kubernetes", "Terraform", "AWS", "Infrastructure"]
@@ -507,6 +507,16 @@ external_contacts:
     trigger_health_threshold: 60 # only surfaces for severe incidents
     internal_liaison: "Sales"
     summary_tone: "concerned about uptime, asking for ETA and root cause"
+
+# ── CRM ───────────────────────────────────────────────────────
+
+crm:
+  salesforce:
+    enabled: true
+    seed_accounts: true
+  zendesk:
+    enabled: true
+    link_to_incidents: true
 
 # ── INSIDER THREAT ────────────────────────────────────────────
 

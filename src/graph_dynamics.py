@@ -12,6 +12,7 @@ Three capabilities:
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from memory import Memory
 import networkx as nx
 
 
@@ -53,9 +54,10 @@ class GraphDynamics:
     that holds a reference to the graph sees live data automatically.
     """
 
-    def __init__(self, G: nx.Graph, config: dict):
+    def __init__(self, G: nx.Graph, config: dict, mem: Memory):
         self.G = G
         self.cfg: Dict = {**DEFAULT_CFG, **config.get("graph_dynamics", {})}
+        self._mem = mem
 
         personas = config.get("personas", {})
         self._stress: Dict[str, int] = {
@@ -278,7 +280,6 @@ class GraphDynamics:
         self,
         event_type: str,
         system_health: int,
-        config: dict,
     ) -> List[dict]:
         """
         Returns external contact config entries that should be triggered
@@ -286,13 +287,28 @@ class GraphDynamics:
         Called from _advance_incidents() to decide whether to generate
         an external contact summary.
         """
+
+        doc = self._mem._db["sim_config"].find_one({"_id": "inbound_email_sources"})
+        if not doc or "sources" not in doc:
+            return []
+
         triggered = []
-        for contact in config.get("external_contacts", []):
-            if event_type not in contact.get("trigger_events", []):
-                continue
-            threshold = contact.get("trigger_health_threshold", 100)
-            if system_health <= threshold:
+        for contact in doc["sources"]:
+            triggers = contact.get("trigger_on", [])
+
+            if "always" in triggers:
                 triggered.append(contact)
+                continue
+
+            if "incident" in triggers and (
+                "incident" in event_type or "fix" in event_type
+            ):
+                triggered.append(contact)
+                continue
+
+            if "low_health" in triggers and system_health < 80:
+                triggered.append(contact)
+
         return triggered
 
     def apply_sentiment_stress(self, actors: List[str], vader_compound: float) -> None:

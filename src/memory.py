@@ -46,13 +46,6 @@ EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "ollama")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "mxbai-embed-large")
 EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "1024"))
 
-# ─────────────────────────────────────────────
-# TOKEN USAGE TRACKING  (debug mode only)
-# Set DEBUG_TOKEN_TRACKING=true in environment
-# or pass debug_tokens=True to Memory.__init__
-# ─────────────────────────────────────────────
-
-DEBUG_TOKEN_TRACKING = os.environ.get("DEBUG_TOKEN_TRACKING", "false").lower() == "true"
 
 _SKIP_EMBED_TYPES = {
     "jira_ticket_created",
@@ -196,8 +189,6 @@ class OllamaEmbedder(BaseEmbedder):
 
             r.raise_for_status()
 
-            self._prompt_embed_tokens = r.json()["prompt_eval_count"]
-
             return r.json()["embeddings"][0]
         except requests.exceptions.HTTPError as e:
             # 2. Attempt to pull the specific error message from Ollama's JSON
@@ -326,9 +317,6 @@ class BedrockEmbedder(BaseEmbedder):
                 result = self._json.loads(raw_body)
                 vector = result["embeddings"]["float"][0]
                 headers = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
-                self._prompt_embed_tokens = int(
-                    headers.get("x-amzn-bedrock-input-token-count", 0)
-                )
                 return vector
             except self._client.exceptions.ThrottlingException:
                 wait = 6.2 * (attempt + 1)  # backoff: 6.2, 12.4, 18.6
@@ -376,7 +364,6 @@ class Memory:
     def __init__(
         self,
         mongo_uri: str = MONGO_URI,
-        debug_tokens: bool = False,
         mongo_client=None,  # inject mongomock.MongoClient() in tests
     ):
         self._embedder = build_embedder()
@@ -389,8 +376,6 @@ class Memory:
 
         self._artifacts = self._db["artifacts"]
         self._events = self._db["events"]
-        self._debug_tokens = debug_tokens or DEBUG_TOKEN_TRACKING
-        self._token_usage = self._db["token_usage"] if self._debug_tokens else None
         self._artifacts = self._db["artifacts"]
         self._events = self._db["events"]
         self._jira = self._db["jira_tickets"]
@@ -439,20 +424,7 @@ class Memory:
         logging is guaranteed regardless of which path triggers the embed.
         """
         vector = self._embedder.embed(text, input_type=input_type)
-        self.log_token_usage(
-            caller=caller,
-            call_type="embed",
-            model=EMBED_MODEL,
-            day=getattr(self, "_current_day", 0),
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            total_tokens=getattr(self._embedder, "_prompt_embed_tokens", 0),
-            prompt_tokens=getattr(self._embedder, "_prompt_embed_tokens", 0),
-            extra={
-                "doc_id": doc_id,
-                "doc_type": doc_type,
-                "text_len": len(text),
-            },
-        )
+
         return vector
 
     def _init_vector_indexes(self):
@@ -1020,10 +992,8 @@ class Memory:
             sort=[("timestamp", -1)],
         )
         header = ""
-        date_str = ""
         if summary_doc:
             f = summary_doc.get("facts", {})
-            date_str = summary_doc.get("date", "")
             header = (
                 f"Yesterday (Day {prev_day}): "
                 f"system health {f.get('system_health', '?')}, "
@@ -1050,6 +1020,11 @@ class Memory:
             "morale_intervention",
             "employee_departed",
             "employee_hired",
+            "zd_ticket_opened",
+            "zd_tickets_escalated",
+            "zd_tickets_resolved",
+            "sf_deals_risk_flagged",
+            "sf_ownership_lapsed",
         }
 
         docs = list(
@@ -1569,8 +1544,6 @@ class Memory:
         self._slack = self._db["slack_messages"]
         self._plans = self._db["dept_plans"]
         self._conversation_summaries = self._db["conversation_summaries"]
-        if self._debug_tokens:
-            self._token_usage = self._db["token_usage"]
 
         self._event_log = []
         self._init_vector_indexes()
@@ -1597,82 +1570,11 @@ class Memory:
             root_logger.addHandler(new_handler)
             logger.info(f"[memory] 🗑️  Export directory cleared: {export_path}")
 
-    def log_token_usage(
-        self,
-        caller: str,  # e.g. "write_adhoc_page", "_handle_async_question"
-        call_type: str,  # "llm" | "embed"
-        model: str,  # full model string, e.g. "bedrock/claude-sonnet-4-6"
-        day: int,
-        timestamp: str,
-        prompt_tokens: int = 0,
-        completion_tokens: int = 0,
-        total_tokens: int = 0,
-        extra: Optional[Dict] = None,  # any caller-specific metadata
-    ) -> None:
-        """
-        Log a single LLM or embed call's token usage to MongoDB.
-        No-op when debug_tokens is False so production runs are unaffected.
-        """
-        if not self._debug_tokens or self._token_usage is None:
-            return
-
-        doc = {
-            "day": day,
-            "timestamp": timestamp,
-            "call_type": call_type,  # "llm" or "embed"
-            "caller": caller,
-            "model": model,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            **(extra or {}),
-        }
-        try:
-            self._token_usage.insert_one(doc)
-        except Exception as e:
-            logger.warning(f"[memory] token_usage insert failed: {e}")
-
-    def token_usage_summary(self) -> Dict:
-        """
-        Aggregate token usage by call_type and caller.
-        Returns a dict suitable for logging at end of simulation.
-        Only meaningful when debug_tokens=True.
-        """
-        if not self._debug_tokens or self._token_usage is None:
-            return {"debug_tokens": False}
-
-        pipeline = [
-            {
-                "$group": {
-                    "_id": {
-                        "call_type": "$call_type",
-                        "caller": "$caller",
-                        "model": "$model",
-                    },
-                    "total_tokens": {"$sum": "$total_tokens"},
-                    "prompt_tokens": {"$sum": "$prompt_tokens"},
-                    "completion_tokens": {"$sum": "$completion_tokens"},
-                    "call_count": {"$sum": 1},
-                }
-            },
-            {"$sort": {"total_tokens": -1}},
-        ]
-
-        rows = list(self._token_usage.aggregate(pipeline))
-        grand_total = sum(r["total_tokens"] for r in rows)
-
-        return {
-            "debug_tokens": True,
-            "grand_total": grand_total,
-            "by_caller": rows,
-        }
-
     def has_genesis_artifacts(self) -> bool:
         """
         Returns True if Genesis artifacts already exist.
         This prevents re-running expensive LLM Genesis calls.
         """
-        # We check the events collection for any 'genesis' tag
         return self._events.count_documents({"tags": "genesis"}) > 0
 
     def save_checkpoint(
@@ -1870,6 +1772,51 @@ class Memory:
     def get_inbound_email_sources(self) -> Optional[list]:
         doc = self._db["sim_config"].find_one({"_id": "inbound_email_sources"})
         return doc["sources"] if doc else None
+
+    def context_for_pr_review(
+        self,
+        pr_id: str,
+        ticket_id: Optional[str] = None,
+        as_of_time: Optional[Any] = None,
+        n: int = 2,
+    ) -> str:
+        """
+        Builds deterministic reviewer context from the PR and its linked ticket.
+        Combines: recent PR comments and author's ticket updates.
+        """
+        lines = []
+        iso = self._to_iso(as_of_time)
+
+        pr = self._prs.find_one({"pr_id": pr_id}, {"_id": 0})
+        if pr:
+            pr_comments = pr.get("comments", [])
+            if iso:
+                pr_comments = [c for c in pr_comments if c.get("timestamp", "") <= iso]
+            if pr_comments:
+                lines.append("=== PR REVIEW HISTORY ===")
+                for c in pr_comments[-3:]:
+                    lines.append(
+                        f"  [{c['date']}] {c['author']} [{c.get('verdict', '?')}]: {c['text'][:200]}"
+                    )
+
+        if ticket_id:
+            ticket = self._jira.find_one({"id": ticket_id}, {"_id": 0, "comments": 1})
+            if ticket:
+                t_comments = ticket.get("comments", [])
+                if iso:
+                    t_comments = [c for c in t_comments if c.get("created", "") <= iso]
+                author = pr.get("author") if pr else None
+                author_updates = [
+                    c for c in t_comments if not author or c.get("author") == author
+                ]
+                if author_updates:
+                    lines.append("=== AUTHOR TICKET UPDATES ===")
+                    for c in author_updates[-3:]:
+                        lines.append(
+                            f"  [{c['date']}] {c['author']}: {c['text'][:200]}"
+                        )
+
+        return "\n".join(lines) if lines else "No prior context found."
 
     def context_for_ticket(
         self,
@@ -2163,13 +2110,6 @@ class Memory:
 
         return "\n".join(lines)
 
-    # ─────────────────────────────────────────────────────────────────────────────
-    # CONVERSATION SUMMARY STORE
-    # Used by 1on1 and mentoring — summary is extracted from the last turn's output
-    # by the LLM itself (no extra call). Call save_conversation_summary() at write
-    # time, context_for_person_conversations() at read time.
-    # ─────────────────────────────────────────────────────────────────────────────
-
     def save_conversation_summary(
         self,
         conv_type: str,  # "1on1" | "mentoring"
@@ -2268,12 +2208,6 @@ class Memory:
             )
 
         return "\n".join(lines)
-
-    # ─────────────────────────────────────────────────────────────────────────────
-    # DESIGN DISCUSSION LINKAGE FOR ASYNC QUESTIONS
-    # Finds design_discussion events where the involved actors overlap with
-    # the ticket's known participants, and returns their slack thread IDs.
-    # ─────────────────────────────────────────────────────────────────────────────
 
     def design_discussions_for_ticket(
         self,

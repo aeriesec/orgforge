@@ -988,9 +988,9 @@ class TestDayPlannerOrchestratorInit:
         ):
             DayPlannerOrchestrator(cfg, MagicMock(), MagicMock(), MagicMock())
         call_kwargs = mock_validator_cls.call_args
-        ext_names = (
-            call_kwargs.kwargs.get("external_contact_names") or call_kwargs.args[1]
-        )
+        ext_names = call_kwargs.kwargs.get("external_contact_names")
+        if ext_names is None and len(call_kwargs.args) > 1:
+            ext_names = call_kwargs.args[1]
         assert "VendorPat" in ext_names
 
 

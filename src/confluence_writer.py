@@ -53,6 +53,7 @@ from config_loader import COMPANY_DESCRIPTION, PERSONAS
 from crewai import Task, Crew
 from memory import Memory, SimEvent
 from artifact_registry import ArtifactRegistry, ConfluencePage
+from utils.persona_utils import get_voice_card
 
 if TYPE_CHECKING:
     from graph_dynamics import GraphDynamics
@@ -295,7 +296,7 @@ class ConfluenceWriter:
         artifact_time, _ = self._clock.advance_actor(on_call, hours=pm_hours)
         timestamp = artifact_time.isoformat()
 
-        backstory = self._persona(on_call, mem=self._mem, graph_dynamics=self._gd)
+        backstory = get_voice_card(on_call, "design", mem=self._mem, graph_dynamics=self._gd)
         related = self._registry.related_context(topic=root_cause, n=3)
         _qa_lead = next(
             (name for name, p in PERSONAS.items() if "QA" in p.get("expertise", [])),
@@ -393,16 +394,12 @@ class ConfluenceWriter:
         chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
         ctx = self._mem.recall_with_rewrite(raw_query=topic, n=3, as_of_time=timestamp)
         related = self._registry.related_context(topic=topic, n=3)
+        backstory = get_voice_card(author, "design", mem=self._mem, graph_dynamics=self._gd)
 
         agent = make_agent(
             role="Technical Lead",
             goal="Document technical decisions and extract an actionable ticket.",
-            backstory=self._persona(
-                author,
-                mem=self._mem,
-                graph_dynamics=self._gd,
-                extra="You just finished a Slack discussion and need to document decisions and assign follow-up work.",
-            ),
+            backstory=backstory,
             llm=self._planner,
         )
         task = Task(
@@ -596,28 +593,17 @@ class ConfluenceWriter:
         expertise_str = ", ".join(expertise_list)
 
         seed_query = f"{resolved_author} {expertise_str} {daily_theme}"
-        # Tier 3: LLM-generated seed query benefits from HyDE rewrite.
-        # recall_with_rewrite degrades to context_for_prompt if no llm_callable
-        # is passed, so this is safe to land before the callable is wired in.
         topic_ctx = self._mem.recall_with_rewrite(
             raw_query=seed_query,
             n=3,
             as_of_time=self._clock.now(resolved_author).isoformat(),
         )
+        backstory = get_voice_card(resolved_author, "design", mem=self._mem, graph_dynamics=self._gd)
 
         topic_agent = make_agent(
             role="Content Planner",
             goal="Identify a unique documentation gap based on your expertise and org history.",
-            backstory=self._persona(
-                resolved_author,
-                mem=self._mem,
-                graph_dynamics=self._gd,
-                extra=(
-                    f"You are {resolved_author} from the {dept} department. "
-                    f"Your expertise includes: {expertise_str}. "
-                    f"You are deciding what to document today to provide the most value to the team."
-                ),
-            ),
+            backstory=backstory,
             llm=self._worker,
         )
 
@@ -662,19 +648,12 @@ class ConfluenceWriter:
 
         ctx = self._mem.context_for_prompt(title, n=3, as_of_time=timestamp)
         related = self._registry.related_context(topic=title, n=4)
+        backstory = get_voice_card(resolved_author, "design", mem=self._mem, graph_dynamics=self._gd)
 
         writer_agent = make_agent(
             role="Corporate Writer",
             goal=f"Draft a {title} Confluence page.",
-            backstory=self._persona(
-                resolved_author,
-                mem=self._mem,
-                graph_dynamics=self._gd,
-                extra=(
-                    f"You are {resolved_author} from the {dept} department. "
-                    f"Your expertise includes: {expertise_str}. "
-                ),
-            ),
+            backstory=backstory,
             llm=self._planner,
         )
         task = Task(

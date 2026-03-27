@@ -27,6 +27,7 @@ class AgendaItem:
     estimated_hrs: float = 2.0
     deferred: bool = False
     defer_reason: Optional[str] = None
+    meeting_medium: str = "slack"
 
 
 @dataclass
@@ -251,4 +252,5 @@ KNOWN_EVENT_TYPES = {
     "email_dropped",
     "dlp_alert",
     "secret_detected",
+    "zoom_meeting",
 }

@@ -83,7 +83,7 @@ CONFIG = {
 
 
 @pytest.fixture
-def graph_and_gd():
+def graph_and_gd(make_test_memory):  # 1. Inject the memory fixture here
     """Real NetworkX graph + GraphDynamics wired to CONFIG."""
     G = nx.Graph()
     for name in ALL_NAMES:
@@ -91,7 +91,9 @@ def graph_and_gd():
     for i, a in enumerate(ALL_NAMES):
         for b in ALL_NAMES[i + 1 :]:
             G.add_edge(a, b, weight=5.0)
-    gd = GraphDynamics(G, CONFIG)
+
+    # 2. Pass the memory instance as the third argument
+    gd = GraphDynamics(G, CONFIG, make_test_memory)
     return G, gd
 
 
@@ -599,7 +601,7 @@ def test_design_discussion_confluence_stub_created_sometimes(handler, mock_state
     handler._confluence = mock_cw
 
     with (
-        patch.object(handler, "_save_slack", return_value=("", "")),
+        patch.object(handler, "_save_slack", return_value=("", "thread-123")),
         patch.object(handler, "_save_md"),
         patch("normal_day.Crew") as mock_crew,
         patch("random.random", return_value=0.10),

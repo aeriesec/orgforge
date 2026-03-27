@@ -6,6 +6,27 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.8] — 2026-03-27
+
+### Added
+
+- **Multi-Channel CRM Simulation (`src/crm_system.py`, `src/external_email_ingest.py`)**: introduced native integrations for **Salesforce** and **Zendesk**. The simulation now tracks CRM account ownership, flags "at-risk" opportunities during incidents, and automatically escalates customer support tickets based on system health.
+- **High-Fidelity Meeting Transcripts (`src/normal_day.py`, `src/day_planner.py`)**: Added **Zoom** as a meeting medium for design discussions. Unlike Slack threads, Zoom produces verbatim Markdown transcripts that capture undocumented verbal decisions, creating intentional "knowledge gaps" for RAG evaluation.
+- **Synthetic Business Telemetry (`src/post_sim_artifacts.py`)**: Introduced a post-processing suite that generates deterministic **Datadog** metrics (latency/error spikes), **NPS surveys**, and **customer invoices** featuring SLA credits calculated directly from simulation incident duration.
+
+### Changed
+
+- **State Machine Grounding (`src/flow.py`, `src/memory.py`)**: Expanded the `SimEvent` bus to include CRM and meeting events. LLMs now receive `crm_summary` context during daily planning to ensure outbound sales emails and support responses align with the global organizational state.
+- **Advanced Social Graph Dynamics (`src/org_lifecycle.py`)**: Enhanced the employee departure logic. When an engineer leaves, the system now deterministically handles **CRM ownership lapses** alongside ticket reassignment and Dijkstra-based incident handoffs.
+- **Simulation Parameters (`config/config.yaml`)**: Updated default simulation length to 30 days and adjusted hire schedules for Janice (Day 7) and Reese (Day 20) to better stress-test mid-sprint transitions.
+
+### Fixed
+
+- **Email Signal Accuracy (`src/external_email_ingest.py`)**: Improved the external contact generator to pull from a larger pool of 14 sources (up from 7) and corrected account name resolution to favor active Salesforce records over static config defaults.
+- **PR Review Context (`src/memory.py`)**: Fixed a lack of historical depth in code reviews by implementing `context_for_pr_review`, which deterministically pulls prior comments and linked Jira updates into the LLM prompt.
+
+---
+
 ## [v1.2.7] — 2026-03-25
 
 ### Added

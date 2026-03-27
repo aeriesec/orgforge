@@ -1530,9 +1530,16 @@ class NormalDayHandler:
         date_str: str,
     ) -> List[str]:
         """
-        Small group design discussion — typically 2-3 engineers.
-        Generates: Slack thread + optional Confluence stub.
-        Uses a single-shot JSON generation to save output tokens while preserving personas.
+        Small group design discussion — 2-3 engineers.
+
+        Routes on item.meeting_medium:
+          "slack" → Slack thread (original path) + optional Confluence stub
+          "zoom"  → Zoom transcript (.md) + optional Confluence stub
+                    The transcript captures decisions verbatim — the knowledge
+                    gap evals want content that never surfaced in Jira/Confluence.
+
+        Both paths share participant resolution, clock advance, and SimEvent
+        structure so downstream evals see a uniform event schema.
         """
         initiator = eng_plan.name
         collaborators = item.collaborator or (
@@ -1540,7 +1547,7 @@ class NormalDayHandler:
         )
         participants = list({initiator} | set(collaborators))
 
-        chat_duration_mins = random.randint(5, 45)
+        chat_duration_mins = random.randint(15, 50)
         chat_duration_hours = chat_duration_mins / 60.0
         provisional_start, _ = self._clock.sync_and_advance(
             participants, hours=chat_duration_hours
@@ -1554,102 +1561,53 @@ class NormalDayHandler:
             max_extras=1,
         )
 
-        meeting_start, meeting_end = self._clock.sync_and_advance(
-            participants,
-            hours=0,
-        )
+        meeting_start, _ = self._clock.sync_and_advance(participants, hours=0)
         meeting_time_iso = meeting_start.isoformat()
 
         ctx = self._mem.context_for_prompt(
             item.description, n=3, as_of_time=meeting_time_iso
         )
 
-        backstory = get_voice_card(participants, "async", self._gd, self._mem)
+        medium = getattr(item, "meeting_medium", "slack")
 
-        turn_speakers = [initiator] + [
-            participants[i % len(participants)] for i in range(1, random.randint(5, 8))
-        ]
-        speaker_sequence = ", ".join(turn_speakers)
-
-        agent = make_agent(
-            role="Slack Conversation Simulator",
-            goal=(
-                "Write a realistic multi-turn Slack technical design discussion."
-                "Treat the provided backstory as character reference sheets for the actors you are writing for."
-            ),
-            backstory=backstory,
-            llm=self._planner,
-        )
-
-        task = Task(
-            description=(
-                f"COMPANY CONTEXT: {self._company} which {COMPANY_DESCRIPTION}\n"
-                f"Write a full Slack thread for a design discussion.\n\n"
-                f"Topic: {item.description}\n"
-                f"Relevant context: {ctx}\n\n"
-                f"Turn order: {speaker_sequence}\n\n"
-                f"Rules:\n"
-                f"- {initiator} opens by framing the problem, constraints, or trade-off they are wrestling with.\n"
-                f"- Others react as engineers working through it — raise a trade-off, push back, or propose a next step. Do not just agree.\n"
-                f"- CRITICAL: DO NOT use generic corporate openers like 'Hey team, let's discuss...' or 'Could you clarify...'. Start naturally.\n"
-                f"- Each message must sound distinctly like that person based on their voice card and mood.\n"
-                f"- Each message 1-3 sentences max. Do not add narration.\n\n"
-                f"Respond ONLY with a JSON array. No preamble, no markdown fences.\n"
-                f'[{{"speaker": "Name", "message": "text"}}, ...]'
-            ),
-            expected_output='A JSON array of objects with "speaker" and "message" keys.',
-            agent=agent,
-        )
-
-        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
-
-        turns = _parse_turn_list(raw, "handle_async_question")
-
-        if not turns:
-            logger.warning(
-                "[design_discussion] Parsed turns are empty, falling back to empty thread."
+        if medium == "zoom":
+            artifact_path, artifact_id, tags = self._run_zoom_design_discussion(
+                initiator=initiator,
+                participants=participants,
+                topic=item.description,
+                ctx=ctx,
+                meeting_time_iso=meeting_time_iso,
+                date_str=date_str,
             )
-            turns = []
-
-        messages = []
-        current_msg_time = datetime.fromisoformat(meeting_time_iso)
-        for turn in turns:
-            speaker = turn.get("speaker", "").strip()
-            text = turn.get("message", "").strip()
-            if speaker and text:
-                messages.append(
-                    {"user": speaker, "text": text, "ts": current_msg_time.isoformat()}
-                )
-                current_msg_time += timedelta(minutes=random.randint(1, 8))
-
-        depts = {dept_of_name(p, self._org_chart) for p in participants}
-        if len(depts) > 1:
-            dept_channel = "digital-hq"
+            medium_key = "zoom_transcript"
         else:
-            dept_channel = (
-                dept_of_name(initiator, self._org_chart).lower().replace(" ", "-")
+            artifact_path, artifact_id, tags = self._run_slack_design_discussion(
+                initiator=initiator,
+                participants=participants,
+                topic=item.description,
+                ctx=ctx,
+                meeting_time_iso=meeting_time_iso,
+                date_str=date_str,
             )
-
-        slack_path, thread_id = self._save_slack(
-            messages, dept_channel, interaction_type="design"
-        )
+            medium_key = "slack_thread"
 
         conf_id = None
-        if random.random() < 0.30 and messages:
+        if random.random() < 0.30 and artifact_id:
+            stub_messages = [{"user": initiator, "text": item.description}]
             conf_id = self._create_design_doc_stub(
-                initiator, participants, item.description, ctx, date_str, messages
+                initiator, participants, item.description, ctx, date_str, stub_messages
             )
 
         facts = {
             "topic": item.description,
             "participants": participants,
             "spawned_doc": conf_id is not None,
-            "message_count": len(messages),
+            "medium": medium,
         }
 
         artifact_ids = {
-            "slack_path": slack_path,
-            "slack_thread": thread_id,
+            medium_key: artifact_id,
+            "artifact_path": artifact_path,
             "confluence": conf_id or "",
         }
 
@@ -1666,9 +1624,9 @@ class NormalDayHandler:
             )
             ticket_chain = CausalChainHandler(related_ticket_id)
             if prior:
-                for artifact_id in prior.get("facts", {}).get("causal_chain", []):
-                    ticket_chain.append(artifact_id)
-            ticket_chain.append(thread_id)
+                for aid in prior.get("facts", {}).get("causal_chain", []):
+                    ticket_chain.append(aid)
+            ticket_chain.append(artifact_id)
             if conf_id:
                 ticket_chain.append(conf_id)
             facts["causal_chain"] = ticket_chain.snapshot()
@@ -1684,16 +1642,18 @@ class NormalDayHandler:
                 artifact_ids=artifact_ids,
                 facts=facts,
                 summary=(
-                    f"{initiator} led design discussion on '{item.description[:80]}' "
+                    f"{initiator} led {'Zoom' if medium == 'zoom' else 'Slack'} "
+                    f"design discussion on '{item.description[:80]}' "
                     f"with {', '.join(p for p in participants if p != initiator)}."
                 ),
-                tags=["design_discussion", "slack"],
+                tags=tags + (["confluence"] if conf_id else []),
             )
         )
 
         self._gd.record_slack_interaction(participants)
         logger.info(
-            f"    [dim]🏗️  Design discussion: {item.description[:80]} "
+            f"    [dim]{'📹' if medium == 'zoom' else '🏗️ '} Design discussion "
+            f"[{medium}]: {item.description[:80]} "
             f"({len(participants)} engineers)[/dim]"
         )
         return participants
@@ -2672,6 +2632,258 @@ class NormalDayHandler:
                 )
 
         return slack_path, thread_id
+
+    def _run_slack_design_discussion(
+        self,
+        initiator: str,
+        participants: List[str],
+        topic: str,
+        ctx: str,
+        meeting_time_iso: str,
+        date_str: str,
+    ) -> Tuple[str, str, List[str]]:
+        """
+        Original Slack-thread path extracted from _handle_design_discussion.
+        Returns (slack_path, thread_id, tags).
+        """
+        from utils.persona_utils import get_voice_card
+
+        backstory = get_voice_card(participants, "async", self._gd, self._mem)
+
+        turn_speakers = [initiator] + [
+            participants[i % len(participants)] for i in range(1, random.randint(5, 8))
+        ]
+        speaker_sequence = ", ".join(turn_speakers)
+
+        agent = make_agent(
+            role="Slack Conversation Simulator",
+            goal=(
+                "Write a realistic multi-turn Slack technical design discussion. "
+                "Treat the provided backstory as character reference sheets."
+            ),
+            backstory=backstory,
+            llm=self._planner,
+        )
+
+        task = Task(
+            description=(
+                f"COMPANY CONTEXT: {self._company} which {COMPANY_DESCRIPTION}\n"
+                f"Write a full Slack thread for a design discussion.\n\n"
+                f"Topic: {topic}\n"
+                f"Relevant context: {ctx}\n\n"
+                f"Turn order: {speaker_sequence}\n\n"
+                f"Rules:\n"
+                f"- {initiator} opens by framing the problem or trade-off.\n"
+                f"- Others raise trade-offs, push back, or propose a next step. Do not just agree.\n"
+                f"- CRITICAL: DO NOT use generic openers like 'Hey team, let's discuss...'\n"
+                f"- Each message 1-3 sentences max. No narration.\n\n"
+                f"Respond ONLY with a JSON array. No preamble, no markdown fences.\n"
+                f'[{{"speaker": "Name", "message": "text"}}, ...]'
+            ),
+            expected_output='JSON array of {{"speaker", "message"}} objects.',
+            agent=agent,
+        )
+
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+        turns = _parse_turn_list(raw, "_run_slack_design_discussion")
+
+        messages = []
+        current_msg_time = datetime.fromisoformat(meeting_time_iso)
+        for turn in turns:
+            speaker = turn.get("speaker", "").strip()
+            text = turn.get("message", "").strip()
+            if speaker and text:
+                messages.append(
+                    {"user": speaker, "text": text, "ts": current_msg_time.isoformat()}
+                )
+                current_msg_time += timedelta(minutes=random.randint(1, 8))
+
+        depts = {dept_of_name(p, self._org_chart) for p in participants}
+        channel = (
+            "digital-hq"
+            if len(depts) > 1
+            else dept_of_name(initiator, self._org_chart).lower().replace(" ", "-")
+        )
+
+        slack_path, thread_id = self._save_slack(
+            messages, channel, interaction_type="design"
+        )
+        return slack_path, thread_id, ["design_discussion", "slack"]
+
+    def _run_zoom_design_discussion(
+        self,
+        initiator: str,
+        participants: List[str],
+        topic: str,
+        ctx: str,
+        meeting_time_iso: str,
+        date_str: str,
+    ) -> Tuple[str, str, List[str]]:
+        """
+        Zoom-transcript path for design discussions.
+
+        The LLM writes a realistic meeting transcript — attendees speak in full
+        sentences, decisions are stated explicitly, action items are called out.
+        This is the knowledge-gap surface: decisions made verbally that won't
+        appear in Jira or Confluence unless someone writes them up afterward.
+
+        Returns (file_path, transcript_id, tags).
+        """
+        from utils.persona_utils import get_voice_card
+
+        backstory = get_voice_card(participants, "sync", self._gd, self._mem)
+
+        agent = make_agent(
+            role="Meeting Transcript Generator",
+            goal=(
+                "Write a realistic Zoom meeting transcript for a technical design session. "
+                "Treat the provided backstory as character reference sheets."
+            ),
+            backstory=backstory,
+            llm=self._planner,
+        )
+
+        attendee_list = ", ".join(participants)
+
+        task = Task(
+            description=(
+                f"COMPANY CONTEXT: {self._company} which {COMPANY_DESCRIPTION}\n\n"
+                f"Write a realistic Zoom meeting transcript for a live design discussion.\n\n"
+                f"Topic: {topic}\n"
+                f"Attendees: {attendee_list}\n"
+                f"Host/initiator: {initiator}\n"
+                f"Relevant context: {ctx}\n\n"
+                f"## Format rules\n"
+                f"- Output a JSON array. Each element is one speaker turn.\n"
+                f"- Schema: [{{'speaker': 'Name', 'message': 'text'}}]\n"
+                f"- Turns should be 1-4 sentences. People interrupt, trail off, agree, disagree.\n"
+                f"- {initiator} opens by stating the meeting goal clearly.\n"
+                f"- The group must reach at least one explicit decision or action item before the meeting ends.\n"
+                f"- Include a brief wrap-up turn from {initiator} that states the decision and who owns the follow-up.\n"
+                f"- DO NOT use filler like 'Great point!' or 'Absolutely!' as standalone turns.\n"
+                f"- Speak naturally — 'gonna', contractions, occasional 'um' are fine.\n"
+                f"- NO narration, NO stage directions, NO markdown in message text.\n\n"
+                f"Respond ONLY with the JSON array. No preamble, no markdown fences."
+            ),
+            expected_output='JSON array of {{"speaker", "message"}} objects only.',
+            agent=agent,
+        )
+
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff())
+        turns = _parse_turn_list(raw, "_run_zoom_design_discussion")
+
+        if not turns:
+            logger.warning(
+                "[zoom_design_discussion] Empty transcript — falling back to Slack path."
+            )
+            return self._run_slack_design_discussion(
+                initiator, participants, topic, ctx, meeting_time_iso, date_str
+            )
+
+        transcript_path, transcript_id = self._save_zoom_transcript(
+            turns=turns,
+            participants=participants,
+            topic=topic,
+            meeting_time_iso=meeting_time_iso,
+            date_str=date_str,
+        )
+        return (
+            transcript_path,
+            transcript_id,
+            ["design_discussion", "zoom", "transcript"],
+        )
+
+    def _save_zoom_transcript(
+        self,
+        turns: List[dict],
+        participants: List[str],
+        topic: str,
+        meeting_time_iso: str,
+        date_str: str,
+    ) -> Tuple[str, str]:
+        """
+        Persists a Zoom-style meeting transcript.
+
+        Storage:
+          - Disk:    {output_dir}/zoom/{date}/zoom_{id}.md   (human-readable)
+          - MongoDB: embed_artifact type="zoom_transcript"
+                     (same RAG surface as slack_thread / confluence)
+
+        Returns (file_path, transcript_id).
+        """
+        import os
+        import uuid
+
+        transcript_id = f"zoom_{date_str}_{uuid.uuid4().hex[:8]}"
+
+        lines = [
+            f"# Zoom Meeting Transcript",
+            f"**Date:** {date_str}",
+            f"**Topic:** {topic}",
+            f"**Attendees:** {', '.join(participants)}",
+            f"",
+            f"---",
+            f"",
+        ]
+
+        current_ts = datetime.fromisoformat(meeting_time_iso)
+        full_text_parts = []
+
+        for turn in turns:
+            speaker = turn.get("speaker", "").strip()
+            message = turn.get("message", "").strip()
+            if not (speaker and message):
+                continue
+            ts_label = current_ts.strftime("%H:%M:%S")
+            lines.append(f"**[{ts_label}] {speaker}:** {message}")
+            lines.append("")
+            full_text_parts.append(f"{speaker}: {message}")
+            current_ts += timedelta(minutes=random.randint(1, 4))
+
+        md_content = "\n".join(lines)
+        full_text = "\n".join(full_text_parts)
+
+        zoom_dir = os.path.join(self._base, "zoom", date_str)
+        os.makedirs(zoom_dir, exist_ok=True)
+        file_path = os.path.join(zoom_dir, f"{transcript_id}.md")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+
+        embed_metadata = {
+            "participants": participants,
+            "topic": topic,
+            "turn_count": len(turns),
+            "medium": "zoom",
+        }
+
+        if self._embed_worker:
+            self._embed_worker.enqueue(
+                id=transcript_id,
+                type="zoom_transcript",
+                title=f"Zoom: {topic[:80]}",
+                content=full_text,
+                day=self._state.day,
+                date=date_str,
+                timestamp=meeting_time_iso,
+                metadata=embed_metadata,
+            )
+        else:
+            self._mem.embed_artifact(
+                id=transcript_id,
+                type="zoom_transcript",
+                title=f"Zoom: {topic[:80]}",
+                content=full_text,
+                day=self._state.day,
+                date=date_str,
+                timestamp=meeting_time_iso,
+                metadata=embed_metadata,
+            )
+
+        logger.info(
+            f"    [dim]📹 Zoom transcript saved: {transcript_id} "
+            f"({len(turns)} turns, {len(participants)} attendees)[/dim]"
+        )
+        return file_path, transcript_id
 
     def _save_md(self, path: str, content: str) -> None:
         import os

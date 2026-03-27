@@ -5,6 +5,8 @@ OrgForge simulation engine. Reads from config.yaml.
 Uses NetworkX for social graphs. Uses MongoDB for vector/artifact storage.
 """
 
+from pathlib import Path
+
 from config_loader import (
     COMPANY_DESCRIPTION,
     EXPORT_DIR,
@@ -36,6 +38,8 @@ import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent_factory import make_agent
+from crm_system import CRMSystem
+import genesis
 from json_repair import json_repair
 import networkx as nx
 from datetime import datetime, timedelta
@@ -48,6 +52,7 @@ from normal_day import NormalDayHandler, dept_of_name
 from artifact_registry import ArtifactRegistry
 from confluence_writer import ConfluenceWriter
 from ticket_assigner import TicketAssigner
+from post_sim_artifacts import run as run_post_sim
 from external_email_ingest import ExternalEmailIngestor
 from insider_threat import _NullInjector, InsiderThreatInjector
 from pydantic import BaseModel, Field
@@ -207,7 +212,7 @@ def email_of(name: str) -> str:
     return f"{name.lower()}@{COMPANY_DOMAIN}"
 
 
-def build_social_graph() -> nx.Graph:
+def build_social_graph(mem: Memory) -> nx.Graph:
     """Builds a weighted social graph of employees and external contacts."""
     G = nx.Graph()
 
@@ -231,7 +236,10 @@ def build_social_graph() -> nx.Graph:
                 weight += 5.0
             G.add_edge(n1, n2, weight=weight)
 
-    for contact in CONFIG.get("external_contacts", []):
+    doc = mem._db["sim_config"].find_one({"_id": "inbound_email_sources"})  #
+    sources = doc.get("sources", []) if doc else []
+
+    for contact in sources:
         node_id = contact["name"]
         liaison_dept = contact.get("internal_liaison", list(LEADS.keys())[0])
         liaison_lead = LEADS.get(liaison_dept, next(iter(LEADS.values())))
@@ -240,7 +248,7 @@ def build_social_graph() -> nx.Graph:
             node_id,
             dept="External",
             org=contact.get("org", "External"),
-            role=contact.get("role", "Contact"),
+            role=contact.get("category", "Contact"),
             display_name=contact.get("display_name", node_id),
             is_lead=False,
             external=True,
@@ -385,7 +393,9 @@ class GitSimulator:
         self._mem = mem
         self._graph = social_graph
         self._worker_llm = worker_llm
-        self.graph_dynamics = GraphDynamics(build_social_graph(), CONFIG)
+        self.graph_dynamics = GraphDynamics(
+            build_social_graph(self._mem), CONFIG, self._mem
+        )
         self._threat = threat_injector or _NullInjector()
 
     def create_pr(
@@ -583,8 +593,6 @@ def next_jira_id(state, registry=None, dept: str = "") -> str:
     raise RuntimeError("next_jira_id()")
 
 
-# Departments that work on action-item tickets rather than code.
-# ticket_progress for these depts routes to a completion artifact, never a PR.
 _NON_ENG_DEPTS = {
     "HR_Ops",
     "Sales_Marketing",
@@ -593,8 +601,7 @@ _NON_ENG_DEPTS = {
     "Product",
 }
 
-# Maps non-eng dept to the preferred completion artifact type.
-# Used when stamping new tickets and when _handle_ticket_progress branches.
+
 _DEPT_COMPLETION_ARTIFACT: dict[str, str] = {
     "HR_Ops": "confluence",
     "Sales_Marketing": "email",
@@ -614,22 +621,18 @@ def score_sentiment(messages: List[Dict]) -> float:
     return round((sum(scores) / len(scores) + 1) / 2, 3)
 
 
-# ─────────────────────────────────────────────
-# 6. SIMULATION
-# ─────────────────────────────────────────────
 class OrgForgeSimulation:
-    def __init__(self):
+    def __init__(self, mem: Optional[Memory] = None):
         self.state = State()
-        self._mem = Memory()
+        self._mem = mem if mem is not None else Memory()
 
-        # Background embed queue — decouples Stella/Ollama inference from LLM
-        # generation so both run concurrently rather than sequentially.
-        # drain() is called before any vector search and at end-of-day.
         self._embed_worker = EmbedWorker(self._mem)
         self._embed_worker.start()
         self._mem.set_embed_worker(self._embed_worker)
 
-        self.graph_dynamics = GraphDynamics(build_social_graph(), CONFIG)
+        self.graph_dynamics = GraphDynamics(
+            build_social_graph(self._mem), CONFIG, self._mem
+        )
         self.social_graph = self.graph_dynamics.G
         self._threat = InsiderThreatInjector.from_config(
             config=CONFIG,
@@ -649,6 +652,12 @@ class OrgForgeSimulation:
         self._day_planner = DayPlannerOrchestrator(
             CONFIG, WORKER_MODEL, PLANNER_MODEL, clock=self._clock
         )
+        self._crm = CRMSystem.from_config(
+            config=CONFIG,
+            export_base=BASE,
+            mem=self._mem,
+            planner_llm=PLANNER_MODEL,
+        )
         self._lifecycle = OrgLifecycleManager(
             config=CONFIG,
             graph_dynamics=self.graph_dynamics,
@@ -659,6 +668,7 @@ class OrgForgeSimulation:
             leads=LEADS,
             worker_llm=WORKER_MODEL,
             base_export_dir=BASE,
+            crm=self._crm,
         )
         self._registry = ArtifactRegistry(self._mem, base_export_dir=BASE)
         self._confluence = ConfluenceWriter(
@@ -685,6 +695,7 @@ class OrgForgeSimulation:
             registry=self._registry,
             clock=self._clock,
             threat_injector=self._threat,
+            crm=self._crm,
         )
         self._normal_day = NormalDayHandler(
             config=CONFIG,
@@ -764,16 +775,6 @@ class OrgForgeSimulation:
 
     # ─── GENESIS ─────────────────────────────
     def genesis_phase(self):
-        if self._mem.has_genesis_artifacts():
-            logger.info(
-                "[bold green]⏩ Genesis Guard: Corporate history exists. Skipping LLM generation.[/bold green]"
-            )
-            # The Registry seeds itself from Mongo in __init__, so IDs are already synced.
-            # Email sources are idempotent — load them even on resume so daily
-            # generate_pre_standup / generate_business_hours have something to fire against.
-            self._email_ingestor.generate_sources()
-            return
-
         logger.info(
             Panel.fit(
                 f"[bold cyan]{COMPANY_NAME.upper()} — ORGFORGE SIMULATION[/bold cyan]\n"
@@ -799,10 +800,6 @@ class OrgForgeSimulation:
         self._confluence.generate_tech_stack()
         tech_context = self._mem.tech_stack_for_prompt()
 
-        # ── Persona embedding + email source generation run in parallel ───────
-        # Persona embeds are all independent (one per employee, no ordering dep).
-        # Email source generation depends on tech_stack (done above) but is
-        # independent of personas and confluence pages.
         persona_items = [
             (dept, name, PERSONAS.get(name, DEFAULT_PERSONA))
             for dept, members in ORG_CHART.items()
@@ -820,23 +817,15 @@ class OrgForgeSimulation:
             persona_futures = {
                 ex.submit(_embed_persona, item): item[1] for item in persona_items
             }
-            # Run email source generation concurrently with persona embedding
-            email_future = ex.submit(self._email_ingestor.generate_sources)
 
-            for future in as_completed(list(persona_futures) + [email_future]):
-                if future is email_future:
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"[genesis] Email source generation failed: {e}")
-                else:
-                    name = persona_futures[future]
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"[genesis] Persona embed failed for {name}: {e}")
+            for future in as_completed(persona_futures):
+                name = persona_futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"[genesis] Persona embed failed for {name}: {e}")
 
-        # ── Genesis: log pre-sim employee departures from config ─────────────────
+
         sim_start = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
         for gap in CONFIG.get("knowledge_gaps", []):
             name = gap["name"]
@@ -873,10 +862,6 @@ class OrgForgeSimulation:
                 f"[genesis] Logged pre-sim departure: {name} (Day {departure_day})"
             )
 
-        # ── Confluence genesis batches — ENG and MKT run in parallel ─────────
-        # Pages within each batch are sequential (related_pages dependency).
-        # The two batches have no cross-references so they're safe to run
-        # concurrently — each is an independent series of Bedrock calls.
         self._confluence.write_genesis_batches_parallel(
             [
                 {
@@ -1003,6 +988,8 @@ class OrgForgeSimulation:
             if self.state.day > 1:
                 self._embed_worker.drain()
 
+            crm_signals = self._crm.planner_context()
+
             org_plan = self._day_planner.plan(
                 self.state,
                 self._mem,
@@ -1010,6 +997,7 @@ class OrgForgeSimulation:
                 lifecycle_context=self._lifecycle.get_roster_context(),
                 clock=self._clock,
                 email_signals=vendor_signals,
+                crm_summary=crm_signals,
             )
             if org_plan is None:
                 logger.error(
@@ -1122,8 +1110,8 @@ class OrgForgeSimulation:
 
         self._embed_worker.stop()
         self._print_final_report()
+        run_post_sim(export_dir=Path(BASE), use_llm=True)
 
-    # ─── SPRINT PLANNING ──────────────────────
     def _handle_sprint_planning(self):
 
         sprint_num = self.state.sprint.sprint_number
@@ -2000,7 +1988,6 @@ class OrgForgeSimulation:
         triggered_contacts = self.graph_dynamics.relevant_external_contacts(
             event_type="incident_opened",
             system_health=self.state.system_health,
-            config=CONFIG,
         )
         for contact in triggered_contacts:
             self._handle_external_contact(inc, contact)
@@ -2036,6 +2023,15 @@ class OrgForgeSimulation:
                 + (["knowledge_gap"] if involves_gap else [])
                 + (["recurrence"] if recurrence_of else []),
             )
+        )
+
+        self._crm.handle_incident_opened(
+            incident_id=ticket_id,
+            component=root_cause[:80],
+            health=self.state.system_health,
+            timestamp=incident_start_iso,
+            date_str=date_str,
+            day=self.state.day,
         )
 
         self._mem.log_event(
@@ -2158,7 +2154,6 @@ class OrgForgeSimulation:
                 triggered_contacts = self.graph_dynamics.relevant_external_contacts(
                     event_type="fix_in_progress",
                     system_health=self.state.system_health,
-                    config=CONFIG,
                 )
                 for contact in triggered_contacts:
                     self._handle_external_contact(inc, contact)
@@ -2203,6 +2198,18 @@ class OrgForgeSimulation:
                 )
                 self.state.system_health = min(100, self.state.system_health + 20)
                 self._write_postmortem(inc)
+                postmortem_id = getattr(inc, "causal_chain", None)
+                postmortem_link = (
+                    postmortem_id.snapshot()[-1] if postmortem_id else inc.ticket_id
+                )
+                self._crm.handle_incident_resolved(
+                    incident_id=inc.ticket_id,
+                    postmortem_link=postmortem_link,
+                    timestamp=cron_time_iso,
+                    date_str=str(self.state.current_date.date()),
+                    day=self.state.day,
+                )
+
                 self.state.resolved_incidents.append(inc.ticket_id)
                 self.state.daily_incidents_resolved += 1
                 self._mem.log_event(
@@ -2252,6 +2259,13 @@ class OrgForgeSimulation:
 
         if conf_id and getattr(inc, "causal_chain", None):
             inc.causal_chain.append(conf_id)
+
+            t = self._mem.get_ticket(inc.ticket_id)
+            if t:
+                t["causal_chain"] = inc.causal_chain.snapshot()
+                self._mem.upsert_ticket(t)
+                save_json(f"{BASE}/jira/{inc.ticket_id}.json", t)
+
             self._mem.log_event(
                 SimEvent(
                     type="postmortem_created",
@@ -2349,12 +2363,8 @@ class OrgForgeSimulation:
             )
         )
 
-        # ── Derive enrichment fields from accumulated daily state ─────────────────
-
-        # Deduplicated actors seen in any event today, ordered by frequency
         unique_actors = list(dict.fromkeys(self.state.daily_active_actors))
 
-        # Dominant event type fired most often today (e.g. "incident_opened")
         event_counts = self.state.daily_event_type_counts
         dominant_event = (
             max(event_counts, key=event_counts.get) if event_counts else "normal_day"
@@ -2365,15 +2375,12 @@ class OrgForgeSimulation:
             {dept_of(name) for name in unique_actors if dept_of(name) != "Unknown"}
         )
 
-        # Still-open incidents at EOD (not yet resolved)
         open_incident_ids = [inc.ticket_id for inc in self.state.active_incidents]
 
-        # Stress snapshot for today's active actors only — keeps the summary tight
         stress_today = dict(
             {name: self.graph_dynamics._stress.get(name, 0) for name in unique_actors}
         )
 
-        # ── Enriched day_summary SimEvent ────────────────────────────────────────
         self._mem.log_event(
             SimEvent(
                 type="day_summary",
@@ -2383,7 +2390,6 @@ class OrgForgeSimulation:
                 actors=unique_actors,  # populated — was always []
                 artifact_ids={},
                 facts={
-                    # ── Original numeric fields (unchanged) ──
                     "incidents_opened": self.state.daily_incidents_opened,
                     "incidents_resolved": self.state.daily_incidents_resolved,
                     "artifacts_created": self.state.daily_artifacts_created,
@@ -2391,14 +2397,12 @@ class OrgForgeSimulation:
                     "morale": self.state.team_morale,
                     "system_health": self.state.system_health,
                     "theme": self.state.daily_theme,
-                    # ── New enrichment fields ──
                     "active_actors": unique_actors,
                     "dominant_event": dominant_event,
                     "event_type_counts": dict(self.state.daily_event_type_counts),
                     "departments_involved": departments_involved,
                     "open_incidents": open_incident_ids,
                     "stress_snapshot": stress_today,
-                    # Trajectory signal — gives DayPlanner a one-glance health picture
                     "health_trend": (
                         "declining"
                         if self.state.system_health < 60
@@ -2430,7 +2434,6 @@ class OrgForgeSimulation:
             )
         )
 
-        # ── Reset all daily counters ──────────────────────────────────────────────
         self.state.daily_incidents_opened = 0
         self.state.daily_incidents_resolved = 0
         self.state.daily_artifacts_created = 0
@@ -2441,8 +2444,8 @@ class OrgForgeSimulation:
         date_str = str(self.state.current_date.date())
         for dep in self._lifecycle._departed:
             if dep.day != self.state.day:
-                continue  # only process today's departures
-            # Pick the on-call engineer or first dept member as first responder
+                continue
+
             dept_members = [
                 n for n in LIVE_ORG_CHART.get(dep.dept, []) if n != dep.name
             ]
@@ -2796,9 +2799,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.reset:
-        mem = Memory()
-        mem.reset(export_dir=BASE)
+    mem = genesis.initialize(config=CONFIG, planner_llm=PLANNER_MODEL, reset=args.reset)
 
-    sim = OrgForgeSimulation()
+    sim = OrgForgeSimulation(mem=mem)
     sim.run()

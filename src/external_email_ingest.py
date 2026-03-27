@@ -54,7 +54,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent_factory import make_agent
 from causal_chain_handler import CausalChainHandler
 from config_loader import COMPANY_DESCRIPTION
+from crm_system import NullCRMSystem
 from crewai import Crew, Task
+import json_repair
 from memory import Memory, SimEvent
 from insider_threat import _NullInjector
 from utils.persona_utils import get_voice_card
@@ -69,7 +71,6 @@ _HEALTH_THRESHOLD = 60
 _PROB_EMAIL_DROPPED = 0.15  # customer emails dropped with no action
 _PROB_CUSTOMER_JIRA = 0.55  # high-priority customer complaint → JIRA
 _PROB_VENDOR_JIRA = 0.45  # vendor alert → JIRA task
-_DEFAULT_SOURCE_COUNT = 7
 _HR_EMAIL_WINDOW = (1, 3)  # days before hire arrival to send email
 
 
@@ -114,19 +115,6 @@ class ExternalEmailSignal:
 class ExternalEmailIngestor:
     """
     Manages genesis-time source generation and all email flows during the sim.
-
-    Call order in flow.py
-    ---------------------
-    Genesis:
-        ingestor.generate_sources()                          # after generate_tech_stack()
-
-    daily_cycle(), before day_planner.plan():
-        vendor_signals = ingestor.generate_pre_standup(state)
-        # vendor_signals injected into DepartmentPlanner prompts
-
-    daily_cycle(), after normal_day / incidents:
-        ingestor.generate_business_hours(state)              # customer routing chains
-        ingestor.generate_hr_outbound(state)                 # pre-hire emails
     """
 
     _MONGO_KEY = "inbound_email_sources"
@@ -144,6 +132,7 @@ class ExternalEmailIngestor:
         registry,
         clock,
         threat_injector=None,
+        crm=None,
     ):
         self._config = config
         self._mem = mem
@@ -163,96 +152,19 @@ class ExternalEmailIngestor:
         self._company_desc: str = config.get("simulation", {}).get(
             "company_description", f"a {self._industry} company"
         )
-        self._sources: Optional[List[dict]] = None
         self._threat = threat_injector or _NullInjector()
+        self._crm = crm or NullCRMSystem()
 
         self._scheduled_hires: Dict[int, List[dict]] = {}
         for hire in config.get("org_lifecycle", {}).get("scheduled_hires", []):
             self._scheduled_hires.setdefault(hire["day"], []).append(hire)
 
-    def generate_sources(self) -> List[dict]:
-        """
-        Generate and persist email sources via LLM. Idempotent.
-        Call after generate_tech_stack() so vendor choices are grounded
-        in the company's actual tech stack.
-        """
-        existing = self._mem.get_inbound_email_sources()
-        if existing:
-            logger.info(
-                f"[bold green]⏩ Email sources: {len(existing)} persisted "
-                f"(skipping LLM generation).[/bold green]"
-            )
-            self._sources = existing
-            return existing
+        @property
+        def _sources(self):
+            """Lazy lookup: pull sources from MongoDB only when needed."""
+            doc = self._mem._db["sim_config"].find_one({"_id": "inbound_email_sources"})
+            return doc.get("sources", []) if doc else []
 
-        logger.info("[cyan]🌐 Generating inbound email sources...[/cyan]")
-
-        tech_stack = self._mem.tech_stack_for_prompt()
-        dept_str = ", ".join(self._leads.keys())
-        accounts = self._config.get("sales_accounts", [])
-        accounts_str = ", ".join(accounts[:3]) if accounts else "enterprise customers"
-
-        agent = make_agent(
-            role="Enterprise IT Architect",
-            goal=f"Design the realistic external email ecosystem for {self._company_name} which {COMPANY_DESCRIPTION}.",
-            backstory=(
-                f"You are an experienced enterprise architect who understands "
-                f"communication patterns between a {self._industry} company and its "
-                f"vendors, customers, and partners."
-            ),
-            llm=self._planner_llm,
-        )
-        task = Task(
-            description=(
-                f"Generate {_DEFAULT_SOURCE_COUNT} realistic inbound email sources"
-                f"TECH STACK: {tech_stack}\n"
-                f"DEPARTMENTS: {dept_str}\n"
-                f"KNOWN CUSTOMERS: {accounts_str}\n\n"
-                f"DEPARTMENTAL LIAISON LOGIC (Assign Liaisons Based on These Rules):\n"
-                f"  - Engineering_Backend: Responsible for Infrastructure (AWS), Databases (TitanDB), Source Control (GitHub), and Monitoring.\n"
-                f"  - Engineering_Mobile: Responsible for React Native and mobile platform issues.\n"
-                f"  - Product: Responsible for project management (Jira) and feature roadmaps.\n"
-                f"  - Sales_Marketing: Responsible for payment/data vendors (e.g., Stripe) and Customer communication.\n"
-                f"  - QA_Support: Responsible for CI/CD (Jenkins) and testing tool alerts.\n"
-                f"  - HR_Ops: Responsible for legal, compliance, and payroll vendors.\n\n"
-                f"Rules:\n"
-                f"  - ADHERENCE: Use ONLY vendors that appear in the TECH STACK above. If Jira is listed, never use Trello.\n"
-                f"  - CUSTOMERS: All category:'customer' entries must be from the KNOWN CUSTOMERS list.\n"
-                f"  - TOPICS: Provide 3-5 hyper-specific topics (e.g., 'GitHub Actions Runner Timeout' or 'Stripe API 402 Payment Required').\n"
-                f"  - CATEGORY: exactly 'vendor' or 'customer'.\n"
-                f"  - TRIGGER_ON: array of 'always', 'incident', 'low_health'.\n"
-                f"  - TONE: formal | technical | frustrated | urgent | friendly.\n\n"
-                f"Raw JSON array only — no preamble, no markdown fences:\n"
-                f'[{{"name":"GitHub","org":"GitHub Inc.","email":"support@github.com",'
-                f'"category":"vendor","internal_liaison":"Engineering_Backend",'
-                f'"trigger_on":["incident"],"tone":"technical",'
-                f'"topics":["Webhooks failing with 5xx","Pull Request comment API latency"]}}]'
-            ),
-            expected_output=f"Raw JSON array of {_DEFAULT_SOURCE_COUNT} source objects.",
-            agent=agent,
-        )
-
-        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
-        sources = self._parse_sources(raw)
-
-        if not sources:
-            logger.warning(
-                "[yellow]⚠ Source generation failed — using fallback.[/yellow]"
-            )
-            sources = self._fallback_sources()
-
-        self._mem.save_inbound_email_sources(sources)
-        self._sources = sources
-
-        logger.info(
-            f"[green]✓ {len(sources)} email sources generated and persisted.[/green]"
-        )
-        for s in sources:
-            logger.info(
-                f"    [dim]→ [{s['category']}] {s['name']} "
-                f"({s['internal_liaison']}) triggers={s['trigger_on']}[/dim]"
-            )
-        return sources
 
     def generate_pre_standup(self, state) -> List[ExternalEmailSignal]:
         """
@@ -837,16 +749,37 @@ class ExternalEmailIngestor:
                 f"You received this email from {signal.source_name}:\n"
                 f"Subject: {signal.subject}\n{signal.full_body}\n\n"
                 f"{urgency_hint}\n"
-                f"Under 80 words. Professional, warm. Use your typing quirks. No [PLACEHOLDER] tokens. "
-                f"Output body only — no subject line."
+                f"Under 80 words. Professional, warm. Use your typing quirks.\n\n"
+                f"Respond ONLY with a JSON object in this exact format:\n"
+                f"{{\n"
+                f'  "body": "<the email text>",\n'
+                f'  "crm_stage": "Choose EXACTLY ONE: Prospecting | Value Proposition | Proposal/Price Quote | Negotiation/Review"\n'
+                f"}}"
             ),
-            expected_output="Email reply body under 80 words.",
+            expected_output="Valid JSON object with 'body' and 'crm_stage' keys.",
             agent=agent,
         )
         try:
-            body = str(
+            raw = str(
                 Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
             ).strip()
+            parsed = json_repair.loads(raw)
+
+            if isinstance(parsed, dict):
+                data = parsed
+            elif (
+                isinstance(parsed, list)
+                and len(parsed) > 0
+                and isinstance(parsed[0], dict)
+            ):
+                data = parsed[0]
+            else:
+                data = {}
+
+            body = data.get(
+                "body", "Thank you for reaching out. We will be in touch shortly."
+            )
+            crm_stage = data.get("crm_stage", "Prospecting")
         except Exception as exc:
             logger.warning(f"[external_email] Customer reply LLM failed: {exc}")
             return None
@@ -866,6 +799,20 @@ class ExternalEmailIngestor:
             body=body,
             timestamp_iso=reply_time.isoformat(),
             direction="outbound",
+        )
+
+        self._crm.process_outbound_email(
+            email_data={
+                "sender": sales_lead,
+                "recipient": signal.source_name,
+                "sender_org": self._company_name,
+                "recipient_org": signal.source_org,
+                "subject": subject,
+                "stage": crm_stage,
+            },
+            timestamp=reply_time.isoformat(),
+            date_str=date_str,
+            day=state.day,
         )
 
         _exfil_path = self._threat.inject_email(
@@ -1242,6 +1189,27 @@ class ExternalEmailIngestor:
                 tags=["email", "inbound", category, source_name.lower()],
             )
         )
+
+        zd_ticket_id = None
+        if category == "customer":
+            zd_ticket_id = self._crm.handle_inbound_complaint(
+                event_facts={
+                    "subject": subject,
+                    "body": body[:500],
+                    "sender_org": source_org,
+                },
+                timestamp=email_ts.isoformat(),
+                date_str=date_str,
+                day=state.day,
+            )
+            if zd_ticket_id:
+                logger.info(
+                    f"    [dim]🔗 ZD ticket {zd_ticket_id} linked to inbound complaint[/dim]"
+                )
+
+        artifact_ids = {"email": embed_id, "eml_path": str(eml_path)}
+        if zd_ticket_id:
+            artifact_ids["zd_ticket"] = zd_ticket_id
 
         body_preview = body[:200].rstrip() + ("…" if len(body) > 200 else "")
 
