@@ -74,6 +74,17 @@ def sim(make_test_memory):
     s._mem.log_slack_messages = MagicMock(return_value=("slack/path", "thread-001"))
     s._mem.has_genesis_artifacts = MagicMock(return_value=True)
     s._mem.load_latest_checkpoint = MagicMock(return_value=None)
+    sources = [
+        {
+            "name": "Vendor",
+            "trigger_on": ["incident"],
+            "internal_liaison": "Engineering",
+        }
+    ]
+    s._mem._db["sim_config"].insert_one(
+        {"_id": "inbound_email_sources", "sources": sources}
+    )
+    s._email_ingestor._sources = sources
 
     s._normal_day._confluence = MagicMock()
 
@@ -466,7 +477,9 @@ class TestPRReviewRouting:
         )
 
         ticket = sim._mem.get_ticket("ENG-103")
-        assert ticket["status"] == "Done", "Ticket must be marked Done when PR is force-merged."
+        assert ticket["status"] == "Done", (
+            "Ticket must be marked Done when PR is force-merged."
+        )
 
     @patch("normal_day.Crew")
     @patch("normal_day.Task")
@@ -695,6 +708,9 @@ class TestPlannerInReviewSection:
 
 
 class TestDailyLoop:
+    @patch("flow.run_post_sim")
+    @patch("external_email_ingest.Crew")
+    @patch("external_email_ingest.Task")
     @patch("normal_day.Crew")
     @patch("normal_day.Task")
     @patch("confluence_writer.Crew")
@@ -703,7 +719,18 @@ class TestDailyLoop:
     @patch("flow.Task")
     @patch("agent_factory.Agent")
     def test_5_day_cycle_completes_and_advances_day(
-        self, mock_agent, mock_ft, mock_fc, mock_cwt, mock_cwc, mock_ndt, mock_ndc, sim
+        self,
+        mock_agent,
+        mock_ft,
+        mock_fc,
+        mock_cwt,
+        mock_cwc,
+        mock_ndt,
+        mock_ndc,
+        mock_eet,
+        mock_eec,
+        mock_run_post_sim,
+        sim,
     ):
         """
         Smoke test: daily_cycle() runs to completion over 5 days without
@@ -713,6 +740,7 @@ class TestDailyLoop:
         mock_fc.return_value = crew_inst
         mock_cwc.return_value = crew_inst
         mock_ndc.return_value = crew_inst
+        mock_eec.return_value = crew_inst
 
         author = ALL_NAMES[0]
         _seed_ticket(sim._mem, "ENG-300", author)
@@ -747,6 +775,9 @@ class TestDailyLoop:
 
         assert sim.state.day == 6
 
+    @patch("flow.run_post_sim")
+    @patch("external_email_ingest.Crew")
+    @patch("external_email_ingest.Task")
     @patch("normal_day.Crew")
     @patch("normal_day.Task")
     @patch("confluence_writer.Crew")
@@ -755,12 +786,24 @@ class TestDailyLoop:
     @patch("flow.Task")
     @patch("agent_factory.Agent")
     def test_incident_probability_branch_opens_incident(
-        self, mock_agent, mock_ft, mock_fc, mock_cwt, mock_cwc, mock_ndt, mock_ndc, sim
+        self,
+        mock_agent,
+        mock_ft,
+        mock_fc,
+        mock_cwt,
+        mock_cwc,
+        mock_ndt,
+        mock_ndc,
+        mock_eet,
+        mock_eec,
+        mock_run_post_sim,
+        sim,
     ):
         crew_inst = _crew_returning({"comment": "Done.", "is_code_complete": False})
         mock_fc.return_value = crew_inst
         mock_cwc.return_value = crew_inst
         mock_ndc.return_value = crew_inst
+        mock_eec.return_value = crew_inst
 
         def dynamic_plan(*args, **kwargs):
             date_str = str(sim.state.current_date.date())
@@ -949,3 +992,270 @@ class TestNonEngineeringLifecycle:
 
         events = list(sim._mem._events.find({"type": "watercooler_chat"}))
         assert len(events) >= 1
+
+
+class TestCRMSimulationIntegration:
+    """
+    Validates that CRM hooks propagate correctly when standard OrgForge
+    mechanics (incidents, departures) fire during the daily cycle.
+    """
+
+    @pytest.fixture
+    def live_crm_sim(self, sim, tmp_path):
+        """Overrides the NullCRMSystem with a live one for these tests."""
+        from crm_system import CRMSystem
+
+        cfg = {
+            "crm": {
+                "salesforce": {"enabled": True},
+                "zendesk": {"enabled": True, "link_to_incidents": True},
+            }
+        }
+        sim._crm = CRMSystem(cfg, tmp_path, sim._mem)
+
+        sim._lifecycle._crm = sim._crm
+        return sim
+
+    def test_incident_escalates_zendesk_tickets(self, live_crm_sim):
+        live_crm_sim._lifecycle.scan_for_knowledge_gaps = MagicMock()
+        with (
+            patch(
+                "flow.OrgForgeSimulation._select_domain_expert", return_value="Alice"
+            ),
+            patch("flow.Task"),
+            patch("flow.Crew") as mock_crew,
+            patch("agent_factory.Agent"),
+        ):
+            mock_crew.return_value.kickoff.return_value = "API Gateway is down"
+            live_crm_sim.state.system_health = 40
+            live_crm_sim._handle_incident()
+
+        live_crm_sim._crm.handle_inbound_complaint(
+            {"subject": "Can't login", "sender_org": "Wayne Ent"},
+            timestamp="2026-03-09T09:00:00",
+            date_str="2026-03-09",
+            day=1,
+        )
+
+        with (
+            patch(
+                "flow.OrgForgeSimulation._select_domain_expert", return_value="Alice"
+            ),
+            patch("flow.Task"),
+            patch("flow.Crew") as mock_crew,
+            patch("agent_factory.Agent"),
+        ):
+            mock_crew.return_value.kickoff.return_value = "API Gateway is down"
+
+            live_crm_sim.state.system_health = 40
+            live_crm_sim._handle_incident()
+
+        zd_ticket = live_crm_sim._mem._db["zd_tickets"].find_one(
+            {"org_name": "Wayne Ent"}
+        )
+        assert zd_ticket["priority"] == "Urgent"
+        assert "ENG-" in zd_ticket["related_incident"]
+
+        events = list(live_crm_sim._mem._events.find({"type": "zd_tickets_escalated"}))
+        assert len(events) == 1
+        assert zd_ticket["ticket_id"] in events[0]["facts"]["ticket_ids"]
+
+    def test_departure_reassigns_crm_assets(self, live_crm_sim):
+        """
+        When a sales rep departs, OrgLifecycleManager must cascade the departure
+        into the CRM to flag open accounts and deals for reassignment.
+        """
+
+        live_crm_sim._crm.process_outbound_email(
+            {
+                "sender": "Charlie",
+                "recipient_org": "Stark Ind",
+                "stage": "Negotiation/Review",
+            },
+            timestamp="2026-03-09T10:00:00",
+            date_str="2026-03-09",
+            day=1,
+        )
+
+        live_crm_sim._crm.handle_employee_departure(
+            "Charlie", "Account Executive", "2026-03-10", 2
+        )
+
+        opp = live_crm_sim._mem._db["sf_opps"].find_one({"account_name": "Stark Ind"})
+        assert opp["owner"] == "Pending Reassignment"
+        assert any("Charlie" in note for note in opp["risk_notes"])
+
+        events = list(live_crm_sim._mem._events.find({"type": "sf_ownership_lapsed"}))
+        assert len(events) == 1
+        assert "Stark Ind" not in events[0]["facts"]["accounts_lapsed"]
+        assert opp["opportunity_id"] in events[0]["facts"]["opportunities_lapsed"]
+
+    @patch("normal_day.Crew")
+    @patch("normal_day.Task")
+    @patch("agent_factory.Agent")
+    def test_non_eng_ticket_completion_triggers_crm_progression(
+        self, mock_agent, mock_task, mock_crew, live_crm_sim
+    ):
+        """
+        Tests the full causal path:
+        1. Sales rep works on a non-eng Jira ticket (MKT-100).
+        2. NormalDayHandler recognizes it's non-eng and routes completion to Email.
+        3. Email emission triggers CRMSystem.process_outbound_email.
+        4. Salesforce opportunity advances.
+        """
+        rep_name = "Alice"
+
+        live_crm_sim._mem._jira.insert_one(
+            {
+                "id": "MKT-100",
+                "title": "Send Proposal to Stark",
+                "status": "To Do",
+                "assignee": rep_name,
+                "dept": "Sales",
+                "dept_type": "non_eng",
+                "completion_artifact": "email",
+                "sprint": 1,
+                "in_progress_since": 1,
+                "description": "",
+                "story_points": 3,
+                "comments": [],
+            }
+        )
+
+        live_crm_sim._crm.process_outbound_email(
+            {
+                "sender": rep_name,
+                "recipient_org": "Stark Ind",
+                "stage": "Prospecting",
+                "subject": "Intro",
+            },
+            "2026-03-08T10:00:00",
+            "2026-03-08",
+            1,
+        )
+
+        mock_crew_inst = MagicMock()
+        mock_crew_inst.kickoff.return_value = '{"subject": "Proposal enclosed", "body": "Here are the terms.", "crm_stage": "Proposal/Price Quote", "recipient_org": "Stark Ind", "is_task_complete": true}'
+        mock_crew.return_value = mock_crew_inst
+
+        org_plan = _make_org_plan(
+            live_crm_sim,
+            {
+                "Sales": [
+                    EngineerDayPlan(
+                        name=rep_name,
+                        dept="Sales",
+                        agenda=[
+                            AgendaItem(
+                                activity_type="ticket_progress",
+                                description="Finish MKT-100",
+                                related_id="MKT-100",
+                                estimated_hrs=2.0,
+                            )
+                        ],
+                        stress_level=20,
+                    )
+                ]
+            },
+        )
+
+        live_crm_sim._mem._db["sf_opps"].insert_one(
+            {
+                "opportunity_id": "OPP-999",
+                "account_name": "Stark Ind",
+                "stage": "Prospecting",
+                "owner": rep_name,  # "Alice"
+                "primary_contact": "Tony Stark",
+                "primary_contact_email": "tony@stark.com",
+                "touchpoints": [],
+            }
+        )
+
+        live_crm_sim._normal_day.handle(org_plan)
+
+        ticket = live_crm_sim._mem.get_ticket("MKT-100")
+        assert ticket["status"] == "Done"
+
+        email_events = list(
+            live_crm_sim._mem._events.find({"type": "ticket_completion_email"})
+        )
+        assert len(email_events) == 1
+
+        opp = live_crm_sim._mem._db["sf_opps"].find_one({"account_name": "Stark Ind"})
+        assert opp["stage"] == "Proposal/Price Quote"
+        assert len(opp["touchpoints"]) == 2
+
+    @patch("flow.Crew")
+    @patch("flow.Task")
+    @patch("confluence_writer.Task")
+    @patch("confluence_writer.Crew")
+    @patch("agent_factory.Agent")
+    def test_incident_causal_chain_preserves_full_lifecycle(
+        self,
+        mock_agent,
+        mock_cw_crew,
+        mock_cw_task,
+        mock_flow_task,
+        mock_flow_crew,
+        sim,
+    ):
+        """
+        Validates that an incident traversing the OrgForge state machine successfully
+        accumulates every generated artifact into a single unbroken Causal Chain.
+        """
+
+        sim.graph_dynamics.relevant_external_contacts = MagicMock(return_value=[])
+        sim._mem.log_slack_messages.side_effect = [
+            ("slack/path", "slack-thread-001"),
+            ("slack/path", "slack-thread-002"),
+            ("slack/path", "slack-thread-003"),
+            ("slack/path", "slack-thread-004"),
+            ("slack/path", "slack-thread-005"),
+        ]
+
+        sim._mem.log_slack_messages.side_effect = [
+            ("slack/path", f"slack-thread-{i:03d}") for i in range(1, 20)
+        ]
+
+        mock_flow_inst = MagicMock()
+        mock_flow_inst.kickoff.return_value = "Memory leak in auth service."
+        mock_flow_crew.return_value = mock_flow_inst
+
+        mock_cw_inst = MagicMock()
+        mock_cw_inst.kickoff.return_value = "## Postmortem\nFixed the leak."
+        mock_cw_crew.return_value = mock_cw_inst
+
+        sim.state.system_health = 30
+        sim._handle_incident()
+
+        inc = sim.state.active_incidents[0]
+        ticket_id = inc.ticket_id
+
+        chain_snap = inc.causal_chain.snapshot()
+        assert len(chain_snap) == 3
+        assert chain_snap[0] == ticket_id
+        assert "slack" in chain_snap[1]
+        assert "slack" in chain_snap[2]
+
+        sim._advance_incidents()
+        sim._advance_incidents()
+
+        chain_snap = inc.causal_chain.snapshot()
+        assert len(chain_snap) == 4
+        assert "PR-" in chain_snap[3]
+        pr_id = chain_snap[3]
+
+        sim._advance_incidents()
+        sim._advance_incidents()
+
+        final_ticket = sim._mem.get_ticket(ticket_id)
+        final_chain = final_ticket.get("causal_chain", [])
+
+        assert len(final_chain) == 5
+        assert final_chain[0] == ticket_id
+        assert pr_id in final_chain
+        assert str(final_chain[-1]).startswith("CONF-")
+
+        pm_events = list(sim._mem._events.find({"type": "postmortem_created"}))
+        assert len(pm_events) == 1
+        assert pm_events[0]["facts"]["causal_chain"] == final_chain

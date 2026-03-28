@@ -143,6 +143,14 @@ class DepartmentPlanner:
     [ ] No collaborative meeting appears in more than one engineer's agenda
     [ ] All related_ids are null or from that engineer's own owned ticket list
     [ ] No engineer's estimated_hrs total exceeds their listed capacity
+    ## MEETING MEDIUM RULE (design_discussion only)
+    Choose "zoom" when ALL of the following apply:
+      - 2 or more collaborators
+      - Topic is architectural, cross-cutting, or requires real-time decision-making
+      - Team morale is not critically low (i.e., not "very low")
+    Otherwise default to "slack".
+    Aim for roughly 35-45% zoom across the day's design discussions.
+    For all other activity types, omit meeting_medium or set it to "slack".
 
     Only output the JSON after confirming all three.
 
@@ -165,7 +173,8 @@ class DepartmentPlanner:
                         "description": "string — max 6 words",
                         "related_id": "string — for ticket_progress: MUST be from owned tickets or null. For pr_review: use the PR ID (e.g. PR-107) from the IN REVIEW TICKETS section above.",
                         "collaborator": ["string"],
-                        "estimated_hrs": float
+                        "estimated_hrs": float,
+                        "meeting_medium": "slack or zoom — for design_discussion only; omit or use slack for all other types"
                     }}
                 ]
             }}
@@ -241,6 +250,7 @@ class DepartmentPlanner:
         eng_plan: Optional[DepartmentDayPlan] = None,
         lifecycle_context: str = "",
         email_signals: Optional[List["ExternalEmailSignal"]] = None,
+        crm_summary: str = "",
     ) -> DepartmentDayPlan:
         """
         Produce a DepartmentDayPlan. eng_plan is provided to non-Engineering
@@ -252,8 +262,12 @@ class DepartmentPlanner:
         dept_history = self._dept_history(mem, day)
         cross_str = self._format_cross_signals(cross_signals, eng_plan)
         email_str = self._format_email_signals(email_signals or [], self.dept)
+        combined_context = [cross_str]
         if email_str:
-            cross_str = cross_str + "\n\n" + email_str
+            combined_context.append(email_str)
+        if crm_summary:
+            combined_context.append(f"### CRM STATE SUMMARY\n{crm_summary}")
+        cross_str = "\n\n".join(combined_context)
         known_str = ", ".join(sorted(KNOWN_EVENT_TYPES))
         morale_label = (
             "low"
@@ -450,7 +464,13 @@ class DepartmentPlanner:
 
                 raw_collabs = _coerce_collaborators(a.get("collaborator"))
                 valid_collabs = [c for c in raw_collabs if c in all_valid_names]
-
+                raw_medium = a.get("meeting_medium", "slack")
+                meeting_medium = (
+                    raw_medium
+                    if activity_type == "design_discussion"
+                    and raw_medium in ("slack", "zoom")
+                    else "slack"
+                )
                 agenda.append(
                     AgendaItem(
                         activity_type=activity_type,
@@ -458,6 +478,7 @@ class DepartmentPlanner:
                         related_id=related_id,
                         collaborator=valid_collabs,
                         estimated_hrs=float(a.get("estimated_hrs", 2.0)),
+                        meeting_medium=meeting_medium,
                     )
                 )
 
@@ -930,10 +951,9 @@ class DayPlannerOrchestrator:
         self._coordinator = OrgCoordinator(config, planner_llm)
 
         all_names = [n for members in LIVE_ORG_CHART.values() for n in members]
-        external_names = [c["name"] for c in config.get("external_contacts", [])]
         self._validator = PlanValidator(
             all_names=all_names,
-            external_contact_names=external_names,
+            external_contact_names=[],
             config=config,
         )
 
@@ -947,11 +967,17 @@ class DayPlannerOrchestrator:
         clock,
         lifecycle_context: str = "",
         email_signals: Optional[List["ExternalEmailSignal"]] = None,
+        crm_summary: str = "",
     ) -> OrgDayPlan:
         """
         Full planning pass for one day.
         Returns an OrgDayPlan the day loop executes against.
         """
+
+        doc = mem._db["sim_config"].find_one({"_id": "inbound_email_sources"})
+        if doc and "sources" in doc:
+            external_names = [s["name"] for s in doc["sources"]]
+            self._validator.external_contact_names = external_names
 
         day = state.day
         date = str(state.current_date.date())
@@ -994,6 +1020,7 @@ class DayPlannerOrchestrator:
                 sprint_context=sprint_contexts.get(eng_key),
                 eng_plan=None,
                 email_signals=email_signals,
+                crm_summary=crm_summary,
             )
             self._patch_stress_levels(eng_plan, graph_dynamics)
             dept_plans[eng_key] = eng_plan
@@ -1025,6 +1052,7 @@ class DayPlannerOrchestrator:
                         eng_plan=eng_plan,
                         lifecycle_context=lifecycle_context,
                         email_signals=email_signals,
+                        crm_summary=crm_summary,
                     ): dept
                     for dept, planner in non_eng_depts.items()
                 }
@@ -1169,6 +1197,10 @@ class DayPlannerOrchestrator:
             "hr_checkin",
             "customer_email_routed",
             "customer_escalation",
+            "zd_tickets_escalated",
+            "zd_tickets_resolved",
+            "sf_deals_risk_flagged",
+            "sf_ownership_lapsed",
         }
 
         recent = [

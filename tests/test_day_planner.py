@@ -980,18 +980,33 @@ class TestDayPlannerOrchestratorInit:
 
     def test_external_contacts_included_in_validator(self):
         cfg = dict(CONFIG)
-        cfg["external_contacts"] = [{"name": "VendorPat"}]
+        mock_mem = MagicMock()
+
+        mock_mem._db.__getitem__.return_value.find_one.return_value = {
+            "sources": [{"name": "VendorPat"}]
+        }
+
         with (
-            patch("day_planner.PlanValidator") as mock_validator_cls,
+            patch("day_planner.PlanValidator"),
             patch("day_planner.OrgCoordinator"),
+            patch("day_planner.TicketAssigner"),
             patch("day_planner.LIVE_ORG_CHART", ORG_CHART),
+            patch.object(
+                DayPlannerOrchestrator, "_generate_org_theme", return_value="Theme"
+            ),
         ):
-            DayPlannerOrchestrator(cfg, MagicMock(), MagicMock(), MagicMock())
-        call_kwargs = mock_validator_cls.call_args
-        ext_names = (
-            call_kwargs.kwargs.get("external_contact_names") or call_kwargs.args[1]
-        )
-        assert "VendorPat" in ext_names
+            orch = DayPlannerOrchestrator(cfg, MagicMock(), MagicMock(), MagicMock())
+
+            for p in orch._dept_planners.values():
+                p.plan = MagicMock(
+                    return_value=MagicMock(
+                        theme="Fake", engineer_plans=[], proposed_events=[]
+                    )
+                )
+
+            orch.plan(MagicMock(), mock_mem, MagicMock(), MagicMock())
+
+            assert "VendorPat" in orch._validator.external_contact_names
 
 
 class TestDayPlannerOrchestratorPlan:

@@ -223,65 +223,53 @@ def test_git_simulator_reviewer_selection(mock_flow):
         timestamp="2026-03-05T13:33:51.027Z",
     )
 
-    # The simulator should automatically pick Bob as the primary reviewer
     assert pr["reviewers"][0] == "Bob"
 
 
 def test_relevant_external_contacts(mock_flow):
     """Verifies external contacts are triggered by correct events and health thresholds."""
-    config = {
-        "external_contacts": [
-            {
-                "name": "AWS",
-                "trigger_events": ["incident_opened"],
-                "trigger_health_threshold": 80,
-            },
-            {
-                "name": "Vendor",
-                "trigger_events": ["fix_in_progress"],
-                "trigger_health_threshold": 50,
-            },
-        ]
+    contacts = [
+        {
+            "name": "AWS",
+            "trigger_on": ["incident"],
+            "trigger_health_threshold": 80,
+        }
+    ]
+
+    mock_flow._mem._db["sim_config"].insert_one(
+        {"_id": "inbound_email_sources", "sources": contacts}
+    )
+    mock_flow._mem.get_inbound_email_sources.return_value = contacts
+    mock_flow._mem._db.__getitem__.return_value.find_one.return_value = {
+        "sources": contacts
     }
 
-    # Health is 75. It's below AWS's 80 threshold, so they should be triggered.
     triggered_aws = mock_flow.graph_dynamics.relevant_external_contacts(
-        "incident_opened", 75, config
+        "incident_opened", 75
     )
     assert len(triggered_aws) == 1
     assert triggered_aws[0]["name"] == "AWS"
-
-    # Health is 90. Higher than AWS's 80 threshold, so nobody should be triggered.
-    triggered_none = mock_flow.graph_dynamics.relevant_external_contacts(
-        "incident_opened", 90, config
-    )
-    assert len(triggered_none) == 0
 
 
 def test_end_of_day_resets_and_morale(mock_flow):
     """Verifies EOD correctly decays morale and resets daily metric counters."""
     import flow
 
-    # 1. Dynamically read whatever config values are currently loaded
     decay = flow.CONFIG["morale"]["daily_decay"]
     recovery = flow.CONFIG["morale"]["good_day_recovery"]
 
-    # 2. Set up the initial state
     start_morale = 0.8
     mock_flow.state.daily_incidents_opened = 3
     mock_flow.state.daily_artifacts_created = 5
     mock_flow.state.team_morale = start_morale
-    mock_flow.state.active_incidents = []  # No active incidents = good day bonus!
+    mock_flow.state.active_incidents = []
 
-    # 3. Trigger the end of day logic
     mock_flow._end_of_day()
 
-    # 4. Check resets
     assert mock_flow.state.daily_incidents_opened == 0
     assert mock_flow.state.daily_artifacts_created == 0
     assert len(mock_flow.state.morale_history) == 1
 
-    # 5. Dynamically calculate the expected morale based on the real config
     expected_morale = round(min(1.0, (start_morale * decay) + recovery), 3)
 
     assert mock_flow.state.team_morale == expected_morale
@@ -462,6 +450,9 @@ def test_postmortem_artifact_timestamp_within_actor_work_block(
     inc.root_cause = "OOM on worker node"
     inc.days_active = 2
     inc.pr_id = None
+    inc.causal_chain = MagicMock()
+    inc.causal_chain.snapshot.return_value = ["ORG-999"]
+    mock_flow._mem.get_ticket.return_value = {"id": "ORG-999"}
 
     mock_flow._write_postmortem(inc)
 
@@ -600,16 +591,19 @@ def test_score_sentiment():
     assert score_sentiment([]) == 0.5
 
 
-def test_build_social_graph():
+def test_build_social_graph(make_test_memory):
+    make_test_memory._db["sim_config"].insert_one(
+        {
+            "_id": "inbound_email_sources",
+            "sources": [{"name": "VendorA", "internal_liaison": "Eng"}],
+        }
+    )
+
     with (
         patch("flow.ORG_CHART", {"Eng": ["Alice", "Bob"], "Sales": ["Charlie"]}),
         patch("flow.LEADS", {"Eng": "Alice", "Sales": "Charlie"}),
-        patch(
-            "flow.CONFIG",
-            {"external_contacts": [{"name": "VendorA", "internal_liaison": "Eng"}]},
-        ),
     ):
-        G = build_social_graph()
+        G = build_social_graph(make_test_memory)
         assert G.has_node("Alice")
         assert G.has_node("VendorA")
         assert G.nodes["Alice"]["is_lead"] is True

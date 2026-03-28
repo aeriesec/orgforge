@@ -34,6 +34,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 from agent_factory import make_agent
+from crm_system import NullCRMSystem
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
 
@@ -103,6 +104,7 @@ class OrgLifecycleManager:
         leads: Dict[str, str],
         worker_llm=None,
         base_export_dir: str = "",
+        crm=None,
     ):
         self._cfg = config.get("org_lifecycle", {})
         self._gd = graph_dynamics
@@ -113,6 +115,7 @@ class OrgLifecycleManager:
         self._leads = leads
         self._llm = worker_llm
         self._base = base_export_dir
+        self._crm = crm or NullCRMSystem()
 
         self._departed: List[DepartureRecord] = []
         self._hired: List[HireRecord] = []
@@ -440,6 +443,13 @@ class OrgLifecycleManager:
                 ),
                 tags=["employee_departed", "lifecycle", dept.lower()],
             )
+        )
+
+        self._crm.handle_employee_departure(
+            employee_name=name,
+            role=actual_role,
+            date_str=date_str,
+            day=day,
         )
 
         logger.info(

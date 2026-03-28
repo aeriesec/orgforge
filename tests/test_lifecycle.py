@@ -80,7 +80,7 @@ def lifecycle(mock_sim):
         "org_chart": org_chart,
         "leads": leads,
     }
-    gd = GraphDynamics(G, config)
+    gd = GraphDynamics(G, config, mock_sim._mem)
 
     mgr = OrgLifecycleManager(
         config=config,
@@ -285,12 +285,7 @@ def test_handoff_emits_escalation_chain_simevent(lifecycle, mock_clock):
     assert escalation_event.facts["departed"] == "Carol"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. CENTRALITY VACUUM
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_centrality_vacuum_stresses_neighbours(lifecycle, mock_clock):
+def test_centrality_vacuum_stresses_neighbors(lifecycle, mock_clock, mock_sim):
     """
     Removing a bridge shortcut node should increase stress on remaining nodes
     that absorb its rerouted traffic.
@@ -327,7 +322,7 @@ def test_centrality_vacuum_stresses_neighbours(lifecycle, mock_clock):
         "org_chart": {"Engineering": ring_nodes},
         "leads": {"Engineering": "Alice"},
     }
-    gd_ring = GraphDynamics(G, config)
+    gd_ring = GraphDynamics(G, config, mock_sim._mem)
     for name in ring_nodes:
         gd_ring._stress[name] = 25
 
@@ -1004,7 +999,7 @@ def test_departure_and_hire_same_day_timestamps_are_in_business_hours(lifecycle)
         assert (ts.hour, ts.minute) <= (17, 30), f"{label} timestamp after 17:30: {ts}"
 
 
-def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
+def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory, mock_sim):
     """
     _execute_hire post-corrects the hire timestamp to be ≥ 09:30 when
     schedule_meeting returns a minute < 30 at 09:xx.
@@ -1037,7 +1032,7 @@ def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
         }
         from org_lifecycle import OrgLifecycleManager
 
-        gd = GraphDynamics(G, config)
+        gd = GraphDynamics(G, config, mock_sim._mem)
         mgr = OrgLifecycleManager(
             config=config,
             graph_dynamics=gd,
@@ -1082,7 +1077,7 @@ def test_hire_simevent_timestamp_not_before_0930(lifecycle, make_test_memory):
         )
 
 
-def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
+def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle, mock_sim):
     """
     _apply_centrality_vacuum receives `timestamp_iso` (a pre-formatted string)
     via a parameter misleadingly named `clock`. The resulting SimEvent's
@@ -1119,7 +1114,7 @@ def test_centrality_vacuum_simevent_timestamp_is_valid_iso_string(lifecycle):
         "org_chart": {"Engineering": list(nodes)},
         "leads": {"Engineering": "Alice"},
     }
-    gd = GraphDynamics(G, config)
+    gd = GraphDynamics(G, config, mock_sim._mem)
     mem = MagicMock()
 
     mgr = OrgLifecycleManager(

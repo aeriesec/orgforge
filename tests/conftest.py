@@ -1,3 +1,4 @@
+from config_loader import ALL_NAMES
 import pytest
 import mongomock
 import builtins
