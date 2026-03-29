@@ -254,5 +254,13 @@ KNOWN_EVENT_TYPES = {
     "secret_detected",
     "zoom_meeting",
     "sales_outbound_email",
-    "proactive_outreach_initiated"
+    "proactive_outreach_initiated",
+    "zd_ticket_opened",
+    "zd_tickets_escalated",
+    "zd_tickets_resolved",
+    "sf_deals_risk_flagged",
+    "sf_ownership_lapsed",
+    "crm_touchpoint",
+    "crm_account_at_risk",
+    "customer_health_briefing",
 }

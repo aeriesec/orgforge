@@ -50,7 +50,7 @@ from config_loader import (
     COMPANY_DESCRIPTION,
     resolve_role,
 )
-from utils.persona_utils import get_voice_card
+from utils.persona_utils import persona_utils
 
 logger = logging.getLogger("orgforge.planner")
 
@@ -75,7 +75,6 @@ class DepartmentPlanner:
     The LLM produces a JSON plan. The engine parses and validates it.
     """
 
-    # Prompt template — kept here so it's easy to tune without touching logic
     _PLAN_PROMPT = """
     You are the planning agent for the {dept} department at {company} which {company_description}.
     Today is Day {day} ({date}).
@@ -98,28 +97,7 @@ class DepartmentPlanner:
     - DO write about maintaining systems, paying down tech debt, iterating on
         existing features, and routine corporate work.
 
-    4. NON-ENGINEERING TEAMS (applies if {dept} is not Engineering_Backend or Engineering_Mobile).
-    - Do NOT propose pr_review or any code-related activities.
-    - ticket_progress IS allowed for non-engineering teams — it means completing an
-      action item (writing a doc, sending an email, running an analysis, aligning
-      with another team). The completion artifact is NEVER a PR.
-      When using ticket_progress, set related_id from the engineer's OWNED ticket list.
-    - DO use these activity types for your team:
-        * ticket_progress  — completing a non-code action item tied to an owned ticket.
-                            completion produces a confluence_page, email, or slack thread.
-        * deep_work        — focused individual work (analysis, writing, planning)
-        * 1on1             — check-in with a team member
-        * async_question   — pinging another department for info or a decision
-        * design_discussion — collaborative session to align on approach
-        * mentoring        — senior helping junior
-        * confluence_page  — writing internal documentation, playbooks, runbooks,
-                            or process guides relevant to your team's expertise.
-                            Use this at least once per day per department.
-    - Examples by department:
-        * Design     → ticket_progress (UX spec), design_discussion, confluence_page (design system docs)
-        * Sales      → ticket_progress (sales proposal), async_question (pinging PM), confluence_page (playbook)
-        * HR_Ops     → ticket_progress (onboarding checklist), 1on1 (wellbeing check), confluence_page (PTO policy)
-        * QA_Support → ticket_progress (test plan execution), design_discussion, confluence_page (QA runbook)
+    {non_eng_rules}
 
     5. NO EVENT REDUNDANCY (CRITICAL TO AVOID DUPLICATES).
     - NEVER put collaborative meetings (1on1, mentoring, design_discussion, async_question) in the individual agendas of BOTH participants.
@@ -139,10 +117,8 @@ class DepartmentPlanner:
     2. Provide a 1-sentence reasoning for the overall plan.
     3. For each team member, write a 1-3 item agenda (keep descriptions under 6 words).
 
-    ## BEFORE YOU OUTPUT — verify each of these:
-    [ ] No collaborative meeting appears in more than one engineer's agenda
-    [ ] All related_ids are null or from that engineer's own owned ticket list
-    [ ] No engineer's estimated_hrs total exceeds their listed capacity
+    Verify rules 1, 2, and 5 before outputting.
+
     ## MEETING MEDIUM RULE (design_discussion only)
     Choose "zoom" when ALL of the following apply:
       - 2 or more collaborators
@@ -221,6 +197,31 @@ class DepartmentPlanner:
     {open_chains_str}
     """
 
+    _NON_ENG_RULES = """
+    4. NON-ENGINEERING TEAMS (applies if {dept} is not Engineering_Backend or Engineering_Mobile).
+    - Do NOT propose pr_review or any code-related activities.
+    - ticket_progress IS allowed for non-engineering teams — it means completing an
+      action item (writing a doc, sending an email, running an analysis, aligning
+      with another team). The completion artifact is NEVER a PR.
+      When using ticket_progress, set related_id from the engineer's OWNED ticket list.
+    - DO use these activity types for your team:
+        * ticket_progress  — completing a non-code action item tied to an owned ticket.
+                            completion produces a confluence_page, email, or slack thread.
+        * deep_work        — focused individual work (analysis, writing, planning)
+        * 1on1             — check-in with a team member
+        * async_question   — pinging another department for info or a decision
+        * design_discussion — collaborative session to align on approach
+        * mentoring        — senior helping junior
+        * confluence_page  — writing internal documentation, playbooks, runbooks,
+                            or process guides relevant to your team's expertise.
+                            Use this at least once per day per department.
+    - Examples by department:
+        * Design     → ticket_progress (UX spec), design_discussion, confluence_page (design system docs)
+        * Sales      → ticket_progress (sales proposal), async_question (pinging PM), confluence_page (playbook)
+        * HR_Ops     → ticket_progress (onboarding checklist), 1on1 (wellbeing check), confluence_page (PTO policy)
+        * QA_Support → ticket_progress (test plan execution), design_discussion, confluence_page (QA runbook)
+    """
+
     def __init__(
         self,
         dept: str,
@@ -234,7 +235,7 @@ class DepartmentPlanner:
         self.members = members
         self.config = config
         self._llm = worker_llm
-        self.is_primary = is_primary  # True for Engineering
+        self.is_primary = is_primary
         self.clock = clock
 
     def plan(
@@ -333,11 +334,16 @@ class DepartmentPlanner:
         agent = make_agent(
             role=f"{lead_name}, {self.dept} Lead",
             goal="Plan your team's day honestly, given your stress, their capacity, and what is actually on fire.",
-            backstory=get_voice_card(lead_name, "design", graph_dynamics, mem),
+            backstory=persona_utils.get_voice_card(
+                lead_name, "design", graph_dynamics, mem
+            ),
             llm=self._llm,
         )
 
         prompt = self._PLAN_PROMPT.format(
+            non_eng_rules=self._NON_ENG_RULES.format(dept=self.dept)
+            if not self.is_primary
+            else "",
             dept=self.dept,
             company=self.config["simulation"]["company_name"],
             company_description=COMPANY_DESCRIPTION,
@@ -595,11 +601,15 @@ class DepartmentPlanner:
         it's already listed in the ACTIVE INCIDENTS section of the prompt.
         Non-engineering depts skip days where they had no active members.
         """
-        summaries = [
-            e
-            for e in mem.get_event_log()
-            if e.type == "day_summary" and e.day >= max(1, day - 2)
-        ]
+        window = 2
+        summaries = []
+        while not summaries and window <= 7:
+            summaries = [
+                e
+                for e in mem.get_event_log()
+                if e.type == "day_summary" and e.day >= max(1, day - window)
+            ]
+            window += 1
         if not summaries:
             return "  (no recent history)"
         lines = []
@@ -608,7 +618,7 @@ class DepartmentPlanner:
                 a for a in s.facts.get("active_actors", []) if a in self.members
             ]
             if not dept_actors and not self.is_primary:
-                continue  # dept was quiet — skip rather than add empty line
+                continue
             lines.append(
                 f"  Day {s.day}: health={s.facts.get('system_health')} "
                 f"morale={s.facts.get('morale_trend', '?')} "
@@ -794,6 +804,9 @@ class OrgCoordinator:
 
     DEPT PLANS & HEADSPACE:
     {other_plans_with_stress}
+
+    CRM PRESSURE (use this to seed realistic Sales/Support ↔ Engineering collisions):
+    {crm_context}
     """
 
     def __init__(self, config: dict, planner_llm):
@@ -811,6 +824,7 @@ class OrgCoordinator:
         day: int,
         date: str,
         org_theme: str,
+        crm_context: str = "",
     ) -> OrgDayPlan:
 
         other_plans_str = ""
@@ -834,6 +848,7 @@ class OrgCoordinator:
             health=state.system_health,
             morale_label=morale_label,
             all_names=self._all_names_str,
+            crm_context=crm_context or "  (no active CRM pressure today)",
         )
         agent = make_agent(
             role="Org Conflict Coordinator",
@@ -1037,7 +1052,7 @@ class DayPlannerOrchestrator:
         }
 
         if non_eng_depts:
-            with ThreadPoolExecutor(max_workers=min(3, len(non_eng_depts))) as ex:
+            with ThreadPoolExecutor(max_workers=min(1, len(non_eng_depts))) as ex:
                 futures = {
                     ex.submit(
                         planner.plan,
@@ -1074,7 +1089,14 @@ class DayPlannerOrchestrator:
                             org_theme, day, date, []
                         )
 
-        org_plan = self._coordinator.coordinate(dept_plans, state, day, date, org_theme)
+        org_plan = self._coordinator.coordinate(
+            dept_plans,
+            state,
+            day,
+            date,
+            org_theme,
+            crm_context=crm_summary,
+        )
 
         recent_summaries = self._recent_day_summaries(mem, day)
         all_proposed = org_plan.all_events_by_priority()
@@ -1179,11 +1201,6 @@ class DayPlannerOrchestrator:
     def _extract_cross_signals(
         self, mem: Memory, day: int
     ) -> Dict[str, List[CrossDeptSignal]]:
-        """
-        Reads recent SimEvents and produces cross-dept signals.
-        Engineering incidents become signals for Sales and HR.
-        Sales escalations become signals for Engineering.
-        """
         signals: Dict[str, List[CrossDeptSignal]] = {}
         config_chart: Dict[str, List] = self._config["org_chart"]
 
@@ -1196,11 +1213,19 @@ class DayPlannerOrchestrator:
             "morale_intervention",
             "hr_checkin",
             "customer_email_routed",
-            "customer_escalation",
             "zd_tickets_escalated",
             "zd_tickets_resolved",
             "sf_deals_risk_flagged",
             "sf_ownership_lapsed",
+            "crm_touchpoint",
+        }
+
+        _CRM_EVENT_SOURCE_DEPT: Dict[str, str] = {
+            "sf_deals_risk_flagged": self._crm_sales_dept(),
+            "sf_ownership_lapsed": self._crm_sales_dept(),
+            "crm_touchpoint": self._crm_sales_dept(),
+            "zd_tickets_escalated": self._crm_support_dept(),
+            "zd_tickets_resolved": self._crm_support_dept(),
         }
 
         recent = [
@@ -1210,28 +1235,54 @@ class DayPlannerOrchestrator:
         ]
 
         for event in recent:
+            source_dept = None
+
             for actor in event.actors:
                 source_dept = next(
                     (d for d, members in config_chart.items() if actor in members),
                     None,
                 )
-                if not source_dept:
-                    continue
+                if source_dept:
+                    break
 
-                signal = CrossDeptSignal(
-                    source_dept=source_dept,
-                    event_type=event.type,
-                    summary=event.summary,
-                    day=event.day,
-                    relevance="direct" if day - event.day <= 2 else "indirect",
-                )
+            if not source_dept:
+                source_dept = _CRM_EVENT_SOURCE_DEPT.get(event.type)
 
-                for dept in config_chart:
-                    if dept != source_dept:
-                        signals.setdefault(dept, []).append(signal)
-                break
+            if not source_dept:
+                continue
+
+            relevance = "direct" if day - event.day <= 2 else "indirect"
+            signal = CrossDeptSignal(
+                source_dept=source_dept,
+                event_type=event.type,
+                summary=event.summary,
+                day=event.day,
+                relevance=relevance,
+            )
+
+            for dept in config_chart:
+                if dept != source_dept:
+                    signals.setdefault(dept, []).append(signal)
 
         return signals
+
+    def _crm_sales_dept(self) -> str:
+        """Best-guess Sales dept key from config."""
+        return next(
+            (k for k in self._config.get("org_chart", {}) if "sales" in k.lower()),
+            next(iter(self._config.get("org_chart", {})), "Sales"),
+        )
+
+    def _crm_support_dept(self) -> str:
+        """Best-guess Support/QA dept key from config."""
+        return next(
+            (
+                k
+                for k in self._config.get("org_chart", {})
+                if "support" in k.lower() or "qa" in k.lower()
+            ),
+            self._crm_sales_dept(),
+        )
 
     def _patch_stress_levels(
         self,

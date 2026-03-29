@@ -2,41 +2,6 @@
 external_email_ingest.py
 ========================
 Inbound and outbound email generation during the simulation.
-
-Three email categories, each with distinct routing and causal tracing:
-
-  1. TECH VENDOR INBOUND  (AWS, Stripe, Snyk, etc.)
-     Arrive pre-standup (06:00–08:59). Routed to the Engineering member
-     whose expertise best overlaps the topic — not just the dept lead.
-     May produce a JIRA task. Appended to any live incident's causal chain
-     if the topic overlaps the root cause.
-
-  2. CUSTOMER / CLIENT INBOUND
-     Arrive during business hours (09:00–16:30). Routed through the
-     product gatekeeper chain:
-       customer email → Sales Slack ping → Product decision → optional JIRA
-     ~15 % of customer emails are dropped (no action taken). These are
-     logged as "email_dropped" SimEvents — an eval agent should detect the
-     gap between the email artifact and the absence of any downstream work.
-
-  3. HR OUTBOUND  (offer letters, onboarding prep)
-     Fired 1–3 days before a scheduled hire arrives. Karen (HR lead) sends
-     to the prospect. Logged as an artifact and linked into the
-     employee_hired causal chain on arrival day.
-
-Causal tracing
---------------
-Every email is assigned an embed_id and rooted in a CausalChainHandler.
-Each downstream artifact (Slack thread, JIRA ticket) is appended in order.
-Chain snapshots are written into every SimEvent's facts so the eval harness
-can reconstruct the full thread — or notice when it terminates early.
-
-Source generation
------------------
-Sources are generated once by LLM during genesis (same pattern as
-generate_tech_stack in confluence_writer.py), persisted to
-sim_config["inbound_email_sources"], and loaded on every subsequent run.
-No config.yaml entries required.
 """
 
 from __future__ import annotations
@@ -56,10 +21,11 @@ from causal_chain_handler import CausalChainHandler
 from config_loader import COMPANY_DESCRIPTION
 from crm_system import NullCRMSystem
 from crewai import Crew, Task
+from graph_dynamics import GraphDynamics
 import json_repair
 from memory import Memory, SimEvent
 from insider_threat import _NullInjector
-from utils.persona_utils import get_voice_card
+from utils.persona_utils import persona_utils
 
 logger = logging.getLogger("orgforge.external_email")
 
@@ -72,6 +38,50 @@ _PROB_EMAIL_DROPPED = 0.15  # customer emails dropped with no action
 _PROB_CUSTOMER_JIRA = 0.55  # high-priority customer complaint → JIRA
 _PROB_VENDOR_JIRA = 0.45  # vendor alert → JIRA task
 _HR_EMAIL_WINDOW = (1, 3)  # days before hire arrival to send email
+_VALID_EMAIL_TYPES = frozenset(
+    ["complaint", "question", "feature_request", "positive_feedback", "general_inquiry"]
+)
+
+_VALID_CRM_STAGES = frozenset(
+    [
+        "Prospecting",
+        "Value Proposition",
+        "Proposal/Price Quote",
+        "Negotiation/Review",
+        "Closed Won",
+        "Closed Lost",
+    ]
+)
+
+
+_STAGE_RANK = {
+    "Prospecting": 1,
+    "Value Proposition": 2,
+    "Proposal/Price Quote": 3,
+    "Negotiation/Review": 4,
+    "Closed Won": 5,
+    "Closed Lost": 0,
+}
+
+
+def _get_stage_probability(stage: str) -> int:
+    return {
+        "Prospecting": 10,
+        "Value Proposition": 25,
+        "Proposal/Price Quote": 50,
+        "Negotiation/Review": 75,
+        "Closed Won": 100,
+        "Closed Lost": 0,
+    }.get(stage, 10)
+
+
+_PROB_CUSTOMER_REPLY = 0.30
+
+
+_PROB_NON_COMPLAINT_SALES_FYI = 0.35
+
+
+_COMPLAINT_EMAIL_TYPES = frozenset(["complaint"])
 
 
 @dataclass
@@ -133,6 +143,7 @@ class ExternalEmailIngestor:
         clock,
         threat_injector=None,
         crm=None,
+        graph_dynamics=GraphDynamics,
     ):
         self._config = config
         self._mem = mem
@@ -155,6 +166,7 @@ class ExternalEmailIngestor:
         self._threat = threat_injector or _NullInjector()
         self._crm = crm or NullCRMSystem()
         self._sources = None
+        self._gd = graph_dynamics
 
         self._scheduled_hires: Dict[int, List[dict]] = {}
         for hire in config.get("org_lifecycle", {}).get("scheduled_hires", []):
@@ -312,8 +324,8 @@ class ExternalEmailIngestor:
         participants = [sales_lead, product_lead]
         ping_time, _ = self._clock.sync_and_advance(participants, hours=0.25)
 
-        backstory = get_voice_card(
-            sales_lead, "async", graph_dynamics=None, mem=self._mem
+        backstory = persona_utils.get_voice_card(
+            sales_lead, "async", self._gd, mem=self._mem
         )
         p = self._personas.get(sales_lead, {})
 
@@ -390,8 +402,8 @@ class ExternalEmailIngestor:
         self._registry.register_jira(ticket_id)
         jira_time, _ = self._clock.sync_and_advance([product_lead], hours=0.3)
 
-        backstory = get_voice_card(
-            product_lead, "async", graph_dynamics=None, mem=self._mem
+        backstory = persona_utils.get_voice_card(
+            product_lead, "async", self._gd, mem=self._mem
         )
         p = self._personas.get(product_lead, {})
 
@@ -599,7 +611,9 @@ class ExternalEmailIngestor:
 
         hr_time, _ = self._clock.sync_and_advance([hr_lead], hours=0.5)
 
-        backstory = get_voice_card(hr_lead, "async", graph_dynamics=None, mem=self._mem)
+        backstory = persona_utils.get_voice_card(
+            hr_lead, "async", self._gd, mem=self._mem
+        )
         p = self._personas.get(hr_lead, {})
 
         agent = make_agent(
@@ -632,6 +646,8 @@ class ExternalEmailIngestor:
             body=body,
             timestamp_iso=hr_time.isoformat(),
             direction="outbound",
+            embed_id=embed_id,
+            day=date_str,
         )
 
         _exfil_path = self._threat.inject_email(
@@ -726,8 +742,8 @@ class ExternalEmailIngestor:
             else "This is routine — thank them, confirm receipt, and say the team will be in touch."
         )
 
-        backstory = get_voice_card(
-            sales_lead, "async", graph_dynamics=None, mem=self._mem
+        backstory = persona_utils.get_voice_card(
+            sales_lead, "async", self._gd, mem=self._mem
         )
         p = self._personas.get(sales_lead, {})
 
@@ -793,6 +809,8 @@ class ExternalEmailIngestor:
             body=body,
             timestamp_iso=reply_time.isoformat(),
             direction="outbound",
+            embed_id=embed_id,
+            day=state.day,
         )
 
         self._crm.process_outbound_email(
@@ -803,6 +821,7 @@ class ExternalEmailIngestor:
                 "recipient_org": signal.source_org,
                 "subject": subject,
                 "stage": crm_stage,
+                "embed_id": embed_id,
             },
             timestamp=reply_time.isoformat(),
             date_str=date_str,
@@ -902,8 +921,8 @@ class ExternalEmailIngestor:
             else "No ticket number yet — just say it is being investigated."
         )
 
-        backstory = get_voice_card(
-            recipient, "async", graph_dynamics=None, mem=self._mem
+        backstory = persona_utils.get_voice_card(
+            recipient, "async", self._gd, mem=self._mem
         )
         p = self._personas.get(recipient, {})
 
@@ -948,6 +967,8 @@ class ExternalEmailIngestor:
             body=body,
             timestamp_iso=ack_time.isoformat(),
             direction="outbound",
+            embed_id=embed_id,
+            day=state.day,
         )
 
         _exfil_path = self._threat.inject_email(
@@ -1047,10 +1068,6 @@ class ExternalEmailIngestor:
             )
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # CORE EMAIL GENERATION
-    # ─────────────────────────────────────────────────────────────────────────
-
     def _generate_email(
         self,
         source: dict,
@@ -1058,8 +1075,11 @@ class ExternalEmailIngestor:
         state,
         hour_range: Tuple[int, int],
         category: str,
-    ) -> Optional[ExternalEmailSignal]:
-        source_name = source["name"]
+    ) -> Optional[Any]:
+
+        source_first_name = source["first_name"]
+        source_name = source_first_name
+        source_last_name = source["last_name"]
         source_org = source.get("org", source_name)
         source_addr = source.get("email", f"contact@{source_name.lower()}.com")
         liaison_dept = source.get("internal_liaison", list(self._leads.keys())[0])
@@ -1075,7 +1095,6 @@ class ExternalEmailIngestor:
                 f"Reference naturally if relevant."
             )
 
-        # 1. Fetch the actual company tech stack from memory
         tech_stack = self._mem.tech_stack_for_prompt()
         tech_ctx = (
             (
@@ -1093,18 +1112,19 @@ class ExternalEmailIngestor:
             second=random.randint(0, 59),
         )
 
+        backstory = persona_utils.get_voice_card(
+            source_first_name, "async", self._gd, mem=self._mem, internal=False
+        )
+
         agent = make_agent(
             role=f"Representative from {source_org}",
             goal=f"Write a realistic email about: {topic}.",
-            backstory=(
-                f"You represent {source_org}. Tone: {tone}. "
-                f"Specific, concise. Never break character."
-            ),
+            backstory=backstory,
             llm=self._worker_llm,
         )
         task = Task(
             description=(
-                f"Email from {source_org} to {liaison_name} at {self._company_name} "
+                f"Email from {source_first_name} {source_last_name} at {source_org} to {liaison_name} at {self._company_name} which {COMPANY_DESCRIPTION} "
                 f"about: {topic}.\nTone: {tone}. Health: {state.system_health}/100."
                 f"{incident_ctx}"
                 f"{tech_ctx}\n\n"
@@ -1132,7 +1152,7 @@ class ExternalEmailIngestor:
 
         eml_path = self._write_eml(
             date_str=date_str,
-            from_name=source_name,
+            from_name=f"{source_first_name} {source_last_name}",
             from_addr=source_addr,
             to_name=liaison_name,
             to_addr=self._email_of(liaison_name),
@@ -1185,29 +1205,44 @@ class ExternalEmailIngestor:
         )
 
         zd_ticket_id = None
-        if category == "customer":
-            zd_ticket_id = self._crm.handle_inbound_complaint(
-                event_facts={
-                    "subject": subject,
-                    "body": body[:500],
-                    "sender_org": source_org,
-                },
-                timestamp=email_ts.isoformat(),
-                date_str=date_str,
-                day=state.day,
-            )
-            if zd_ticket_id:
-                logger.info(
-                    f"    [dim]🔗 ZD ticket {zd_ticket_id} linked to inbound complaint[/dim]"
-                )
+        email_type = "general_inquiry"
 
-        artifact_ids = {"email": embed_id, "eml_path": str(eml_path)}
+        if category == "customer":
+            email_type = self._classify_customer_email(
+                subject=subject,
+                body=body,
+                source_name=source_name,
+                tone=tone,
+            )
+            logger.debug(
+                f"    [dim]🔍 Email classified as '{email_type}': "
+                f"{source_name} — {subject[:50]}[/dim]"
+            )
+
+            if email_type in _COMPLAINT_EMAIL_TYPES:
+                zd_ticket_id = self._crm.handle_inbound_complaint(
+                    event_facts={
+                        "subject": subject,
+                        "body": body[:500],
+                        "sender_org": source_org,
+                    },
+                    timestamp=email_ts.isoformat(),
+                    date_str=date_str,
+                    day=state.day,
+                )
+                if zd_ticket_id:
+                    logger.info(
+                        f"    [dim]🔗 ZD ticket {zd_ticket_id} linked to complaint from "
+                        f"{source_name}[/dim]"
+                    )
+
+        artifact_ids: Dict[str, Any] = {"email": embed_id, "eml_path": str(eml_path)}
         if zd_ticket_id:
             artifact_ids["zd_ticket"] = zd_ticket_id
 
         body_preview = body[:200].rstrip() + ("…" if len(body) > 200 else "")
 
-        return ExternalEmailSignal(
+        signal = ExternalEmailSignal(
             source_name=source_name,
             source_org=source_org,
             source_email=source_addr,
@@ -1224,6 +1259,674 @@ class ExternalEmailIngestor:
             causal_chain=CausalChainHandler(root_id=embed_id),
             facts={"subject": subject, "topic": topic, "org": source_org},
         )
+
+        signal.facts["email_type"] = email_type
+        if zd_ticket_id:
+            signal.facts["zd_ticket_id"] = zd_ticket_id
+
+        return signal
+
+    def _classify_customer_email(
+        self,
+        subject: str,
+        body: str,
+        source_name: str,
+        tone: str,
+    ) -> str:
+        """
+        Classify an inbound customer email into one of five categories using a
+        single, lightweight LLM call.
+        """
+        agent = make_agent(
+            role="Email Classifier",
+            goal="Classify a customer email into exactly one category.",
+            backstory=(
+                "You are a triage assistant. You read customer emails and output "
+                "a single classification label. You never explain your reasoning."
+            ),
+            llm=self._worker_llm,
+        )
+        task = Task(
+            description=(
+                f"Classify the following customer email.\n\n"
+                f"Subject: {subject}\n"
+                f"Body: {body[:600]}\n\n"
+                f"Output ONLY a JSON object with a single key 'email_type'.\n"
+                f"The value must be EXACTLY one of:\n"
+                f"  complaint, question, feature_request, positive_feedback, general_inquiry\n\n"
+                f"Definitions:\n"
+                f"  complaint        — customer reports a problem, outage, bug, or unmet SLA\n"
+                f"  question         — customer asks how something works or for clarification\n"
+                f"  feature_request  — customer requests new or changed functionality\n"
+                f"  positive_feedback — customer compliments the product or team\n"
+                f"  general_inquiry  — anything that does not fit the above\n\n"
+                f'Example output: {{"email_type": "complaint"}}\n'
+                f"No preamble. No explanation. Output only the JSON object."
+            ),
+            expected_output='{"email_type": "<one of the five categories>"}',
+            agent=agent,
+        )
+
+        try:
+            raw = str(
+                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            ).strip()
+            parsed = json_repair.loads(raw)
+            if isinstance(parsed, dict):
+                result = parsed.get("email_type", "").strip().lower()
+                if result in _VALID_EMAIL_TYPES:
+                    return result
+        except Exception as exc:
+            logger.warning(f"[external_email] Email classification LLM failed: {exc}")
+
+        if tone in ("frustrated", "urgent"):
+            return "complaint"
+        return "general_inquiry"
+
+    def _generate_customer_reply_email(
+        self,
+        contact_name: str,
+        account_name: str,
+        owner: str,
+        prior_subject: str,
+        prior_body: str,
+        current_stage: str,
+        opp_id: str,
+        state,
+    ) -> Optional[Tuple[str, str, str]]:
+        """
+        Generates a customer reply using an LLM.
+
+        The customer is given the full body of the prior outbound email and their
+        deal stage context, then asked to reply as themselves. The prompt
+        explicitly instructs the LLM not to force a stage advance — only output
+        one if the reply honestly warrants it.
+
+        Returns (body, email_type, crm_stage) or None on failure.
+        """
+        prior_email_ctx = (
+            f"The email you are replying to:\n"
+            f"Subject: {prior_subject}\n"
+            f"---\n{prior_body[:800]}\n\n"
+            if prior_body
+            else (
+                f"You are replying to a recent email from {owner} "
+                f'with subject: "{prior_subject}".\n\n'
+            )
+        )
+
+        stage_guidance = {
+            "Prospecting": (
+                "You are early in conversations — curious but not yet committed. "
+                "You might ask questions, request more information, or express cautious interest."
+            ),
+            "Value Proposition": (
+                "You've seen some value but haven't committed. You might push back on pricing, "
+                "ask about integrations, or request a demo or case study."
+            ),
+            "Proposal/Price Quote": (
+                "You have a proposal in hand. You might negotiate terms, ask for clarification "
+                "on scope, or flag internal approval steps you need to complete."
+            ),
+            "Negotiation/Review": (
+                "You're close to a decision. You might raise a final objection, request a small "
+                "concession, confirm timeline, or — if everything looks right — signal readiness to proceed."
+            ),
+        }.get(current_stage, "Respond naturally based on the conversation so far.")
+
+        agent = make_agent(
+            role=f"{contact_name} — {account_name}",
+            goal=f"Reply to an email from {owner} at {self._company_name}.",
+            backstory=(
+                f"You are {contact_name}, a decision-maker at {account_name}. "
+                f"You are in active conversations with {self._company_name}. "
+                f"You communicate professionally but directly. "
+                f"Never acknowledge being an AI."
+            ),
+            llm=self._worker_llm,
+        )
+
+        task = Task(
+            description=(
+                f"{prior_email_ctx}"
+                f"Deal context: You are currently at the '{current_stage}' stage "
+                f"with {self._company_name}.\n"
+                f"{stage_guidance}\n\n"
+                f"Write a reply from {contact_name} to {owner}.\n\n"
+                f"Rules:\n"
+                f"- Reply specifically to what was said above. Reference it directly.\n"
+                f"- Do NOT force positivity or urgency. Let your reply honestly reflect "
+                f"  where you are. If you are uncertain or have concerns, say so.\n"
+                f"- Under 120 words. Professional but human.\n\n"
+                f"Then classify your reply and assess the deal stage it implies.\n\n"
+                f"Respond ONLY with a JSON object. No preamble, no markdown fences.\n"
+                f"{{\n"
+                f'  "body": "<your reply email text>",\n'
+                f'  "email_type": "<exactly one of: complaint, question, '
+                f'feature_request, positive_feedback, general_inquiry>",\n'
+                f'  "crm_stage": "<the SF stage this reply honestly implies. '
+                f"Return the CURRENT stage ('{current_stage}') if the reply does not "
+                f"move things forward — only advance the stage if the reply genuinely "
+                f"signals it. Must be exactly one of: Prospecting, Value Proposition, "
+                f'Proposal/Price Quote, Negotiation/Review, Closed Won, Closed Lost>"\n'
+                f"}}"
+            ),
+            expected_output='JSON with "body", "email_type", and "crm_stage" keys.',
+            agent=agent,
+        )
+
+        try:
+            raw = str(
+                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            ).strip()
+            parsed = json_repair.loads(raw)
+
+            if isinstance(parsed, list) and parsed:
+                parsed = parsed[0]
+            if not isinstance(parsed, dict):
+                raise ValueError("LLM did not return a dict")
+
+            body = parsed.get("body", "").strip()
+            email_type = parsed.get("email_type", "general_inquiry").strip().lower()
+            crm_stage = parsed.get("crm_stage", current_stage).strip()
+
+            if email_type not in _VALID_EMAIL_TYPES:
+                email_type = "general_inquiry"
+            if crm_stage not in _VALID_CRM_STAGES:
+                crm_stage = current_stage
+            if not body:
+                raise ValueError("Empty body in LLM reply")
+
+            return body, email_type, crm_stage
+
+        except Exception as exc:
+            logger.warning(
+                f"[external_email] Customer reply generation failed for "
+                f"{contact_name} ({account_name}): {exc}"
+            )
+            return None
+
+    def generate_customer_replies(self, state) -> List[Any]:
+        """
+        For each open SF opportunity, probabilistically generate a customer reply
+        to the most recent outbound email sent by the account owner.
+        """
+
+        if not self._crm or not hasattr(self._crm, "_sf_o"):
+            return []
+
+        signals: List[Any] = []
+        date_str = str(state.current_date.date())
+
+        open_opps = list(
+            self._crm._sf_o.find(
+                {"stage": {"$nin": ["Closed Won", "Closed Lost"]}},
+                {"_id": 0, "_seq": 0},
+            )
+        )
+
+        if not open_opps:
+            return []
+
+        for opp in open_opps:
+            if random.random() > _PROB_CUSTOMER_REPLY:
+                continue
+
+            opp_id = opp.get("opportunity_id", "")
+            account_name = opp.get("account_name", "Unknown")
+            current_stage = opp.get("stage", "Prospecting")
+            owner = opp.get("owner", "")
+            touchpoints = opp.get("touchpoints", [])
+
+            if not touchpoints:
+                continue
+
+            last_touchpoint = touchpoints[-1]
+            last_subject = last_touchpoint.get("subject", "")
+            last_embed_id = last_touchpoint.get("embed_id", "")
+
+            prior_body = ""
+            if last_embed_id:
+                prior_doc = self._mem._db["emails"].find_one(
+                    {"embed_id": last_embed_id}, {"body": 1, "_id": 0}
+                )
+                if prior_doc:
+                    prior_body = prior_doc.get("body", "")
+
+            acc = self._crm._sf_a.find_one(
+                {"name": account_name}, {"_id": 0, "_seq": 0}
+            )
+            contact_name = (acc or {}).get("primary_contact", account_name)
+            contact_email = (acc or {}).get(
+                "primary_contact_email",
+                (
+                    f"{contact_name.lower().replace(' ', '.')}"
+                    f"@{account_name.lower().replace(' ', '')}.com"
+                ),
+            )
+
+            result = self._generate_customer_reply_email(
+                contact_name=contact_name,
+                account_name=account_name,
+                owner=owner,
+                prior_subject=last_subject,
+                prior_body=prior_body,
+                current_stage=current_stage,
+                opp_id=opp_id,
+                state=state,
+            )
+            if not result:
+                continue
+
+            reply_body, email_type, suggested_stage = result
+
+            reply_ts = state.current_date.replace(
+                hour=random.randint(9, 16),
+                minute=random.randint(0, 59),
+                second=random.randint(0, 59),
+            )
+
+            reply_subject = (
+                f"Re: {last_subject}" if last_subject else f"Re: {account_name}"
+            )
+            embed_id = (
+                f"customer_reply_{account_name.lower().replace(' ', '_')}"
+                f"_{opp_id}_{state.day}"
+            )
+
+            sales_dept = next((d for d in self._leads if "sales" in d.lower()), None)
+            sales_lead = self._leads.get(sales_dept, owner) if sales_dept else owner
+            owner_addr = self._email_of(owner) if owner else self._email_of(sales_lead)
+
+            eml_path = self._write_eml(
+                date_str=date_str,
+                from_name=contact_name,
+                from_addr=contact_email,
+                to_name=owner if owner else sales_lead,
+                to_addr=owner_addr,
+                subject=reply_subject,
+                body=reply_body,
+                timestamp_iso=reply_ts.isoformat(),
+                direction="inbound",
+                embed_id=embed_id,
+                day=state.day,
+            )
+
+            # Embed artifact for RAG.
+            self._mem.embed_artifact(
+                id=embed_id,
+                type="email",
+                title=reply_subject,
+                content=f"From: {contact_name} ({account_name})\n\n{reply_body}",
+                day=state.day,
+                date=date_str,
+                timestamp=reply_ts.isoformat(),
+                metadata={
+                    "source": contact_name,
+                    "org": account_name,
+                    "category": "customer",
+                    "direction": "inbound",
+                    "opportunity_id": opp_id,
+                    "reply_to_subject": last_subject,
+                    "email_type": email_type,
+                },
+            )
+
+            self._mem.log_event(
+                SimEvent(
+                    type="inbound_external_email",
+                    timestamp=reply_ts.isoformat(),
+                    day=state.day,
+                    date=date_str,
+                    actors=[contact_name, sales_lead],
+                    artifact_ids={"email": embed_id, "eml_path": str(eml_path)},
+                    facts={
+                        "source": contact_name,
+                        "org": account_name,
+                        "category": "customer",
+                        "topic": current_stage,
+                        "subject": reply_subject,
+                        "liaison": sales_lead,
+                        "tone": "professional",
+                        "body_preview": reply_body[:200],
+                        "opportunity_id": opp_id,
+                        "is_customer_reply": True,
+                    },
+                    summary=(
+                        f"Inbound [customer_reply] from {contact_name} "
+                        f'({account_name}): "{reply_subject}"'
+                    ),
+                    tags=["email", "inbound", "customer", "customer_reply"],
+                )
+            )
+
+            body_preview = reply_body[:200].rstrip() + (
+                "…" if len(reply_body) > 200 else ""
+            )
+            internal_liaison_dept = sales_dept or next(iter(self._leads.keys()))
+
+            signal = ExternalEmailSignal(
+                source_name=contact_name,
+                source_org=account_name,
+                source_email=contact_email,
+                internal_liaison=internal_liaison_dept,
+                subject=reply_subject,
+                body_preview=body_preview,
+                full_body=reply_body,
+                tone="professional",
+                topic=current_stage,
+                timestamp_iso=reply_ts.isoformat(),
+                embed_id=embed_id,
+                category="customer",
+                eml_path=str(eml_path),
+                causal_chain=CausalChainHandler(root_id=embed_id),
+                facts={
+                    "subject": reply_subject,
+                    "topic": current_stage,
+                    "org": account_name,
+                    "email_type": email_type,
+                    "opportunity_id": opp_id,
+                    "is_customer_reply": True,
+                },
+            )
+
+            self._route_customer_email(signal, state)
+
+            if (
+                suggested_stage
+                and suggested_stage in _VALID_CRM_STAGES
+                and _STAGE_RANK.get(suggested_stage, 0)
+                > _STAGE_RANK.get(current_stage, 0)
+            ):
+                self._crm._sf_o.update_one(
+                    {"opportunity_id": opp_id},
+                    {
+                        "$set": {
+                            "stage": suggested_stage,
+                            "probability": _get_stage_probability(suggested_stage),
+                            "updated_at": reply_ts.isoformat(),
+                        }
+                    },
+                )
+                updated_doc = self._crm._sf_o.find_one(
+                    {"opportunity_id": opp_id}, {"_id": 0, "_seq": 0}
+                )
+                if updated_doc:
+                    self._crm._write(
+                        f"salesforce/opportunities/{opp_id}.json", updated_doc
+                    )
+
+                self._mem.log_event(
+                    SimEvent(
+                        type="sf_stage_advanced_by_customer",
+                        timestamp=reply_ts.isoformat(),
+                        day=state.day,
+                        date=date_str,
+                        actors=[contact_name, owner],
+                        artifact_ids={"email": embed_id, "sf_opp": opp_id},
+                        facts={
+                            "opportunity_id": opp_id,
+                            "account_name": account_name,
+                            "previous_stage": current_stage,
+                            "new_stage": suggested_stage,
+                            "triggered_by": embed_id,
+                        },
+                        summary=(
+                            f"SF opp {opp_id} ({account_name}) advanced "
+                            f"{current_stage} → {suggested_stage} by customer reply"
+                        ),
+                        tags=["salesforce", "stage_advanced", "customer_reply"],
+                    )
+                )
+                logger.info(
+                    f"  [green]📈 {opp_id} ({account_name}): "
+                    f"{current_stage} → {suggested_stage}[/green]"
+                )
+
+            signals.append(signal)
+            logger.info(
+                f"  [cyan]📬 Customer reply: {contact_name} ({account_name})[/cyan] "
+                f"[{email_type}]"
+            )
+
+        if signals:
+            logger.info(f"  [cyan]📬 {len(signals)} customer reply(s) generated[/cyan]")
+
+        return signals
+
+    def _route_customer_email(self, signal: Any, state) -> None:
+        """
+        Patched router. Dispatches based on email_type rather than assuming
+        every inbound customer email is a complaint.
+        """
+        email_type = signal.facts.get("email_type", "general_inquiry")
+
+        if email_type in _COMPLAINT_EMAIL_TYPES:
+            self._route_complaint_email(signal, state)
+        else:
+            self._route_non_complaint_email(signal, state, email_type=email_type)
+
+    def _route_non_complaint_email(
+        self, signal: Any, state, email_type: str = "general_inquiry"
+    ) -> None:
+        """
+        Lightweight routing for non-complaint customer emails.
+
+        Sales replies directly to the customer — no Slack ping to Product,
+        no JIRA ticket. For feature_request emails, a low-probability (~35%)
+        FYI message is posted in #product so the team is aware without being
+        formally escalated.
+
+        This preserves causal chain integrity: the reply is appended to the
+        chain, and the SimEvent type distinguishes these emails from complaints
+        so eval agents can verify the correct branching behaviour.
+        """
+        date_str = str(state.current_date.date())
+        sales_lead = self._leads.get(
+            signal.internal_liaison, next(iter(self._leads.values()))
+        )
+
+        fyi_thread_id = None
+        if (
+            email_type == "feature_request"
+            and random.random() < _PROB_NON_COMPLAINT_SALES_FYI
+        ):
+            fyi_thread_id = self._sales_fyi_to_product(
+                signal, sales_lead, state, date_str
+            )
+            if fyi_thread_id:
+                signal.causal_chain.append(fyi_thread_id)
+
+        reply_id = self._send_customer_reply(
+            signal, sales_lead, is_high=False, state=state, date_str=date_str
+        )
+        if reply_id:
+            signal.causal_chain.append(reply_id)
+
+        self._mem.log_event(
+            SimEvent(
+                type="customer_email_routed",
+                timestamp=signal.timestamp_iso,
+                day=state.day,
+                date=date_str,
+                actors=[signal.source_name, sales_lead],
+                artifact_ids={"email": signal.embed_id},
+                facts={
+                    "source": signal.source_name,
+                    "subject": signal.subject,
+                    "email_type": email_type,
+                    "high_priority": False,
+                    "fyi_sent": fyi_thread_id is not None,
+                    "causal_chain": signal.causal_chain.snapshot(),
+                },
+                summary=(
+                    f"{email_type.replace('_', ' ').title()} from {signal.source_name} "
+                    f"handled by {sales_lead} (no escalation)"
+                    + (" [FYI sent to Product]" if fyi_thread_id else "")
+                ),
+                tags=["email", "customer", email_type, "routed", "causal_chain"],
+            )
+        )
+
+    def _sales_fyi_to_product(
+        self, signal: Any, sales_lead: str, state, date_str: str
+    ) -> Optional[str]:
+        """
+        Posts a low-friction FYI in #product when a customer sends a feature
+        request. This is deliberately lighter than _sales_pings_product():
+        no explicit ask, no urgency label — just awareness.
+
+        Returns the Slack thread_id, or None on failure.
+        """
+        product_dept = next((d for d in self._leads if "product" in d.lower()), None)
+        product_lead = self._leads.get(product_dept, sales_lead)
+
+        participants = [sales_lead, product_lead]
+        fyi_time, _ = self._clock.sync_and_advance(participants, hours=0.1)
+
+        backstory = persona_utils.get_voice_card(
+            sales_lead, "async", graph_dynamics=None, mem=self._mem
+        )
+        p = self._personas.get(sales_lead, {})
+
+        agent = make_agent(
+            role=f"{sales_lead} — {p.get('social_role', 'Sales Lead')}",
+            goal="Share a brief, low-priority customer feature request with Product.",
+            backstory=backstory,
+            llm=self._worker_llm,
+        )
+        task = Task(
+            description=(
+                f"You just read a feature request email from {signal.source_name}:\n"
+                f"Subject: {signal.subject}\n{signal.full_body}\n\n"
+                f"Write a short, casual Slack FYI to {product_lead} (Product). This is "
+                f"NOT urgent — you're just sharing it for awareness. No action required.\n"
+                f"Under 60 words. No bullets. Write as {sales_lead} using your typing quirks."
+            ),
+            expected_output="Casual Slack FYI under 60 words.",
+            agent=agent,
+        )
+        try:
+            text = str(
+                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            ).strip()
+        except Exception as exc:
+            logger.warning(f"[external_email] Sales FYI LLM failed: {exc}")
+            return None
+
+        _, thread_id = self._mem.log_slack_messages(
+            channel="product",
+            messages=[
+                {
+                    "user": sales_lead,
+                    "email": self._email_of(sales_lead),
+                    "text": text,
+                    "ts": fyi_time.isoformat(),
+                    "date": date_str,
+                    "is_bot": False,
+                    "metadata": {
+                        "type": "customer_feature_request_fyi",
+                        "source_email_id": signal.embed_id,
+                        "customer": signal.source_name,
+                    },
+                }
+            ],
+            export_dir=self._export_dir,
+        )
+
+        self._mem.log_event(
+            SimEvent(
+                type="feature_request_fyi",
+                timestamp=fyi_time.isoformat(),
+                day=state.day,
+                date=date_str,
+                actors=[sales_lead, product_lead],
+                artifact_ids={
+                    "slack_thread": thread_id,
+                    "email": signal.embed_id,
+                },
+                facts={
+                    "customer": signal.source_name,
+                    "subject": signal.subject,
+                    "relayed_by": sales_lead,
+                    "product_gatekeeper": product_lead,
+                    "causal_chain": signal.causal_chain.snapshot(),
+                },
+                summary=(
+                    f"{sales_lead} shared feature request FYI from "
+                    f"{signal.source_name} in #product (no action required)"
+                ),
+                tags=["feature_request", "fyi", "slack", "causal_chain"],
+            )
+        )
+        logger.info(
+            f"    [dim]💬 FYI → #product: feature request from {signal.source_name}[/dim]"
+        )
+        return thread_id
+
+    def _route_complaint_email(self, signal: Any, state) -> None:
+        date_str = str(state.current_date.date())
+        sales_lead = self._leads.get(
+            signal.internal_liaison, next(iter(self._leads.values()))
+        )
+        product_dept = next((d for d in self._leads if "product" in d.lower()), None)
+        product_lead = self._leads.get(product_dept, sales_lead)
+
+        thread_id = self._sales_pings_product(
+            signal, sales_lead, product_lead, state, date_str
+        )
+        if thread_id:
+            signal.causal_chain.append(thread_id)
+
+        is_high = signal.tone in ("frustrated", "urgent") or (
+            state.system_health < 70 and "stability" in signal.topic.lower()
+        )
+
+        if is_high and random.random() < _PROB_CUSTOMER_JIRA:
+            ticket_id = self._product_opens_jira(signal, product_lead, state, date_str)
+            if ticket_id:
+                signal.causal_chain.append(ticket_id)
+
+        reply_id = self._send_customer_reply(
+            signal, sales_lead, is_high, state, date_str
+        )
+        if reply_id:
+            signal.causal_chain.append(reply_id)
+
+        self._mem.log_event(
+            SimEvent(
+                type="customer_email_routed",
+                timestamp=signal.timestamp_iso,
+                day=state.day,
+                date=date_str,
+                actors=[signal.source_name, sales_lead, product_lead],
+                artifact_ids={"email": signal.embed_id},
+                facts={
+                    "source": signal.source_name,
+                    "subject": signal.subject,
+                    "email_type": "complaint",
+                    "high_priority": is_high,
+                    "causal_chain": signal.causal_chain.snapshot(),
+                },
+                summary=(
+                    f"Complaint from {signal.source_name} routed: "
+                    f"{sales_lead} → {product_lead}"
+                    + (" [JIRA opened]" if len(signal.causal_chain) > 2 else "")
+                ),
+                tags=["email", "customer", "complaint", "routed", "causal_chain"],
+            )
+        )
+
+    def _get_stage_probability(self, stage: str) -> int:
+        """Returns the default SF probability for a given stage."""
+        return {
+            "Prospecting": 10,
+            "Value Proposition": 25,
+            "Proposal/Price Quote": 50,
+            "Negotiation/Review": 75,
+            "Closed Won": 100,
+            "Closed Lost": 0,
+        }.get(stage, 10)
 
     def _ensure_sources_loaded(self) -> None:
         if self._sources is None:
@@ -1324,15 +2027,17 @@ class ExternalEmailIngestor:
 
     def _write_eml(
         self,
-        date_str,
-        from_name,
-        from_addr,
-        to_name,
-        to_addr,
-        subject,
-        body,
-        timestamp_iso,
-        direction="inbound",
+        date_str: str,
+        from_name: str,
+        from_addr: str,
+        to_name: str,
+        to_addr: str,
+        subject: str,
+        body: str,
+        timestamp_iso: str,
+        direction: str = "inbound",
+        embed_id: str = "",
+        day: int = 0,
     ) -> Path:
         out_dir = self._export_dir / "emails" / direction / date_str
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1347,4 +2052,30 @@ class ExternalEmailIngestor:
         msg.attach(MIMEText(body, "plain"))
         with open(path, "w") as fh:
             fh.write(msg.as_string())
+
+        doc_id = embed_id or f"{from_name.lower().replace(' ', '_')}_{timestamp_iso}"
+        try:
+            self._mem._db["emails"].update_one(
+                {"embed_id": doc_id},
+                {
+                    "$setOnInsert": {
+                        "embed_id": doc_id,
+                        "direction": direction,
+                        "from_name": from_name,
+                        "from_addr": from_addr,
+                        "to_name": to_name,
+                        "to_addr": to_addr,
+                        "subject": subject,
+                        "body": body,
+                        "timestamp": timestamp_iso,
+                        "day": day,
+                        "date": date_str,
+                        "eml_path": str(path),
+                    }
+                },
+                upsert=True,
+            )
+        except Exception as exc:
+            logger.warning(f"[external_email] emails collection insert failed: {exc}")
+
         return path

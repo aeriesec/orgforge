@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 import time
 from typing import List, Dict, Optional, Any, Tuple
+import boto3
 
 from pymongo import MongoClient
 from pymongo.operations import SearchIndexModel
@@ -34,9 +35,6 @@ from pathlib import Path
 
 logger = logging.getLogger("orgforge.memory")
 
-# ─────────────────────────────────────────────
-# CONFIG  (all overridable via environment)
-# ─────────────────────────────────────────────
 MONGO_URI = os.environ.get(
     "MONGO_URI", "mongodb://localhost:27017/?directConnection=true"
 )
@@ -83,9 +81,6 @@ _TICKET_PROGRESS_PROJECTION = {
 _EVENT_LOG_MAX_DAYS = 7
 
 
-# ─────────────────────────────────────────────
-# SIM EVENT
-# ─────────────────────────────────────────────
 @dataclass
 class SimEvent:
     type: str
@@ -250,6 +245,51 @@ class OpenAIEmbedder(BaseEmbedder):
             return self._fallback(text)
 
 
+class InfinityEmbedder(BaseEmbedder):
+    """OpenAI-compatible embedder for Infinity server."""
+
+    _INSTRUCTIONS = {
+        "search_document": "",  # no prefix at index time
+        "search_query": "Instruct: Given an enterprise knowledge query, retrieve the most relevant document\nQuery: ",
+    }
+
+    def __init__(
+        self, model: str = EMBED_MODEL, host: str = OLLAMA_HOST, dims: int = EMBED_DIMS
+    ):
+        super().__init__(dims)
+        self._model = model
+        self._host = host
+        self._session = requests.Session()  # reuse connections
+        self._ok = self._check_connection()
+
+    def _check_connection(self) -> bool:
+        try:
+            r = self._session.get(f"{self._host}/health", timeout=3)
+            return r.status_code == 200
+        except Exception:
+            logger.warning(
+                f"[memory] ⚠️  Cannot connect to Infinity at {self._host}. Using fallback."
+            )
+            return False
+
+    def embed(self, text: str, input_type: str = "search_document") -> List[float]:
+        if not self._ok:
+            return self._fallback(text)
+
+        prefix = self._INSTRUCTIONS.get(input_type, "")
+        try:
+            r = self._session.post(
+                f"{self._host}/embeddings",
+                json={"model": self._model, "input": prefix + text},
+                timeout=300,
+            )
+            r.raise_for_status()
+            return r.json()["data"][0]["embedding"]
+        except Exception as e:
+            logger.warning(f"[memory] Infinity embedding failed: {e}")
+            return []
+
+
 # ── CLOUD: AWS Bedrock ─────────────────────────
 class BedrockEmbedder(BaseEmbedder):
     """
@@ -353,6 +393,8 @@ def build_embedder(
             "aws_region", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
         )
         return BedrockEmbedder(region=region, dims=dims)
+    if provider == "infinity":
+        return InfinityEmbedder(model=model, dims=dims)
     # Default: Ollama (local)
     return OllamaEmbedder(model=model, dims=dims)
 
@@ -364,13 +406,10 @@ class Memory:
     def __init__(
         self,
         mongo_uri: str = MONGO_URI,
-        mongo_client=None,  # inject mongomock.MongoClient() in tests
+        mongo_client=None,
     ):
         self._embedder = build_embedder()
         self._embed_worker = None
-        # Accept an injected client (e.g. mongomock) so tests never touch a
-        # real MongoDB instance.  Production code passes nothing and gets the
-        # real MongoClient as before.
         self._client = mongo_client or MongoClient(mongo_uri)
         self._db = self._client[DB_NAME]
 
@@ -406,7 +445,6 @@ class Memory:
 
         self._current_day: int = 0
 
-        # In-memory ordered log for strict sequential access
         self._event_log: List[SimEvent] = []
 
         self._init_vector_indexes()
@@ -445,18 +483,15 @@ class Memory:
         }
 
         for coll_name in ["artifacts", "events"]:
-            # 1. Force creation of the collection if it doesn't exist
             if coll_name not in self._db.list_collection_names():
                 try:
                     self._db.create_collection(coll_name)
                     logger.info(f"[memory] Created collection: {coll_name}")
                 except Exception:
-                    # Handle race conditions if another process created it simultaneously
                     pass
 
             coll = self._db[coll_name]
 
-            # 2. Proceed with index creation
             existing_indexes = list(coll.list_search_indexes())
             if not any(idx.get("name") == "vector_index" for idx in existing_indexes):
                 try:
@@ -486,7 +521,6 @@ class Memory:
         """Upsert artifact into MongoDB immediately. Embedding is deferred to the
         background queue if set_embed_worker() has been called, otherwise synchronous."""
 
-        # Write document immediately with null embedding so it's queryable by ID
         doc = {
             "_id": id,
             "type": type,
@@ -500,7 +534,6 @@ class Memory:
         }
         self._artifacts.update_one({"_id": id}, {"$set": doc}, upsert=True)
 
-        # Embed asynchronously if worker is attached, synchronously otherwise
         embed_text = f"{title}\n\n{content}"
         if self._embed_worker is not None:
             self._embed_worker.enqueue(
@@ -1445,7 +1478,6 @@ class Memory:
         n: int = 4,
         as_of_time: Optional[Any] = None,
         since: Optional[Any] = None,
-        llm_callable=None,
     ) -> str:
         """
         HyDE variant — rewrites the query before embedding.
@@ -1463,29 +1495,17 @@ class Memory:
             n:            Number of artifacts to retrieve.
             as_of_time:   Causal ceiling — passed through to recall().
             since:        Causal floor — passed through to recall().
-            llm_callable: Optional callable(prompt: str) -> str for the rewrite
-                          step.  If None, falls back to context_for_prompt()
-                          so callers degrade gracefully before an LLM is wired in.
 
         Returns:
             Formatted context string identical in shape to context_for_prompt().
         """
-        if llm_callable is None:
-            # Graceful degradation — behaves like context_for_prompt() until
-            # an LLM callable is injected at the call site.
-            logger.debug(
-                "[memory] recall_with_rewrite: no llm_callable, falling back to context_for_prompt"
-            )
-            return self.context_for_prompt(
-                raw_query, n=n, as_of_time=as_of_time, since=since
-            )
 
-        rewritten = self._rewrite_query(raw_query, llm_callable)
+        rewritten = self._rewrite_query(raw_query)
         return self.context_for_prompt(
             rewritten, n=n, as_of_time=as_of_time, since=since
         )
 
-    def _rewrite_query(self, raw_query: str, llm_callable) -> str:
+    def _rewrite_query(self, raw_query) -> str:
         """
         Generates a short hypothetical passage for HyDE-style query rewriting.
 
@@ -1500,7 +1520,26 @@ class Memory:
             f"Topic: {raw_query}\n\nPassage:"
         )
         try:
-            rewritten = llm_callable(prompt).strip()
+            client = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+            body = json.dumps(
+                {
+                    "prompt": prompt,
+                    "max_gen_len": 256,
+                    "temperature": 0.3,
+                }
+            )
+
+            response = client.invoke_model(
+                modelId="us.meta.llama3-3-70b-instruct-v1:0",
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+
+            response_body = json.loads(response.get("body").read())
+            rewritten = response_body.get("generation", "").strip()
+
             logger.debug(
                 f"[memory] query rewrite: '{raw_query[:60]}' → '{rewritten[:80]}'"
             )
@@ -1837,9 +1876,6 @@ class Memory:
         - Recent async_question and design_discussion events linked to this ticket
             or its participants — so the conversation doesn't rehash settled ground
         - Any blocker events on this ticket
-
-        Use this instead of context_for_prompt(ticket_title) in
-        _handle_async_question and _handle_design_discussion.
 
         Args:
             ticket_id:   The JIRA ticket ID the conversation is about.

@@ -5,7 +5,7 @@ Unit tests for causal chain construction and hybrid Recurrence Detection.
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from causal_chain_handler import (
     CausalChainHandler,
     RecurrenceDetector,

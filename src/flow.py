@@ -1,8 +1,5 @@
 """
-flow.py (MongoDB + YAML + NetworkX Edition)
-=================================================
-OrgForge simulation engine. Reads from config.yaml.
-Uses NetworkX for social graphs. Uses MongoDB for vector/artifact storage.
+OrgForge simulation engine.
 """
 
 from pathlib import Path
@@ -61,7 +58,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.logging import RichHandler
 from rich import box
-from utils.persona_utils import get_voice_card
+from utils.persona_utils import persona_utils
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from crewai import Process, Task, Crew
@@ -153,7 +150,7 @@ def build_llm(model_key: str):
                 "model": model,
                 "region_name": region,
                 "temperature": 0.7,
-                "max_tokens": 8192,
+                "max_tokens": 16384,
             }
 
             llm = LLM(**llm_args)
@@ -314,7 +311,6 @@ class State(BaseModel):
     persona_stress: Dict[str, int] = {}
     actor_cursors: Dict[str, Any] = Field(default_factory=dict)
 
-    # Daily counters — reset each morning, read at end of day
     daily_incidents_opened: int = 0
     daily_incidents_resolved: int = 0
     daily_artifacts_created: int = 0
@@ -324,9 +320,7 @@ class State(BaseModel):
     org_day_plan: Optional[Any] = None
     daily_active_actors: List[str] = []
     daily_event_type_counts: Dict[str, int] = {}
-    departed_employees: Dict[
-        str, Dict
-    ] = {}  # name → {left, role, knew_about, documented_pct}
+    departed_employees: Dict[str, Dict] = {}
     new_hires: Dict[str, Dict] = {}  # name → {joined, role, dept, expertise}
     ticket_actors_today: Dict[str, List[str]] = Field(default_factory=dict)
 
@@ -441,7 +435,7 @@ class GitSimulator:
             agent = make_agent(
                 role=f"{author}, Software Engineer",
                 goal=f"Write a PR description for your own code as {author} would.",
-                backstory=get_voice_card(
+                backstory=persona_utils.get_voice_card(
                     author, "async", self.graph_dynamics, self._mem
                 ),
                 llm=self._worker_llm,
@@ -658,6 +652,11 @@ class OrgForgeSimulation:
             mem=self._mem,
             planner_llm=PLANNER_MODEL,
         )
+        persona_utils.configure(
+            graph_dynamics=self.graph_dynamics,
+            mem=self._mem,
+            crm=self._crm,
+        )
         self._lifecycle = OrgLifecycleManager(
             config=CONFIG,
             graph_dynamics=self.graph_dynamics,
@@ -696,6 +695,7 @@ class OrgForgeSimulation:
             clock=self._clock,
             threat_injector=self._threat,
             crm=self._crm,
+            graph_dynamics=self.graph_dynamics,
         )
         self._normal_day = NormalDayHandler(
             config=CONFIG,
@@ -1024,6 +1024,7 @@ class OrgForgeSimulation:
 
             self._normal_day.handle(self.state.org_day_plan)
             self._email_ingestor.generate_business_hours(state=self.state)
+            self._email_ingestor.generate_customer_replies(state=self.state)
             self._email_ingestor.generate_hr_outbound(state=self.state)
 
             if random.random() < CONFIG["simulation"].get("adhoc_confluence_prob", 0.3):
@@ -1053,21 +1054,35 @@ class OrgForgeSimulation:
                 if r.get("pattern") == "trust_building":
                     self._se_followup_days[r["followup_due_day"]] = r["target"]
 
-            # Incident fires after normal day work, mid-day
             _base_prob = CONFIG["simulation"].get("incident_base_prob", 0.15)
-            _health_factor = max(0.5, (100 - self.state.system_health) / 100)
             _cooldown = CONFIG["simulation"].get("incident_cooldown_days", 3)
             days_since_incident = self.state.day - self.state.last_incident_day
+
+            _incident_triggers = CONFIG["simulation"].get(
+                "incident_triggers",
+                [
+                    "crash",
+                    "fail",
+                    "error",
+                    "latency",
+                    "timeout",
+                    "outage",
+                    "down",
+                    "spike",
+                ],
+            )
+            _theme_lower = self.state.daily_theme.lower()
+            _theme_triggered = any(x in _theme_lower for x in _incident_triggers)
+            _prob_triggered = random.random() < _base_prob
 
             if (
                 not self.state.active_incidents
                 and days_since_incident > _cooldown
-                and random.random() < _base_prob * _health_factor
+                and (_theme_triggered or _prob_triggered)
             ):
                 self.state.last_incident_day = self.state.day
                 self._handle_incident()
 
-            # Drain embed queue before checkpoint so MongoDB is fully consistent.
             self._embed_worker.drain()
 
             serialized_incidents = []
@@ -1148,7 +1163,7 @@ class OrgForgeSimulation:
         product_agent = make_agent(
             role=f"{product_lead} — {p_persona.get('social_role', 'Product Manager')}",
             goal="Propose a sprint theme grounded in business priorities.",
-            backstory=get_voice_card(
+            backstory=persona_utils.get_voice_card(
                 product_lead, "design", self.graph_dynamics, self._mem
             ),
             llm=PLANNER_MODEL,
@@ -1174,7 +1189,7 @@ class OrgForgeSimulation:
         eng_agent = make_agent(
             role=f"{eng_lead} — {e_persona.get('social_role', 'Engineering Lead')}",
             goal="Ratify or amend the sprint theme based on technical reality.",
-            backstory=get_voice_card(
+            backstory=persona_utils.get_voice_card(
                 eng_lead, "design", self.graph_dynamics, self._mem
             ),
             llm=PLANNER_MODEL,
@@ -1237,7 +1252,7 @@ class OrgForgeSimulation:
             agent = make_agent(
                 role=f"{dept} Lead",
                 goal=f"Create realistic sprint tickets for the {dept} team.",
-                backstory=get_voice_card(
+                backstory=persona_utils.get_voice_card(
                     lead_name, "design", self.graph_dynamics, self._mem
                 ),
                 llm=WORKER_MODEL,
@@ -1441,7 +1456,9 @@ class OrgForgeSimulation:
 
         messages = []
         for name in attendees:
-            backstory = get_voice_card(name, "async", self.graph_dynamics, self._mem)
+            backstory = persona_utils.get_voice_card(
+                name, "async", self.graph_dynamics, self._mem
+            )
 
             personal_ctx = self._mem.context_for_person(
                 name=name,
@@ -1638,7 +1655,7 @@ class OrgForgeSimulation:
             agent = make_agent(
                 role=role_label,
                 goal=f"Contribute authentically to the Sprint #{sprint_num} retrospective.",
-                backstory=get_voice_card(
+                backstory=persona_utils.get_voice_card(
                     name, "design", self.graph_dynamics, self._mem
                 ),
                 llm=PLANNER_MODEL,
@@ -1721,7 +1738,7 @@ class OrgForgeSimulation:
         rc_agent = make_agent(
             role=f"{on_call}, Senior On-Call Engineer",
             goal=f"Diagnose the root cause of today's incident as {on_call}, given what you know about this system.",
-            backstory=get_voice_card(
+            backstory=persona_utils.get_voice_card(
                 on_call, "collision", self.graph_dynamics, self._mem
             ),
             llm=PLANNER_MODEL,
@@ -1826,10 +1843,14 @@ class OrgForgeSimulation:
         )
 
         gap_kw = [k for emp in DEPARTED_EMPLOYEES.values() for k in emp["knew_about"]]
-        chain = self.graph_dynamics.build_escalation_chain(
+        chain = self.graph_dynamics.crm_aware_escalation_chain(
             first_responder=on_call,
+            crm=self._crm,
+            root_cause=root_cause,
+            for_org=None,
             domain_keywords=gap_kw if involves_gap else None,
         )
+
         escalation_narrative = self.graph_dynamics.escalation_narrative(chain)
         escalation_actors = [n for n, _ in chain.chain]
 
@@ -1862,7 +1883,9 @@ class OrgForgeSimulation:
         desc_agent = make_agent(
             role="Senior Engineer",
             goal="Write a concise Jira ticket description for an incident.",
-            backstory=get_voice_card(on_call, "design", self.graph_dynamics, self._mem),
+            backstory=persona_utils.get_voice_card(
+                on_call, "design", self.graph_dynamics, self._mem
+            ),
             llm=WORKER_MODEL,
         )
         desc_task = Task(
@@ -2321,7 +2344,6 @@ class OrgForgeSimulation:
     ):
         self._confluence.write_adhoc_page(author=author, backstory=backstory)
 
-    # ─── END OF DAY ───────────────────────────
     def _end_of_day(self):
         date_str = str(self.state.current_date.date())
         decay = CONFIG["morale"]["daily_decay"]
@@ -2340,12 +2362,10 @@ class OrgForgeSimulation:
             max(all_cursors) if all_cursors else self.state.current_date
         )
 
-        # Ensure the summary doesn't happen before 17:30
         eod_baseline = self.state.current_date.replace(hour=17, minute=30, second=0)
         summary_time = max(latest_time_worked, eod_baseline)
         housekeeping_time = summary_time + timedelta(minutes=1)
 
-        # ── end_of_day event (unchanged) ─────────────────────────────────────────
         self._mem.log_event(
             SimEvent(
                 type="end_of_day",
@@ -2370,7 +2390,6 @@ class OrgForgeSimulation:
             max(event_counts, key=event_counts.get) if event_counts else "normal_day"
         )
 
-        # Departments represented by today's active actors
         departments_involved = list(
             {dept_of(name) for name in unique_actors if dept_of(name) != "Unknown"}
         )
@@ -2387,7 +2406,7 @@ class OrgForgeSimulation:
                 timestamp=housekeeping_time.isoformat(),
                 day=self.state.day,
                 date=date_str,
-                actors=unique_actors,  # populated — was always []
+                actors=unique_actors,
                 artifact_ids={},
                 facts={
                     "incidents_opened": self.state.daily_incidents_opened,
@@ -2454,6 +2473,7 @@ class OrgForgeSimulation:
                     self.graph_dynamics,
                     departed=dep,
                     first_responder=dept_members[0],
+                    crm=self._crm,
                 )
                 self._mem.log_event(
                     SimEvent(
@@ -2474,6 +2494,19 @@ class OrgForgeSimulation:
                 )
 
         self.graph_dynamics.decay_edges()
+
+        self.graph_dynamics.decay_edges()
+
+        edge_changes = self.graph_dynamics.sync_crm_edge_weights(self._crm)
+        if edge_changes:
+            logger.debug(
+                f"[graph] CRM edge sync: {len(edge_changes)} external edges updated"
+            )
+
+        crm_stress_deltas = self.graph_dynamics.apply_crm_stress(self._crm)
+        if crm_stress_deltas:
+            logger.debug(f"[graph] CRM stress applied: {crm_stress_deltas}")
+
         self._last_stress_prop = self.graph_dynamics.propagate_stress()
         prop = self._last_stress_prop
         if prop.burnt_out:
@@ -2598,14 +2631,12 @@ class OrgForgeSimulation:
         )
         interaction_start_iso = start_time.isoformat()
 
-        # Boost the edge between liaison and external node — they just talked
         external_node = contact["name"]
         if self.social_graph.has_edge(liaison_name, external_node):
             self.graph_dynamics.record_incident_collaboration(
                 [liaison_name, external_node]
             )
 
-        # Tier 1: structured incident fetch — no embedding.
         ctx = self._mem.context_for_incident(
             ticket_id=inc.ticket_id,
             as_of_time=interaction_start_iso,
@@ -2614,7 +2645,7 @@ class OrgForgeSimulation:
         agent = make_agent(
             role="Employee",
             goal="Summarize an external conversation for your team on Slack.",
-            backstory=get_voice_card(
+            backstory=persona_utils.get_voice_card(
                 liaison_name, "dm", self.graph_dynamics, self._mem
             ),
             llm=WORKER_MODEL,
@@ -2639,7 +2670,6 @@ class OrgForgeSimulation:
             Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         ).strip()
 
-        # Write to the incidents Slack channel
         message = {
             "user": liaison_name,
             "email": email_of(liaison_name),
@@ -2666,7 +2696,6 @@ class OrgForgeSimulation:
         if thread_id and getattr(inc, "causal_chain", None):
             inc.causal_chain.append(thread_id)
 
-        # SimEvent — this is what makes it retrievable as ground truth
         self._mem.log_event(
             SimEvent(
                 type="external_contact_summarized",

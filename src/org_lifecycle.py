@@ -943,15 +943,45 @@ def recompute_escalation_after_departure(
     graph_dynamics: GraphDynamics,
     departed: DepartureRecord,
     first_responder: str,
+    crm=None,
+    root_cause: str = "",
 ) -> str:
     """
     Rebuild escalation chain post-departure and return a log-ready narrative.
     The node has already been removed, so Dijkstra routes around the gap.
+
+    If crm is provided and the departed employee owned SF accounts, the chain
+    prefers routing through whoever is best positioned to handle the customer
+    relationship — not just the topologically nearest lead.
     """
-    chain = graph_dynamics.build_escalation_chain(
-        first_responder=first_responder,
-        domain_keywords=departed.knowledge_domains or None,
-    )
+    from crm_system import NullCRMSystem
+
+    use_crm_aware = crm is not None and not isinstance(crm, NullCRMSystem)
+
+    if use_crm_aware:
+        owned_opps = list(
+            crm._sf_o.find(
+                {
+                    "owner": departed.name,
+                    "stage": {"$nin": ["Closed Won", "Closed Lost"]},
+                },
+                {"account_name": 1},
+            )
+        )
+        for_org = owned_opps[0]["account_name"] if owned_opps else None
+
+        chain = graph_dynamics.crm_aware_escalation_chain(
+            first_responder=first_responder,
+            crm=crm,
+            root_cause=root_cause or "",
+            for_org=for_org,
+        )
+    else:
+        chain = graph_dynamics.build_escalation_chain(
+            first_responder=first_responder,
+            domain_keywords=departed.knowledge_domains or None,
+        )
+
     narrative = graph_dynamics.escalation_narrative(chain)
     note = f"[Post-departure re-route after {departed.name} left] Path: {narrative}"
     logger.info(f"    [cyan]🔀 Escalation re-routed:[/cyan] {note}")

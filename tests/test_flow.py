@@ -23,10 +23,13 @@ def mock_flow():
         sim.state.day = 1
         sim.state.system_health = 100
         sim._mem.log_slack_messages = MagicMock(return_value=("", ""))
+
+        from crm_system import NullCRMSystem
+        from utils.persona_utils import persona_utils
+
+        persona_utils.configure(crm=NullCRMSystem())
+
         return sim
-
-
-### --- Bug Catching Tests ---
 
 
 def test_embed_and_count_recursion_fix(mock_flow):

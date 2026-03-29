@@ -21,6 +21,10 @@ Question types handled
   PLAN          dept + theme match (theme uses substring matching for LLM prose).
   ESCALATION    escalation_actors set match, partial credit for overlap.
   KNOWLEDGE_GAP gap_areas set match, partial credit for overlap.
+  ZD_RESOLUTION resolved boolean + duration_days exact match; escalated bonus.
+  SF_RISK       incident_id match + at_risk_accounts set overlap.
+  NPS_SCORE     nps_score exact + classification match; escalated_tickets bonus.
+  INVOICE_SLA   breach_duration_days exact + sla_credit_per_org within 5%.
 
 Partial credit via evidence_chain
 ----------------------------------
@@ -322,8 +326,6 @@ class TemporalScorer(_BaseScorer):
                     else "Agent reported a departure day that doesn't exist"
                 )
 
-        # Temporal questions have no explicit retrieved artifacts,
-        # so we check evidence_chain directly.
         evidence = self._evidence_overlap(
             question.get("evidence_chain", []),
             agent_answer.get("retrieved_artifact_ids", []),
@@ -353,13 +355,11 @@ class GapDetectionScorer(_BaseScorer):
             primary = 0.0
             failure = f"was_actioned expected {gt_bool}, got {agent_bool}"
         elif not gt_bool:
-            # Correctly identified as not actioned — no downstream check needed
             primary = 1.0
             failure = None
         else:
-            # Correctly identified as actioned — check downstream recall
             ds_overlap = self._evidence_overlap(gt_downstream, agent_downstream)
-            primary = 0.6 + 0.4 * ds_overlap  # 0.6 floor for correct boolean
+            primary = 0.6 + 0.4 * ds_overlap
             failure = (
                 None
                 if ds_overlap >= 0.5
@@ -568,9 +568,309 @@ class KnowledgeGapScorer(_BaseScorer):
         return primary, evidence, failure
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DISPATCHER
-# ─────────────────────────────────────────────────────────────────────────────
+class PRReviewScorer(_BaseScorer):
+    """
+    PR_REVIEW — "Who reviewed PR-X and what was the verdict?"
+
+    Full credit:  pr_id matches AND verdict matches.
+    Partial:      pr_id correct but verdict wrong (0.5).
+                  reviewer correct adds 0.15 bonus on top, capped at 1.0.
+
+    Verdict is case-insensitive and normalised so "LGTM" / "approve" /
+    "approved" all resolve to "approved", and "changes" / "request changes"
+    resolve to "changes_requested" before comparison.
+    """
+
+    _APPROVE_ALIASES = {"approved", "approve", "lgtm", "merged", "merge"}
+    _CHANGES_ALIASES = {
+        "changes_requested",
+        "changes requested",
+        "request changes",
+        "needs changes",
+        "needs work",
+    }
+
+    @staticmethod
+    def _normalise_verdict(raw: str) -> str:
+        v = raw.strip().lower()
+        if v in PRReviewScorer._APPROVE_ALIASES:
+            return "approved"
+        if v in PRReviewScorer._CHANGES_ALIASES:
+            return "changes_requested"
+        return v  # return as-is — will fail comparison cleanly
+
+    def score(
+        self, question: dict, agent_answer: dict
+    ) -> Tuple[float, float, Optional[str]]:
+        gt = question["ground_truth"]
+        gt_pr = gt.get("pr_id", "")
+        gt_verdict = self._normalise_verdict(gt.get("verdict", ""))
+        gt_reviewer = gt.get("reviewer", "").strip().lower()
+
+        agent_pr = agent_answer.get("pr_id", "")
+        agent_verdict = self._normalise_verdict(agent_answer.get("verdict", ""))
+        agent_reviewer = agent_answer.get("reviewer", "").strip().lower()
+
+        pr_match = agent_pr == gt_pr
+
+        if not pr_match:
+            primary = 0.0
+            failure = f"Expected pr_id={gt_pr!r}, got {agent_pr!r}"
+        elif agent_verdict == gt_verdict:
+            primary = 1.0
+            failure = None
+        else:
+            primary = 0.5
+            failure = (
+                f"Correct PR but wrong verdict: expected {gt_verdict!r}, "
+                f"got {agent_verdict!r}"
+            )
+
+        # Reviewer identification bonus
+        if gt_reviewer and agent_reviewer == gt_reviewer:
+            primary = min(1.0, primary + 0.15)
+
+        evidence = self._evidence_overlap(
+            question.get("evidence_chain", []),
+            agent_answer.get("retrieved_artifact_ids", []),
+        )
+        return primary, evidence, failure
+
+
+class ZDResolutionScorer(_BaseScorer):
+    """
+    ZD_RESOLUTION — "Was Zendesk ticket X resolved and how long did it take?"
+
+    Full credit:    resolved boolean matches AND duration_days matches exactly.
+    Partial credit: boolean correct but duration wrong or missing (0.6).
+                    escalated flag correct adds 0.1 bonus on top of partial.
+    """
+
+    def score(
+        self, question: dict, agent_answer: dict
+    ) -> Tuple[float, float, Optional[str]]:
+        gt = question["ground_truth"]
+        gt_resolved = gt.get("resolved")
+        gt_duration = gt.get("duration_days")
+        gt_escalated = gt.get("escalated", False)
+
+        agent_resolved = agent_answer.get("resolved")
+        agent_duration = agent_answer.get("duration_days")
+        agent_escalated = agent_answer.get("escalated")
+
+        if agent_resolved != gt_resolved:
+            primary = 0.0
+            failure = f"resolved expected {gt_resolved}, got {agent_resolved}"
+        else:
+            # Resolution boolean correct — check duration
+            if gt_duration is None:
+                # Ticket unresolved: correct if agent also has no duration
+                primary = 1.0 if agent_duration is None else 0.7
+                failure = (
+                    None
+                    if agent_duration is None
+                    else "Correctly identified unresolved but reported a duration"
+                )
+            elif agent_duration is not None and int(agent_duration) == int(gt_duration):
+                primary = 1.0
+                failure = None
+            elif agent_duration is not None:
+                primary = 0.6
+                failure = (
+                    f"Duration off: expected {gt_duration}d, got {agent_duration}d"
+                )
+            else:
+                primary = 0.6
+                failure = f"Correct resolution status but missing duration (expected {gt_duration}d)"
+
+            # Escalation awareness bonus (+0.1, capped at 1.0)
+            if agent_escalated is not None and agent_escalated == gt_escalated:
+                primary = min(1.0, primary + 0.1)
+
+        evidence = self._evidence_overlap(
+            question.get("evidence_chain", []),
+            agent_answer.get("retrieved_artifact_ids", []),
+        )
+        return primary, evidence, failure
+
+
+class SFRiskScorer(_BaseScorer):
+    """
+    SF_RISK — "Which Salesforce accounts were flagged at-risk after incident X?"
+
+    Full credit:  all at_risk_accounts matched (order-insensitive) AND
+                  incident_id correct.
+    Partial:      incident_id correct but incomplete account list (scaled by overlap).
+                  0.3 floor for incident match with zero account overlap.
+    """
+
+    def score(
+        self, question: dict, agent_answer: dict
+    ) -> Tuple[float, float, Optional[str]]:
+        gt = question["ground_truth"]
+        gt_incident = gt.get("incident_id", "")
+        gt_accounts = [a.lower() for a in gt.get("at_risk_accounts", [])]
+
+        agent_incident = agent_answer.get("incident_id", "")
+        agent_accounts = [a.lower() for a in agent_answer.get("at_risk_accounts", [])]
+
+        incident_match = agent_incident == gt_incident
+
+        if not gt_accounts:
+            primary = 1.0 if incident_match else 0.0
+            failure = (
+                None
+                if incident_match
+                else f"Expected incident_id={gt_incident!r}, got {agent_incident!r}"
+            )
+        elif not incident_match:
+            primary = 0.0
+            failure = f"Expected incident_id={gt_incident!r}, got {agent_incident!r}"
+        else:
+            gt_set = set(gt_accounts)
+            agent_set = set(agent_accounts)
+            overlap = len(gt_set & agent_set) / len(gt_set) if gt_set else 1.0
+
+            if overlap == 1.0 and len(agent_set) == len(gt_set):
+                primary = 1.0
+                failure = None
+            elif overlap > 0:
+                primary = round(0.3 + 0.7 * overlap, 4)
+                failure = (
+                    f"Partial account match ({len(gt_set & agent_set)}/{len(gt_set)}): "
+                    f"missing {gt_set - agent_set}"
+                )
+            else:
+                primary = 0.3  # floor for correct incident identification
+                failure = (
+                    f"Correct incident but no accounts matched. Expected {gt_accounts}"
+                )
+
+        evidence = self._evidence_overlap(
+            question.get("evidence_chain", []),
+            agent_answer.get("retrieved_artifact_ids", []),
+        )
+        return primary, evidence, failure
+
+
+class NPSScoreScorer(_BaseScorer):
+    """
+    NPS_SCORE — "What NPS score did customer X give and what drove it?"
+
+    Full credit:  nps_score exact match AND classification correct.
+    Partial:      classification correct but score wrong (0.6).
+                  escalated_tickets count correct adds 0.1 bonus.
+    """
+
+    def score(
+        self, question: dict, agent_answer: dict
+    ) -> Tuple[float, float, Optional[str]]:
+        gt = question["ground_truth"]
+        gt_score = gt.get("nps_score")
+        gt_class = gt.get("classification", "").lower()
+        gt_escalated = gt.get("escalated_tickets", 0)
+
+        agent_score = agent_answer.get("nps_score")
+        agent_class = agent_answer.get("classification", "").lower()
+        agent_escalated = agent_answer.get("escalated_tickets")
+
+        class_match = agent_class == gt_class
+        score_match = agent_score is not None and int(agent_score) == int(gt_score)
+
+        if class_match and score_match:
+            primary = 1.0
+            failure = None
+        elif class_match:
+            primary = 0.6
+            failure = f"Correct classification but wrong score: expected {gt_score}, got {agent_score}"
+        else:
+            primary = 0.0
+            failure = (
+                f"Classification wrong: expected {gt_class!r}, got {agent_class!r}"
+            )
+
+        # Escalation count awareness bonus
+        if agent_escalated is not None and int(agent_escalated) == int(gt_escalated):
+            primary = min(1.0, primary + 0.1)
+
+        evidence = self._evidence_overlap(
+            question.get("evidence_chain", []),
+            agent_answer.get("retrieved_artifact_ids", []),
+        )
+        return primary, evidence, failure
+
+
+class InvoiceSLAScorer(_BaseScorer):
+    """
+    INVOICE_SLA — "What SLA credit appeared on the invoice for customers
+                   affected by incident X?"
+
+    Full credit:  breach_duration_days exact AND sla_credit_per_org within 5%.
+    Partial:      incident identified correctly but wrong duration/credit (0.5).
+    Evidence:     affected_orgs overlap used as secondary evidence score.
+    """
+
+    def score(
+        self, question: dict, agent_answer: dict
+    ) -> Tuple[float, float, Optional[str]]:
+        gt = question["ground_truth"]
+        gt_incident = gt.get("incident_id", "")
+        gt_duration = gt.get("breach_duration_days")
+        gt_credit = gt.get("sla_credit_per_org")
+        gt_orgs = [o.lower() for o in gt.get("affected_orgs", [])]
+
+        agent_incident = agent_answer.get("incident_id", "")
+        agent_duration = agent_answer.get("breach_duration_days")
+        agent_credit = agent_answer.get("sla_credit_per_org")
+        agent_orgs = [o.lower() for o in agent_answer.get("affected_orgs", [])]
+
+        if agent_incident != gt_incident:
+            primary = 0.0
+            failure = f"Expected incident_id={gt_incident!r}, got {agent_incident!r}"
+        else:
+            duration_ok = agent_duration is not None and int(agent_duration) == int(
+                gt_duration
+            )
+            credit_ok = False
+            if agent_credit is not None and gt_credit:
+                try:
+                    ratio = abs(float(agent_credit) - float(gt_credit)) / float(
+                        gt_credit
+                    )
+                    credit_ok = ratio <= 0.05
+                except (TypeError, ZeroDivisionError):
+                    pass
+
+            if duration_ok and credit_ok:
+                primary = 1.0
+                failure = None
+            elif duration_ok:
+                primary = 0.7
+                failure = f"Correct duration but credit off: expected {gt_credit}, got {agent_credit}"
+            elif credit_ok:
+                primary = 0.7
+                failure = f"Correct credit but duration off: expected {gt_duration}d, got {agent_duration}d"
+            else:
+                primary = 0.4  # floor for correct incident identification
+                failure = (
+                    f"Correct incident but duration ({agent_duration} vs {gt_duration}) "
+                    f"and credit ({agent_credit} vs {gt_credit}) both wrong"
+                )
+
+        # Affected orgs as evidence (secondary signal for partial credit)
+        evidence = (
+            self._evidence_overlap(
+                gt_orgs,
+                agent_orgs,
+            )
+            if gt_orgs
+            else self._evidence_overlap(
+                question.get("evidence_chain", []),
+                agent_answer.get("retrieved_artifact_ids", []),
+            )
+        )
+        return primary, evidence, failure
+
 
 _SCORERS: Dict[str, _BaseScorer] = {
     "RETRIEVAL": RetrievalScorer(),
@@ -581,12 +881,16 @@ _SCORERS: Dict[str, _BaseScorer] = {
     "PLAN": PlanScorer(),
     "ESCALATION": EscalationScorer(),
     "KNOWLEDGE_GAP": KnowledgeGapScorer(),
-    # These types were defined in the README but missing from the registry.
-    # POSTMORTEM and STANDUP are single-artifact lookups — RetrievalScorer is correct.
-    # CUSTOMER_ESC involves a causal chain — CausalScorer is the closest match.
     "POSTMORTEM": PostmortemScorer(),
     "STANDUP": RetrievalScorer(),
     "CUSTOMER_ESC": CausalScorer(),
+    "ZD_RESOLUTION": ZDResolutionScorer(),
+    "ZD_ESCALATION": CausalScorer(),
+    "SF_RISK": SFRiskScorer(),
+    "NPS_SCORE": NPSScoreScorer(),
+    "INVOICE_SLA": InvoiceSLAScorer(),
+    "DATADOG_ALERT": RetrievalScorer(),
+    "PR_REVIEW": PRReviewScorer(),
 }
 
 
@@ -718,10 +1022,6 @@ class OrgForgeScorer:
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI — quick sanity check
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import json
     import pathlib
@@ -735,8 +1035,6 @@ if __name__ == "__main__":
     data = json.loads(eval_path.read_text())
     questions = data.get("questions", [])
 
-    # Mock answers: return correct artifact_id for every RETRIEVAL question,
-    # random booleans for others — so we can see partial scores in action.
     mock_answers = {}
     for q in questions:
         gt = q["ground_truth"]
@@ -767,6 +1065,43 @@ if __name__ == "__main__":
         elif qtype == "KNOWLEDGE_GAP":
             mock_answers[qid] = {
                 "gap_areas": gt.get("gap_areas", []),
+            }
+        elif qtype == "ZD_RESOLUTION":
+            mock_answers[qid] = {
+                "resolved": gt.get("resolved"),
+                "duration_days": gt.get("duration_days"),
+                "escalated": gt.get("escalated"),
+            }
+        elif qtype == "ZD_ESCALATION":
+            mock_answers[qid] = {
+                "artifact_id": gt.get("artifact_id", ""),
+                "event_type": gt.get("event_type", ""),
+            }
+        elif qtype == "SF_RISK":
+            mock_answers[qid] = {
+                "incident_id": gt.get("incident_id", ""),
+                "at_risk_accounts": gt.get("at_risk_accounts", []),
+            }
+        elif qtype == "NPS_SCORE":
+            mock_answers[qid] = {
+                "nps_score": gt.get("nps_score"),
+                "classification": gt.get("classification", ""),
+                "escalated_tickets": gt.get("escalated_tickets", 0),
+            }
+        elif qtype == "INVOICE_SLA":
+            mock_answers[qid] = {
+                "incident_id": gt.get("incident_id", ""),
+                "breach_duration_days": gt.get("breach_duration_days"),
+                "sla_credit_per_org": gt.get("sla_credit_per_org"),
+                "affected_orgs": gt.get("affected_orgs", []),
+            }
+        elif qtype == "DATADOG_ALERT":
+            mock_answers[qid] = {"artifact_id": gt.get("artifact_id", "")}
+        elif qtype == "PR_REVIEW":
+            mock_answers[qid] = {
+                "pr_id": gt.get("pr_id", ""),
+                "verdict": gt.get("verdict", ""),
+                "reviewer": gt.get("reviewer", ""),
             }
 
     scorer = OrgForgeScorer()

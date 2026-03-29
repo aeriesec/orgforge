@@ -8,7 +8,10 @@ from normal_day import NormalDayHandler
 @pytest.fixture
 def mock_handler():
     # Safely bypass the persona voice engine so it doesn't query mocked graphs
-    with patch("normal_day.get_voice_card", return_value="Mock backstory"):
+    with patch(
+        "utils.persona_utils.persona_utils.get_voice_card",
+        return_value="Mock backstory",
+    ):
         config = {
             "simulation": {
                 "domain": "test.com",
