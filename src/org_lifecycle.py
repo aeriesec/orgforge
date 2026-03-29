@@ -26,6 +26,7 @@ Three departure side-effects handled deterministically (no LLM involvement):
 
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 import json as _json
 import random
@@ -122,7 +123,6 @@ class OrgLifecycleManager:
         self._gap_events: List[KnowledgeGapEvent] = []
         self._domains_surfaced: Set[str] = set()
 
-        # Build day-keyed lookup tables from config
         self._scheduled_departures: Dict[int, List[dict]] = {}
         for dep in self._cfg.get("scheduled_departures", []):
             self._scheduled_departures.setdefault(dep["day"], []).append(dep)
@@ -131,7 +131,27 @@ class OrgLifecycleManager:
         for hire in self._cfg.get("scheduled_hires", []):
             self._scheduled_hires.setdefault(hire["day"], []).append(hire)
 
-    # ─── PUBLIC ───────────────────────────────────────────────────────────────
+        sim_start_str = config.get("simulation", {}).get("start_date", "2024-01-01")
+        sim_start = datetime.strptime(sim_start_str, "%Y-%m-%d")
+
+        for gap in config.get("knowledge_gaps", []):
+            left_dt = datetime.strptime(gap["left"], "%Y-%m")
+            day = -(sim_start - left_dt).days
+
+            self._departed.append(
+                DepartureRecord(
+                    name=gap["name"],
+                    dept=gap.get("dept", "Unknown"),
+                    role=gap.get("role", "Former Employee"),
+                    day=day,
+                    reason="voluntary",
+                    knowledge_domains=gap.get("knew_about", []),
+                    documented_pct=float(gap.get("documented_pct", 0.5)),
+                    peak_stress=50,
+                    edge_snapshot={},
+                    centrality_at_departure=0.0,
+                )
+            )
 
     def process_departures(
         self, day: int, date_str: str, state, clock
@@ -206,55 +226,140 @@ class OrgLifecycleManager:
         date_str: str,
         state,
         timestamp: str,
+        similarity_threshold: float = 0.65,
     ) -> List[KnowledgeGapEvent]:
+        """
+        Detect knowledge gaps using semantic similarity.
+
+        Instead of checking whether a departed employee's domain keyword appears
+        verbatim in the incident text, we embed the incident text and compare it
+        against the departed employee's persona_skill artifacts (expertise profile)
+        and any author_expertise artifacts (topics they wrote about).
+
+        This catches cases where incident terminology differs from the departed
+        employee's stated expertise — e.g., "auth timeout" matches against
+        "identity management" because the embeddings are semantically close.
+
+        Args:
+            text:                  The incident root cause or description text.
+            triggered_by:          The artifact ID (e.g., JIRA ticket) that surfaced this.
+            day:                   Current simulation day.
+            date_str:              Current date as ISO string.
+            state:                 Simulation state object.
+            timestamp:             ISO timestamp of the triggering event.
+            similarity_threshold:  Minimum vector similarity score (0–1) to consider
+                                a departed employee's expertise a match. Default 0.65
+                                is tuned for dotProduct with 1024-dim vectors.
+        """
         found: List[KnowledgeGapEvent] = []
-        text_lower = text.lower()
+
+        if not self._departed:
+            return found
+
+        expert_matches = self._mem.find_expert_by_skill(text, n=20)
+
+        match_scores: Dict[str, float] = {}
+        for match in expert_matches:
+            name = match.get("name")
+            score = match.get("score", 0.0)
+            if name and score >= similarity_threshold:
+                if name not in match_scores or score > match_scores[name]:
+                    match_scores[name] = score
+
         for record in self._departed:
-            for domain in record.knowledge_domains:
-                if domain.lower() not in text_lower:
-                    continue
-                gap_key = f"{record.name}:{domain}:{triggered_by}"
-                if gap_key in self._domains_surfaced:
-                    continue
-                self._domains_surfaced.add(gap_key)
-                gap_event = KnowledgeGapEvent(
-                    departed_name=record.name,
-                    domain_hit=domain,
-                    triggered_by=triggered_by,
-                    triggered_on_day=day,
-                    documented_pct=record.documented_pct,
+            if record.name not in match_scores:
+                continue
+
+            score = match_scores[record.name]
+
+            gap_key = f"{record.name}:semantic:{triggered_by}"
+            if gap_key in self._domains_surfaced:
+                continue
+            self._domains_surfaced.add(gap_key)
+
+            gap_domains = (
+                record.knowledge_domains
+                if record.knowledge_domains
+                else ["undocumented expertise"]
+            )
+            domain_label = ", ".join(gap_domains)
+
+            gap_event = KnowledgeGapEvent(
+                departed_name=record.name,
+                domain_hit=domain_label,
+                triggered_by=triggered_by,
+                triggered_on_day=day,
+                documented_pct=record.documented_pct,
+            )
+            self._gap_events.append(gap_event)
+            found.append(gap_event)
+
+            self._mem.log_event(
+                SimEvent(
+                    type="knowledge_gap_detected",
+                    timestamp=timestamp,
+                    day=day,
+                    date=date_str,
+                    actors=[record.name],
+                    artifact_ids={"jira": triggered_by},
+                    facts={
+                        "departed_employee": record.name,
+                        "gap_areas": gap_domains,
+                        "triggered_by": triggered_by,
+                        "documented_pct": record.documented_pct,
+                        "days_since_departure": day - record.day,
+                        "escalation_harder": True,
+                        "semantic_score": round(score, 4),
+                        "detection_method": "embedding_similarity",
+                    },
+                    summary=(
+                        f"Knowledge gap: {domain_label} (owned by ex-{record.name}, "
+                        f"similarity={score:.3f}) surfaced in {triggered_by}. "
+                        f"~{int(record.documented_pct * 100)}% documented."
+                    ),
+                    tags=["knowledge_gap", "departed_employee"],
                 )
-                self._gap_events.append(gap_event)
-                found.append(gap_event)
-                self._mem.log_event(
-                    SimEvent(
-                        type="knowledge_gap_detected",
-                        timestamp=timestamp,
-                        day=day,
-                        date=date_str,
-                        actors=[record.name],
-                        artifact_ids={"jira": triggered_by},
-                        facts={
-                            "departed_employee": record.name,
-                            "gap_areas": [domain],
-                            "triggered_by": triggered_by,
-                            "documented_pct": record.documented_pct,
-                            "days_since_departure": day - record.day,
-                            "escalation_harder": True,
-                        },
-                        summary=(
-                            f"Knowledge gap: {domain} (owned by ex-{record.name}) "
-                            f"surfaced in {triggered_by}. "
-                            f"~{int(record.documented_pct * 100)}% documented."
-                        ),
-                        tags=["knowledge_gap", "departed_employee"],
-                    )
-                )
-                logger.info(
-                    f"    [yellow]⚠ Knowledge gap:[/yellow] {domain} "
-                    f"(was {record.name}'s) surfaced in {triggered_by}"
-                )
+            )
+            logger.info(
+                f"    [yellow]⚠ Knowledge gap:[/yellow] {domain_label} "
+                f"(was {record.name}'s, score={score:.3f}) surfaced in {triggered_by}"
+            )
+
         return found
+
+    def _load_departed_from_log(self, events: List[SimEvent]) -> None:
+        """
+        Reconstructs the _departed registry from the SimEvent log.
+        Used by backfill scripts that run after the sim completes.
+        """
+
+        for e in events:
+            if e.type != "employee_departed":
+                continue
+            name = next(iter(e.actors), None)
+            if not name:
+                continue
+            # Avoid duplicates if called multiple times
+            if any(r.name == name for r in self._departed):
+                continue
+            self._departed.append(
+                DepartureRecord(
+                    name=name,
+                    day=e.day,
+                    knowledge_domains=e.facts.get("knowledge_domains", []),
+                    documented_pct=e.facts.get("documented_pct", 0.0),
+                    dept=e.facts.get("dept", ""),
+                    role=e.facts.get("role", e.facts.get("dept", "")),
+                    reason=e.facts.get("reason", "voluntary"),
+                    peak_stress=e.facts.get("peak_stress", 50),
+                    edge_snapshot={
+                        bond[0]: bond[1] for bond in e.facts.get("strongest_bonds", [])
+                    },
+                )
+            )
+        logger.info(
+            f"[lifecycle] Loaded {len(self._departed)} departed employee(s) from event log."
+        )
 
     def get_roster_context(self) -> str:
         lines: List[str] = []

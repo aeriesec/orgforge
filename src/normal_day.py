@@ -3023,38 +3023,21 @@ class NormalDayHandler:
                 "ts", self._clock.now("system").isoformat()
             )
 
-            if self._embed_worker:
-                self._embed_worker.enqueue(
-                    id=thread_id,
-                    type="slack_thread",
-                    title=f"{interaction_type.replace('_', ' ').title()} in #{channel}",
-                    content=full_transcript,
-                    day=self._state.day,
-                    date=date_str,
-                    timestamp=start_timestamp,
-                    metadata={
-                        "channel": channel,
-                        "interaction_type": interaction_type,
-                        "participants": list({m["user"] for m in messages}),
-                        "message_count": len(messages),
-                    },
-                )
-            else:
-                self._mem.embed_artifact(
-                    id=thread_id,
-                    type="slack_thread",
-                    title=f"{interaction_type.replace('_', ' ').title()} in #{channel}",
-                    content=full_transcript,
-                    day=self._state.day,
-                    date=date_str,
-                    timestamp=start_timestamp,
-                    metadata={
-                        "channel": channel,
-                        "interaction_type": interaction_type,
-                        "participants": list({m["user"] for m in messages}),
-                        "message_count": len(messages),
-                    },
-                )
+            self._mem.embed_artifact(
+                id=thread_id,
+                type="slack_thread",
+                title=f"{interaction_type.replace('_', ' ').title()} in #{channel}",
+                content=full_transcript,
+                day=self._state.day,
+                date=date_str,
+                timestamp=start_timestamp,
+                metadata={
+                    "channel": channel,
+                    "interaction_type": interaction_type,
+                    "participants": list({m["user"] for m in messages}),
+                    "message_count": len(messages),
+                },
+            )
 
         return slack_path, thread_id
 
@@ -3283,28 +3266,16 @@ class NormalDayHandler:
             "medium": "zoom",
         }
 
-        if self._embed_worker:
-            self._embed_worker.enqueue(
-                id=transcript_id,
-                type="zoom_transcript",
-                title=f"Zoom: {topic[:80]}",
-                content=full_text,
-                day=self._state.day,
-                date=date_str,
-                timestamp=meeting_time_iso,
-                metadata=embed_metadata,
-            )
-        else:
-            self._mem.embed_artifact(
-                id=transcript_id,
-                type="zoom_transcript",
-                title=f"Zoom: {topic[:80]}",
-                content=full_text,
-                day=self._state.day,
-                date=date_str,
-                timestamp=meeting_time_iso,
-                metadata=embed_metadata,
-            )
+        self._mem.embed_artifact(
+            id=transcript_id,
+            type="zoom_transcript",
+            title=f"Zoom: {topic[:80]}",
+            content=full_text,
+            day=self._state.day,
+            date=date_str,
+            timestamp=meeting_time_iso,
+            metadata=embed_metadata,
+        )
 
         logger.info(
             f"    [dim]📹 Zoom transcript saved: {transcript_id} "

@@ -16,7 +16,7 @@ from config_loader import (
     LEGACY,
     ORG_CHART,
 )
-from memory import Memory
+from memory import Memory, SimEvent
 from agent_factory import make_agent
 from crewai import Task, Crew
 
@@ -43,6 +43,7 @@ def initialize(config, planner_llm, reset=False):
     seed_tech_stack(mem, planner_llm)
     seed_external_sources(mem, planner_llm)
     seed_crm_accounts(mem)
+    seed_knowledge_gaps(mem)
     logger.info("[genesis] ✅ Seeding complete.")
 
     return mem
@@ -332,6 +333,54 @@ def seed_crm_accounts(mem: Memory):
         )
 
     pass
+
+
+def seed_knowledge_gaps(mem: Memory):
+    """Embeds skills and logs departure events for pre-simulation employees."""
+    if not CONFIG.get("knowledge_gaps"):
+        return
+
+    logger.info("[genesis] Seeding pre-simulation knowledge gaps...")
+
+    sim_start = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
+
+    for gap in CONFIG.get("knowledge_gaps", []):
+        name = gap["name"]
+        left_date = gap["left"]
+        left_dt = datetime.strptime(left_date, "%Y-%m")
+        departure_day = -(sim_start - left_dt).days
+
+        mem.embed_persona_skills(
+            name=name,
+            data={
+                "expertise": gap.get("knew_about", []),
+                "social_role": gap.get("role", "Former Employee"),
+            },
+            dept=gap.get("dept", "Engineering"),
+            day=departure_day,
+            timestamp_iso=f"{left_date}-01T09:00:00",
+        )
+
+        mem.log_event(
+            SimEvent(
+                type="employee_departed",
+                day=departure_day,
+                date=f"{left_date}-01",
+                timestamp=f"{left_date}-01T09:00:00",
+                actors=[name],
+                artifact_ids={},
+                facts={
+                    "name": name,
+                    "role": gap.get("role", ""),
+                    "knowledge_domains": gap.get("knew_about", []),
+                    "documented_pct": gap.get("documented_pct", 0.5),
+                    "is_genesis_gap": True,
+                },
+                summary=f"Genesis Gap: {name} ({gap.get('role')}) left Day {departure_day}.",
+                tags=["employee_departed", "lifecycle", "genesis"],
+            )
+        )
+        logger.info(f"    [dim]→ Seeded Genesis Gap: {name}[/dim]")
 
 
 @staticmethod

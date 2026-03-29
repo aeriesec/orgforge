@@ -482,11 +482,6 @@ def test_departure_record_stored_on_state(lifecycle, mock_clock):
     assert "redis-cache" in state.departed_employees["Bob"]["knew_about"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. KNOWLEDGE GAP SCANNING
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def test_knowledge_gap_scan_detects_domain_hit(lifecycle, mock_clock):
     """
     scan_for_knowledge_gaps must emit a knowledge_gap_detected SimEvent when
@@ -495,7 +490,6 @@ def test_knowledge_gap_scan_detects_domain_hit(lifecycle, mock_clock):
     mgr, gd, org_chart, all_names, state = lifecycle
     state.active_incidents = []
 
-    # First, register a departure with known domains
     dep_cfg = {
         "name": "Bob",
         "reason": "voluntary",
@@ -506,30 +500,35 @@ def test_knowledge_gap_scan_detects_domain_hit(lifecycle, mock_clock):
     }
     mgr._scheduled_departures = {3: [dep_cfg]}
     mgr.process_departures(day=3, date_str="2026-01-03", state=state, clock=mock_clock)
-    mgr._mem.log_event.reset_mock()
 
-    # Now trigger a scan with text that mentions the domain
-    gaps = mgr.scan_for_knowledge_gaps(
-        text="Root cause: auth-service JWT validation failing after config change.",
-        triggered_by="ORG-400",
-        day=5,
-        date_str="2026-01-05",
-        state=state,
-        timestamp=mock_clock,
-    )
+    with patch.object(mgr._mem, "find_expert_by_skill") as mock_search:
+        mock_search.return_value = [
+            {"name": "Bob", "score": 0.85, "dept": "Engineering"}
+        ]
+        mgr._mem.log_event.reset_mock()
 
-    assert len(gaps) == 1
-    assert gaps[0].domain_hit == "auth-service"
-    assert gaps[0].departed_name == "Bob"
-    assert gaps[0].triggered_by == "ORG-400"
-    assert gaps[0].documented_pct == 0.25
+        text = "auth-service and redis-cache are failing."
+        gaps = mgr.scan_for_knowledge_gaps(
+            text=text,
+            triggered_by="ORG-400",
+            day=5,
+            date_str="2026-01-05",
+            state=state,
+            timestamp="2026-01-05T10:00:00",
+        )
 
-    gap_events = [
-        call.args[0]
-        for call in mgr._mem.log_event.call_args_list
-        if call.args[0].type == "knowledge_gap_detected"
-    ]
-    assert len(gap_events) == 1
+        assert len(gaps) == 1
+
+        assert gaps[0].domain_hit == "auth-service, redis-cache"
+        assert gaps[0].departed_name == "Bob"
+
+        gap_events = [
+            c.args[0]
+            for c in mgr._mem.log_event.call_args_list
+            if c.args[0].type == "knowledge_gap_detected"
+        ]
+        assert len(gap_events) == 1
+        assert gap_events[0].facts["gap_areas"] == ["auth-service", "redis-cache"]
 
 
 def test_knowledge_gap_scan_deduplicates(lifecycle, mock_clock):
@@ -550,32 +549,48 @@ def test_knowledge_gap_scan_deduplicates(lifecycle, mock_clock):
     }
     mgr._scheduled_departures = {3: [dep_cfg]}
     mgr.process_departures(day=3, date_str="2026-01-03", state=state, clock=mock_clock)
-    mgr._mem.log_event.reset_mock()
+    with patch.object(mgr._mem, "find_expert_by_skill") as mock_search:
+        mock_search.return_value = [
+            {"name": "Bob", "score": 0.9, "dept": "Engineering"}
+        ]
+        mgr._mem.log_event.reset_mock()
 
-    text = "redis-cache connection pool exhausted"
-    mgr.scan_for_knowledge_gaps(
-        text=text,
-        triggered_by="ORG-401",
-        day=5,
-        date_str="2026-01-05",
-        state=state,
-        timestamp=mock_clock,
-    )
-    mgr.scan_for_knowledge_gaps(
-        text=text,
-        triggered_by="ORG-402",
-        day=6,
-        date_str="2026-01-06",
-        state=state,
-        timestamp=mock_clock,
-    )
+        text = "redis-cache connection pool exhausted"
 
-    gap_events = [
-        call.args[0]
-        for call in mgr._mem.log_event.call_args_list
-        if call.args[0].type == "knowledge_gap_detected"
-    ]
-    assert len(gap_events) == 2
+        mgr.scan_for_knowledge_gaps(
+            text=text,
+            triggered_by="ORG-401",
+            day=5,
+            date_str="x",
+            state=state,
+            timestamp="t",
+        )
+
+        mgr.scan_for_knowledge_gaps(
+            text=text,
+            triggered_by="ORG-401",
+            day=5,
+            date_str="x",
+            state=state,
+            timestamp="t",
+        )
+
+        mgr.scan_for_knowledge_gaps(
+            text=text,
+            triggered_by="ORG-402",
+            day=6,
+            date_str="y",
+            state=state,
+            timestamp="t",
+        )
+
+        gap_events = [
+            call.args[0]
+            for call in mgr._mem.log_event.call_args_list
+            if call.args[0].type == "knowledge_gap_detected"
+        ]
+
+        assert len(gap_events) == 2
 
 
 def test_knowledge_gap_scan_no_false_positives(lifecycle, mock_clock):

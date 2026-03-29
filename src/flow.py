@@ -826,42 +826,6 @@ class OrgForgeSimulation:
                 except Exception as e:
                     logger.error(f"[genesis] Persona embed failed for {name}: {e}")
 
-        sim_start = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
-        for gap in CONFIG.get("knowledge_gaps", []):
-            name = gap["name"]
-            left_date = gap["left"]  # "2024-06"
-            left_dt = datetime.strptime(left_date, "%Y-%m")
-            departure_day = -(sim_start - left_dt).days
-
-            self._mem.log_event(
-                SimEvent(
-                    type="employee_departed",
-                    day=departure_day,
-                    date=f"{left_date}-01",
-                    timestamp=f"{left_date}-01T09:00:00",
-                    actors=[name],
-                    artifact_ids={},
-                    facts={
-                        "name": name,
-                        "role": gap.get("role", ""),
-                        "knowledge_domains": gap.get("knew_about", []),
-                        "documented_pct": gap.get("documented_pct", 0.0),
-                        "reason": "voluntary",
-                        "scheduled": True,
-                    },
-                    summary=(
-                        f"{name} ({gap.get('role', 'unknown role')}) departed "
-                        f"Day {departure_day} [voluntary]. "
-                        f"Gaps: {', '.join(gap.get('knew_about', []))}. "
-                        f"~{int(gap.get('documented_pct', 0) * 100)}% documented."
-                    ),
-                    tags=["employee_departed", "lifecycle", "genesis"],
-                )
-            )
-            logger.info(
-                f"[genesis] Logged pre-sim departure: {name} (Day {departure_day})"
-            )
-
         self._confluence.write_genesis_batches_parallel(
             [
                 {
@@ -1790,33 +1754,7 @@ class OrgForgeSimulation:
             on_call,
         )
 
-        involves_gap = any(
-            k.lower() in root_cause.lower()
-            for emp in DEPARTED_EMPLOYEES.values()
-            for k in emp["knew_about"]
-        )
-
-        gap_areas: List[str] = []
-        gap_context_str: str = ""
-        if involves_gap:
-            departed_details: List[str] = []
-            for emp_name, emp in DEPARTED_EMPLOYEES.items():
-                hits = [k for k in emp["knew_about"] if k.lower() in root_cause.lower()]
-                if hits:
-                    gap_areas.extend(hits)
-                    departed_details.append(
-                        f"{emp_name} (ex-{emp['role']}, left {emp['left']}, "
-                        f"{int(emp['documented_pct'] * 100)}% documented) "
-                        f"owned: {', '.join(hits)}"
-                    )
-            if departed_details:
-                gap_context_str = (
-                    f"KNOWLEDGE GAP FLAG: This incident touches underdocumented systems. "
-                    f"{' | '.join(departed_details)}. "
-                    f"Resolution may be blocked pending knowledge recovery."
-                )
-
-        self._lifecycle.scan_for_knowledge_gaps(
+        detected_gaps = self._lifecycle.scan_for_knowledge_gaps(
             text=root_cause,
             triggered_by=ticket_id,
             day=self.state.day,
@@ -1824,6 +1762,21 @@ class OrgForgeSimulation:
             state=self.state,
             timestamp=incident_start_iso,
         )
+
+        involves_gap = len(detected_gaps) > 0
+        gap_areas = [g.domain_hit for g in detected_gaps]
+        gap_context_str = ""
+
+        if involves_gap:
+            details = [
+                f"{g.departed_name} (owned {g.domain_hit}, {int(g.documented_pct * 100)}% documented)"
+                for g in detected_gaps
+            ]
+            gap_context_str = (
+                f"KNOWLEDGE GAP FLAG: This incident touches underdocumented systems. "
+                f"{' | '.join(details)}. "
+                f"Resolution may be blocked pending knowledge recovery."
+            )
 
         prior = self._recurrence_detector.find_prior_incident(
             root_cause, self.state.day, ticket_id

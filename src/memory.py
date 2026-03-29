@@ -483,17 +483,23 @@ class Memory:
         }
 
         for coll_name in ["artifacts", "events"]:
-            if coll_name not in self._db.list_collection_names():
-                try:
-                    self._db.create_collection(coll_name)
-                    logger.info(f"[memory] Created collection: {coll_name}")
-                except Exception:
-                    pass
-
             coll = self._db[coll_name]
 
-            existing_indexes = list(coll.list_search_indexes())
-            if not any(idx.get("name") == "vector_index" for idx in existing_indexes):
+            existing = list(coll.list_search_indexes())
+            vector_idx = next(
+                (i for i in existing if i.get("name") == "vector_index"), None
+            )
+
+            if vector_idx:
+                status = vector_idx.get("status")
+                if status in ("FAILED", "DOES_NOT_EXIST"):
+                    logger.warning(
+                        f"[memory] Index on {coll_name} is {status}. Dropping..."
+                    )
+                    coll.drop_search_index("vector_index")
+                    vector_idx = None
+
+            if not vector_idx:
                 try:
                     search_index_model = SearchIndexModel(
                         definition=index_definition,
@@ -501,9 +507,9 @@ class Memory:
                         type="vectorSearch",
                     )
                     coll.create_search_index(model=search_index_model)
-                    logger.info(f"[memory] Created vector_index on {coll.name}")
+                    logger.info(f"[memory] Created vector_index on {coll_name}")
                 except Exception as e:
-                    logger.error(f"[memory] Could not create index on {coll.name}: {e}")
+                    logger.error(f"[memory] Failed to create index on {coll_name}: {e}")
 
     # ─── WRITE ────────────────────────────────
 
