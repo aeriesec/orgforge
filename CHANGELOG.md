@@ -6,7 +6,31 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [v1.2.8] — 2026-03-27
+## [v1.3.1] — 2026-03-28
+
+### Added
+
+- **Cross-Domain Evaluation Suite (`eval/`, `src/post_sim_artifacts.py`)**: introduced 11 new evaluation question types including **ZD_RESOLUTION**, **SF_RISK**, and **INVOICE_SLA**. The framework now includes specialized scorers for financial credits, NPS drivers, and PR review verdicts to validate RAG performance across the entire business logic stack.
+- **Reactive Customer Reply Loop (`src/external_email_ingest.py`)**: implemented a probabilistic customer response system. The simulation now classifies inbound emails (Complaints vs. Feature Requests) and allows customers to autonomously advance **Salesforce Opportunity stages** based on the quality of outbound sales replies.
+- **Concurrent Embedding Engine (`src/embed_worker.py`)**: replaced the serial background worker with a `ThreadPoolExecutor`-based system. This supports high-throughput embedding via **Infinity** (up to 16 concurrent calls) while maintaining causal consistency through a new `drain()` synchronization mechanism.
+- **Advanced Retrieval Architectures (`eval/eval_e2e.py`)**: added support for **Reciprocal Rank Fusion (RRF)** and **Graph-Augmented Retrievers**, allowing the evaluation agent to fuse BM25 lexical search with dense vector embeddings and 2-hop artifact expansion.
+
+### Changed
+
+- **Stateful Persona Architecture (`src/utils/persona_utils.py`)**: refactored persona generation into a centralized `PersonaUtils` singleton. Voice cards now inject **"CRM Pressure" hints**, causing internal employees to exhibit higher stress and terser communication when they own at-risk deals or urgent Zendesk tickets.
+- **CRM-Driven Graph Dynamics (`src/graph_dynamics.py`, `src/flow.py`)**: integrated live Salesforce/Zendesk telemetry into the social graph. Edge weights between liaisons and external contacts now fluctuate based on account sentiment, and stress propagates through the organization when "lighthouse" customers flag risks.
+- **Theme-Triggered Incidents (`src/flow.py`)**: updated the incident generator to be reactive to the daily planning theme. Stability "collisions" are now more likely to fire if the daily plan involves high-risk activities like "migrations" or "refactors" identified via keyword triggers.
+- **HyDE Query Rewriting (`src/memory.py`)**: migrated the `recall_with_rewrite` logic from a generic callable to a native **Bedrock-hosted Llama 3.3** implementation for more robust hypothetical document generation.
+
+### Fixed
+
+- **PR Review Approval Logic (`src/normal_day.py`)**: fixed a bug where engineers would requested changes indefinitely by implementing "Review Round" guidance, forcing approvals after 3 rounds unless critical bugs are present.
+- **Causal Chain Integrity (`src/external_email_ingest.py`)**: corrected an issue where inbound vendor emails were orphaned; all external communications are now properly rooted in a `CausalChainHandler` and tracked through downstream JIRA/Slack artifacts.
+- **Cleanup**: deleted the legacy `src/email_gen.py` script in favor of the live, event-driven ingestor system.
+
+---
+
+## [v1.3.0] — 2026-03-27
 
 ### Added
 

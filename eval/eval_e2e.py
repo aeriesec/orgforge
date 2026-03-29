@@ -61,6 +61,14 @@ import numpy as np
 
 logger = logging.getLogger("orgforge.eval_e2e")
 
+# Lazy import so the module is optional when only using built-in retrievers.
+try:
+    from retrieval_extensions import RRFRetriever, GraphAugmentedRetriever
+
+    _EXTENSIONS_AVAILABLE = True
+except ImportError:
+    _EXTENSIONS_AVAILABLE = False
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 HF_DATASET_ID = os.environ.get("HF_DATASET_ID", "INSERT_ID_HERE")
@@ -354,6 +362,7 @@ class BedrockCohereRetriever(Retriever):
 
 
 def build_retriever(name: str, region: str = "us-east-1") -> Retriever:
+    # ── original retrievers ────────────────────────────────────────────────────
     if name == "bm25":
         return BM25Retriever()
     if name == "cohere":
@@ -362,8 +371,36 @@ def build_retriever(name: str, region: str = "us-east-1") -> Retriever:
         return BedrockCohereRetriever(region=region)
     if name == "openai":
         return OpenAIRetriever()
+
+    # ── RRF and Graph retrievers (require retrieval_extensions.py) ─────────────
+    if not _EXTENSIONS_AVAILABLE:
+        raise SystemExit(
+            f"retriever={name!r} requires retrieval_extensions.py in the same "
+            "directory.  Make sure that file is present and importable."
+        )
+
+    # RRF: fuse BM25 + dense retriever
+    if name == "rrf":
+        return RRFRetriever([BM25Retriever(), CohereRetriever()])
+    if name == "rrf-openai":
+        return RRFRetriever([BM25Retriever(), OpenAIRetriever()])
+    if name == "rrf-bedrock":
+        return RRFRetriever([BM25Retriever(), BedrockCohereRetriever(region=region)])
+
+    # Graph-Augmented: expand any base retriever along the artifact graph
+    if name == "graph-bm25":
+        return GraphAugmentedRetriever(BM25Retriever())
+    if name == "graph-cohere":
+        return GraphAugmentedRetriever(CohereRetriever())
+    if name == "graph-rrf":
+        base = RRFRetriever([BM25Retriever(), CohereRetriever()])
+        return GraphAugmentedRetriever(base)
+
     raise ValueError(
-        f"Unknown retriever: {name!r}. Choose bm25 | cohere | cohere-bedrock | openai"
+        f"Unknown retriever: {name!r}. "
+        "Choose bm25 | cohere | cohere-bedrock | openai | "
+        "rrf | rrf-openai | rrf-bedrock | "
+        "graph-bm25 | graph-cohere | graph-rrf"
     )
 
 
@@ -1163,9 +1200,27 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--retriever",
-        choices=["bm25", "cohere", "cohere-bedrock", "openai"],
+        choices=[
+            "bm25",
+            "cohere",
+            "cohere-bedrock",
+            "openai",
+            # Reciprocal Rank Fusion
+            "rrf",
+            "rrf-openai",
+            "rrf-bedrock",
+            # Graph-Augmented (1-2 hop artifact expansion)
+            "graph-bm25",
+            "graph-cohere",
+            "graph-rrf",
+        ],
         default="bm25",
-        help="Retriever to use (default: bm25). cohere-bedrock uses Bedrock credentials.",
+        help=(
+            "Retriever to use (default: bm25).\n"
+            "  bm25 / cohere / cohere-bedrock / openai  — single retrievers\n"
+            "  rrf / rrf-openai / rrf-bedrock            — BM25 + dense fusion (RRF)\n"
+            "  graph-bm25 / graph-cohere / graph-rrf     — graph-augmented expansion"
+        ),
     )
     p.add_argument(
         "--generator",

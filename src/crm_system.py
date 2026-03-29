@@ -64,13 +64,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 import random
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-from config_loader import CONFIG
+from config_loader import COMPANY_NAME, CONFIG
 
 logger = logging.getLogger("orgforge.crm")
 
@@ -346,7 +345,7 @@ class CRMSystem:
 
             if active_pipeline:
                 lines.append(
-                    f"ACTIVE SALES PIPELINE (Target these for proactive outreach!):"
+                    "ACTIVE SALES PIPELINE (Target these for proactive outreach!):"
                 )
 
                 for stage in [
@@ -795,6 +794,9 @@ class CRMSystem:
         sender_org = email_data.get("sender_org", "")
         recip_org = email_data.get("recipient_org", email_data.get("to_org", "Unknown"))
 
+        if not recip_org or recip_org.lower() == COMPANY_NAME.lower():
+            return None
+
         stage = email_data.get("stage", "Prospecting")
 
         safe_org = recip_org.upper().replace(" ", "").replace("-", "")
@@ -838,6 +840,7 @@ class CRMSystem:
                             "sender": sender,
                             "subject": email_data.get("subject", ""),
                             "timestamp": timestamp,
+                            "embed_id": email_data.get("embed_id", ""),
                         }
                     }
                 },

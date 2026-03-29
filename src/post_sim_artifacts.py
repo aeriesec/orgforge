@@ -24,8 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
-import os
 import random
 import uuid
 from datetime import datetime, timedelta
@@ -38,7 +36,6 @@ from config_loader import (
     COMPANY_DOMAIN,
     COMPANY_NAME,
     CONFIG,
-    EXPORT_DIR,
     INDUSTRY,
 )
 from memory import Memory, SimEvent
@@ -312,7 +309,7 @@ class NPSWriter:
             t["resolved_day"] for t in tickets if t.get("resolved_day") is not None
         ]
         base_day = max(resolved_days) if resolved_days else self._end_day
-        response_day = min(base_day + self._response_delay_days, self._end_day + 5)
+        response_day = min(base_day + self._RESPONSE_DELAY_DAYS, self._end_day + 5)
         return _iso(_sim_date(response_day, self._start))
 
     def build_responses(self) -> List[Dict]:
@@ -699,7 +696,7 @@ class DatadogWriter:
                 p50 = self._latency_p50(p99)
 
                 tags = [
-                    f"env:production",
+                    "env:production",
                     f"service:{COMPANY_NAME.lower().replace(' ', '-')}",
                     f"sim_day:{day}",
                 ]
@@ -770,7 +767,7 @@ class DatadogWriter:
                 "tags": [
                     "severity:critical",
                     f"incident:{iid}",
-                    f"env:production",
+                    "env:production",
                     f"sim_day:{inc['open_day']}",
                 ],
                 "attributes": {
@@ -1018,18 +1015,18 @@ def _nps_placeholder(r: Dict) -> str:
         )
     if classification == "passive":
         return (
-            f"Generally good but there have been a couple of hiccups. "
-            f"Would be a 10 if the reliability was more consistent."
+            "Generally good but there have been a couple of hiccups. "
+            "Would be a 10 if the reliability was more consistent."
         )
 
     if detail.get("escalated_tickets", 0):
         return (
-            f"We had a support ticket escalate into a full incident and it "
-            f"took longer than expected to resolve. Impacted our team significantly."
+            "We had a support ticket escalate into a full incident and it "
+            "took longer than expected to resolve. Impacted our team significantly."
         )
     return (
-        f"Some reliability issues during our contract period that affected our "
-        f"operations. Hoping to see improvement before renewal."
+        "Some reliability issues during our contract period that affected our "
+        "operations. Hoping to see improvement before renewal."
     )
 
 

@@ -24,7 +24,7 @@ from planner_models import (
 )
 from causal_chain_handler import CausalChainHandler
 from insider_threat import _NullInjector
-from utils.persona_utils import get_voice_card
+from utils.persona_utils import persona_utils
 
 logger = logging.getLogger("orgforge.normalday")
 
@@ -263,7 +263,7 @@ class NormalDayHandler:
                 )
             )
 
-        backstory = get_voice_card(assignee, "async", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(assignee, "async", self._gd, self._mem)
 
         if is_non_eng:
             persona = self._config.get("personas", {}).get(assignee, {})
@@ -286,6 +286,26 @@ class NormalDayHandler:
             )
             completion_note = ""
 
+        reviewer_feedback_hint = ""
+        if ticket.get("status") == "In Review":
+            for linked_pr_id in ticket.get("linked_prs", []):
+                linked_pr = self._mem._prs.find_one(
+                    {"pr_id": linked_pr_id, "status": "open"}, {"_id": 0}
+                )
+                if linked_pr and linked_pr.get("changes_requested"):
+                    recent_feedback = linked_pr.get("comments", [])[-3:]
+                    if recent_feedback:
+                        feedback_lines = "\n".join(
+                            f"  - {c['author']}: {c['text'][:200]}"
+                            for c in recent_feedback
+                        )
+                        reviewer_feedback_hint = (
+                            f"\nREVIEWER FEEDBACK TO ADDRESS:\n{feedback_lines}\n"
+                            f"Your comment must describe specifically how you addressed this feedback. "
+                            f"Do not describe unrelated work.\n"
+                        )
+                    break
+
         agent = make_agent(
             role=f"{assignee} — {agent_role}",
             backstory=backstory,
@@ -296,6 +316,7 @@ class NormalDayHandler:
             description=(
                 f"You are {assignee}. You worked on ticket [{ticket_id}] today.\n\n"
                 f"Your task today: {item.description}\n"
+                f"{reviewer_feedback_hint}"
                 f"IMPORTANT: Your comment must be specifically about this ticket's work — "
                 f"do not describe unrelated tasks.\n"
                 f"{completion_note}\n\n"
@@ -365,6 +386,16 @@ class NormalDayHandler:
                 "day": self._state.day,
             }
         )
+
+        if ticket.get("status") == "In Review":
+            for linked_pr_id in ticket.get("linked_prs", []):
+                linked_pr = self._mem._prs.find_one(
+                    {"pr_id": linked_pr_id, "status": "open"}, {"_id": 0}
+                )
+                if linked_pr and linked_pr.get("changes_requested"):
+                    linked_pr["changes_requested"] = False
+                    self._mem.upsert_pr(linked_pr)
+
         if ticket["status"] == "To Do":
             ticket["status"] = "In Progress"
             if "in_progress_since" not in ticket:
@@ -781,7 +812,7 @@ class NormalDayHandler:
         current_actor_time = artifact_time.isoformat()
 
         ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
-        backstory = get_voice_card(reviewer, "async", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(reviewer, "async", self._gd, self._mem)
         p = self._config.get("personas", {}).get(reviewer, {})
 
         recurrence_hint = ""
@@ -797,26 +828,58 @@ class NormalDayHandler:
                     f"Prior root cause: {ancestor_root_cause[:120]}"
                 )
 
+        prior_reviews = pr.get("comments", [])
+        round_count = len(prior_reviews)
+
+        prior_reviews = pr.get("comments", [])
+        review_history = ""
+        if prior_reviews:
+            rounds = "\n".join(
+                f"  - {c['author']} ({c['date']}): [{c.get('verdict', '?')}] {c['text'][:120]}"
+                for c in prior_reviews[-6:]  # last 6 comments max
+            )
+            review_history = f"\n--- PRIOR REVIEW ROUNDS ---\n{rounds}\n\n"
+
         agent = make_agent(
             role=f"{reviewer} — {p.get('social_role', 'Code Reviewer')}",
             goal=f"Write a PR review comment as {reviewer} would, reflecting your current stress and style.",
             backstory=backstory,
             llm=self._worker,
         )
+        if round_count == 0:
+            approval_guidance = (
+                "This is the first review. Scrutinize carefully — request changes if "
+                "there are correctness, safety, or design issues."
+            )
+        elif round_count == 1:
+            approval_guidance = (
+                "This is the second review round. The author has had one round of feedback. "
+                "Approve if the main issues have been addressed, even if minor things remain. "
+                "Only request changes again if a concrete correctness issue is still unresolved."
+            )
+        else:
+            approval_guidance = (
+                f"This is review round {round_count + 1}. The author has responded to "
+                f"{round_count} rounds of feedback. You MUST approve unless there is an "
+                f"obvious unresolved bug or security issue. Do not invent new concerns."
+            )
+
         task = Task(
             description=(
                 f"You are {reviewer}. You are reviewing this PR by {author}: {pr_title}\n\n"
-                f"Write a review comment (1-4 sentences). Be specific — mention code patterns, "
-                f"potential edge cases, or required changes. Your tone must reflect your current "
-                f"stress level (see your backstory).\n\n"
-                f"Then decide: does this PR meet the bar to merge, or does it need changes?\n\n"
+                f"{review_history}"
+                f"STEP 1 — DECIDE YOUR VERDICT FIRST:\n"
+                f"{approval_guidance}\n"
+                f"Choose: 'approved' or 'changes_requested'.\n\n"
+                f"STEP 2 — WRITE YOUR COMMENT:\n"
+                f"Write 1-3 sentences consistent with your verdict. If approved, acknowledge "
+                f"what looks good. If changes_requested, name the specific issue only.\n"
+                f"Your tone must reflect your current stress level (see your backstory).\n\n"
                 f"Respond ONLY with valid JSON. No preamble, no markdown fences.\n"
                 f"{{\n"
                 f'  "comment": "your review comment here",\n'
                 f'  "verdict": "approved" or "changes_requested"\n'
                 f"}}\n\n"
-                f"verdict must be exactly 'approved' if the code is ready to merge, "
-                f"or 'changes_requested' if the author needs to address something first.\n\n"
                 f"{recurrence_hint}"
                 f"--- CONTEXT ---\n{ctx}"
             ),
@@ -826,6 +889,7 @@ class NormalDayHandler:
             ),
             agent=agent,
         )
+
         raw_review = str(
             Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         ).strip()
@@ -877,7 +941,7 @@ class NormalDayHandler:
             if linked_ticket and linked_ticket.get("status") == "In Review":
                 linked_ticket["status"] = "In Progress"
 
-                linked_ticket["in_progress_since"] = self._state.day
+                linked_ticket["last_review_requested_day"] = self._state.day
                 linked_ticket["updated_at"] = current_actor_time
                 self._save_ticket(linked_ticket)
             self._emit_bot_message(
@@ -1038,7 +1102,7 @@ class NormalDayHandler:
                 )
 
         ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
-        backstory = get_voice_card(reviewer, "async", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(reviewer, "async", self._gd, self._mem)
         p = self._config.get("personas", {}).get(reviewer, {})
 
         agent = make_agent(
@@ -1182,7 +1246,7 @@ class NormalDayHandler:
             as_of_time=meeting_time_iso,
         )
 
-        backstory = get_voice_card(
+        backstory = persona_utils.get_voice_card(
             [name, collaborator], "one_on_one", self._gd, self._mem
         )
 
@@ -1367,8 +1431,8 @@ class NormalDayHandler:
         meeting_start, _ = self._clock.sync_and_advance(all_actors, hours=0)
         meeting_time_iso = meeting_start.isoformat()
 
-        ctx = self._mem.context_for_prompt(
-            ticket_title, n=2, as_of_time=meeting_time_iso
+        ctx = self._mem.context_for_ticket(
+            ticket_id=ticket_id, as_of_time=meeting_time_iso
         )
 
         relevant_experts = self._mem.find_confluence_experts(
@@ -1396,7 +1460,9 @@ class NormalDayHandler:
         )
         design_hint = self._mem.format_design_discussions_hint(discussions)
 
-        backstory = get_voice_card(all_actors, "async", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(
+            all_actors, "async", self._gd, self._mem
+        )
 
         responders = [a for a in all_actors if a != asker]
         turn_speakers = [asker] + responders
@@ -1581,8 +1647,8 @@ class NormalDayHandler:
         meeting_start, _ = self._clock.sync_and_advance(participants, hours=0)
         meeting_time_iso = meeting_start.isoformat()
 
-        ctx = self._mem.context_for_prompt(
-            item.description, n=3, as_of_time=meeting_time_iso
+        ctx = self._mem.context_for_ticket(
+            ticket_id=item.related_id, as_of_time=meeting_time_iso
         )
 
         medium = getattr(item, "meeting_medium", "slack")
@@ -1707,7 +1773,9 @@ class NormalDayHandler:
             as_of_time=meeting_time_iso,
         )
 
-        backstory = get_voice_card([mentor, mentee], "mentoring", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(
+            [mentor, mentee], "mentoring", self._gd, self._mem
+        )
 
         agents, tasks, prev_task = [], [], None
         n_turns = self._turn_count([mentor, mentee], (3, 6))
@@ -1876,7 +1944,9 @@ class NormalDayHandler:
             event.rationale, n=2, as_of_time=thread_start_iso
         )
 
-        voice_cards = get_voice_card(participants, "collision", self._gd, self._mem)
+        voice_cards = persona_utils.get_voice_card(
+            participants, "collision", self._gd, self._mem
+        )
 
         n_turns = {
             "high": random.randint(5, 8),
@@ -1989,7 +2059,9 @@ class NormalDayHandler:
         channel = asker_dept.lower().replace(" ", "-")
         participants = [asker, collaborator]
 
-        backstory = get_voice_card(participants, "dm", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(
+            participants, "dm", self._gd, self._mem
+        )
 
         asker_role = (
             self._config.get("personas", {})
@@ -2122,7 +2194,7 @@ class NormalDayHandler:
         dept = dept_of_name(assignee, self._org_chart)
         lead = self._find_lead_for(assignee) or assignee
 
-        backstory = get_voice_card(assignee, "async", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(assignee, "async", self._gd, self._mem)
 
         p = self._config.get("personas", {}).get(assignee, {})
 
@@ -2263,7 +2335,7 @@ class NormalDayHandler:
                 )
 
         p = self._config.get("personas", {}).get(assignee, {})
-        backstory = get_voice_card(assignee, "async", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(assignee, "async", self._gd, self._mem)
         stage = opportunity_id and self._crm._sf_o.find_one(
             {"opportunity_id": opportunity_id}, {"stage": 1, "_id": 0}
         )
@@ -2333,6 +2405,8 @@ class NormalDayHandler:
         with open(eml_path, "w") as fh:
             fh.write(msg.as_string())
 
+        thread_id = f"sales_email_{ticket_id}_{self._state.day}"
+
         self._crm.process_outbound_email(
             email_data={
                 "sender": assignee,
@@ -2341,13 +2415,33 @@ class NormalDayHandler:
                 "recipient_org": account_name,
                 "subject": subject,
                 "stage": new_stage,
+                "embed_id": thread_id,
             },
             timestamp=timestamp,
             date_str=date_str,
             day=self._state.day,
         )
 
-        thread_id = f"sales_email_{ticket_id}_{self._state.day}"
+        self._mem._db["emails"].update_one(
+            {"embed_id": thread_id},
+            {
+                "$setOnInsert": {
+                    "embed_id": thread_id,
+                    "direction": "outbound",
+                    "from_name": assignee,
+                    "from_addr": sender_addr,
+                    "to_name": contact_name,
+                    "to_addr": contact_email,
+                    "subject": subject,
+                    "body": body,
+                    "timestamp": timestamp,
+                    "day": self._state.day,
+                    "date": date_str,
+                    "eml_path": str(eml_path),
+                }
+            },
+            upsert=True,
+        )
 
         chain.append(thread_id)
 
@@ -2535,7 +2629,7 @@ class NormalDayHandler:
     ) -> Tuple[List[str], str]:
         """Author replies to a review question in #engineering."""
 
-        backstory = get_voice_card(author, "async", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(author, "async", self._gd, self._mem)
         p = self._config.get("personas", {}).get(author, {})
 
         agent = make_agent(
@@ -2745,7 +2839,9 @@ class NormalDayHandler:
             Crew(agents=[topic_agent], tasks=[topic_task], verbose=False).kickoff()
         ).strip()
 
-        voice_cards = get_voice_card(participants, "watercooler", self._gd, self._mem)
+        voice_cards = persona_utils.get_voice_card(
+            participants, "watercooler", self._gd, self._mem
+        )
 
         speaker_sequence = ", ".join(
             participants[i % len(participants)] for i in range(len(participants) + 1)
@@ -2975,9 +3071,10 @@ class NormalDayHandler:
         Original Slack-thread path extracted from _handle_design_discussion.
         Returns (slack_path, thread_id, tags).
         """
-        from utils.persona_utils import get_voice_card
 
-        backstory = get_voice_card(participants, "async", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(
+            participants, "async", self._gd, self._mem
+        )
 
         turn_speakers = [initiator] + [
             participants[i % len(participants)] for i in range(1, random.randint(5, 8))
@@ -3058,9 +3155,10 @@ class NormalDayHandler:
 
         Returns (file_path, transcript_id, tags).
         """
-        from utils.persona_utils import get_voice_card
 
-        backstory = get_voice_card(participants, "sync", self._gd, self._mem)
+        backstory = persona_utils.get_voice_card(
+            participants, "sync", self._gd, self._mem
+        )
 
         agent = make_agent(
             role="Meeting Transcript Generator",
@@ -3146,13 +3244,13 @@ class NormalDayHandler:
         transcript_id = f"zoom_{date_str}_{uuid.uuid4().hex[:8]}"
 
         lines = [
-            f"# Zoom Meeting Transcript",
+            "# Zoom Meeting Transcript",
             f"**Date:** {date_str}",
             f"**Topic:** {topic}",
             f"**Attendees:** {', '.join(participants)}",
-            f"",
-            f"---",
-            f"",
+            "",
+            "---",
+            "",
         ]
 
         current_ts = datetime.fromisoformat(meeting_time_iso)

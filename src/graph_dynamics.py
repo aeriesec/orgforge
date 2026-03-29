@@ -394,3 +394,252 @@ class GraphDynamics:
             (d for d, members in self._org_chart.items() if name in members), ""
         )
         return f"{dept} Engineer" if dept else "Engineer"
+
+    def crm_aware_escalation_chain(
+        self,
+        first_responder: str,
+        crm,
+        root_cause: str = "",
+        for_org: Optional[str] = None,
+        domain_keywords: Optional[List[str]] = None,
+    ) -> EscalationChain:
+        """
+        Escalation chain that prefers routing through whoever owns the affected
+        SF account, then falls back to the standard Dijkstra path.
+
+        Use instead of build_escalation_chain() when an incident has a known
+        customer blast radius (i.e. ZD tickets were opened or SF deals flagged).
+
+        Args:
+            first_responder: The on-call engineer starting the chain.
+            crm:             Live CRMSystem (or NullCRMSystem — safely ignored).
+            incident_component: Passed through to domain_keywords fallback.
+            for_org:         If set, look up the SF account owner for this org
+                            and prefer them as an intermediate hop.
+        """
+        from crm_system import NullCRMSystem
+
+        preferred_intermediate: Optional[str] = None
+
+        if not isinstance(crm, NullCRMSystem) and for_org:
+            opp = crm._sf_o.find_one(
+                {
+                    "account_name": for_org,
+                    "stage": {"$nin": ["Closed Won", "Closed Lost"]},
+                    "owner": {"$nin": ["Pending Reassignment", "Unassigned"]},
+                },
+                {"owner": 1},
+            )
+            if opp:
+                candidate = opp["owner"]
+                if candidate != first_responder and self.G.has_node(candidate):
+                    preferred_intermediate = candidate
+
+        if preferred_intermediate:
+            leg1 = self.build_escalation_chain(
+                first_responder,
+                domain_keywords=[root_cause] if root_cause else None,
+            )
+
+            raw = leg1.raw_path
+            if preferred_intermediate not in raw:
+                raw = [raw[0], preferred_intermediate] + raw[1:]
+
+            chain = [(n, self._role_label(n)) for n in raw]
+            reached_lead = any(n in self._leads.values() for n in raw[1:])
+            return EscalationChain(
+                chain=chain,
+                path_length=len(raw) - 1,
+                reached_lead=reached_lead,
+                raw_path=raw,
+            )
+
+        return self.build_escalation_chain(
+            first_responder,
+            domain_keywords=[root_cause] if root_cause else None,
+        )
+
+    def sync_crm_edge_weights(self, crm) -> Dict[str, float]:
+        """
+        Reads live CRM state and adjusts edge weights between external contact
+        nodes and their internal liaison to reflect relationship health.
+
+        Weight logic:
+        - Base:                    0.5  (floor)
+        - Recent ZD ticket:       +2.0  (they're actively talking to us)
+        - Urgent ZD ticket:       +1.0  (extra signal — high-touch moment)
+        - Open SF opp:            +3.0  (active sales relationship)
+        - Opp in Negotiation:     +2.0  (deal heat)
+        - SF risk flag:           -2.5  (relationship in trouble)
+        - No opp, no ticket:      -0.5  (going quiet — drift toward estranged)
+
+        Returns a dict of {node_id: new_weight} for SimEvent logging.
+        """
+        from crm_system import NullCRMSystem
+
+        if isinstance(crm, NullCRMSystem):
+            return {}
+
+        zd = crm._zd
+        sf_a = crm._sf_a
+        sf_o = crm._sf_o
+        floor = self.cfg.get("edge_weight_floor", 0.5)
+        changed: Dict[str, float] = {}
+
+        for node, data in self.G.nodes(data=True):
+            if not data.get("external", False):
+                continue
+
+            neighbours = list(self.G.neighbors(node))
+            if not neighbours:
+                continue
+            liaison = neighbours[0]
+
+            org_name = data.get("org", node)
+
+            open_tickets = list(
+                zd.find(
+                    {"org_name": org_name, "status": {"$in": ["Open", "Pending"]}},
+                    {"priority": 1},
+                )
+            )
+            ticket_boost = 0.0
+            if open_tickets:
+                ticket_boost += 2.0
+                if any(t.get("priority") == "Urgent" for t in open_tickets):
+                    ticket_boost += 1.0
+
+            account = sf_a.find_one({"name": org_name}, {"risk_flag": 1})
+            open_opp = sf_o.find_one(
+                {
+                    "account_name": org_name,
+                    "stage": {"$nin": ["Closed Won", "Closed Lost"]},
+                },
+                {"stage": 1, "risk_notes": 1},
+            )
+
+            opp_boost = 0.0
+            risk_penalty = 0.0
+            silence_penalty = 0.0
+
+            if open_opp:
+                opp_boost += 3.0
+                if open_opp.get("stage") == "Negotiation/Review":
+                    opp_boost += 2.0
+                if open_opp.get("risk_notes"):
+                    risk_penalty += 2.5
+            elif not open_tickets:
+                silence_penalty = 0.5  # going quiet
+
+            if account and account.get("risk_flag"):
+                risk_penalty += 1.0
+
+            current_w = (
+                self.G[node][liaison].get("weight", floor)
+                if self.G.has_edge(node, liaison)
+                else floor
+            )
+            new_w = round(
+                max(
+                    floor,
+                    current_w
+                    + ticket_boost
+                    + opp_boost
+                    - risk_penalty
+                    - silence_penalty,
+                ),
+                4,
+            )
+
+            if new_w != current_w:
+                if not self.G.has_edge(node, liaison):
+                    self.G.add_edge(node, liaison, weight=floor)
+                self.G[node][liaison]["weight"] = new_w
+                self._centrality_dirty = True
+                changed[node] = new_w
+
+        return changed
+
+    def apply_crm_stress(self, crm) -> Dict[str, int]:
+        """
+        Nudges stress for internal employees based on their CRM exposure.
+        Called once per day, after sync_crm_edge_weights().
+
+        Stress sources:
+        - Each open Urgent ZD ticket for an account they liaise:  +4
+        - Each open Normal ZD ticket:                             +1
+        - Each SF opportunity with risk_notes:                    +6
+        - Each SF opportunity in Negotiation (positive pressure): +2
+        - Opportunity owner for a Closed Won today:               -8 (relief)
+
+        Caps at the existing stress min/max (0-100). Returns {name: delta}.
+        """
+        from crm_system import NullCRMSystem
+
+        if isinstance(crm, NullCRMSystem):
+            return {}
+
+        deltas: Dict[str, int] = {}
+
+        # Build a map: internal_node -> [org_names they're liaison for]
+        liaison_orgs: Dict[str, List[str]] = {}
+        for node, data in self.G.nodes(data=True):
+            if not data.get("external", False):
+                continue
+            org = data.get("org", node)
+            for neighbour in self.G.neighbors(node):
+                if not self.G.nodes[neighbour].get("external", False):
+                    liaison_orgs.setdefault(neighbour, []).append(org)
+
+        for employee, orgs in liaison_orgs.items():
+            if employee not in self._stress:
+                continue
+            delta = 0
+            for org in orgs:
+                tickets = list(
+                    crm._zd.find(
+                        {"org_name": org, "status": {"$in": ["Open", "Pending"]}},
+                        {"priority": 1},
+                    )
+                )
+                for t in tickets:
+                    delta += 4 if t.get("priority") == "Urgent" else 1
+
+                at_risk_opp = crm._sf_o.find_one(
+                    {
+                        "account_name": org,
+                        "stage": {"$nin": ["Closed Won", "Closed Lost"]},
+                        "risk_notes": {"$not": {"$size": 0}},
+                    },
+                    {"stage": 1},
+                )
+                if at_risk_opp:
+                    delta += 6
+                    if at_risk_opp.get("stage") == "Negotiation/Review":
+                        delta += 2  # so close, yet so at-risk
+
+            self._stress[employee] = max(0, min(100, self._stress[employee] + delta))
+            if delta != 0:
+                deltas[employee] = delta
+
+        open_opps = list(
+            crm._sf_o.find(
+                {"stage": {"$nin": ["Closed Won", "Closed Lost"]}},
+                {"owner": 1, "stage": 1, "risk_notes": 1},
+            )
+        )
+        for opp in open_opps:
+            owner = opp.get("owner")
+            if not owner or owner in ("Pending Reassignment", "Unassigned"):
+                continue
+            if owner not in self._stress:
+                continue
+            delta = 0
+            if opp.get("risk_notes"):
+                delta += 5
+            if opp.get("stage") == "Negotiation/Review":
+                delta += 2
+            self._stress[owner] = max(0, min(100, self._stress[owner] + delta))
+            deltas[owner] = deltas.get(owner, 0) + delta
+
+        return deltas

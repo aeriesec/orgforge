@@ -6,7 +6,6 @@ Validates MongoDB writes, JSON exports, and SimEvent emissions.
 """
 
 import pytest
-from datetime import datetime
 from crm_system import CRMSystem, NullCRMSystem
 
 

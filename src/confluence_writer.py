@@ -53,7 +53,7 @@ from config_loader import COMPANY_DESCRIPTION, PERSONAS
 from crewai import Task, Crew
 from memory import Memory, SimEvent
 from artifact_registry import ArtifactRegistry, ConfluencePage
-from utils.persona_utils import get_voice_card
+from utils.persona_utils import persona_utils
 
 if TYPE_CHECKING:
     from graph_dynamics import GraphDynamics
@@ -296,7 +296,7 @@ class ConfluenceWriter:
         artifact_time, _ = self._clock.advance_actor(on_call, hours=pm_hours)
         timestamp = artifact_time.isoformat()
 
-        backstory = get_voice_card(
+        backstory = persona_utils.get_voice_card(
             on_call, "design", mem=self._mem, graph_dynamics=self._gd
         )
         related = self._registry.related_context(topic=root_cause, n=3)
@@ -396,7 +396,7 @@ class ConfluenceWriter:
         chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
         ctx = self._mem.recall_with_rewrite(raw_query=topic, n=3, as_of_time=timestamp)
         related = self._registry.related_context(topic=topic, n=3)
-        backstory = get_voice_card(
+        backstory = persona_utils.get_voice_card(
             author, "design", mem=self._mem, graph_dynamics=self._gd
         )
 
@@ -602,7 +602,7 @@ class ConfluenceWriter:
             n=3,
             as_of_time=self._clock.now(resolved_author).isoformat(),
         )
-        backstory = get_voice_card(
+        backstory = persona_utils.get_voice_card(
             resolved_author, "design", mem=self._mem, graph_dynamics=self._gd
         )
 
@@ -654,7 +654,7 @@ class ConfluenceWriter:
 
         ctx = self._mem.context_for_prompt(title, n=3, as_of_time=timestamp)
         related = self._registry.related_context(topic=title, n=4)
-        backstory = get_voice_card(
+        backstory = persona_utils.get_voice_card(
             resolved_author, "design", mem=self._mem, graph_dynamics=self._gd
         )
 

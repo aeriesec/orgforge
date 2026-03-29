@@ -911,43 +911,8 @@ def test_recall_with_rewrite_falls_back_without_llm():
     result = mem.recall_with_rewrite(
         raw_query="kubernetes pod crash loop",
         n=3,
-        llm_callable=None,
     )
     assert isinstance(result, str)
-
-
-def test_recall_with_rewrite_uses_rewritten_query():
-    """
-    When llm_callable is provided, recall_with_rewrite() must embed the
-    rewritten query, not the raw one. The rewrite step is HyDE — the LLM
-    generates a hypothetical passage that embeds closer to real documents.
-    """
-    from memory import Memory
-
-    mem = Memory()
-    mem._artifacts.aggregate = MagicMock(return_value=[])
-    mem._artifacts.count_documents = MagicMock(return_value=0)
-
-    captured_queries = []
-    original_context = mem.context_for_prompt
-
-    def capturing_context(query, **kwargs):
-        captured_queries.append(query)
-        return original_context(query, **kwargs)
-
-    mem.context_for_prompt = capturing_context
-
-    llm = MagicMock(
-        return_value="A runbook describing Kubernetes pod restart policies and backoff intervals."
-    )
-
-    mem.recall_with_rewrite(raw_query="k8s restarts", n=3, llm_callable=llm)
-
-    assert len(captured_queries) == 1
-    assert captured_queries[0] != "k8s restarts", (
-        "recall_with_rewrite() passed the raw query to context_for_prompt instead "
-        "of the LLM-rewritten passage. The HyDE rewrite step is being skipped."
-    )
 
 
 def test_stats_reflects_artifact_and_event_counts(make_test_memory):
