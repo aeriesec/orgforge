@@ -140,9 +140,9 @@ class PersonaUtils:
 
             lines = [header, f"  Typing style: {quirks}", f"  Current mood: {mood}"]
 
-            if context == "async":
-                lines.insert(2, f"  Expertise: {expertise}")
-            elif context == "watercooler":
+            lines.insert(2, f"  Expertise: {expertise}")
+
+            if context == "watercooler":
                 lines.insert(2, f"  Personal interests: {interests}")
 
             _anti_pattern_contexts = {"async", "design", "collision", "dm"}

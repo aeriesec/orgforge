@@ -419,6 +419,34 @@ class TicketAssigner:
 
         return vector
 
+    def evict_engineer(self, name: str) -> None:
+        """
+        Remove a departed engineer's vector from the cache so they no longer
+        influence cost matrix scoring in _hungarian_assign.
+        Called by OrgLifecycleManager after _execute_departure completes.
+        """
+        self._engineer_vectors.pop(name, None)
+        logger.debug(f"[assigner] Evicted vector for departed engineer: {name}")
+
+    def register_hire(self, name: str) -> None:
+        """
+        Pre-warm the expertise vector for a new hire so their first sprint
+        assignment scores correctly rather than defaulting to the neutral 1.0.
+        Called by OrgLifecycleManager after _execute_hire completes.
+        The persona must already be written to PERSONAS before this is called.
+        """
+        vec = self._expertise_vector(name)
+        if vec:
+            logger.debug(
+                f"[assigner] Pre-warmed expertise vector for new hire: {name} "
+                f"({len(vec)}-dim)"
+            )
+        else:
+            logger.debug(
+                f"[assigner] No expertise vector for new hire {name} "
+                f"(empty expertise — will score neutral)"
+            )
+
     def _ticket_history(self, state) -> Dict[str, set]:
         """
         Returns {engineer: {ticket_ids they've touched in prior days}}.

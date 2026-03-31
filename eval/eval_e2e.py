@@ -48,6 +48,7 @@ leaderboard.json      — append-only leaderboard table (one row per run)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -285,6 +286,129 @@ class OpenAIRetriever(Retriever):
         return [self._doc_ids[int(i)] for i in indices]
 
 
+class InfinityRetriever(Retriever):
+    """
+    OpenAI-compatible retriever for a local/remote Infinity server.
+    Configurable via INFINITY_HOST environment variable (default: http://localhost:11434).
+    """
+
+    name = "infinity"
+
+    _INSTRUCTIONS = {
+        "search_document": "",
+        "search_query": "query: ",
+    }
+
+    def __init__(
+        self,
+        model: str = "Qwen/Qwen3-Embedding-4B",
+        batch_size: int = 2,
+        cache_dir: str = ".embed_cache",
+    ):
+        import requests
+
+        self._model = os.environ.get("EMBED_MODEL", model)
+        self._host = os.environ.get("INFINITY_HOST", "http://localhost:11434")
+        self._batch_size = batch_size
+        self._session = requests.Session()
+        self._cache_dir = Path(cache_dir)
+        self._cache_dir.mkdir(exist_ok=True)
+        self._q_cache = {}
+        self._q_cache_path = None
+
+    def _cache_key(self, corpus: List[dict]) -> str:
+        """Stable key based on model + corpus content."""
+        corpus_fingerprint = hashlib.md5(
+            json.dumps([r["doc_id"] for r in corpus], sort_keys=True).encode()
+        ).hexdigest()[:12]
+        safe_model = self._model.replace("/", "_")
+        return f"{safe_model}__{corpus_fingerprint}"
+
+    def index(self, corpus: List[dict]) -> None:
+        self._doc_ids = [r["doc_id"] for r in corpus]
+        key = self._cache_key(corpus)
+        cache_path = self._cache_dir / f"{self._cache_key(corpus)}.npz"
+
+        self._q_cache_path = self._cache_dir / f"{key}_questions.json"
+        if self._q_cache_path.exists():
+            with open(self._q_cache_path, "r") as f:
+                self._q_cache = json.load(f)
+            logger.info(
+                f"  Loaded {len(self._q_cache)} cached questions from {self._q_cache_path}"
+            )
+
+        if cache_path.exists():
+            logger.info(f"  Loading Infinity embeddings from cache: {cache_path}")
+            data = np.load(cache_path, allow_pickle=True)
+            self._matrix = data["matrix"]
+            assert list(data["doc_ids"]) == self._doc_ids, "Cache doc_id mismatch!"
+            logger.info("  Infinity index ready (from cache)")
+            return
+
+        bodies = [r.get("body", "") or "" for r in corpus]
+
+        logger.info(
+            f"  Embedding {len(bodies)} docs via Infinity ({self._model} at {self._host}) ..."
+        )
+
+        embeddings = []
+        prefix = self._INSTRUCTIONS["search_document"]
+
+        for i in range(0, len(bodies), self._batch_size):
+            batch = bodies[i : i + self._batch_size]
+            prefixed_batch = [prefix + text for text in batch]
+
+            try:
+                resp = self._session.post(
+                    f"{self._host}/embeddings",
+                    json={"model": self._model, "input": prefixed_batch},
+                    timeout=300,
+                )
+                resp.raise_for_status()
+
+                batch_vecs = [d["embedding"] for d in resp.json()["data"]]
+                embeddings.extend(batch_vecs)
+            except Exception as e:
+                logger.error(f"  Crash during corpus indexing at doc {i}: {e}")
+                raise
+            logger.info(
+                f"    embedded {min(i + self._batch_size, len(bodies))}/{len(bodies)}"
+            )
+
+        mat = np.array(embeddings, dtype=np.float32)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        self._matrix = mat / np.where(norms == 0, 1, norms)
+        np.savez_compressed(cache_path, matrix=self._matrix, doc_ids=self._doc_ids)
+        logger.info(f"  Embeddings cached to {cache_path}")
+
+    def retrieve(self, query: str, top_k: int = TOP_K) -> List[str]:
+
+        if query in self._q_cache:
+            q_vec = np.array(self._q_cache[query], dtype=np.float32)
+        else:
+            prefix = self._INSTRUCTIONS["search_query"]
+            resp = self._session.post(
+                f"{self._host}/embeddings",
+                json={"model": self._model, "input": [prefix + query]},
+                timeout=30,
+            )
+            resp.raise_for_status()
+
+            vec_list = resp.json()["data"][0]["embedding"]
+            self._q_cache[query] = vec_list
+
+            if self._q_cache_path:
+                with open(self._q_cache_path, "w") as f:
+                    json.dump(self._q_cache, f)
+
+            q_vec = np.array(vec_list, dtype=np.float32)
+
+        q_vec /= max(np.linalg.norm(q_vec), 1e-9)
+        scores = self._matrix @ q_vec
+        indices = scores.argsort()[::-1][:top_k]
+        return [self._doc_ids[int(i)] for i in indices]
+
+
 class BedrockCohereRetriever(Retriever):
     """
     Cohere Embed v4 via Amazon Bedrock (invoke_model).
@@ -371,6 +495,8 @@ def build_retriever(name: str, region: str = "us-east-1") -> Retriever:
         return BedrockCohereRetriever(region=region)
     if name == "openai":
         return OpenAIRetriever()
+    if name == "infinity":
+        return InfinityRetriever()
 
     # ── RRF and Graph retrievers (require retrieval_extensions.py) ─────────────
     if not _EXTENSIONS_AVAILABLE:
@@ -386,6 +512,8 @@ def build_retriever(name: str, region: str = "us-east-1") -> Retriever:
         return RRFRetriever([BM25Retriever(), OpenAIRetriever()])
     if name == "rrf-bedrock":
         return RRFRetriever([BM25Retriever(), BedrockCohereRetriever(region=region)])
+    if name == "rrf-infinity":
+        return RRFRetriever([BM25Retriever(), InfinityRetriever()])
 
     # Graph-Augmented: expand any base retriever along the artifact graph
     if name == "graph-bm25":
@@ -395,12 +523,15 @@ def build_retriever(name: str, region: str = "us-east-1") -> Retriever:
     if name == "graph-rrf":
         base = RRFRetriever([BM25Retriever(), CohereRetriever()])
         return GraphAugmentedRetriever(base)
+    if name == "graph-rrf":
+        base = RRFRetriever([BM25Retriever(), CohereRetriever()])
+        return GraphAugmentedRetriever(base)
 
     raise ValueError(
         f"Unknown retriever: {name!r}. "
-        "Choose bm25 | cohere | cohere-bedrock | openai | "
-        "rrf | rrf-openai | rrf-bedrock | "
-        "graph-bm25 | graph-cohere | graph-rrf"
+        "Choose bm25 | cohere | cohere-bedrock | openai | infinity | "
+        "rrf | rrf-openai | rrf-bedrock | rrf-infinity | "
+        "graph-bm25 | graph-cohere | graph-infinity | graph-rrf"
     )
 
 
@@ -1205,21 +1336,24 @@ def _parse_args() -> argparse.Namespace:
             "cohere",
             "cohere-bedrock",
             "openai",
+            "infinity",
             # Reciprocal Rank Fusion
             "rrf",
             "rrf-openai",
             "rrf-bedrock",
+            "rrf-infinity",
             # Graph-Augmented (1-2 hop artifact expansion)
             "graph-bm25",
             "graph-cohere",
+            "graph-infinity",
             "graph-rrf",
         ],
         default="bm25",
         help=(
             "Retriever to use (default: bm25).\n"
-            "  bm25 / cohere / cohere-bedrock / openai  — single retrievers\n"
-            "  rrf / rrf-openai / rrf-bedrock            — BM25 + dense fusion (RRF)\n"
-            "  graph-bm25 / graph-cohere / graph-rrf     — graph-augmented expansion"
+            "  bm25 / cohere / cohere-bedrock / openai / infinity  — single retrievers\n"
+            "  rrf / rrf-openai / rrf-bedrock / rrf-infinity        — BM25 + dense fusion (RRF)\n"
+            "  graph-bm25 / graph-cohere / graph-infinity / graph-rrf — graph-augmented expansion"
         ),
     )
     p.add_argument(

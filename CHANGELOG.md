@@ -6,6 +6,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.3.2] — 2026-03-31
+
+### Added
+
+- **Eval Dataset Generator v2 (`eval/eval_harness.py`, `eval/eval_e2e.py`)**: Introduced three novel evaluation tracks: **PERSPECTIVE** (actor visibility cones and information asymmetry), **COUNTERFACTUAL** (causal link testing), and **SILENCE** (expected-but-absent artifact cataloging). Added an **InfinityRetriever** integration with local caching for high-throughput dense retrieval.
+- **Dynamic Domain Registry (`src/memory.py`, `src/org_lifecycle.py`, `src/genesis.py`)**: Implemented a live MongoDB `domain_registry` tracking system ownership and documentation coverage. Coverage automatically degrades into "orphaned" status during departures (`_orphan_domains_on_departure`) and recovers organically as engineers write Confluence docs or new hires claim domains.
+- **Organic Gap Detection (`src/normal_day.py`, `src/confluence_writer.py`)**: Added "SELF-AUDIT" metadata generation to Confluence page creation and peer-review audits to PRs to proactively detect knowledge gaps. Slack Q&A threads are now asynchronously classified by a dedicated LLM (`_assess_async_thread_gap`) to identify unresolved questions.
+- **Commercial & Ops Personas (`config/config.yaml`)**: Expanded the simulation with new department personas including Marcus (Head of Sales & Marketing), Jenna (Marketing), Karen (HR & Ops), and Tom (Operations Manager), while adding strict role definitions for all existing engineers.
+
+### Changed
+
+- **Strict Temporal Horizons (`src/memory.py`, `src/flow.py`, `src/normal_day.py`)**: Threaded an `as_of_time` parameter through core fetch methods (`get_ticket`, `get_event_log`, `get_reviewable_prs_for`) to strictly enforce visibility cones and prevent LLM agents from "seeing into the future" during state assessments.
+- **HuggingFace Corpus Export (`eval/export_to_hf.py`)**: Overhauled the corpus builder to directly sweep native MongoDB collections (Zendesk tickets, Salesforce deals/accounts, PRs, Emails, and Slack messages) instead of relying solely on the primary artifacts collection. Default dense baseline switched to **Qwen/Qwen3-Embedding-4B**.
+- **Multi-Category Scoring (`eval/scorer.py`)**: Upgraded the `TemporalScorer` to support dynamic sub-categories (`knowledge_gap`, `point_in_time`, `stress_state`, `propagation`) and introduced a new `MultiHopScorer` to evaluate partial credit across multi-stage causal chains.
+- **Incident On-Call Rotation (`src/flow.py`)**: Refactored incident generation to use a deterministic daily on-call rotation (`_get_next_on_call`) paired with dynamic cross-department friction signals, replacing the previous hardcoded gap-incident generation.
+
+### Fixed
+
+- **Insider Threat Telemetry (`eval/insider_threat/eval_insider_threat.py`)**: Removed faulty phone call access log scraping that improperly linked innocent victim records to attacker actors.
+- **Persona Prompt Bleed (`src/utils/persona_utils.py`)**: Fixed missing expertise context in async and watercooler interactions by unconditionally injecting the "Expertise" list into all persona voice cards.
+- **Redundant Email Routing (`src/external_email_ingest.py`)**: Disabled legacy/redundant customer email routing pathways and stripped stale incident context from outbound sales generation.
+
+---
+
 ## [v1.3.1] — 2026-03-28
 
 ### Added

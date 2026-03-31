@@ -10,11 +10,6 @@ Architecture:
 
 Engineering is the primary driver. Other departments react to Engineering's
 plan before the OrgCoordinator looks for collision points.
-
-Replace _generate_theme() in flow.py with:
-    org_plan = self._day_planner.plan(self.state, self._mem, self.graph_dynamics)
-    self.state.daily_theme = org_plan.org_theme
-    self.state.org_day_plan = org_plan   # new State field — see note at bottom
 """
 
 from __future__ import annotations
@@ -1199,7 +1194,7 @@ class DayPlannerOrchestrator:
         return str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
 
     def _extract_cross_signals(
-        self, mem: Memory, day: int
+        self, mem: Memory, day: int, as_of_time: Optional[str] = None
     ) -> Dict[str, List[CrossDeptSignal]]:
         signals: Dict[str, List[CrossDeptSignal]] = {}
         config_chart: Dict[str, List] = self._config["org_chart"]
@@ -1230,7 +1225,7 @@ class DayPlannerOrchestrator:
 
         recent = [
             e
-            for e in mem.get_event_log()
+            for e in mem.get_event_log(from_db=True, as_of_time=as_of_time)
             if e.type in relevant_types and e.day >= max(1, day - 5)
         ]
 

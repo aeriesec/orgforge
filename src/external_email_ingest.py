@@ -21,7 +21,6 @@ from causal_chain_handler import CausalChainHandler
 from config_loader import COMPANY_DESCRIPTION
 from crm_system import NullCRMSystem
 from crewai import Crew, Task
-from graph_dynamics import GraphDynamics
 import json_repair
 from memory import Memory, SimEvent
 from insider_threat import _NullInjector
@@ -143,7 +142,7 @@ class ExternalEmailIngestor:
         clock,
         threat_injector=None,
         crm=None,
-        graph_dynamics=GraphDynamics,
+        graph_dynamics=None,
     ):
         self._config = config
         self._mem = mem
@@ -267,7 +266,7 @@ class ExternalEmailIngestor:
                 self._send_hr_outbound(hire, hr_lead, days_until, state, date_str)
                 hire["_hr_email_sent"] = True
 
-    def _route_customer_email(self, signal: ExternalEmailSignal, state) -> None:
+    """ def _route_customer_email(self, signal: ExternalEmailSignal, state) -> None:
         date_str = str(state.current_date.date())
         sales_lead = self._leads.get(
             signal.internal_liaison, next(iter(self._leads.values()))
@@ -316,7 +315,7 @@ class ExternalEmailIngestor:
                 ),
                 tags=["email", "customer", "routed", "causal_chain"],
             )
-        )
+        ) """
 
     def _sales_pings_product(
         self, signal, sales_lead, product_lead, state, date_str
@@ -1087,14 +1086,6 @@ class ExternalEmailIngestor:
         tone = source.get("tone", "professional")
         date_str = str(state.current_date.date())
 
-        incident_ctx = ""
-        if state.active_incidents:
-            inc = state.active_incidents[0]
-            incident_ctx = (
-                f"\nActive incident: {inc.ticket_id} — {inc.root_cause}. "
-                f"Reference naturally if relevant."
-            )
-
         tech_stack = self._mem.tech_stack_for_prompt()
         tech_ctx = (
             (
@@ -1126,7 +1117,6 @@ class ExternalEmailIngestor:
             description=(
                 f"Email from {source_first_name} {source_last_name} at {source_org} to {liaison_name} at {self._company_name} which {COMPANY_DESCRIPTION} "
                 f"about: {topic}.\nTone: {tone}. Health: {state.system_health}/100."
-                f"{incident_ctx}"
                 f"{tech_ctx}\n\n"
                 f"COMPANY CONTEXT: {self._company_name} is {self._company_desc}. "
                 f"Ground your email in this reality.\n\n"

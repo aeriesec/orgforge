@@ -23,7 +23,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 import time
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Union
 import boto3
 
 from pymongo import MongoClient
@@ -356,7 +356,6 @@ class BedrockEmbedder(BaseEmbedder):
 
                 result = self._json.loads(raw_body)
                 vector = result["embeddings"]["float"][0]
-                headers = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
                 return vector
             except self._client.exceptions.ThrottlingException:
                 wait = 6.2 * (attempt + 1)  # backoff: 6.2, 12.4, 18.6
@@ -434,6 +433,7 @@ class Memory:
             [("participants", 1), ("type", 1), ("day", -1)]
         )
         self._conversation_summaries.create_index([("day", -1)])
+        self._events.create_index([("timestamp", 1)])
         self._events.create_index([("type", 1), ("day", 1)])
         self._events.create_index([("type", 1), ("timestamp", -1)])
         self._events.create_index([("actors", 1), ("timestamp", -1)])
@@ -442,7 +442,6 @@ class Memory:
         self._events.create_index([("type", 1), ("facts.participants", 1)])
         self._checkpoints.create_index([("day", -1)])
         self._jira.create_index([("dept", 1), ("status", 1)])
-
         self._current_day: int = 0
 
         self._event_log: List[SimEvent] = []
@@ -923,11 +922,27 @@ class Memory:
         ]
         return relevant[-n:]
 
-    def get_event_log(self, from_db: bool = False) -> List[SimEvent]:
+    def get_event_log(
+        self, from_db: bool = False, as_of_time: Optional[str] = None
+    ) -> List[SimEvent]:
+        """
+        Returns the event log, optionally filtered by a specific timestamp
+        to prevent 'seeing into the future.'
+        """
+
         if from_db:
-            raw = self._events.find({}, {"_id": 0}).sort("timestamp", 1)
+            query = {}
+            if as_of_time:
+                query["timestamp"] = {"$lte": as_of_time}
+
+            raw = self._events.find(query, {"_id": 0}).sort("timestamp", 1)
             return [SimEvent.from_dict(r) for r in raw]
-        return self._event_log
+
+        log = self._event_log
+        if as_of_time:
+            log = [e for e in log if e.timestamp <= as_of_time]
+
+        return log
 
     def events_by_type(self, event_type: str) -> List[SimEvent]:
         return [e for e in self._event_log if e.type == event_type]
@@ -1183,7 +1198,6 @@ class Memory:
                     f"    Day {inc.get('day', '?')} — {facts.get('title', facts.get('root_cause', 'Unknown'))}"
                 )
 
-        # ── Velocity from last checkpoint ─────────────────────────────────────
         checkpoint = self._checkpoints.find_one(sort=[("day", -1)])
         if checkpoint:
             state = checkpoint.get("state", {})
@@ -1200,6 +1214,31 @@ class Memory:
             else f"No sprint planning context found for {dept}."
         )
 
+    def get_domain_registry(self) -> dict:
+        """Returns {domain: record} for all registered domains."""
+        return {rec["domain"]: rec for rec in self._db["domain_registry"].find({})}
+
+    def get_orphaned_domains(self) -> list:
+        """Returns all domains with no current primary owner."""
+        return list(self._db["domain_registry"].find({"primary_owner": None}))
+
+    def update_domain_coverage(self, domain: str, delta: float, author: str, day: int):
+        """Called when a Confluence page is written covering this domain."""
+        key = domain.lower().replace(" ", "_")
+        rec = self._db["domain_registry"].find_one({"_id": key})
+        if rec:
+            new_coverage = min(1.0, rec["documentation_coverage"] + delta)
+            self._db["domain_registry"].update_one(
+                {"_id": key},
+                {
+                    "$set": {
+                        "documentation_coverage": new_coverage,
+                        "last_updated_day": day,
+                    },
+                    "$addToSet": {"known_by": author},
+                },
+            )
+
     def context_for_retrospective(
         self,
         sprint_num: int,
@@ -1215,12 +1254,9 @@ class Memory:
           - Tickets that carried over (not Done)
           - Incidents that fired during the sprint
           - Retrospective-relevant events (deploys, postmortems, etc.)
-
-        Use this instead of context_for_prompt() in _handle_retrospective.
         """
         lines: List[str] = [f"=== SPRINT #{sprint_num} RETROSPECTIVE CONTEXT ==="]
 
-        # ── Tickets active in this sprint window ──────────────────────────────
         done_tickets = list(
             self._jira.find(
                 {"status": "Done"},
@@ -1263,7 +1299,6 @@ class Memory:
                     f"(status={t.get('status', '?')}, assignee={t.get('assignee', '?')})"
                 )
 
-        # ── Events in the sprint window ────────────────────────────────────────
         _RETRO_TYPES = {
             "incident_detected",
             "incident_resolved",
@@ -1580,6 +1615,9 @@ class Memory:
         self._client.drop_database(db_name)
         self._db = self._client[db_name]
 
+        self._db.create_collection("artifacts")
+        self._db.create_collection("events")
+
         # Re-bind all collection references to the fresh database
         self._artifacts = self._db["artifacts"]
         self._events = self._db["events"]
@@ -1661,9 +1699,17 @@ class Memory:
     def upsert_ticket(self, ticket: Dict):
         self._jira.update_one({"id": ticket["id"]}, {"$set": ticket}, upsert=True)
 
-    def get_ticket(self, ticket_id: str) -> Optional[Dict]:
-        # Exclude _id so callers never receive a non-serialisable ObjectId
-        return self._jira.find_one({"id": ticket_id}, {"_id": 0})
+    def get_ticket(
+        self, ticket_id: str, as_of_time: Optional[str] = None
+    ) -> Optional[Dict]:
+        query: dict[str, Union[str, dict[str, str]]] = {"id": ticket_id}
+        if as_of_time:
+            query["$or"] = [
+                {"timestamp": {"$lte": as_of_time}},
+                {"timestamp": {"$exists": False}},
+            ]
+
+        return self._jira.find_one(query, {"_id": 0})
 
     def get_open_tickets_for_dept(
         self, members: List[str], dept_name: str = ""
@@ -1679,8 +1725,17 @@ class Memory:
     def upsert_pr(self, pr: Dict):
         self._prs.update_one({"pr_id": pr["pr_id"]}, {"$set": pr}, upsert=True)
 
-    def get_reviewable_prs_for(self, name: str) -> List[Dict]:
-        return list(self._prs.find({"reviewers": name, "status": "open"}, {"_id": 0}))
+    def get_reviewable_prs_for(
+        self, name: str, as_of_time: Optional[str] = None
+    ) -> List[Dict]:
+        query: dict[str, Union[str, dict[str, str]]] = {
+            "reviewers": name,
+            "status": "open",
+        }
+        if as_of_time:
+            query["timestamp"] = {"$lte": as_of_time}
+
+        return list(self._prs.find(query, {"_id": 0}))
 
     def get_pr_by_ticket_id(self, ticket_id: str) -> Optional[Dict]:
         return self._prs.find_one({"ticket_id": ticket_id}, {"_id": 0})

@@ -225,7 +225,10 @@ class NormalDayHandler:
         if not ticket_id:
             return []
 
-        ticket = self._mem.get_ticket(ticket_id)
+        current_actor_time, new_cursor = self._clock.advance_actor(assignee, hours=2.0)
+        current_actor_time_iso = current_actor_time.isoformat()
+
+        ticket = self._mem.get_ticket(ticket_id, as_of_time=current_actor_time_iso)
         if not ticket:
             return [eng_plan.name]
 
@@ -235,9 +238,6 @@ class NormalDayHandler:
         dept_type = ticket.get("dept_type", "eng")
         is_non_eng = dept_type == "non_eng"
         completion_artifact = ticket.get("completion_artifact", "slack")
-
-        current_actor_time, new_cursor = self._clock.advance_actor(assignee, hours=2.0)
-        current_actor_time_iso = current_actor_time.isoformat()
 
         ctx = self._mem.context_for_person(
             name=assignee,
@@ -265,6 +265,31 @@ class NormalDayHandler:
 
         backstory = persona_utils.get_voice_card(assignee, "async", self._gd, self._mem)
 
+        # Surface any orphaned domains this ticket touches so the engineer's
+        # comment naturally reflects uncertainty about legacy systems
+        orphaned_domain_hint = ""
+        if self._lifecycle:
+            all_domains = list(
+                self._mem._db["domain_registry"].find({"primary_owner": None})
+            )
+            ticket_text = (
+                f"{ticket.get('title', '')} {ticket.get('description', '')}".lower()
+            )
+            for rec in all_domains:
+                if any(tag in ticket_text for tag in rec.get("system_tags", [])):
+                    pct = int(rec.get("documentation_coverage", 0) * 100)
+                    known_by = rec.get("known_by", [])
+                    orphaned_domain_hint += (
+                        f"\n⚠ NOTE: '{rec['domain']}' is underdocumented ({pct}% coverage). "
+                        f"Former owner: {rec.get('former_owner', 'unknown')}. "
+                        f"If your work touches this system, reflect genuine uncertainty in your comment."
+                        + (
+                            f" Others with partial knowledge: {', '.join(known_by)}."
+                            if known_by
+                            else ""
+                        )
+                    )
+
         if is_non_eng:
             persona = self._config.get("personas", {}).get(assignee, {})
             agent_role = persona.get("role", dept_of_name(assignee, self._org_chart))
@@ -290,7 +315,12 @@ class NormalDayHandler:
         if ticket.get("status") == "In Review":
             for linked_pr_id in ticket.get("linked_prs", []):
                 linked_pr = self._mem._prs.find_one(
-                    {"pr_id": linked_pr_id, "status": "open"}, {"_id": 0}
+                    {
+                        "pr_id": linked_pr_id,
+                        "status": "open",
+                        "created_at": {"$lte": current_actor_time_iso},
+                    },
+                    {"_id": 0},
                 )
                 if linked_pr and linked_pr.get("changes_requested"):
                     recent_feedback = linked_pr.get("comments", [])[-3:]
@@ -317,7 +347,8 @@ class NormalDayHandler:
                 f"You are {assignee}. You worked on ticket [{ticket_id}] today.\n\n"
                 f"Your task today: {item.description}\n"
                 f"{reviewer_feedback_hint}"
-                f"IMPORTANT: Your comment must be specifically about this ticket's work — "
+                + (orphaned_domain_hint + "\n" if orphaned_domain_hint else "")
+                + f"IMPORTANT: Your comment must be specifically about this ticket's work — "
                 f"do not describe unrelated tasks.\n"
                 f"{completion_note}\n\n"
                 f"Respond ONLY with valid JSON. No preamble, no markdown fences.\n"
@@ -390,7 +421,12 @@ class NormalDayHandler:
         if ticket.get("status") == "In Review":
             for linked_pr_id in ticket.get("linked_prs", []):
                 linked_pr = self._mem._prs.find_one(
-                    {"pr_id": linked_pr_id, "status": "open"}, {"_id": 0}
+                    {
+                        "pr_id": linked_pr_id,
+                        "status": "open",
+                        "created_at": {"$lte": current_actor_time_iso},
+                    },
+                    {"_id": 0},
                 )
                 if linked_pr and linked_pr.get("changes_requested"):
                     linked_pr["changes_requested"] = False
@@ -460,7 +496,14 @@ class NormalDayHandler:
         ticket["updated_at"] = current_actor_time_iso
 
         for pr_id in ticket.get("linked_prs", []):
-            pr = self._mem._prs.find_one({"pr_id": pr_id, "status": "open"}, {"_id": 0})
+            pr = self._mem._prs.find_one(
+                {
+                    "pr_id": pr_id,
+                    "status": "open",
+                    "created_at": {"$lte": current_actor_time_iso},
+                },
+                {"_id": 0},
+            )
             if pr and pr.get("changes_requested"):
                 pr["changes_requested"] = False
                 ticket["status"] = "In Review"
@@ -754,9 +797,15 @@ class NormalDayHandler:
         linked_prs = ticket.get("linked_prs", [])
         ticket_age = self._state.day - ticket.get("in_progress_since", self._state.day)
         actor_clock_ok = self._clock.now(assignee).hour < 17
+        actor_clock_iso_format = self._clock.now(assignee).isoformat()
         open_pr_with_changes = bool(linked_prs) and any(
             self._mem._prs.find_one(
-                {"pr_id": p, "status": "open", "changes_requested": True},
+                {
+                    "pr_id": p,
+                    "status": "open",
+                    "changes_requested": True,
+                    "created_at": {"$lte": actor_clock_iso_format},
+                },
                 {"_id": 0, "pr_id": 1},
             )
             for p in linked_prs
@@ -840,6 +889,39 @@ class NormalDayHandler:
             )
             review_history = f"\n--- PRIOR REVIEW ROUNDS ---\n{rounds}\n\n"
 
+        author_persona = self._config.get("personas", {}).get(author, {})
+        expertise_list = author_persona.get("expertise", ["general tasks"])
+        expertise_str = ", ".join(str(e) for e in expertise_list[:5])
+        author_dept = next(
+            (d for d, members in self._org_chart.items() if author in members),
+            "Unknown",
+        )
+
+        reviewer_persona = self._config.get("personas", {}).get(reviewer, {})
+        reviewer_expertise_list = reviewer_persona.get("expertise", ["general tasks"])
+        reviewer_expertise_str = ", ".join(str(e) for e in reviewer_expertise_list[:5])
+        reviewer_dept = next(
+            (d for d, members in self._org_chart.items() if reviewer in members),
+            "Unknown",
+        )
+
+        orphaned_domain_context = ""
+        if self._lifecycle:
+            all_domains = list(
+                self._mem._db["domain_registry"].find({"primary_owner": None})
+            )
+            pr_title_lower = pr_title.lower()
+            for rec in all_domains:
+                if any(tag in pr_title_lower for tag in rec.get("system_tags", [])):
+                    pct = int(rec.get("documentation_coverage", 0) * 100)
+                    known_by = rec.get("known_by", [])
+                    orphaned_domain_context += (
+                        f"\n⚠ '{rec['domain']}' is an orphaned domain: "
+                        f"former owner={rec.get('former_owner', 'unknown')}, "
+                        f"documentation={pct}%, "
+                        f"partial knowledge: {known_by or 'nobody'}."
+                    )
+
         agent = make_agent(
             role=f"{reviewer} — {p.get('social_role', 'Code Reviewer')}",
             goal=f"Write a PR review comment as {reviewer} would, reflecting your current stress and style.",
@@ -868,25 +950,55 @@ class NormalDayHandler:
             description=(
                 f"You are {reviewer}. You are reviewing this PR by {author}: {pr_title}\n\n"
                 f"{review_history}"
-                f"STEP 1 — DECIDE YOUR VERDICT FIRST:\n"
+                + (
+                    f"DOMAIN CONTEXT:{orphaned_domain_context}\n\n"
+                    if orphaned_domain_context
+                    else ""
+                )
+                + f"STEP 1 — DECIDE YOUR VERDICT FIRST:\n"
                 f"{approval_guidance}\n"
                 f"Choose: 'approved' or 'changes_requested'.\n\n"
                 f"STEP 2 — WRITE YOUR COMMENT:\n"
                 f"Write 1-3 sentences consistent with your verdict. If approved, acknowledge "
                 f"what looks good. If changes_requested, name the specific issue only.\n"
                 f"Your tone must reflect your current stress level (see your backstory).\n\n"
+                f"STEP 3 — AUTHOR KNOWLEDGE AUDIT (answer objectively, NOT in character):\n"
+                f"Your expertise as reviewer: [{reviewer_expertise_str}]\n"
+                f"Your department: {reviewer_dept}\n"
+                f"{author}'s expertise on record: [{expertise_str}]\n"
+                f"{author}'s department: {author_dept}\n"
+                f"Based on the PR content and your expertise, assess whether {author} "
+                f"demonstrates a knowledge gap in the domains this PR touches.\n"
+                f"- In 'topics_beyond_author_expertise', list any technical areas where "
+                f"{author}'s implementation, approach, or omissions suggest unfamiliarity.\n"
+                f"- In 'hedged_claims', list specific decisions or statements in the PR "
+                f"that appear incorrect, naive, or underconfident given the problem domain.\n"
+                f"- If {author} deferred or left incomplete any section you know should "
+                f"exist, list it in 'deferred_or_incomplete'.\n\n"
+                f"Use these criteria:\n"
+                f"  author_domain_fit:\n"
+                f"    'high'   — PR demonstrates fluency: correct abstractions, aware of edge cases, idiomatic\n"
+                f"    'medium' — PR is functional but shows shallow understanding or minor missteps\n"
+                f"    'low'    — PR shows clear unfamiliarity: wrong patterns, missing fundamentals, or over-reliance on guesswork\n\n"
+                f"  gap_classification:\n"
+                f"    'none'     — {author}'s expertise aligns with all domains touched by this PR\n"
+                f"    'possible' — PR touches 1-2 domains outside {author}'s expertise but implementation looks adequate\n"
+                f"    'likely'   — PR touches domains outside {author}'s expertise AND the implementation shows it\n\n"
                 f"Respond ONLY with valid JSON. No preamble, no markdown fences.\n"
                 f"{{\n"
                 f'  "comment": "your review comment here",\n'
-                f'  "verdict": "approved" or "changes_requested"\n'
-                f"}}\n\n"
-                f"{recurrence_hint}"
-                f"--- CONTEXT ---\n{ctx}"
+                f'  "verdict": "approved" or "changes_requested",\n'
+                f'  "metadata": {{\n'
+                f'    "author_domain_fit": "low | medium | high",\n'
+                f'    "confidence": "low | medium | high",\n'
+                f'    "gap_classification": "none | possible | likely",\n'
+                f'    "topics_beyond_author_expertise": ["string"],\n'
+                f'    "hedged_claims": ["string"],\n'
+                f'    "deferred_or_incomplete": ["string"]\n'
+                f"  }}\n"
+                f"}}"
             ),
-            expected_output=(
-                'Valid JSON only with keys "comment" (string) and "verdict" '
-                '("approved" or "changes_requested"). No preamble, no markdown.'
-            ),
+            expected_output="Valid JSON only. No preamble, no markdown fences.",
             agent=agent,
         )
 
@@ -901,9 +1013,11 @@ class NormalDayHandler:
             verdict = parsed_review.get("verdict", "approved")
             if verdict not in ("approved", "changes_requested"):
                 verdict = "approved"
+            review_metadata = parsed_review.get("metadata", {})
         except (json.JSONDecodeError, AttributeError):
             review_text = raw_review
             verdict = "approved"
+            review_metadata = {}
 
         pr_comment = {
             "author": reviewer,
@@ -1052,6 +1166,53 @@ class NormalDayHandler:
                 timestamp=current_actor_time,
             )
 
+        # Fire a structured gap event from reviewer audit metadata — distinct
+        # from the embedding scan above so the two signal sources are traceable
+        if review_metadata:
+            domain_fit = review_metadata.get("author_domain_fit", "high")
+            gap_class = review_metadata.get("gap_classification", "none")
+            beyond = review_metadata.get("topics_beyond_author_expertise", [])
+            hedged = review_metadata.get("hedged_claims", [])
+            deferred = review_metadata.get("deferred_or_incomplete", [])
+
+            gap_detected = (
+                domain_fit == "low"
+                or gap_class == "likely"
+                or (gap_class == "possible" and len(beyond) > 0)
+            )
+
+            if gap_detected:
+                self._mem.log_event(
+                    SimEvent(
+                        type="knowledge_gap_detected",
+                        timestamp=current_actor_time,
+                        day=self._state.day,
+                        date=date_str,
+                        actors=[author],
+                        artifact_ids={"pr": pr.get("pr_id", pr_id or "")},
+                        facts={
+                            "detection_method": "reviewer_audit",
+                            "reviewer": reviewer,
+                            "author": author,
+                            "pr_title": pr_title,
+                            "author_domain_fit": domain_fit,
+                            "author_expertise": expertise_list,
+                            "reviewer_expertise": reviewer_expertise_list,
+                            "gap_classification": gap_class,
+                            "topics_beyond_author_expertise": beyond,
+                            "hedged_claims": hedged,
+                            "deferred_or_incomplete": deferred,
+                        },
+                        summary=(
+                            f"Knowledge gap detected via reviewer audit: "
+                            f"{author} (expertise: {expertise_str}) submitted PR '{pr_title}' "
+                            f"with fit={domain_fit}, gap={gap_class}. "
+                            f"Reviewed by {reviewer}."
+                        ),
+                        tags=["knowledge_gap", "pr_review", "reviewer_audit"],
+                    )
+                )
+
         logger.info(
             f"    [dim]🔍 {reviewer} reviewed {pr.get('pr_id', 'PR')} [{verdict}][/dim]"
         )
@@ -1091,9 +1252,13 @@ class NormalDayHandler:
         recurrence_hint = ""
         linked_ticket_id = pr.get("linked_ticket") or pr.get("ticket_id", "")
         if linked_ticket_id:
-            ticket = self._mem.get_ticket(linked_ticket_id)
+            ticket = self._mem.get_ticket(
+                linked_ticket_id, as_of_time=current_actor_time
+            )
             if ticket and ticket.get("recurrence_of"):
-                ancestor = self._mem.get_ticket(ticket["recurrence_of"])
+                ancestor = self._mem.get_ticket(
+                    ticket["recurrence_of"], as_of_time=current_actor_time
+                )
                 ancestor_root_cause = ancestor.get("root_cause", "") if ancestor else ""
                 recurrence_hint = (
                     f"Note: this PR fixes {linked_ticket_id}, which is a recurrence of "
@@ -1186,7 +1351,7 @@ class NormalDayHandler:
             active_inc.causal_chain.append(pr_id)
             causal_facts["causal_chain"] = active_inc.causal_chain.snapshot()
 
-            t = self._mem.get_ticket(linked_ticket_id)
+            t = self._mem.get_ticket(linked_ticket_id, as_of_time=current_actor_time)
             if t:
                 t["causal_chain"] = active_inc.causal_chain.snapshot()
                 t["updated_at"] = current_actor_time
@@ -1399,9 +1564,6 @@ class NormalDayHandler:
         collaborator = next(iter(item.collaborator), None) or self._closest_colleague(
             asker
         )
-        ticket_id = item.related_id
-        ticket = self._find_ticket(ticket_id)
-        ticket_title = ticket["title"] if ticket else item.description
 
         initial_participants = [asker]
         if collaborator:
@@ -1419,6 +1581,10 @@ class NormalDayHandler:
             initial_participants, hours=chat_duration_hours
         )
         meeting_time_iso = provisional_start.isoformat()
+
+        ticket_id = item.related_id
+        ticket = self._find_ticket(ticket_id, meeting_time_iso)
+        ticket_title = ticket["title"] if ticket else item.description
 
         seed = [collaborator] if collaborator else []
         all_actors = self._expertise_matched_participants(
@@ -1472,6 +1638,8 @@ class NormalDayHandler:
 
         combined_hint = f"{doc_hint}\n\n{design_hint}" if design_hint else doc_hint
 
+        tech_stack = self._mem.tech_stack_for_prompt()
+
         agent = make_agent(
             role="Slack Conversation Simulator",
             goal=(
@@ -1487,6 +1655,7 @@ class NormalDayHandler:
                 f"COMPANY CONTEXT: {self._company} which {COMPANY_DESCRIPTION}\n"
                 f"Write a full Slack thread where a colleague asks a question.\n\n"
                 f"Topic: {ticket_title}\n"
+                f"Tech Stack: {tech_stack}\n"
                 f"Relevant context: {ctx}\n"
                 f"{combined_hint}\n\n"
                 f"Turn order: {speaker_sequence}\n\n"
@@ -1547,26 +1716,25 @@ class NormalDayHandler:
             "responders": [a for a in all_actors if a != asker],
             "message_count": len(messages),
         }
-        if active_inc and getattr(active_inc, "causal_chain", None):
-            facts["causal_chain"] = active_inc.causal_chain.snapshot()
 
-        if ticket_id and not active_inc:
+        chain = CausalChainHandler(thread_id)
+        if ticket_id:
+            chain.append(ticket_id)
             prior = self._mem._events.find_one(
                 {
                     "type": "ticket_progress",
                     "artifact_ids.jira": ticket_id,
                     "facts.causal_chain": {"$exists": True},
+                    "timestamp": {"$lte": meeting_time_iso},
                 },
                 {"facts.causal_chain": 1, "_id": 0},
                 sort=[("timestamp", -1)],
             )
-
-            ticket_chain = CausalChainHandler(ticket_id)
             if prior:
-                for artifact_id in prior.get("facts", {}).get("causal_chain", []):
-                    ticket_chain.append(artifact_id)
-            ticket_chain.append(thread_id)
-            facts["causal_chain"] = ticket_chain.snapshot()
+                for aid in prior.get("facts", {}).get("causal_chain", []):
+                    chain.append(aid)
+
+        facts["causal_chain"] = chain.snapshot()
 
         self._mem.log_event(
             SimEvent(
@@ -1592,12 +1760,13 @@ class NormalDayHandler:
 
         if self._lifecycle and messages:
             thread_text = " ".join(m["text"] for m in messages)
-            self._lifecycle.scan_for_knowledge_gaps(
-                text=f"{ticket_title} {thread_text}",
-                triggered_by=thread_id,
-                day=self._state.day,
+            self._assess_async_thread_gap(
+                messages=messages,
+                topic=ticket_title,
+                asker=asker,
+                thread_id=thread_id,
+                ticket_id=ticket_id,
                 date_str=date_str,
-                state=self._state,
                 timestamp=meeting_time_iso,
             )
 
@@ -1695,25 +1864,28 @@ class NormalDayHandler:
         }
 
         related_ticket_id = item.related_id
+
+        chain = CausalChainHandler(artifact_id)
         if related_ticket_id:
+            chain.append(related_ticket_id)
             prior = self._mem._events.find_one(
                 {
                     "type": "ticket_progress",
                     "artifact_ids.jira": related_ticket_id,
                     "facts.causal_chain": {"$exists": True},
+                    "timestamp": {"$lte": meeting_time_iso},
                 },
                 {"facts.causal_chain": 1, "_id": 0},
                 sort=[("timestamp", -1)],
             )
-            ticket_chain = CausalChainHandler(related_ticket_id)
             if prior:
                 for aid in prior.get("facts", {}).get("causal_chain", []):
-                    ticket_chain.append(aid)
-            ticket_chain.append(artifact_id)
-            if conf_id:
-                ticket_chain.append(conf_id)
-            facts["causal_chain"] = ticket_chain.snapshot()
+                    chain.append(aid)
             artifact_ids["jira"] = related_ticket_id
+
+        if conf_id:
+            chain.append(conf_id)
+        facts["causal_chain"] = chain.snapshot()
 
         self._mem.log_event(
             SimEvent(
@@ -2053,7 +2225,6 @@ class NormalDayHandler:
         Short Slack exchange when an engineer is blocked.
         Each participant speaks in their own voice via a dedicated Agent.
         """
-        from causal_chain_handler import CausalChainHandler
 
         asker_dept = dept_of_name(asker, self._org_chart)
         channel = asker_dept.lower().replace(" ", "-")
@@ -2137,6 +2308,7 @@ class NormalDayHandler:
                         "type": "ticket_progress",
                         "artifact_ids.jira": ticket_id,
                         "facts.causal_chain": {"$exists": True},
+                        "timestamp": {"$lte": timestamp},
                     },
                     {"facts.causal_chain": 1, "_id": 0},
                     sort=[("timestamp", -1)],
@@ -2562,8 +2734,6 @@ class NormalDayHandler:
                 "completion_artifact": "email",
             }
 
-            from causal_chain_handler import CausalChainHandler
-
             chain = CausalChainHandler(root_id=synthetic_ticket["id"])
 
             opp_updated_str = opp.get("updated_at")
@@ -2681,8 +2851,6 @@ class NormalDayHandler:
             date_str=date_str,
         )
 
-    # ─── LOGGING HELPERS ─────────────────────────────────────────────────────
-
     def _log_deferred_item(self, name: str, item: AgendaItem, date_str: str) -> None:
         """Log a deferred agenda item so the record shows the interruption."""
         current_time_iso = self._clock.now(name).isoformat()
@@ -2730,8 +2898,6 @@ class NormalDayHandler:
                 tags=["deep_work"],
             )
         )
-
-    # ─── AMBIENT SIGNALS (unchanged from original) ────────────────────────────
 
     def _maybe_bot_alerts(self) -> None:
         cron_time_iso = self._clock.now("system").isoformat()
@@ -2927,6 +3093,108 @@ class NormalDayHandler:
                 f"    [dim]☕ Distraction: {target_actor} pulled into chat about {topic}[/dim]"
             )
 
+    def _assess_async_thread_gap(
+        self,
+        messages: List[dict],
+        topic: str,
+        asker: str,
+        thread_id: str,
+        ticket_id: Optional[str],
+        date_str: str,
+        timestamp: str,
+    ) -> None:
+        """
+        Classify whether an async Q&A thread reveals a genuine knowledge gap
+        vs a routine question that got answered.
+
+        Uses a fast LLM call (worker model) to classify the thread outcome
+        rather than scanning raw text against departed employee embeddings.
+        """
+        thread_text = "\n".join(f"{m['user']}: {m['text']}" for m in messages)
+
+        asker_persona = self._config.get("personas", {}).get(asker, {})
+        asker_expertise = ", ".join(
+            str(e) for e in asker_persona.get("expertise", [])[:5]
+        )
+
+        agent = make_agent(
+            role="Thread Analyst",
+            goal="Classify whether a Slack Q&A thread reveals a knowledge gap.",
+            backstory="You analyze workplace conversations to identify unresolved questions.",
+            llm=self._worker,
+        )
+        task = Task(
+            description=(
+                f"Analyze this Slack Q&A thread.\n\n"
+                f"Asker: {asker} (expertise: {asker_expertise})\n"
+                f"Topic: {topic}\n\n"
+                f"Thread:\n{thread_text}\n\n"
+                f"Classify the thread outcome:\n"
+                f"- 'resolved': the question was answered confidently and correctly\n"
+                f"- 'uncertain': responders hedged, guessed, or gave conflicting answers\n"
+                f"- 'unresolved': the question went unanswered or was deferred\n"
+                f"- 'escalated': someone suggested asking another person or checking docs\n\n"
+                f"Respond ONLY with JSON:\n"
+                f"{{\n"
+                f'  "outcome": "resolved | uncertain | unresolved | escalated",\n'
+                f'  "gap_domain": "short topic label if uncertain/unresolved/escalated, '
+                f'else empty string",\n'
+                f'  "evidence": "one sentence explaining your classification"\n'
+                f"}}"
+            ),
+            expected_output="Valid JSON only.",
+            agent=agent,
+        )
+
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+
+        try:
+            clean = raw.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(clean)
+            outcome = parsed.get("outcome", "resolved")
+            gap_domain = parsed.get("gap_domain", "")
+            evidence = parsed.get("evidence", "")
+        except json.JSONDecodeError:
+            return
+
+        if outcome in ("uncertain", "unresolved", "escalated") and gap_domain:
+            self._lifecycle.scan_for_knowledge_gaps(
+                text=gap_domain,
+                triggered_by=thread_id,
+                day=self._state.day,
+                date_str=date_str,
+                state=self._state,
+                timestamp=timestamp,
+            )
+
+            self._mem.log_event(
+                SimEvent(
+                    type="knowledge_gap_detected",
+                    timestamp=timestamp,
+                    day=self._state.day,
+                    date=date_str,
+                    actors=[m["user"] for m in messages],
+                    artifact_ids={
+                        "slack_thread": thread_id,
+                        "jira": ticket_id or "",
+                    },
+                    facts={
+                        "detection_method": "async_thread_classification",
+                        "outcome": outcome,
+                        "gap_domain": gap_domain,
+                        "evidence": evidence,
+                        "asker": asker,
+                        "asker_expertise": asker_expertise,
+                        "topic": topic,
+                    },
+                    summary=(
+                        f"Async thread {outcome}: {asker} asked about '{topic}' — "
+                        f"{evidence}"
+                    ),
+                    tags=["knowledge_gap", "slack", "async_question"],
+                )
+            )
+
     def _last_turn_desc(
         self,
         speaker: str,
@@ -2994,8 +3262,6 @@ class NormalDayHandler:
         # Fallback — treat the whole output as the message
         return raw, None
 
-    # ─── LOW-LEVEL UTILITIES ──────────────────────────────────────────────────
-
     def _save_slack(
         self, messages: List[dict], channel: str, interaction_type: str = "general"
     ) -> Tuple[str, str]:
@@ -3051,7 +3317,6 @@ class NormalDayHandler:
         date_str: str,
     ) -> Tuple[str, str, List[str]]:
         """
-        Original Slack-thread path extracted from _handle_design_discussion.
         Returns (slack_path, thread_id, tags).
         """
 
@@ -3322,15 +3587,21 @@ class NormalDayHandler:
         )
         return thread_id
 
-    def _find_ticket(self, ticket_id: Optional[str]) -> Optional[dict]:
-        if not ticket_id:
+    def _find_ticket(
+        self, ticket_id: Optional[str] = "", meeting_time_iso: Optional[str] = ""
+    ) -> Optional[dict]:
+        if not ticket_id and meeting_time_iso:
             return None
-        return self._mem.get_ticket(ticket_id)
+        return self._mem.get_ticket(ticket_id, as_of_time=meeting_time_iso)
 
-    def _find_pr(self, pr_id: Optional[str]) -> Optional[dict]:
+    def _find_pr(
+        self, pr_id: Optional[str], timestamp: Optional[str] = ""
+    ) -> Optional[dict]:
         if not pr_id:
             return None
-        return self._mem._prs.find_one({"pr_id": pr_id}, {"_id": 0})
+        return self._mem._prs.find_one(
+            {"pr_id": pr_id, "created_at": {"$lte": timestamp}}, {"_id": 0}
+        )
 
     def _find_reviewable_pr(self, reviewer: str) -> Optional[dict]:
         """Find an open PR where this person is listed as a reviewer."""

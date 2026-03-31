@@ -139,6 +139,9 @@ class SprintContext:
     capacity_by_member: Dict[str, float]
     in_review: List[str]
     sprint_theme: str = ""
+    ticket_domain_tags: Dict[str, List[str]] = field(default_factory=dict)
+    # e.g. {"TICKET-42": ["billing-legacy"], "TICKET-43": ["kafka", "infra"]}
+    # Populated by TicketAssigner via domain registry cross-reference.
 
 
 @dataclass
@@ -263,4 +266,5 @@ KNOWN_EVENT_TYPES = {
     "crm_touchpoint",
     "crm_account_at_risk",
     "customer_health_briefing",
+    "assignment_domain_mismatch",
 }

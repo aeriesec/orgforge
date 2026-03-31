@@ -15,7 +15,9 @@ Question types handled
 ----------------------
   RETRIEVAL     Exact artifact_id match + optional timestamp proximity bonus.
   CAUSAL        Artifact match AND event_type match required for full credit.
-  TEMPORAL      Boolean + optional departure_day agreement.
+  TEMPORAL      Boolean match routed by temporal_category (knowledge_gap/
+                point_in_time/stress_state/propagation). Ground truth field
+                is had_knowledge, was_true, or knew_before per sub-category.
   GAP_DETECTION Boolean was_actioned + downstream artifact overlap.
   ROUTING       first_recipient exact match.
   PLAN          dept + theme match (theme uses substring matching for LLM prose).
@@ -63,12 +65,23 @@ CAUSAL:
     }
 
 TEMPORAL:
+    # knowledge_gap sub-category (default):
     {
         "had_knowledge": true,
         "person": "Alice",
         "domain": "auth-service",
         "departure_day": null,                     # null if agent thinks no departure
         "reasoning": "..."                         # free text — not scored
+    }
+    # point_in_time / stress_state sub-categories:
+    {
+        "was_true": false,
+        "reasoning": "..."
+    }
+    # propagation sub-category:
+    {
+        "knew_before": true,
+        "reasoning": "..."
     }
 
 GAP_DETECTION:
@@ -277,31 +290,53 @@ class CausalScorer(_BaseScorer):
 
 class TemporalScorer(_BaseScorer):
     """
-    TEMPORAL — "Did person P know about domain D when incident I was opened?"
+    TEMPORAL — multi-sub-category scorer routed by temporal_category.
 
-    Full credit: had_knowledge boolean matches AND departure_day matches
-                 (within ±1 day tolerance for off-by-one).
-    Partial:     boolean correct but departure_day wrong or missing (0.6).
+    Sub-categories and their ground truth boolean fields:
+      knowledge_gap  (default) — had_knowledge  + optional departure_day
+      point_in_time            — was_true        (no secondary date field)
+      stress_state             — was_true        (no secondary date field)
+      propagation              — knew_before     (no secondary date field)
+
+    Full credit logic per sub-category:
+      knowledge_gap: boolean matches AND departure_day matches (±1 day).
+                     Partial (0.6) when boolean correct but departure_day wrong.
+      point_in_time / stress_state / propagation: boolean match only → 1.0 or 0.0.
     """
+
+    # Maps temporal_category → (gt_field, agent_field)
+    _BOOL_FIELDS = {
+        "knowledge_gap": ("had_knowledge", "had_knowledge"),
+        "point_in_time": ("was_true", "was_true"),
+        "stress_state": ("was_true", "was_true"),
+        "propagation": ("knew_before", "knew_before"),
+    }
 
     def score(
         self, question: dict, agent_answer: dict
     ) -> Tuple[float, float, Optional[str]]:
         gt = question["ground_truth"]
-        gt_bool = gt.get("had_knowledge")
-        gt_dep_day = gt.get("departure_day")  # int or None
-        agent_bool = agent_answer.get("had_knowledge")
-        agent_dep_day = agent_answer.get("departure_day")
+        category = question.get("temporal_category", "knowledge_gap")
+
+        gt_field, agent_field = self._BOOL_FIELDS.get(
+            category, ("had_knowledge", "had_knowledge")
+        )
+        gt_bool = gt.get(gt_field)
+        agent_bool = agent_answer.get(agent_field)
 
         bool_match = agent_bool == gt_bool
 
         if not bool_match:
             primary = 0.0
-            failure = f"had_knowledge expected {gt_bool}, got {agent_bool}"
-        else:
-            # Departure day agreement
+            failure = f"{gt_field} expected {gt_bool}, got {agent_bool}"
+        elif category == "knowledge_gap":
+            # knowledge_gap questions carry an optional departure_day for
+            # additional precision credit.
+            gt_dep_day = gt.get("departure_day")  # int or None
+            agent_dep_day = agent_answer.get("departure_day")
+
             if gt_dep_day is None and agent_dep_day is None:
-                # Both agree no departure occurred — full credit.
+                # Both agree no departure relevant — full credit.
                 # Note: when the dataset has had_knowledge=True for all questions
                 # (e.g. short sim runs where no incident touches a departed
                 # employee's domains), an agent that always returns
@@ -325,11 +360,116 @@ class TemporalScorer(_BaseScorer):
                     if gt_dep_day is not None
                     else "Agent reported a departure day that doesn't exist"
                 )
+        else:
+            # point_in_time, stress_state, propagation — boolean match is
+            # sufficient for full credit; no secondary date field to check.
+            primary = 1.0
+            failure = None
 
         evidence = self._evidence_overlap(
             question.get("evidence_chain", []),
             agent_answer.get("retrieved_artifact_ids", []),
         )
+        return primary, evidence, failure
+
+
+class MultiHopScorer(_BaseScorer):
+    """
+    MULTI_HOP — full customer complaint → resolution chain traversal.
+
+    Scored as a weighted checklist across four hops. Each hop is worth
+    0.25 of the primary score — partial credit scales with how far the
+    agent traced the chain before losing it.
+
+      Hop 1 (0.25): correct email_id / source identified
+      Hop 2 (0.25): correct slack_thread_id (internal relay)
+      Hop 3 (0.25): correct ticket_id + assignee
+      Hop 4 (0.25): correct reply_id OR correct resolved_same_day boolean
+
+    This structure means an agent that traces email→slack→jira but misses
+    the reply scores 0.75 rather than 0 — which correctly reflects that
+    it found 3 of 4 artifacts.
+    """
+
+    def score(
+        self, question: dict, agent_answer: dict
+    ) -> Tuple[float, float, Optional[str]]:
+        gt = question["ground_truth"]
+        failures = []
+        hop_scores = []
+
+        # Hop 1: source / email identified
+        gt_email = gt.get("email_id", "")
+        agent_email = agent_answer.get("email_id", "")
+        hop1 = 1.0 if agent_email == gt_email else 0.0
+        if not hop1:
+            failures.append(
+                f"Hop 1: email_id expected {gt_email!r}, got {agent_email!r}"
+            )
+        hop_scores.append(hop1)
+
+        # Hop 2: internal relay (Slack thread)
+        gt_slack = gt.get("slack_thread_id", "")
+        agent_slack = agent_answer.get("slack_thread_id", "")
+        hop2 = (
+            1.0
+            if (gt_slack and agent_slack == gt_slack)
+            else (0.5 if (gt_slack and agent_slack) else (1.0 if not gt_slack else 0.0))
+        )
+        if gt_slack and agent_slack != gt_slack:
+            failures.append(
+                f"Hop 2: slack_thread expected {gt_slack!r}, got {agent_slack!r}"
+            )
+        hop_scores.append(hop2)
+
+        # Hop 3: ticket + assignee
+        gt_ticket = gt.get("ticket_id", "")
+        agent_ticket = agent_answer.get("ticket_id", "")
+        gt_assignee = gt.get("assignee", "").lower()
+        agent_assignee = agent_answer.get("assignee", "").lower()
+        ticket_match = agent_ticket == gt_ticket
+        assignee_match = agent_assignee == gt_assignee
+        hop3 = (
+            1.0 if (ticket_match and assignee_match) else (0.6 if ticket_match else 0.0)
+        )
+        if not ticket_match:
+            failures.append(
+                f"Hop 3: ticket expected {gt_ticket!r}, got {agent_ticket!r}"
+            )
+        elif not assignee_match:
+            failures.append(
+                f"Hop 3: assignee expected {gt_assignee!r}, got {agent_assignee!r}"
+            )
+        hop_scores.append(hop3)
+
+        # Hop 4: reply sent + same-day resolution
+        gt_reply = gt.get("reply_id", "")
+        gt_same_day = gt.get("resolved_same_day", False)
+        agent_reply = agent_answer.get("reply_id", "")
+        agent_same_day = agent_answer.get("resolved_same_day")
+        reply_match = (not gt_reply) or (agent_reply == gt_reply)
+        same_day_match = agent_same_day == gt_same_day
+        hop4 = (
+            1.0
+            if (reply_match and same_day_match)
+            else (0.5 if (reply_match or same_day_match) else 0.0)
+        )
+        if not reply_match:
+            failures.append(
+                f"Hop 4: reply_id expected {gt_reply!r}, got {agent_reply!r}"
+            )
+        if not same_day_match:
+            failures.append(
+                f"Hop 4: resolved_same_day expected {gt_same_day}, got {agent_same_day}"
+            )
+        hop_scores.append(hop4)
+
+        primary = sum(hop_scores) / len(hop_scores)
+        evidence = self._evidence_overlap(
+            question.get("evidence_chain", []),
+            agent_answer.get("retrieved_artifact_ids", []),
+        )
+        failure = "; ".join(failures) if failures else None
         return primary, evidence, failure
 
 
@@ -358,6 +498,15 @@ class GapDetectionScorer(_BaseScorer):
             primary = 1.0
             failure = None
         else:
+            # was_actioned=True: reward boolean correctness with a 0.6 floor,
+            # then scale the remaining 0.4 by downstream artifact recall.
+            # INTENTIONAL ASYMMETRY: a correct True boolean with zero downstream
+            # overlap yields primary=0.6, which after PRIMARY_WEIGHT produces a
+            # combined floor of ~0.48+ (plus any evidence credit). This is
+            # deliberate — correctly identifying that an email was actioned is
+            # meaningful signal even when the agent can't enumerate the artifacts.
+            # If you want a stricter floor, lower 0.6 here (e.g. to 0.4) or make
+            # it conditional on ds_overlap > 0.
             ds_overlap = self._evidence_overlap(gt_downstream, agent_downstream)
             primary = 0.6 + 0.4 * ds_overlap
             failure = (
@@ -475,7 +624,10 @@ class EscalationScorer(_BaseScorer):
             agent_set = set(agent_actors)
             overlap = len(gt_set & agent_set) / len(gt_set)
 
-            if overlap == 1.0 and len(agent_set) == len(gt_set):
+            if overlap == 1.0:
+                # All ground-truth actors retrieved — full credit regardless of
+                # extra actors returned. Penalising for extras would unfairly
+                # punish agents that recall correctly but over-enumerate slightly.
                 primary = 1.0
                 failure = None
             elif overlap > 0:
@@ -548,7 +700,9 @@ class KnowledgeGapScorer(_BaseScorer):
             agent_set = set(agent_gaps)
             overlap = len(gt_set & agent_set) / len(gt_set)
 
-            if overlap == 1.0 and len(agent_set) == len(gt_set):
+            if overlap == 1.0:
+                # Full recall of ground-truth gap areas — full credit regardless
+                # of any additional areas the agent returns.
                 primary = 1.0
                 failure = None
             elif overlap > 0:
@@ -857,18 +1011,20 @@ class InvoiceSLAScorer(_BaseScorer):
                     f"and credit ({agent_credit} vs {gt_credit}) both wrong"
                 )
 
-        # Affected orgs as evidence (secondary signal for partial credit)
-        evidence = (
-            self._evidence_overlap(
-                gt_orgs,
-                agent_orgs,
-            )
-            if gt_orgs
-            else self._evidence_overlap(
-                question.get("evidence_chain", []),
-                agent_answer.get("retrieved_artifact_ids", []),
-            )
+        # Evidence: blend evidence_chain retrieval (did the agent find the invoice?)
+        # with affected_orgs overlap (did it identify the right customers?).
+        # evidence_chain recall is weighted more heavily (0.7) because it
+        # directly reflects whether the invoice artifact was retrieved; org
+        # overlap (0.3) is a secondary signal of answer quality.
+        chain_evidence = self._evidence_overlap(
+            question.get("evidence_chain", []),
+            agent_answer.get("retrieved_artifact_ids", []),
         )
+        if gt_orgs:
+            org_overlap = self._evidence_overlap(gt_orgs, agent_orgs)
+            evidence = round(0.7 * chain_evidence + 0.3 * org_overlap, 4)
+        else:
+            evidence = chain_evidence
         return primary, evidence, failure
 
 
@@ -891,6 +1047,7 @@ _SCORERS: Dict[str, _BaseScorer] = {
     "INVOICE_SLA": InvoiceSLAScorer(),
     "DATADOG_ALERT": RetrievalScorer(),
     "PR_REVIEW": PRReviewScorer(),
+    "MULTI_HOP": MultiHopScorer(),
 }
 
 
@@ -1102,6 +1259,15 @@ if __name__ == "__main__":
                 "pr_id": gt.get("pr_id", ""),
                 "verdict": gt.get("verdict", ""),
                 "reviewer": gt.get("reviewer", ""),
+            }
+        elif qtype == "MULTI_HOP":
+            mock_answers[qid] = {
+                "email_id": gt.get("email_id", ""),
+                "slack_thread_id": gt.get("slack_thread_id", ""),
+                "ticket_id": gt.get("ticket_id", ""),
+                "assignee": gt.get("assignee", ""),
+                "reply_id": gt.get("reply_id", ""),
+                "resolved_same_day": gt.get("resolved_same_day"),
             }
 
     scorer = OrgForgeScorer()

@@ -26,7 +26,8 @@ export/hf_dataset/
 Corpus schema (one row per document)
 -------------------------------------
   doc_id          str   — globally unique, e.g. "ORG-42", "CONF-ENG-007", "EMAIL-001"
-  doc_type        str   — "jira" | "confluence" | "slack" | "email" | "pr" | "sim_event"
+  doc_type        str   — "jira" | "confluence" | "slack" | "email" | "pr" |
+                         "zd_ticket" | "sf_opp" | "sf_account" | "sim_event"
   title           str   — human-readable title or subject line
   body            str   — full text content for retrieval
   day             int   — simulation day this artifact was created
@@ -57,7 +58,7 @@ BM25   — rank_bm25 (Okapi BM25) over the body field.
           returned doc_ids are compared against evidence_chain.
           MRR@10 and Recall@10 are reported per question type.
 
-Dense  — sentence-transformers "Losspost/stella_en_1.5b_v5" (1024-dim).
+Dense  — sentence-transformers "Qwen/Qwen3-Embedding-4B" (2560-dim).
           Cosine similarity between question_text embedding and body embeddings.
           Same MRR@10 / Recall@10 reported for comparison.
           If sentence-transformers is not installed, this section is skipped
@@ -77,6 +78,7 @@ import textwrap
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+import numpy as np
 
 import yaml
 
@@ -131,15 +133,9 @@ except ImportError:
         "rank_bm25 not installed — BM25 baseline disabled. pip install rank-bm25"
     )
 
-try:
-    import ollama
-    import numpy as np
 
-    _DENSE_AVAILABLE = True
-    _DENSE_MODEL_NAME = "Losspost/stella_en_1.5b_v5"  # or whatever your memory.py uses
-except ImportError:
-    _DENSE_AVAILABLE = False
-    logger.warning("ollama not installed — dense baseline disabled.")
+_DENSE_AVAILABLE = True
+_DENSE_MODEL_NAME = "Qwen/Qwen3-Embedding-4B"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,7 +161,7 @@ def _dept_from_artifact_id(artifact_id: str) -> str:
 class CorpusBuilder:
     """
     Reads the MongoDB-persisted artifacts (via Memory) and the SimEvent log,
-    then normalises every artifact into a flat list of corpus rows.
+    then normalizes every artifact into a flat list of corpus rows.
 
     Falls back to reconstructing from eval JSON if MongoDB is unavailable,
     which allows the exporter to run in offline/CI environments.
@@ -199,6 +195,8 @@ class CorpusBuilder:
         if self._mem is not None:
             rows = self._enrich_from_mongo(rows)
             rows.extend(self._plans_to_corpus_rows())
+
+        rows.extend(self._post_sim_to_corpus_rows())
 
         # Deduplicate: keep the row with the longest body for each doc_id
         seen: Dict[str, dict] = {}
@@ -251,12 +249,21 @@ class CorpusBuilder:
             "incident_resolved",
             "escalation_chain",
             "postmortem_created",
+            "zd_tickets_escalated",
+            "sf_deals_risk_flagged",
+            "crm_account_at_risk",
         )
         is_external = event_type in (
             "inbound_external_email",
             "customer_email_routed",
             "vendor_email_routed",
             "email_dropped",
+            "sales_outbound_email",
+            "proactive_outreach_initiated",
+            "zd_ticket_opened",
+            "zd_tickets_resolved",
+            "crm_touchpoint",
+            "customer_health_briefing",
         )
 
         shared = {
@@ -320,6 +327,8 @@ class CorpusBuilder:
             "customer_email_routed",
             "vendor_email_routed",
             "email_dropped",
+            "sales_outbound_email",
+            "proactive_outreach_initiated",
         ):
             rows.append(
                 {
@@ -359,6 +368,73 @@ class CorpusBuilder:
                     "doc_type": "pr",
                     "title": str(facts.get("title", pr_id))[:512],
                     "body": facts.get("description", facts.get("summary", "")),
+                }
+            )
+
+        # ── ZENDESK TICKET ────────────────────────────────────────────────────
+        # zd_ticket_opened carries a single ID; zd_tickets_escalated and
+        # zd_tickets_resolved carry a list under "zd_tickets".
+        zd_ids: List[str] = []
+        single_zd = artifact_ids.get("zd_ticket", "")
+        if single_zd:
+            zd_ids = [single_zd]
+        else:
+            multi_zd = artifact_ids.get("zd_tickets", [])
+            if isinstance(multi_zd, list):
+                zd_ids = [str(z) for z in multi_zd if z]
+        for zd_id in zd_ids:
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": zd_id,
+                    "doc_type": "zd_ticket",
+                    "title": str(facts.get("subject", facts.get("ticket_id", zd_id)))[
+                        :512
+                    ],
+                    "body": self._zd_body(facts),
+                }
+            )
+
+        # ── SALESFORCE OPPORTUNITY ────────────────────────────────────────────
+        # sf_opps may be a single ID (crm_touchpoint) or a list
+        # (sf_deals_risk_flagged, sf_ownership_lapsed).
+        sf_opp_ids: List[str] = []
+        single_opp = artifact_ids.get("sf_opp", "")
+        if single_opp:
+            sf_opp_ids = [single_opp]
+        else:
+            multi_opp = artifact_ids.get("sf_opps", [])
+            if isinstance(multi_opp, list):
+                sf_opp_ids = [str(o) for o in multi_opp if o]
+        for opp_id in sf_opp_ids:
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": opp_id,
+                    "doc_type": "sf_opp",
+                    "title": str(
+                        facts.get("account_name", opp_id)
+                        + " — "
+                        + facts.get("stage", "")
+                    )[:512],
+                    "body": self._sf_opp_body(facts),
+                }
+            )
+
+        # ── SALESFORCE ACCOUNT ────────────────────────────────────────────────
+        # sf_ownership_lapsed carries a list of account IDs.
+        sf_acc_ids: List[str] = []
+        multi_acc = artifact_ids.get("sf_accounts", [])
+        if isinstance(multi_acc, list):
+            sf_acc_ids = [str(a) for a in multi_acc if a]
+        for acc_id in sf_acc_ids:
+            rows.append(
+                {
+                    **shared,
+                    "doc_id": acc_id,
+                    "doc_type": "sf_account",
+                    "title": str(facts.get("account_name", acc_id))[:512],
+                    "body": self._sf_account_body(facts, acc_id),
                 }
             )
 
@@ -416,6 +492,58 @@ class CorpusBuilder:
                 parts.append(f"{key}: {val}")
         if not parts:
             parts.append(evt.get("summary", ""))
+        return "\n".join(parts)
+
+    def _zd_body(self, facts: dict) -> str:
+        parts = []
+        for key in ("subject", "org_name", "description", "ticket_id", "component"):
+            val = facts.get(key)
+            if val:
+                parts.append(f"{key}: {val}")
+        ticket_ids = facts.get("ticket_ids", [])
+        if ticket_ids:
+            parts.append("ticket_ids: " + ", ".join(str(t) for t in ticket_ids))
+        incident_id = facts.get("incident_id", "")
+        if incident_id:
+            parts.append(f"related_incident: {incident_id}")
+        return "\n".join(parts)
+
+    def _sf_opp_body(self, facts: dict) -> str:
+        parts = []
+        for key in (
+            "account_name",
+            "stage",
+            "sender",
+            "subject",
+            "risk_note",
+            "opportunity_id",
+        ):
+            val = facts.get(key)
+            if val:
+                parts.append(f"{key}: {val}")
+        opp_ids = facts.get("opp_ids", [])
+        if opp_ids:
+            parts.append("opp_ids: " + ", ".join(str(o) for o in opp_ids))
+        incident_id = facts.get("incident_id", "")
+        if incident_id:
+            parts.append(f"related_incident: {incident_id}")
+        return "\n".join(parts)
+
+    def _sf_account_body(self, facts: dict, acc_id: str) -> str:
+        parts = []
+        for key in ("departed_employee", "role", "account_name"):
+            val = facts.get(key)
+            if val:
+                parts.append(f"{key}: {val}")
+        accounts_lapsed = facts.get("accounts_lapsed", [])
+        if acc_id in accounts_lapsed:
+            parts.append(f"account_id: {acc_id}")
+            parts.append("status: ownership lapsed — pending reassignment")
+        opps_lapsed = facts.get("opportunities_lapsed", [])
+        if opps_lapsed:
+            parts.append(
+                "opportunities_lapsed: " + ", ".join(str(o) for o in opps_lapsed)
+            )
         return "\n".join(parts)
 
     def _plans_to_corpus_rows(self) -> List[dict]:
@@ -486,6 +614,61 @@ class CorpusBuilder:
             )
         return rows
 
+    def _post_sim_to_corpus_rows(self) -> List[dict]:
+        rows = []
+        nps_dir = BASE / "nps" / "responses"
+        if nps_dir.exists():
+            for p in nps_dir.glob("*.json"):
+                data = json.loads(p.read_text())
+                rows.append(
+                    {
+                        "doc_id": data["response_id"],
+                        "doc_type": "nps_survey",
+                        "title": f"NPS Survey: {data['org_name']}",
+                        "body": f"Score: {data['score']}\nComment: {data.get('verbatim_comment', '')}",
+                        "day": 30,
+                        "date": data["submitted_at"][:10],
+                        "timestamp": data["submitted_at"],
+                        "actors": json.dumps([data["org_name"]]),
+                        "tags": json.dumps(["nps", data["classification"]]),
+                        "artifact_ids": json.dumps({"nps": data["response_id"]}),
+                        "dept": "Sales_Marketing",
+                        "is_incident": data["score"] < 7,
+                        "is_external": True,
+                    }
+                )
+
+        inv_dir = BASE / "invoices"
+        if inv_dir.exists():
+            for p in inv_dir.glob("*.json"):
+                data = json.loads(p.read_text())
+                body_text = (
+                    data.get("notes", "")
+                    + "\n"
+                    + json.dumps(data.get("line_items", []))
+                )
+                rows.append(
+                    {
+                        "doc_id": data["invoice_id"],
+                        "doc_type": "invoice",
+                        "title": f"Invoice {data['invoice_id']} - {data['customer']['org_name']}",
+                        "body": body_text,
+                        "day": 30,
+                        "date": data["invoice_date"][:10],
+                        "timestamp": data["invoice_date"],
+                        "actors": json.dumps([data["customer"]["org_name"]]),
+                        "tags": json.dumps(["invoice", "billing"]),
+                        "artifact_ids": json.dumps({"invoice": data["invoice_id"]}),
+                        "dept": "Finance",
+                        "is_incident": data.get("metadata", {}).get(
+                            "sla_credits_count", 0
+                        )
+                        > 0,
+                        "is_external": True,
+                    }
+                )
+        return rows
+
     def _enrich_from_mongo(self, rows: List[dict]) -> List[dict]:
         """
         Attempt to replace thin SimEvent body text with richer MongoDB content.
@@ -551,12 +734,200 @@ class CorpusBuilder:
                     parts.append(c)
                 rich_map[tid] = "\n".join(p for p in parts if p)
 
-            for artifact in self._mem._db["artifacts"].find(
-                {"type": "email"}, {"_id": 1, "content": 1, "title": 1}
+            # Pull requests — stored in the pull_requests collection.
+            # PRs are written via mem.upsert_pr() and are never in artifacts.
+            # Key fields: pr_id, title, description, author, ticket_id,
+            #             reviewers, status, dept, day, date, timestamp,
+            #             comments[].{date, author, verdict, text}.
+            for pr in self._mem._db["pull_requests"].find(
+                {},
+                {
+                    "_id": 0,
+                    "pr_id": 1,
+                    "title": 1,
+                    "description": 1,
+                    "author": 1,
+                    "ticket_id": 1,
+                    "reviewers": 1,
+                    "status": 1,
+                    "comments": 1,
+                },
             ):
-                art_id = artifact.get("_id")
-                if art_id and artifact.get("content"):
-                    rich_map[art_id] = artifact["content"]
+                pid = pr.get("pr_id")
+                if not pid:
+                    continue
+                parts = []
+                if pr.get("title"):
+                    parts.append(f"title: {pr['title']}")
+                if pr.get("description"):
+                    parts.append(f"description: {pr['description']}")
+                if pr.get("author"):
+                    parts.append(f"author: {pr['author']}")
+                if pr.get("ticket_id"):
+                    parts.append(f"ticket: {pr['ticket_id']}")
+                if pr.get("status"):
+                    parts.append(f"status: {pr['status']}")
+                reviewers = pr.get("reviewers", [])
+                if reviewers:
+                    parts.append(f"reviewers: {', '.join(reviewers)}")
+                for c in pr.get("comments") or []:
+                    verdict = f" [{c['verdict']}]" if c.get("verdict") else ""
+                    text = c.get("text", "")
+                    author = c.get("author", "")
+                    if text:
+                        parts.append(f"review ({author}{verdict}): {text}")
+                rich_map[pid] = "\n".join(p for p in parts if p)
+
+            # Emails — stored in the dedicated emails collection.
+            # Schema: _id (ObjectId), embed_id, subject, body, from_name,
+            # from_addr, to_name, to_addr, direction, day, date, timestamp.
+            # Use embed_id as the corpus doc_id to match what SimEvents carry.
+            for email in self._mem._db["emails"].find(
+                {},
+                {
+                    "_id": 0,
+                    "embed_id": 1,
+                    "subject": 1,
+                    "body": 1,
+                    "from_name": 1,
+                    "from_addr": 1,
+                    "to_name": 1,
+                    "to_addr": 1,
+                    "direction": 1,
+                },
+            ):
+                eid = email.get("embed_id")
+                if not eid:
+                    continue
+                parts = []
+                if email.get("subject"):
+                    parts.append(f"subject: {email['subject']}")
+                if email.get("from_name") or email.get("from_addr"):
+                    parts.append(
+                        f"from: {email.get('from_name', '')} <{email.get('from_addr', '')}>"
+                    )
+                if email.get("to_name") or email.get("to_addr"):
+                    parts.append(
+                        f"to: {email.get('to_name', '')} <{email.get('to_addr', '')}>"
+                    )
+                if email.get("body"):
+                    parts.append(email["body"])
+                rich_map[eid] = "\n".join(parts)
+
+            # Zendesk tickets — rich body folds in subject, org, description,
+            # all comment texts, and the related incident reference.
+            for ticket in self._mem._db["zd_tickets"].find(
+                {},
+                {
+                    "_id": 0,
+                    "ticket_id": 1,
+                    "subject": 1,
+                    "org_name": 1,
+                    "description": 1,
+                    "comments": 1,
+                    "related_incident": 1,
+                    "priority": 1,
+                    "status": 1,
+                },
+            ):
+                tid = ticket.get("ticket_id")
+                if not tid:
+                    continue
+                parts = [
+                    f"subject: {ticket.get('subject', '')}",
+                    f"org: {ticket.get('org_name', '')}",
+                    f"status: {ticket.get('status', '')}",
+                    f"priority: {ticket.get('priority', '')}",
+                ]
+                if ticket.get("description"):
+                    parts.append(f"description: {ticket['description']}")
+                if ticket.get("related_incident"):
+                    parts.append(f"related_incident: {ticket['related_incident']}")
+                for c in ticket.get("comments") or []:
+                    author = c.get("author", "")
+                    text = c.get("text", "")
+                    if text:
+                        parts.append(
+                            f"comment ({author}): {text}"
+                            if author
+                            else f"comment: {text}"
+                        )
+                rich_map[tid] = "\n".join(p for p in parts if p)
+
+            # Salesforce opportunities — rich body from sf_opps collection.
+            for opp in self._mem._db["sf_opps"].find(
+                {},
+                {
+                    "_id": 0,
+                    "opportunity_id": 1,
+                    "account_name": 1,
+                    "stage": 1,
+                    "probability": 1,
+                    "amount": 1,
+                    "owner": 1,
+                    "lead_source": 1,
+                    "next_step": 1,
+                    "risk_notes": 1,
+                    "touchpoints": 1,
+                    "close_date": 1,
+                },
+            ):
+                oid = opp.get("opportunity_id")
+                if not oid:
+                    continue
+                parts = [
+                    f"account: {opp.get('account_name', '')}",
+                    f"stage: {opp.get('stage', '')}",
+                    f"probability: {opp.get('probability', '')}%",
+                    f"amount: ${opp.get('amount', 0):,}",
+                    f"owner: {opp.get('owner', '')}",
+                    f"close_date: {opp.get('close_date', '')}",
+                    f"lead_source: {opp.get('lead_source', '')}",
+                    f"next_step: {opp.get('next_step', '')}",
+                ]
+                for note in opp.get("risk_notes") or []:
+                    parts.append(f"risk: {note}")
+                for tp in opp.get("touchpoints") or []:
+                    subject = tp.get("subject", "")
+                    sender = tp.get("sender", "")
+                    ts = tp.get("timestamp", "")
+                    if subject:
+                        parts.append(f"touchpoint ({sender}, {ts}): {subject}")
+                rich_map[oid] = "\n".join(p for p in parts if p)
+
+            # Salesforce accounts — rich body from sf_accounts collection.
+            for acc in self._mem._db["sf_accounts"].find(
+                {},
+                {
+                    "_id": 0,
+                    "account_id": 1,
+                    "name": 1,
+                    "primary_contact": 1,
+                    "type": 1,
+                    "industry": 1,
+                    "tier": 1,
+                    "billing_region": 1,
+                    "arr": 1,
+                    "owner": 1,
+                    "risk_flag": 1,
+                },
+            ):
+                aid = acc.get("account_id")
+                if not aid:
+                    continue
+                parts = [
+                    f"name: {acc.get('name', '')}",
+                    f"type: {acc.get('type', '')}",
+                    f"tier: {acc.get('tier', '')}",
+                    f"industry: {acc.get('industry', '')}",
+                    f"billing_region: {acc.get('billing_region', '')}",
+                    f"arr: ${acc.get('arr', 0):,}",
+                    f"owner: {acc.get('owner', '')}",
+                    f"primary_contact: {acc.get('primary_contact', '')}",
+                ]
+                if acc.get("risk_flag"):
+                    parts.append("risk_flag: true — ownership lapsed or at-risk")
+                rich_map[aid] = "\n".join(p for p in parts if p)
 
             for row in rows:
                 if row["doc_id"] == "CONF-UNKNOWN" and row["doc_type"] == "confluence":
@@ -591,29 +962,77 @@ class CorpusBuilder:
                     if row["doc_type"] == "confluence" and not row.get("dept"):
                         row["dept"] = _dept_from_artifact_id(row["doc_id"])
             # ── Orphan sweep ──────────────────────────────────────────────
-            # Create corpus rows for any artifacts in MongoDB not yet in corpus.
-            # Covers all retrievable types; excludes jira_comment (folded above)
-            # and persona_skill (not a corpus artifact).
-            # slack_thread = full thread document (correct corpus unit)
-            # slack = individual message fragments — excluded, same as jira_comment
-            # slack_messages collection also excluded for same reason
-            _TYPE_MAP = {
+            # Each collection is queried directly. This correctly handles the
+            # fact that emails, PRs, slack messages, ZD tickets, SF opps, and
+            # SF accounts all have their own dedicated collections and are NOT
+            # reliably present in the artifacts collection.
+            #
+            # artifacts is still swept for confluence/jira/slack_thread types
+            # (embed_artifact() is the write path for those), plus any CRM
+            # embeddings that landed there via crm_system._embed().
+            #
+            # Exclusions:
+            #   - jira_comment: folded into parent JIRA body above
+            #   - persona_skill: internal planner state, not a corpus artifact
+            #   - slack_messages individual rows: the corpus unit is the thread
+            #     (from SimEvent slack_thread key), not individual messages
+            #   - insider threat artifacts (exfil_/hoarding_/snooping_/dlp_ prefixes)
+
+            existing_ids = {row["doc_id"] for row in rows}
+
+            def _make_orphan_row(
+                doc_id,
+                doc_type,
+                title,
+                body,
+                day,
+                date,
+                timestamp,
+                actors,
+                tags,
+                artifact_type,
+                is_incident=False,
+                is_external=False,
+            ):
+                dept = _dept_from_artifact_id(doc_id) or next(
+                    (
+                        _ACTOR_TO_DEPT.get(str(a), "")
+                        for a in actors
+                        if _ACTOR_TO_DEPT.get(str(a))
+                    ),
+                    "",
+                )
+                return {
+                    "doc_id": doc_id,
+                    "doc_type": doc_type,
+                    "title": str(title)[:512],
+                    "body": str(body),
+                    "day": int(day or 0),
+                    "date": str(date or ""),
+                    "timestamp": str(timestamp or ""),
+                    "actors": json.dumps(actors),
+                    "tags": json.dumps(tags),
+                    "artifact_ids": json.dumps({artifact_type: doc_id}),
+                    "dept": dept,
+                    "is_incident": is_incident,
+                    "is_external": is_external,
+                }
+
+            # ── artifacts (confluence, jira, slack_thread, CRM embeds) ───────
+            _ARTIFACT_TYPE_MAP = {
                 "confluence": "confluence",
                 "slack_thread": "slack",
-                "email": "email",
-                "pr": "pr",
                 "jira": "jira",
+                "zd_ticket": "zd_ticket",
+                "sf_opportunity": "sf_opp",
             }
-            existing_ids = {row["doc_id"] for row in rows}
             for artifact in self._mem._db["artifacts"].find(
-                {"type": {"$in": list(_TYPE_MAP.keys())}},
+                {"type": {"$in": list(_ARTIFACT_TYPE_MAP.keys())}},
                 {
                     "_id": 1,
                     "type": 1,
                     "content": 1,
-                    "body": 1,
                     "title": 1,
-                    "subject": 1,
                     "day": 1,
                     "date": 1,
                     "timestamp": 1,
@@ -624,12 +1043,11 @@ class CorpusBuilder:
             ):
                 art_id = str(artifact.get("_id", ""))
                 art_type = artifact.get("type", "")
-                doc_type = _TYPE_MAP.get(art_type, "sim_event")
                 if not art_id or art_id in existing_ids:
                     continue
                 if any(
-                    art_id.startswith(prefix)
-                    for prefix in ("exfil_", "hoarding_", "snooping_", "dlp_")
+                    art_id.startswith(p)
+                    for p in ("exfil_", "hoarding_", "snooping_", "dlp_")
                 ):
                     logger.debug(f"  skipping insider threat artifact: {art_id}")
                     continue
@@ -637,41 +1055,280 @@ class CorpusBuilder:
                 author = artifact.get("author") or meta.get("author", "")
                 actors = artifact.get("actors") or ([author] if author else [])
                 tags = meta.get("tags", [art_type])
-                body = (
-                    artifact.get("content")
-                    or artifact.get("body")
-                    or artifact.get("subject")
-                    or ""
-                )
-                title = artifact.get("title") or artifact.get("subject") or art_id
-                dept = _dept_from_artifact_id(art_id) or next(
-                    (
-                        _ACTOR_TO_DEPT.get(str(a), "")
-                        for a in actors
-                        if _ACTOR_TO_DEPT.get(str(a))
-                    ),
-                    "",
-                )
+                body = rich_map.get(art_id) or artifact.get("content") or ""
+                title = artifact.get("title") or art_id
                 rows.append(
-                    {
-                        "doc_id": art_id,
-                        "doc_type": doc_type,
-                        "title": str(title)[:512],
-                        "body": str(body),
-                        "day": int(artifact.get("day", 0)),
-                        "date": str(artifact.get("date", "")),
-                        "timestamp": str(artifact.get("timestamp", "")),
-                        "actors": json.dumps(actors),
-                        "tags": json.dumps(tags),
-                        "artifact_ids": json.dumps({art_type: art_id}),
-                        "dept": dept,
-                        "is_incident": any(
-                            t in tags for t in ("postmortem", "incident")
+                    _make_orphan_row(
+                        doc_id=art_id,
+                        doc_type=_ARTIFACT_TYPE_MAP.get(art_type, "sim_event"),
+                        title=title,
+                        body=body,
+                        day=artifact.get("day"),
+                        date=artifact.get("date"),
+                        timestamp=artifact.get("timestamp"),
+                        actors=actors,
+                        tags=tags,
+                        artifact_type=art_type,
+                        is_incident=any(
+                            t in tags
+                            for t in (
+                                "postmortem",
+                                "incident",
+                                "escalation",
+                                "zd_escalated",
+                            )
                         ),
-                        "is_external": art_type == "email",
-                    }
+                        is_external=art_type in ("zd_ticket", "sf_opportunity"),
+                    )
                 )
-                logger.debug(f"  orphan artifact added: {art_id} ({doc_type})")
+                logger.debug(f"  orphan artifact added: {art_id} ({art_type})")
+                existing_ids.add(art_id)
+
+            # ── pull_requests ─────────────────────────────────────────────────
+            for pr in self._mem._db["pull_requests"].find(
+                {},
+                {
+                    "_id": 0,
+                    "pr_id": 1,
+                    "title": 1,
+                    "author": 1,
+                    "day": 1,
+                    "date": 1,
+                    "timestamp": 1,
+                    "dept": 1,
+                },
+            ):
+                pid = pr.get("pr_id", "")
+                if not pid or pid in existing_ids:
+                    continue
+                body = rich_map.get(pid, "")
+                rows.append(
+                    _make_orphan_row(
+                        doc_id=pid,
+                        doc_type="pr",
+                        title=pr.get("title", pid),
+                        body=body,
+                        day=pr.get("day"),
+                        date=pr.get("date"),
+                        timestamp=pr.get("timestamp"),
+                        actors=[pr["author"]] if pr.get("author") else [],
+                        tags=["pr"],
+                        artifact_type="pr",
+                    )
+                )
+                logger.debug(f"  orphan PR added: {pid}")
+                existing_ids.add(pid)
+
+            # ── emails ────────────────────────────────────────────────────────
+            for email in self._mem._db["emails"].find(
+                {},
+                {
+                    "_id": 0,
+                    "embed_id": 1,
+                    "subject": 1,
+                    "from_name": 1,
+                    "from_addr": 1,
+                    "direction": 1,
+                    "day": 1,
+                    "date": 1,
+                    "timestamp": 1,
+                },
+            ):
+                eid = email.get("embed_id", "")
+                if not eid or eid in existing_ids:
+                    continue
+                body = rich_map.get(eid, "")
+                direction = email.get("direction", "")
+                rows.append(
+                    _make_orphan_row(
+                        doc_id=eid,
+                        doc_type="email",
+                        title=email.get("subject", eid),
+                        body=body,
+                        day=email.get("day"),
+                        date=email.get("date"),
+                        timestamp=email.get("timestamp"),
+                        actors=[email["from_name"]] if email.get("from_name") else [],
+                        tags=["email", direction] if direction else ["email"],
+                        artifact_type="email",
+                        is_external=True,
+                    )
+                )
+                logger.debug(f"  orphan email added: {eid}")
+                existing_ids.add(eid)
+
+            # ── zd_tickets ────────────────────────────────────────────────────
+            for ticket in self._mem._db["zd_tickets"].find(
+                {},
+                {
+                    "_id": 0,
+                    "ticket_id": 1,
+                    "subject": 1,
+                    "org_name": 1,
+                    "day": 1,
+                    "date": 1,
+                    "created_at": 1,
+                    "status": 1,
+                    "priority": 1,
+                },
+            ):
+                tid = ticket.get("ticket_id", "")
+                if not tid or tid in existing_ids:
+                    continue
+                body = rich_map.get(tid, "")
+                rows.append(
+                    _make_orphan_row(
+                        doc_id=tid,
+                        doc_type="zd_ticket",
+                        title=ticket.get("subject", tid),
+                        body=body,
+                        day=ticket.get("day"),
+                        date=ticket.get("date"),
+                        timestamp=ticket.get("created_at"),
+                        actors=[],
+                        tags=["zendesk", "support"],
+                        artifact_type="zd_ticket",
+                        is_external=True,
+                        is_incident=ticket.get("priority") == "Urgent",
+                    )
+                )
+                logger.debug(f"  orphan ZD ticket added: {tid}")
+                existing_ids.add(tid)
+
+            # ── sf_opps ───────────────────────────────────────────────────────
+            for opp in self._mem._db["sf_opps"].find(
+                {},
+                {
+                    "_id": 0,
+                    "opportunity_id": 1,
+                    "account_name": 1,
+                    "stage": 1,
+                    "owner": 1,
+                    "day": 1,
+                    "date": 1,
+                    "created_at": 1,
+                },
+            ):
+                oid = opp.get("opportunity_id", "")
+                if not oid or oid in existing_ids:
+                    continue
+                body = rich_map.get(oid, "")
+                title = (
+                    f"{opp.get('account_name', oid)} — {opp.get('stage', '')}"
+                ).strip(" —")
+                rows.append(
+                    _make_orphan_row(
+                        doc_id=oid,
+                        doc_type="sf_opp",
+                        title=title,
+                        body=body,
+                        day=opp.get("day"),
+                        date=opp.get("date"),
+                        timestamp=opp.get("created_at"),
+                        actors=[opp["owner"]] if opp.get("owner") else [],
+                        tags=["salesforce", "opportunity"],
+                        artifact_type="sf_opp",
+                        is_external=True,
+                    )
+                )
+                logger.debug(f"  orphan SF opp added: {oid}")
+                existing_ids.add(oid)
+
+            # ── sf_accounts ───────────────────────────────────────────────────
+            for acc in self._mem._db["sf_accounts"].find(
+                {},
+                {
+                    "_id": 0,
+                    "account_id": 1,
+                    "name": 1,
+                    "owner": 1,
+                    "created_at": 1,
+                },
+            ):
+                aid = acc.get("account_id", "")
+                if not aid or aid in existing_ids:
+                    continue
+                body = rich_map.get(aid, "")
+                rows.append(
+                    _make_orphan_row(
+                        doc_id=aid,
+                        doc_type="sf_account",
+                        title=acc.get("name", aid),
+                        body=body,
+                        day=None,
+                        date=None,
+                        timestamp=acc.get("created_at"),
+                        actors=[acc["owner"]] if acc.get("owner") else [],
+                        tags=["salesforce", "account"],
+                        artifact_type="sf_account",
+                        is_external=True,
+                    )
+                )
+                logger.debug(f"  orphan SF account added: {aid}")
+                existing_ids.add(aid)
+
+            # ── slack_messages (thread-level grouping) ────────────────────────
+            # Individual slack_messages rows are per-message. For the corpus we
+            # group by thread_id and concatenate message texts into one document,
+            # which matches how SimEvents reference slack content (by thread).
+            thread_buckets: Dict[str, dict] = {}
+            for msg in self._mem._db["slack_messages"].find(
+                {},
+                {
+                    "_id": 0,
+                    "thread_id": 1,
+                    "channel": 1,
+                    "text": 1,
+                    "author": 1,
+                    "sender": 1,
+                    "ts": 1,
+                    "day": 1,
+                    "date": 1,
+                },
+            ):
+                tid = msg.get("thread_id", "")
+                if not tid or tid in existing_ids:
+                    continue
+                if tid not in thread_buckets:
+                    thread_buckets[tid] = {
+                        "channel": msg.get("channel", ""),
+                        "day": msg.get("day"),
+                        "date": msg.get("date"),
+                        "ts": msg.get("ts", ""),
+                        "actors": set(),
+                        "texts": [],
+                    }
+                bucket = thread_buckets[tid]
+                author = msg.get("author") or msg.get("sender", "")
+                if author:
+                    bucket["actors"].add(author)
+                text = msg.get("text", "")
+                if text:
+                    prefix = f"{author}: " if author else ""
+                    bucket["texts"].append(f"{prefix}{text}")
+
+            for tid, bucket in thread_buckets.items():
+                if tid in existing_ids:
+                    continue
+                actors = sorted(bucket["actors"])
+                channel = bucket["channel"]
+                body = "\n".join(bucket["texts"])
+                rows.append(
+                    _make_orphan_row(
+                        doc_id=tid,
+                        doc_type="slack",
+                        title=f"#{channel}" if channel else tid,
+                        body=body,
+                        day=bucket["day"],
+                        date=bucket["date"],
+                        timestamp=bucket["ts"],
+                        actors=actors,
+                        tags=["slack", channel] if channel else ["slack"],
+                        artifact_type="slack_thread",
+                    )
+                )
+                logger.debug(f"  orphan slack thread added: {tid}")
+                existing_ids.add(tid)
 
         except Exception as exc:
             logger.debug(f"MongoDB enrichment skipped: {exc}")
@@ -736,6 +1393,29 @@ class BaselineRunner:
         else:
             self._bm25 = None
 
+        if _DENSE_AVAILABLE:
+            logger.info("  Embedding corpus for dense baseline...")
+            embeddings = []
+
+            for i, body in enumerate(self._bodies):
+                text_to_embed = (
+                    body.strip() if body and body.strip() else "empty document"
+                )
+                vec = self._mem._embed(
+                    text_to_embed,
+                    input_type="search_document",
+                )
+                embeddings.append(vec)
+
+                if (i + 1) % 500 == 0:
+                    logger.info(f" embedded {i + 1}/{len(self._bodies)} docs...")
+
+            mat = np.array(embeddings, dtype=np.float32)
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            self._dense_matrix = mat / np.where(norms == 0, 1, norms)
+        else:
+            self._dense_matrix = None
+
     # ── PUBLIC ────────────────────────────────────────────────────────────────
 
     def run_bm25(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -749,13 +1429,17 @@ class BaselineRunner:
         return self._run_retrieval(use_dense=True)
 
     def _rank(self, query: str, use_dense: bool, top_k: int = 10) -> List[str]:
-        if use_dense and self._mem is not None:
-            # Use the same collection and pattern as Memory.recall()
-            results = self._mem.recall(query=query, n=top_k)
-            corpus_ids = set(self._doc_ids)
-            filtered = [r["id"] for r in results if r.get("id") in corpus_ids]
-            return filtered[:top_k]
-        elif self._bm25 is not None:
+        if use_dense and self._dense_matrix is not None:
+            q_vec = np.array(
+                self._mem._embed(query, input_type="search_query"), dtype=np.float32
+            )
+            q_vec /= max(np.linalg.norm(q_vec), 1e-9)
+
+            scores = self._dense_matrix @ q_vec
+            indices = scores.argsort()[::-1][:top_k]
+            return [self._doc_ids[int(i)] for i in indices]
+
+        elif not use_dense and self._bm25 is not None:
             scores = self._bm25.get_scores(_tokenize(query))
             indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
             return [self._doc_ids[i] for i in indices[:top_k]]
@@ -815,18 +1499,6 @@ class BaselineRunner:
             },
         }
         return per_question, aggregate
-
-    """ def _rank(self, query: str, use_dense: bool, top_k: int = 10) -> List[str]:
-        if use_dense and self._dense_matrix is not None:
-            q_vec = self._dense_model.encode([query], normalize_embeddings=True)[0]
-            scores = self._dense_matrix @ q_vec
-            indices = scores.argsort()[::-1][:top_k]
-            return [self._doc_ids[i] for i in indices]
-        elif self._bm25 is not None:
-            scores = self._bm25.get_scores(_tokenize(query))
-            indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-            return [self._doc_ids[i] for i in indices[:top_k]]
-        return [] """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -957,7 +1629,7 @@ class DatasetCardWriter:
         | Column | Type | Description |
         |---|---|---|
         | `doc_id` | str | Unique artifact ID (e.g. `ORG-42`, `CONF-ENG-007`) |
-        | `doc_type` | str | `jira`, `confluence`, `slack`, `email`, `pr`, `sim_event` |
+        | `doc_type` | str | `jira`, `confluence`, `slack`, `email`, `pr`, `zd_ticket`, `sf_opp`, `sf_account`, `sim_event` |
         | `title` | str | Human-readable title or subject |
         | `body` | str | Full retrievable text |
         | `day` | int | Simulation day (1-indexed) |
@@ -996,6 +1668,11 @@ class DatasetCardWriter:
         | `POSTMORTEM` | Which Confluence doc captured the postmortem for incident X? | Yes (2-hop) |
         | `STANDUP` | What did person X report at standup on Day N? | No |
         | `CUSTOMER_ESC` | Who handled the escalation from customer X and what action was taken? | Yes (2-hop) |
+        | `ZD_RESOLUTION` | How quickly was a specific Zendesk ticket resolved? | Yes (cross-thread) |
+        | `DATADOG_ALERT` | What server metric triggered the alert on Day N? | No |
+        | `INVOICE_SLA` | What SLA credits were applied to a specific customer? | Yes |
+        | `NPS_SCORE` | What was the reasoning behind the customer's NPS score? | Yes |
+        | `PR_REVIEW` | What was the verdict of the code review? | No |
 
         ### Question Schema
 
@@ -1126,7 +1803,7 @@ def _write_parquet(rows: List[dict], out_dir: Path, stem: str = "part-00000") ->
     out_path = out_dir / f"{stem}.parquet"
     pq.write_table(tbl, out_path, compression="snappy")
     logger.info(
-        f"  → {out_path} ({len(rows):,} rows, {out_path.stat().st_size // 1024} KB)"
+        f"  → {out_path} ({len(rows):,} rows, {out_path.stat().st_size // 2560} KB)"
     )
 
 

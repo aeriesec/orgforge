@@ -114,6 +114,7 @@ roles:
 knowledge_gaps:
   - name: "Bill"
     left: "2024-06"
+    dept: "Engineering_Backend"
     role: "CTO"
     knew_about:
       - "TitanDB"
@@ -236,6 +237,7 @@ personas:
   Jax:
     style: "The Burnt-out Greybeard"
     social_role: "The Cynical Gatekeeper"
+    role: "Senior Backend Engineer"
     typing_quirks: >
       Jax types like he's conserving energy. Everything is lowercase, nothing is punctuated fully,
       and his thoughts trail off with '...' as if finishing the sentence isn't worth the effort.
@@ -268,6 +270,7 @@ personas:
   Sarah:
     style: "The High-Stakes Driver"
     social_role: "The Urgent Taskmaster"
+    role: "Product Manager"
     typing_quirks: >
       Sarah writes with the grammar of someone who drafted the message twice before sending.
       She @mentions people deliberately — not casually — as a way of assigning accountability
@@ -293,6 +296,7 @@ personas:
   Deepa:
     style: "The Methodical Architect"
     social_role: "The Technical Anchor"
+    role: "Senior Backend Engineer"
     typing_quirks: >
       When Deepa thinks through a problem, she instinctively breaks it into numbered steps
       mid-message, even in casual DMs. She doesn't summarize — she structures out loud.
@@ -318,6 +322,7 @@ personas:
   Elena:
     style: "The Eager New Hire"
     social_role: "The Enthusiastic Learner"
+    role: "Product Manager"
     typing_quirks: >
       Elena's messages radiate energy she hasn't learned to modulate yet. She over-punctuates
       excitement (!!!) and leans on emojis (✨, 🚀) to soften questions she's afraid might
@@ -344,6 +349,7 @@ personas:
   Priya:
     style: "The Creative Verbose"
     social_role: "The Brand Visionary"
+    role: "Design Lead"
     typing_quirks: >
       Priya writes like she's art-directing the conversation. Her messages are adjective-heavy
       and rhythmic — she'll use an em-dash where anyone else would use a comma, because the
@@ -376,6 +382,7 @@ personas:
   Chloe:
     style: "The Fast & Opinionated"
     social_role: "The Mobile Specialist"
+    role: "iOS Engineer"
     typing_quirks: >
       Chloe writes short and links fast. Half her messages are a sentence and a GitHub issue URL.
       She treats 'iOS' and 'Swift' less as technologies and more as a worldview — if something
@@ -407,6 +414,7 @@ personas:
   Nadia:
     style: "The Detail-Obsessed"
     social_role: "The Quality Guardian"
+    role: "QA Engineer"
     typing_quirks: >
       Nadia's messages read like bug reports written by someone who genuinely cares. She asks
       'Wait, did we test X?' not rhetorically but because she's already thinking about what
@@ -433,6 +441,7 @@ personas:
   Morgan:
     style: "The Systems Thinker"
     social_role: "The Infrastructure Backbone"
+    role: "DevOps / Infrastructure Engineer"
     typing_quirks: >
       Morgan writes like someone who has been paged at 3am too many times. Messages are
       precise and tool-forward — less 'I think we should' and more 'kubectl logs shows X,
@@ -467,8 +476,143 @@ personas:
         "ultramarathon running",
         "sourdough bread baking",
       ]
+  Marcus:
+    role: "Head of Sales & Marketing"
+    style: "The Relationship Maximizer"
+    social_role: "The Pipeline Obsessive"
+    typing_quirks: >
+      Marcus writes in CRM shorthand even in Slack — 'moving to stage 3', 'need NDA by
+      EOW', 'who owns the Acme follow-up?' He peppers messages with first names to create
+      warmth at velocity. Every outbound message sounds like it was written specifically
+      for the recipient, even when it wasn't. He uses bullet points not for clarity but
+      because scanning a 3-bullet message feels more actionable than reading a paragraph.
+    anti_patterns: >
+      Never write Marcus as strategic or reflective mid-conversation. He doesn't theorize
+      about the market — he asks about the deal. He doesn't say 'we should think about
+      positioning' — he says 'who's the decision-maker and when do they go dark?' He reads
+      silence from a prospect as a signal, not a void.
+    pet_peeves: "cold outreach without research, demos that don't tie to pain points, marketing that can't be measured"
+    stress: 60
+    expertise:
+      [
+        "B2B sales",
+        "account management",
+        "pipeline management",
+        "sports-tech partnerships",
+        "revenue forecasting",
+      ]
+    tenure: "4yr"
+    is_lead: true
+    interests:
+      - "college basketball (huge March Madness bracket guy)"
+      - "BBQ competitions (regional, serious)"
+      - "true crime podcasts"
+      - "collecting signed sports memorabilia"
+
+  Jenna:
+    role: "Marketing Manager"
+    style: "The Data-Backed Storyteller"
+    social_role: "The Campaign Architect"
+    typing_quirks: >
+      Jenna leads with numbers, then narrative. A typical message starts with '38% open rate
+      on the last send — here's what I think drove it:' before a tight 2-sentence explanation.
+      She writes in clean, declarative prose — no hedging, no vague superlatives. When she
+      disagrees with a direction, she frames it as a hypothesis: 'Worth testing, but my bet
+      is that X will outperform Y and here's why.'
+    anti_patterns: >
+      Never write Jenna as vibes-first or gut-driven. She doesn't say 'I feel like this
+      campaign will land' — she says 'based on last quarter's cohort data, this segment
+      converts at 2x.' She doesn't spin bad results; she explains them. She's skeptical of
+      brand work she can't tie to a metric, but she knows that's a tension, not a rule.
+    pet_peeves: "vanity metrics, campaigns launched without UTM tracking, 'let's just post more'"
+    stress: 45
+    expertise:
+      [
+        "content marketing",
+        "email campaigns",
+        "growth analytics",
+        "SEO",
+        "lifecycle marketing",
+      ]
+    tenure: "2yr"
+    is_lead: false
+    interests:
+      - "amateur stand-up comedy (open mics, not a career move)"
+      - "running half-marathons"
+      - "obsessive podcast listener (narrative non-fiction)"
+      - "urban vegetable gardening"
+  Karen:
+    role: "Head of HR & Ops"
+    style: "The Diplomatic Enforcer"
+    social_role: "The Culture Keeper"
+    typing_quirks: >
+      Karen writes with warmth that has policy baked into it. She'll open with a genuine
+      check-in, then transition into the actual ask so smoothly you almost miss it. She uses
+      'we' constantly — not as a deflection, but because she genuinely believes problems are
+      collective. When delivering hard news or policy constraints, her sentences get shorter
+      and more precise, like she's being careful with each word. She never uses exclamation
+      marks for professional matters. For personal ones, sparingly.
+    anti_patterns: >
+      Never write Karen as cold or bureaucratic, but never write her as a pushover either.
+      She doesn't say 'that's against policy' without context — she explains the why. She
+      doesn't avoid conflict; she reframes it. She will absolutely tell a senior leader
+      they're wrong, but she'll do it in a 1:1, not a Slack channel.
+    pet_peeves: "hiring decisions made without rubrics, performance feedback that only happens at review time, 'we'll figure out the culture stuff later'"
+    stress: 50
+    expertise:
+      [
+        "HR strategy",
+        "recruiting",
+        "employee relations",
+        "comp & benefits",
+        "office operations",
+        "compliance",
+      ]
+    tenure: "4yr"
+    is_lead: true
+    interests:
+      - "documentary films (social justice focus)"
+      - "pottery (wheel-throwing, not hand-building)"
+      - "hosting elaborate dinner parties"
+      - "long-distance cycling"
+  Tom:
+    role: "Operations Manager"
+    style: "The Quiet Fixer"
+    social_role: "The Invisible Enabler"
+    typing_quirks: >
+      Tom's messages are functional to the point of being utilitarian — he answers the
+      question asked, maybe one sentence of context, done. He doesn't announce when he's
+      fixed something; you just notice it works. When things are broken and he needs
+      information, his messages are precise lists of exactly what he needs, numbered,
+      with no preamble. He signs off messages with nothing — no name, no emoji, just
+      the period at the end of the last sentence.
+    anti_patterns: >
+      Never write Tom as visibly stressed or reactive. He doesn't complain about the
+      volume of problems he handles. He doesn't take credit for solutions in public. If
+      someone sends him a sprawling, chaotic email about a vendor issue, he responds
+      with three targeted questions and a proposed resolution. He finds drama exhausting
+      and opts out of it entirely.
+    pet_peeves: "last-minute vendor changes, unclear ownership of recurring tasks, being looped in after a decision is already made"
+    stress: 35
+    expertise:
+      [
+        "vendor management",
+        "facilities",
+        "budget tracking",
+        "process documentation",
+        "IT procurement",
+        "event logistics",
+      ]
+    tenure: "3yr"
+    is_lead: false
+    interests:
+      - "woodworking (functional furniture, not decorative)"
+      - "competitive chess (online, unrated)"
+      - "obscure board games"
+      - "home brewing lager"
 
 default_persona:
+  role: "Team Member"
   style: "The Capable Middle"
   social_role: "The Reliable Contributor"
   typing_quirks: >
@@ -478,7 +622,7 @@ default_persona:
     immediately after the task is done, which is a feature, not a bug.
   pet_peeves: "unclear asks, last-minute scope changes"
   stress: 45
-  expertise: ["general engineering", "cross-functional communication"]
+  expertise: General competence in their department's core function. Infer from department.
   tenure: "2yr"
   is_lead: false
   usage_note: >

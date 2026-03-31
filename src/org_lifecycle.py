@@ -154,7 +154,7 @@ class OrgLifecycleManager:
             )
 
     def process_departures(
-        self, day: int, date_str: str, state, clock
+        self, day: int, date_str: str, state, clock, ticket_assigner=None
     ) -> List[DepartureRecord]:
         departures: List[DepartureRecord] = []
 
@@ -164,6 +164,8 @@ class OrgLifecycleManager:
             )
             if record:
                 departures.append(record)
+                if ticket_assigner is not None:
+                    ticket_assigner.evict_engineer(record.name)
 
         if self._cfg.get("enable_random_attrition", False):
             prob = self._cfg.get("random_attrition_daily_prob", 0.01)
@@ -193,8 +195,6 @@ class OrgLifecycleManager:
                         "reason": "voluntary",
                         "knowledge_domains": [],
                         "documented_pct": 0.5,
-                        # role intentionally omitted — _execute_departure resolves it
-                        # from personas so we don't hardcode anything here
                     }
                     record = self._execute_departure(
                         attrition_cfg,
@@ -206,16 +206,22 @@ class OrgLifecycleManager:
                     )
                     if record:
                         departures.append(record)
+                        if ticket_assigner is not None:
+                            ticket_assigner.evict_engineer(record.name)
                     break
 
         return departures
 
-    def process_hires(self, day: int, date_str: str, state, clock) -> List[HireRecord]:
+    def process_hires(
+        self, day: int, date_str: str, state, clock, ticket_assigner=None
+    ) -> List[HireRecord]:
         hires: List[HireRecord] = []
         for hire_cfg in self._scheduled_hires.get(day, []):
             record = self._execute_hire(hire_cfg, day, date_str, state, clock)
             if record:
                 hires.append(record)
+                if ticket_assigner is not None:
+                    ticket_assigner.register_hire(record.name)
         return hires
 
     def scan_for_knowledge_gaps(
@@ -229,16 +235,18 @@ class OrgLifecycleManager:
         similarity_threshold: float = 0.65,
     ) -> List[KnowledgeGapEvent]:
         """
-        Detect knowledge gaps using semantic similarity.
+        Detect knowledge gaps using semantic similarity against departed employee
+        expertise profiles, then cross-reference the DomainRegistry for live
+        documentation coverage and orphan status.
 
-        Instead of checking whether a departed employee's domain keyword appears
-        verbatim in the incident text, we embed the incident text and compare it
-        against the departed employee's persona_skill artifacts (expertise profile)
-        and any author_expertise artifacts (topics they wrote about).
-
-        This catches cases where incident terminology differs from the departed
-        employee's stated expertise — e.g., "auth timeout" matches against
-        "identity management" because the embeddings are semantically close.
+        Two-pass detection:
+          Pass 1 — Embedding similarity: embed the trigger text and compare
+                   against departed employees' persona_skill vectors. Catches
+                   semantic drift (e.g. "auth timeout" → "identity management").
+          Pass 2 — DomainRegistry cross-reference: for each matched domain,
+                   pull the current documentation_coverage from the registry so
+                   the SimEvent carries an accurate, mutable coverage score rather
+                   than the static documented_pct frozen at departure.
 
         Args:
             text:                  The incident root cause or description text.
@@ -256,6 +264,7 @@ class OrgLifecycleManager:
         if not self._departed:
             return found
 
+        # ── Pass 1: embedding similarity ──────────────────────────────────────
         expert_matches = self._mem.find_expert_by_skill(text, n=20)
 
         match_scores: Dict[str, float] = {}
@@ -284,15 +293,50 @@ class OrgLifecycleManager:
             )
             domain_label = ", ".join(gap_domains)
 
+            # ── Pass 2: DomainRegistry cross-reference ─────────────────────
+            # Look up live coverage for each matched domain. If the registry
+            # has been updated by Confluence writes since genesis, this will
+            # reflect partial recovery rather than the static departure value.
+            registry_hits: List[dict] = []
+            live_coverage: float = record.documented_pct  # fallback to departure value
+
+            for domain in gap_domains:
+                key = domain.lower().replace(" ", "_")
+                reg_doc = self._mem._db["domain_registry"].find_one({"_id": key})
+                if reg_doc:
+                    registry_hits.append(reg_doc)
+
+            if registry_hits:
+                # Use the lowest coverage across all matched domains — most
+                # conservative estimate, most useful for gap severity scoring.
+                live_coverage = min(r["documentation_coverage"] for r in registry_hits)
+                known_by = list(
+                    {name for r in registry_hits for name in r.get("known_by", [])}
+                )
+                orphaned_domains = [
+                    r["domain"] for r in registry_hits if r.get("primary_owner") is None
+                ]
+            else:
+                known_by = []
+                orphaned_domains = gap_domains  # assume orphaned if not in registry
+
             gap_event = KnowledgeGapEvent(
                 departed_name=record.name,
                 domain_hit=domain_label,
                 triggered_by=triggered_by,
                 triggered_on_day=day,
-                documented_pct=record.documented_pct,
+                documented_pct=live_coverage,
             )
             self._gap_events.append(gap_event)
             found.append(gap_event)
+
+            # Severity classification — used downstream by gap_detected logic
+            if live_coverage < 0.3:
+                gap_classification = "likely"
+            elif live_coverage < 0.6:
+                gap_classification = "possible"
+            else:
+                gap_classification = "none"
 
             self._mem.log_event(
                 SimEvent(
@@ -306,23 +350,52 @@ class OrgLifecycleManager:
                         "departed_employee": record.name,
                         "gap_areas": gap_domains,
                         "triggered_by": triggered_by,
-                        "documented_pct": record.documented_pct,
+                        "documented_pct": record.documented_pct,  # at departure
+                        "live_documentation_coverage": round(
+                            live_coverage, 3
+                        ),  # current
                         "days_since_departure": day - record.day,
                         "escalation_harder": True,
                         "semantic_score": round(score, 4),
                         "detection_method": "embedding_similarity",
+                        "gap_classification": gap_classification,
+                        "orphaned_domains": orphaned_domains,
+                        "known_by": known_by,
+                        # Fields aligned with PR reviewer audit schema
+                        "topics_beyond_author_expertise": gap_domains,
+                        "author_domain_fit": (
+                            "low"
+                            if live_coverage < 0.3
+                            else "medium"
+                            if live_coverage < 0.6
+                            else "high"
+                        ),
                     },
                     summary=(
                         f"Knowledge gap: {domain_label} (owned by ex-{record.name}, "
                         f"similarity={score:.3f}) surfaced in {triggered_by}. "
-                        f"~{int(record.documented_pct * 100)}% documented."
+                        f"Coverage at departure: {int(record.documented_pct * 100)}% → "
+                        f"live: {int(live_coverage * 100)}%."
+                        + (
+                            f" Orphaned: {orphaned_domains}."
+                            if orphaned_domains
+                            else ""
+                        )
+                        + (
+                            f" Partial knowledge held by: {known_by}."
+                            if known_by
+                            else ""
+                        )
                     ),
-                    tags=["knowledge_gap", "departed_employee"],
+                    tags=["knowledge_gap", "departed_employee"]
+                    + (["orphaned_domain"] if orphaned_domains else []),
                 )
             )
             logger.info(
                 f"    [yellow]⚠ Knowledge gap:[/yellow] {domain_label} "
-                f"(was {record.name}'s, score={score:.3f}) surfaced in {triggered_by}"
+                f"(was {record.name}'s, score={score:.3f}, "
+                f"live_coverage={int(live_coverage * 100)}%) surfaced in {triggered_by}"
+                + (f" | orphaned: {orphaned_domains}" if orphaned_domains else "")
             )
 
         return found
@@ -361,14 +434,50 @@ class OrgLifecycleManager:
             f"[lifecycle] Loaded {len(self._departed)} departed employee(s) from event log."
         )
 
-    def get_roster_context(self) -> str:
+    def get_roster_context(self, include_all_open_gaps: bool = False) -> str:
         lines: List[str] = []
-        for d in self._departed[-3:]:
-            gap_str = (
-                f"Knowledge gaps: {', '.join(d.knowledge_domains)}. "
-                f"~{int(d.documented_pct * 100)}% documented."
-                if d.knowledge_domains
-                else "No critical knowledge gaps."
+
+        departed_to_show = (
+            [
+                d
+                for d in self._departed
+                if any(g.departed_name == d.name for g in self._gap_events)
+            ]
+            if include_all_open_gaps
+            else self._departed[-3:]
+        )
+        for d in departed_to_show:
+            # Pull live coverage from registry rather than the static departure value
+            live_coverages: List[str] = []
+            orphaned: List[str] = []
+            for domain in d.knowledge_domains:
+                key = domain.lower().replace(" ", "_")
+                reg = self._mem._db["domain_registry"].find_one({"_id": key})
+                if reg:
+                    pct = int(reg.get("documentation_coverage", d.documented_pct) * 100)
+                    owner = reg.get("primary_owner")
+                    known_by = reg.get("known_by", [])
+                    status = (
+                        f"owner={owner}"
+                        if owner
+                        else f"ORPHANED, known_by={known_by or 'nobody'}"
+                    )
+                    live_coverages.append(f"{domain} ({pct}%, {status})")
+                    if not owner:
+                        orphaned.append(domain)
+                else:
+                    live_coverages.append(
+                        f"{domain} (~{int(d.documented_pct * 100)}%, no registry entry)"
+                    )
+                    orphaned.append(domain)
+
+            if live_coverages:
+                gap_str = "Knowledge gaps: " + "; ".join(live_coverages) + "."
+            else:
+                gap_str = "No critical knowledge gaps."
+
+            orphan_str = (
+                f" ⚠ Orphaned domains: {', '.join(orphaned)}." if orphaned else ""
             )
             ticket_str = (
                 f" Reassigned: {', '.join(d.reassigned_tickets)}."
@@ -384,7 +493,7 @@ class OrgLifecycleManager:
                 lines.append("RECENT DEPARTURES:")
             lines.append(
                 f"  - {d.name} ({d.dept}) left Day {d.day} [{d.reason}]. "
-                f"{gap_str}{ticket_str}{handoff_str}"
+                f"{gap_str}{orphan_str}{ticket_str}{handoff_str}"
             )
         for h in self._hired[-3:]:
             warm = self._count_warm_edges(h)
@@ -556,6 +665,11 @@ class OrgLifecycleManager:
             date_str=date_str,
             day=day,
         )
+
+        # ── Orphan any DomainRegistry records this engineer owned ─────────────
+        # Mid-sim departures may leave primary_owner set. Null it out so
+        # scan_for_knowledge_gaps correctly treats those domains as orphaned.
+        self._orphan_domains_on_departure(name, record, day)
 
         logger.info(
             f"  [red]👋 Departure:[/red] {name} ({dept}) [{record.reason}]. "
@@ -795,6 +909,88 @@ class OrgLifecycleManager:
             f"Stress absorbed by: {summary_str}"
         )
 
+    # ── Domain registry maintenance ──────────────────────────────────────────
+
+    def _orphan_domains_on_departure(
+        self, name: str, record: DepartureRecord, day: int
+    ) -> None:
+        """
+        Null out primary_owner on any DomainRegistry records this engineer
+        owned. Called after _execute_departure so the registry stays in sync
+        with the live org chart.
+
+        Also appends the name to former_owners so audit trails are preserved,
+        and records the coverage value at the time of departure so analysts can
+        see how much degradation happened on their watch.
+        """
+        result = self._mem._db["domain_registry"].update_many(
+            {"primary_owner": name},
+            {
+                "$set": {
+                    "primary_owner": None,
+                    "coverage_at_last_departure": None,  # will be set per-doc below
+                },
+                "$addToSet": {"former_owners": name},
+            },
+        )
+        if result.modified_count == 0:
+            return
+
+        # Per-doc update to capture individual coverage values at departure
+        orphaned = self._mem._db["domain_registry"].find(
+            {"former_owners": name, "primary_owner": None}
+        )
+        for doc in orphaned:
+            self._mem._db["domain_registry"].update_one(
+                {"_id": doc["_id"]},
+                {
+                    "$set": {
+                        "coverage_at_last_departure": doc.get("documentation_coverage"),
+                        "last_updated_day": day,
+                    }
+                },
+            )
+            logger.info(
+                f"    [dim]→ Domain '{doc['domain']}' orphaned after {name}'s departure. "
+                f"Coverage frozen at {int(doc.get('documentation_coverage', 0) * 100)}%.[/dim]"
+            )
+
+    def _claim_domains_on_hire(self, name: str, expertise: List[str], day: int) -> None:
+        """
+        When a new engineer is hired, check whether any orphaned DomainRegistry
+        domains overlap with their stated expertise. If so, assign them as
+        primary_owner and add them to known_by.
+
+        This models the realistic scenario where a targeted backfill hire
+        deliberately covers a known gap — the registry reflects the recovery
+        immediately so planner prompts and gap detection see the updated state.
+        """
+        for domain_key_str in expertise:
+            key = domain_key_str.lower().replace(" ", "_")
+            doc = self._mem._db["domain_registry"].find_one(
+                {"_id": key, "primary_owner": None}
+            )
+            if not doc:
+                # Also try system_tags match for inexact expertise names
+                doc = self._mem._db["domain_registry"].find_one(
+                    {"system_tags": key, "primary_owner": None}
+                )
+            if doc:
+                self._mem._db["domain_registry"].update_one(
+                    {"_id": doc["_id"]},
+                    {
+                        "$set": {
+                            "primary_owner": name,
+                            "last_updated_day": day,
+                        },
+                        "$addToSet": {"known_by": name},
+                    },
+                )
+                logger.info(
+                    f"    [dim]→ Domain '{doc['domain']}' claimed by new hire {name}. "
+                    f"Coverage: {int(doc.get('documentation_coverage', 0) * 100)}%.[/dim]"
+                )
+
     # ─── HIRE ENGINE ──────────────────────────────────────────────────────────
 
     def _execute_hire(
@@ -828,6 +1024,9 @@ class OrgLifecycleManager:
             day=day,
             timestamp_iso=clock.now("system").isoformat(),
         )
+
+        # Claim any orphaned DomainRegistry domains that match this hire's expertise
+        self._claim_domains_on_hire(name, expertise, day)
 
         if name in G:
             logger.warning(f"[lifecycle] '{name}' already in graph — skipping hire.")

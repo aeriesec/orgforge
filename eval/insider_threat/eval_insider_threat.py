@@ -1327,16 +1327,6 @@ def run_correlation(
         # Telemetry scoped to this actor only
         relevant = [r for r in access_log if r.get("actor") == actor]
 
-        # Also pull phone_call records where this actor made the call,
-        # and any vishing auth records filed under other actors that
-        # originated from a call by this actor
-        phone_calls = [
-            r
-            for r in access_log
-            if r.get("record_type") == "phone_call" and r.get("actor") != actor
-            # include calls made by others only if they precede an
-            # idp_auth on this actor's account (they may be the victim)
-        ]
         vishing_on_actor = [
             r
             for r in access_log

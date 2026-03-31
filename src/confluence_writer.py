@@ -400,6 +400,33 @@ class ConfluenceWriter:
             author, "design", mem=self._mem, graph_dynamics=self._gd
         )
 
+        persona = self._config.get("personas", {}).get(author, {})
+        expertise_list = persona.get("expertise", ["general tasks"])
+        expertise_str = ", ".join(str(e) for e in expertise_list[:5])
+        author_dept = next(
+            (d for d, members in self._org_chart.items() if author in members),
+            "Unknown",
+        )
+
+        # Pull live domain registry context for orphaned domains so the LLM
+        # knows it's writing about an underdocumented area
+        orphaned_domain_context = ""
+        all_domains = list(
+            self._mem._db["domain_registry"].find({"primary_owner": None})
+        )
+        for rec in all_domains:
+            tags = rec.get("system_tags", [])
+            topic_lower = topic.lower()
+            if any(tag in topic_lower for tag in tags):
+                pct = int(rec.get("documentation_coverage", 0) * 100)
+                known_by = rec.get("known_by", [])
+                orphaned_domain_context += (
+                    f"\n⚠ '{rec['domain']}' is an orphaned domain: "
+                    f"former owner={rec.get('former_owner', 'unknown')}, "
+                    f"documentation={pct}%, "
+                    f"partial knowledge held by: {known_by or 'nobody'}."
+                )
+
         agent = make_agent(
             role="Technical Lead",
             goal="Document technical decisions and extract an actionable ticket.",
@@ -412,15 +439,46 @@ class ConfluenceWriter:
                 f"Background context: {ctx}\n"
                 f"Existing pages you may reference:\n{related}\n\n"
                 f"Write a design doc Confluence page with ID {conf_id}.\n"
-                f"Also extract 1 concrete next steps as a single JIRA ticket definition.\n"
-                f"Respond ONLY with valid JSON matching this exact schema:\n"
+                f"Also extract 1 concrete next step as a JIRA ticket.\n\n"
+                + (
+                    f"DOMAIN CONTEXT:{orphaned_domain_context}\n\n"
+                    if orphaned_domain_context
+                    else ""
+                )
+                + "### SELF-AUDIT (fill metadata objectively, not in character)\n"
+                f"Your expertise on record: [{expertise_str}]\n"
+                f"Your department: {author_dept}\n"
+                "Compare every topic in your doc against that expertise list.\n"
+                "If the doc discusses areas NOT in that list, name them in "
+                "'topics_beyond_author_expertise'.\n"
+                "If you had to guess, hedge, or hand-wave on any claim, list it "
+                "in 'hedged_claims'.\n"
+                "If you deferred or left incomplete any section you know should "
+                "exist, list it in 'deferred_or_incomplete'.\n\n"
+                "Use these criteria:\n"
+                "  author_domain_fit:\n"
+                "    'high'   — doc demonstrates fluency: correct abstractions, aware of edge cases\n"
+                "    'medium' — doc is functional but shows shallow understanding or minor missteps\n"
+                "    'low'    — doc shows clear unfamiliarity: wrong patterns, missing fundamentals\n\n"
+                "  gap_classification:\n"
+                f"    'none'     — {author}'s expertise aligns with all domains in this doc\n"
+                f"    'possible' — doc touches 1-2 domains outside {author}'s expertise but content looks adequate\n"
+                f"    'likely'   — doc touches domains outside {author}'s expertise AND the content shows it\n\n"
+                f"Respond ONLY with valid JSON:\n"
                 f"{{\n"
-                f'  "markdown_doc": "string (full Markdown, no main # title, start directly with ## Problem Statement)",\n'
+                f'  "markdown_doc": "full Markdown, no # title, start with '
+                f'## Problem Statement",\n'
                 f'  "new_tickets": [\n'
-                f'    {{"title": "string", '
-                f'"assignee": "string (must be exactly: {author})", '
+                f'    {{"title": "string", "assignee": "{author}", '
                 f'"story_points": 1|2|3|5|8}}\n'
-                f"  ]\n"
+                f"  ],\n"
+                f'  "metadata": {{\n'
+                f'    "author_domain_fit": "low | medium | high",\n'
+                f'    "gap_classification": "none | possible | likely",\n'
+                f'    "topics_beyond_author_expertise": ["string"],\n'
+                f'    "hedged_claims": ["string"],\n'
+                f'    "deferred_or_incomplete": ["string"]\n'
+                f"  }}\n"
                 f"}}"
             ),
             expected_output="Valid JSON only. No markdown fences.",
@@ -444,6 +502,7 @@ class ConfluenceWriter:
             parsed = json.loads(clean)
             content = parsed.get("markdown_doc", "Draft pending.")
             new_tickets = parsed.get("new_tickets", [])
+            metadata = parsed.get("metadata", {})
         except json.JSONDecodeError as e:
             logger.warning(
                 f"[confluence] JSON parse failed for design doc: {e} — "
@@ -451,6 +510,7 @@ class ConfluenceWriter:
             )
             content = raw
             new_tickets = []
+            metadata = {}
 
         conf_ids = self._finalize_page(
             raw_content=content,
@@ -462,30 +522,69 @@ class ConfluenceWriter:
             subdir="design",
             tags=["confluence", "design_doc"],
             facts={"title": f"Design: {topic[:80]}", "type": "design_doc"},
+            skip_event=True,
         )
 
-        gaps = self._lifecycle.scan_for_knowledge_gaps(
-            text=content,
-            triggered_by=conf_ids[0],
-            day=self._state.day,
-            date_str=date_str,
-            state=self._state,
-            timestamp=timestamp,
+        _updated_domains = [
+            rec["domain"]
+            for rec in self._mem._db["domain_registry"].find(
+                {"known_by": author, "last_updated_day": self._state.day}
+            )
+        ]
+
+        domain_fit = metadata.get("author_domain_fit", "high")
+        gap_class = metadata.get("gap_classification", "none")
+        beyond_expertise = metadata.get("topics_beyond_author_expertise", [])
+        hedged = metadata.get("hedged_claims", [])
+        deferred = metadata.get("deferred_or_incomplete", [])
+
+        gap_detected = (
+            domain_fit == "low"
+            or gap_class == "likely"
+            or (gap_class == "possible" and len(beyond_expertise) > 0)
         )
-        if gaps:
-            gap_lines = "\n\n".join(
-                f"> ⚠️ **Knowledge Gap**: `{g.domain_hit}` was owned by "
-                f"ex-{g.departed_name} (~{int(g.documented_pct * 100)}% documented). "
-                f"Proceed with caution."
-                for g in gaps
+
+        if gap_detected:
+            self._mem.log_event(
+                SimEvent(
+                    type="knowledge_gap_detected",
+                    timestamp=timestamp,
+                    day=self._state.day,
+                    date=date_str,
+                    actors=[author],
+                    artifact_ids={"confluence": conf_id},
+                    facts={
+                        "detection_method": "author_self_audit",
+                        "topic": topic,
+                        "author_domain_fit": domain_fit,
+                        "author_expertise": expertise_list,
+                        "gap_classification": gap_class,
+                        "topics_beyond_expertise": beyond_expertise,
+                        "hedged_claims": hedged,
+                        "deferred_sections": deferred,
+                    },
+                    summary=(
+                        f"Knowledge gap detected in {conf_id}: "
+                        f"{author} (expertise: {expertise_str}) wrote about '{topic}' "
+                        f"with fit={domain_fit}, gap={gap_class}"
+                    ),
+                    tags=["knowledge_gap", "confluence", "design_doc"],
+                )
             )
 
-            import os
+        if beyond_expertise:
+            targeted_text = ". ".join(beyond_expertise)
+            if hedged:
+                targeted_text += ". " + ". ".join(hedged)
 
-            doc_path = f"{self._base}/confluence/design/{conf_ids[0]}.md"
-            if os.path.exists(doc_path):
-                with open(doc_path, "a") as f:
-                    f.write(f"\n\n{gap_lines}")
+            self._lifecycle.scan_for_knowledge_gaps(
+                text=targeted_text,
+                triggered_by=conf_id,
+                day=self._state.day,
+                date_str=date_str,
+                state=self._state,
+                timestamp=timestamp,
+            )
 
         created_ticket_ids = self._spawn_tickets(
             new_tickets, author, participants, date_str, timestamp
@@ -511,6 +610,9 @@ class ConfluenceWriter:
                     "type": "design_doc",
                     "spawned_tickets": created_ticket_ids,
                     "causal_chain": chain.snapshot(),  # ← add this
+                    "author_domain_fit": metadata.get("author_domain_fit", "high"),
+                    "gap_classification": metadata.get("gap_classification", "none"),
+                    "domains_updated": _updated_domains,
                 },
                 summary=(
                     f"{author} created {conf_ids[0]} and spawned "
@@ -575,7 +677,11 @@ class ConfluenceWriter:
 
         doc_history = list(
             self._mem._events.find(
-                {"type": "confluence_created"}, {"facts.title": 1, "actors": 1}
+                {
+                    "type": "confluence_created",
+                    "timestamp": {"$lte": self._clock.now(resolved_author).isoformat()},
+                },
+                {"facts.title": 1, "actors": 1},
             )
             .sort("timestamp", -1)
             .limit(20)
@@ -706,10 +812,6 @@ class ConfluenceWriter:
             facts={"title": title, "adhoc": True},
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PRIVATE — PAGE FINALISATION PIPELINE
-    # ─────────────────────────────────────────────────────────────────────────
-
     def _finalize_page(
         self,
         raw_content: str,
@@ -722,9 +824,10 @@ class ConfluenceWriter:
         tags: List[str],
         facts: Dict,
         extra_artifact_ids: Optional[Dict[str, str]] = None,
+        skip_event: bool = False,
     ) -> List[str]:
         """
-        Common finalisation pipeline for every Confluence page:
+        Common finalization pipeline for every Confluence page:
           1. Strip broken cross-references
           2. Register ID (raises DuplicateArtifactError — caller handles)
           3. Chunk into child pages if content is long
@@ -749,13 +852,10 @@ class ConfluenceWriter:
 
         created_ids: List[str] = []
         for page in pages:
-            # _registry.chunk_into_pages already registered IDs —
-            # catch the rare race where an ID was registered externally
             logger.info(
                 f"[finalize] embedding page.id={page.id} parent={page.parent_id or 'ROOT'} content_len={len(page.content)}"
             )
             try:
-                # strip broken refs one more time after chunking added headers
                 final_content = self._registry.strip_broken_references(page.content)
             except Exception as e:
                 logger.info(f"[finalize] Caught exception {e}")
@@ -782,6 +882,16 @@ class ConfluenceWriter:
                 timestamp=timestamp,
                 metadata=meta,
             )
+
+            if page.parent_id is None and author and "genesis" not in (tags or []):
+                domains_updated = self._update_domain_registry_on_write(
+                    author=author,
+                    title=page.title,
+                    content=final_content,
+                    day=self._state.day,
+                )
+                if domains_updated:
+                    meta["domains_updated"] = domains_updated
 
             if page.parent_id is None and author:
                 self._mem._db["author_expertise"].update_one(
@@ -823,21 +933,23 @@ class ConfluenceWriter:
                 f"summary={'Child' if page.parent_id else 'Page'} {page.id} created: {page.title} "
                 f"tags={tags}"
             )
-            self._mem.log_event(
-                SimEvent(
-                    type="confluence_created",
-                    timestamp=timestamp,
-                    day=self._state.day,
-                    date=date_str,
-                    actors=[author],
-                    artifact_ids=artifact_ids,
-                    facts=page_facts,
-                    summary=(
-                        f"{'Child' if page.parent_id else 'Page'} {page.id} created: {page.title}"
-                    ),
-                    tags=tags,
+
+            if not skip_event:
+                self._mem.log_event(
+                    SimEvent(
+                        type="confluence_created",
+                        timestamp=timestamp,
+                        day=self._state.day,
+                        date=date_str,
+                        actors=[author],
+                        artifact_ids=artifact_ids,
+                        facts=page_facts,
+                        summary=(
+                            f"{'Child' if page.parent_id else 'Page'} {page.id} created: {page.title}"
+                        ),
+                        tags=tags,
+                    )
                 )
-            )
             logger.debug(f"[finalize] post-log-event page.id={page.id}")
 
             logger.info(f"[confluence] _finalize_page complete: {page.id}")
@@ -910,12 +1022,71 @@ class ConfluenceWriter:
             created_ids.append(tid)
         return created_ids
 
+    def _update_domain_registry_on_write(
+        self,
+        author: str,
+        title: str,
+        content: str,
+        day: int,
+        coverage_delta: float = 0.10,
+    ) -> List[str]:
+        """
+        After any Confluence page is finalised, check whether the page title or
+        content touches any registered domain in the DomainRegistry. If it does,
+        increment documentation_coverage by coverage_delta (default +10%) and
+        add the author to known_by.
+
+        This is the recovery arc: every page written against an orphaned domain
+        nudges coverage upward. The planner prompt and gap detection both read
+        live coverage, so this produces visible narrative improvement over time.
+
+        Matching is done against system_tags so variant spellings still resolve
+        (e.g. "titan" matches "TitanDB", "auth" matches "legacy auth service").
+
+        Returns:
+            List of domain names that were updated.
+        """
+        updated: List[str] = []
+
+        all_domains = list(self._mem._db["domain_registry"].find({}))
+        if not all_domains:
+            return updated
+
+        search_text = f"{title} {content[:500]}".lower()
+
+        for rec in all_domains:
+            tags = rec.get("system_tags", [])
+            if not any(tag in search_text for tag in tags):
+                continue
+
+            old_coverage = rec.get("documentation_coverage", 0.0)
+            new_coverage = min(1.0, old_coverage + coverage_delta)
+
+            self._mem._db["domain_registry"].update_one(
+                {"_id": rec["_id"]},
+                {
+                    "$set": {
+                        "documentation_coverage": round(new_coverage, 3),
+                        "last_updated_day": day,
+                    },
+                    "$addToSet": {"known_by": author},
+                },
+            )
+            updated.append(rec["domain"])
+            logger.info(
+                f"    [dim]→ Domain registry: '{rec['domain']}' coverage "
+                f"{int(old_coverage * 100)}% → {int(new_coverage * 100)}% "
+                f"(author: {author})[/dim]"
+            )
+
+        return updated
+
     def _pick_dept_author(self, prefix: str) -> str:
         """Return a random member of the department matching prefix, fallback to any employee."""
         for dept, members in self._org_chart.items():
             if prefix.upper() in dept.upper() and members:
                 return random.choice(members)
-        # Fallback: any employee at all
+
         return random.choice(self._all_names)
 
     def _conf_prefix_for(self, author: str) -> str:
@@ -1017,10 +1188,37 @@ class ConfluenceWriter:
         return parts[1] if len(parts) >= 3 else "GEN"
 
     def _knowledge_gap_warning(self, topic: str) -> str:
-        """Append a knowledge-gap warning if the topic touches a departed employee's domain."""
+        """
+        Append a knowledge-gap warning if the topic touches a registered orphaned domain.
+        Uses live documentation_coverage from DomainRegistry rather than the static
+        config value so the warning reflects any recovery that has happened since genesis.
+        """
+        topic_lower = topic.lower()
+
+        # First try live registry — preferred source
+        all_domains = list(
+            self._mem._db["domain_registry"].find({"primary_owner": None})
+        )
+        for rec in all_domains:
+            tags = rec.get("system_tags", [])
+            if any(tag in topic_lower for tag in tags):
+                pct = int(rec.get("documentation_coverage", 0.2) * 100)
+                former = rec.get("former_owner", "a former employee")
+                known_by = rec.get("known_by", [])
+                known_str = (
+                    f" Partial knowledge held by: {', '.join(known_by)}."
+                    if known_by
+                    else " No current owner."
+                )
+                return (
+                    f"\n\n> ⚠️ **Knowledge Gap**: This area ({rec['domain']}) was owned by "
+                    f"{former}. Only ~{pct}% documented.{known_str}"
+                )
+
+        # Fallback to static config if domain not in registry (e.g. pre-registry data)
         departed = self._config.get("knowledge_gaps", [])
         for emp in departed:
-            hits = [k for k in emp.get("knew_about", []) if k.lower() in topic.lower()]
+            hits = [k for k in emp.get("knew_about", []) if k.lower() in topic_lower]
             if hits:
                 return (
                     f"\n\n> ⚠️ **Knowledge Gap**: This area ({', '.join(hits)}) was owned by "

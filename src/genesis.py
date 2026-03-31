@@ -263,6 +263,9 @@ def seed_crm_accounts(mem: Memory):
     }
 
     for contact in contacts:
+        if contact.get("category", "").lower() != "customer":
+            continue
+
         org_name = contact.get("org", "Unknown")
         safe_id = org_name.upper().replace(" ", "").replace("-", "")
         account_id = f"ACC-{safe_id}"
@@ -335,8 +338,60 @@ def seed_crm_accounts(mem: Memory):
     pass
 
 
+def _domain_key(domain: str) -> str:
+    """Normalise a domain name to a stable MongoDB key."""
+    return domain.lower().replace(" ", "_")
+
+
+def _build_system_tags(domain: str, knew_about: List[str]) -> List[str]:
+    """
+    Derive search-friendly system tags from a domain name and the full
+    knew_about list so ticket tagging has multiple match surfaces.
+
+    e.g. "TitanDB" → ["titandb", "titan", "db"]
+         "legacy auth service" → ["legacy auth service", "legacy auth", "auth service", "auth"]
+    """
+    tags = set()
+    raw = domain.lower()
+    tags.add(raw)
+
+    for token in re.split(r"[\s_\-]+", raw):
+        if len(token) >= 3:
+            tags.add(token)
+
+    for sibling in knew_about:
+        for token in re.split(r"[\s_\-]+", sibling.lower()):
+            if len(token) >= 3 and token in raw:
+                tags.add(token)
+
+    return sorted(tags)
+
+
 def seed_knowledge_gaps(mem: Memory):
-    """Embeds skills and logs departure events for pre-simulation employees."""
+    """
+    Embeds skills, logs departure events, and seeds the DomainRegistry for
+    every pre-simulation employee defined under knowledge_gaps in config.
+
+    DomainRegistry documents live in mem._db["domain_registry"] with _id
+    equal to the normalised domain key.  Each document schema:
+
+        {
+            "_id":                  "titandb",          # normalised key
+            "domain":               "TitanDB",          # display name
+            "primary_owner":        None,               # None = orphaned
+            "former_owner":         "Bill",
+            "documentation_coverage": 0.20,
+            "last_updated_day":     -180,               # day relative to sim start
+            "known_by":             [],                 # engineers with partial knowledge
+            "system_tags":          ["titandb", "titan", "db"],
+            "dept":                 "Engineering_Backend",
+            "is_genesis_gap":       True,
+        }
+
+    Callers (DepartmentPlanner, PR reviewer) should call
+    mem.get_domain_registry() to receive the full registry dict keyed by
+    domain display name.
+    """
     if not CONFIG.get("knowledge_gaps"):
         return
 
@@ -344,19 +399,26 @@ def seed_knowledge_gaps(mem: Memory):
 
     sim_start = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
 
+    mem._db["domain_registry"].create_index([("system_tags", 1)])
+    mem._db["domain_registry"].create_index([("primary_owner", 1)])
+
     for gap in CONFIG.get("knowledge_gaps", []):
         name = gap["name"]
         left_date = gap["left"]
         left_dt = datetime.strptime(left_date, "%Y-%m")
         departure_day = -(sim_start - left_dt).days
+        dept = gap.get("dept", "Engineering")
+        role = gap.get("role", "Former Employee")
+        knew_about = gap.get("knew_about", [])
+        doc_pct = gap.get("documented_pct", 0.5)
 
         mem.embed_persona_skills(
             name=name,
             data={
-                "expertise": gap.get("knew_about", []),
-                "social_role": gap.get("role", "Former Employee"),
+                "expertise": knew_about,
+                "social_role": role,
             },
-            dept=gap.get("dept", "Engineering"),
+            dept=dept,
             day=departure_day,
             timestamp_iso=f"{left_date}-01T09:00:00",
         )
@@ -371,16 +433,94 @@ def seed_knowledge_gaps(mem: Memory):
                 artifact_ids={},
                 facts={
                     "name": name,
-                    "role": gap.get("role", ""),
-                    "knowledge_domains": gap.get("knew_about", []),
-                    "documented_pct": gap.get("documented_pct", 0.5),
+                    "role": role,
+                    "knowledge_domains": knew_about,
+                    "documented_pct": doc_pct,
                     "is_genesis_gap": True,
                 },
-                summary=f"Genesis Gap: {name} ({gap.get('role')}) left Day {departure_day}.",
+                summary=f"Genesis Gap: {name} ({role}) left Day {departure_day}.",
                 tags=["employee_departed", "lifecycle", "genesis"],
             )
         )
-        logger.info(f"    [dim]→ Seeded Genesis Gap: {name}[/dim]")
+
+        for domain in knew_about:
+            key = _domain_key(domain)
+            system_tags = _build_system_tags(domain, knew_about)
+
+            existing = mem._db["domain_registry"].find_one({"_id": key})
+            if existing:
+                # Domain already registered (e.g. two departures knew the
+                # same system).  Just ensure former_owners is a list and
+                # append — don't overwrite coverage.
+                mem._db["domain_registry"].update_one(
+                    {"_id": key},
+                    {
+                        "$addToSet": {
+                            "former_owners": name,
+                            "system_tags": {"$each": system_tags},
+                        }
+                    },
+                )
+                logger.info(
+                    f"    [dim]→ Domain '{domain}' already registered — "
+                    f"appended {name} as former owner.[/dim]"
+                )
+                continue
+
+            record = {
+                "_id": key,
+                "domain": domain,
+                "primary_owner": None,  # orphaned from day 0
+                "former_owner": name,
+                "former_owners": [name],
+                "documentation_coverage": doc_pct,
+                "last_updated_day": departure_day,
+                "known_by": [],  # no current engineers
+                "system_tags": system_tags,
+                "dept": dept,
+                "is_genesis_gap": True,
+            }
+
+            mem._db["domain_registry"].insert_one(record)
+
+            logger.info(
+                f"    [dim]→ Domain registry: '{domain}' "
+                f"(owner=None, coverage={int(doc_pct * 100)}%, "
+                f"tags={system_tags})[/dim]"
+            )
+
+        mem.log_event(
+            SimEvent(
+                type="knowledge_gap_detected",
+                day=departure_day,
+                date=f"{left_date}-01",
+                timestamp=f"{left_date}-01T09:00:00",
+                actors=[name],
+                artifact_ids={},
+                facts={
+                    "detection_method": "genesis_seed",
+                    "former_owner": name,
+                    "role": role,
+                    "dept": dept,
+                    "domains": knew_about,
+                    "documentation_coverage": doc_pct,
+                    "gap_classification": "likely",
+                    "author_domain_fit": "low",
+                    "topics_beyond_author_expertise": knew_about,
+                    "is_genesis_gap": True,
+                },
+                summary=(
+                    f"Genesis gap seeded: {name} ({role}) departed with sole "
+                    f"ownership of {knew_about}. "
+                    f"Documentation coverage: {int(doc_pct * 100)}%."
+                ),
+                tags=["knowledge_gap", "genesis", "orphaned_domain"],
+            )
+        )
+
+        logger.info(
+            f"    [dim]→ Seeded Genesis Gap: {name} | domains: {knew_about}[/dim]"
+        )
 
 
 @staticmethod

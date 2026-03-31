@@ -26,56 +26,19 @@ build_retriever() and the existing eval loop:
   Wraps any base Retriever and expands results by walking artifact
   relationship edges that are embedded in the corpus itself.
 
-  The corpus documents produced by OrgForge's simulation carry relationship
-  metadata in several forms:
-    • JSON-encoded "related_ids" / "causal_chain" / "artifact_ids" fields
-    • Inline artifact-ID tokens (ORG-\d+, CONF-\w+, EMAIL-\d+, etc.)
-      referenced in the body text
-    • A free-form "evidence_chain" field
-
   The graph expander:
     1. Indexes all edges at index() time  →  O(|corpus|) build
     2. At retrieve() time, takes the base retriever's top-K results,
-       adds 1-hop neighbours from the edge graph, re-ranks the combined
+       adds 1-hop neighbors from the edge graph, re-ranks the combined
        pool by (base_score + neighbour_boost), and returns top-K.
 
-  Neighbour boost decays with hop distance:
+  Neighbor boost decays with hop distance:
       boost(d, hop) = NEIGHBOUR_BOOST_BASE ** hop   (default: 0.5 per hop)
 
   Usage:
       python eval_e2e.py --retriever graph-bm25 --generator claude
       python eval_e2e.py --retriever graph-cohere --generator claude
       python eval_e2e.py --retriever graph-rrf --generator claude
-
-Integration
------------
-Add the following block to eval_e2e.py's build_retriever() function:
-
-    # ── paste after the existing if/elif chain ──────────────────────────
-    from retrieval_extensions import RRFRetriever, GraphAugmentedRetriever
-
-    if name == "rrf":
-        return RRFRetriever([BM25Retriever(), CohereRetriever()])
-    if name == "rrf-openai":
-        return RRFRetriever([BM25Retriever(), OpenAIRetriever()])
-    if name == "rrf-bedrock":
-        return RRFRetriever([BM25Retriever(), BedrockCohereRetriever(region=region)])
-    if name == "graph-bm25":
-        return GraphAugmentedRetriever(BM25Retriever())
-    if name == "graph-cohere":
-        return GraphAugmentedRetriever(CohereRetriever())
-    if name == "graph-rrf":
-        base = RRFRetriever([BM25Retriever(), CohereRetriever()])
-        return GraphAugmentedRetriever(base)
-    # ────────────────────────────────────────────────────────────────────
-
-Also add the new choices to the --retriever argparse argument:
-
-    choices=[
-        "bm25", "cohere", "cohere-bedrock", "openai",
-        "rrf", "rrf-openai", "rrf-bedrock",
-        "graph-bm25", "graph-cohere", "graph-rrf",
-    ],
 """
 
 from __future__ import annotations
@@ -84,9 +47,8 @@ import json
 import logging
 import re
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
-import numpy as np
 
 logger = logging.getLogger("orgforge.retrieval_extensions")
 
@@ -110,7 +72,7 @@ _RELATION_FIELDS = (
 # RRF smoothing constant (Cormack et al. 2009 recommend k=60).
 RRF_K: int = 60
 
-# Graph expansion: score boost applied to 1-hop neighbours.
+# Graph expansion: score boost applied to 1-hop neighbors.
 # Each additional hop multiplies by this factor  (geometric decay).
 NEIGHBOUR_BOOST_BASE: float = 0.5
 
@@ -253,7 +215,7 @@ class _ArtifactGraph:
 
         for doc in corpus:
             src = doc["doc_id"]
-            neighbours: Set[str] = set()
+            neighbors: Set[str] = set()
 
             # 1. Structured relation fields.
             for field in _RELATION_FIELDS:
@@ -266,30 +228,30 @@ class _ArtifactGraph:
                         val = json.loads(val)
                     except (json.JSONDecodeError, ValueError):
                         # Try to extract IDs inline from the raw string.
-                        neighbours.update(self._extract_ids_from_text(val, doc_ids))
+                        neighbors.update(self._extract_ids_from_text(val, doc_ids))
                         continue
                 # Might be a dict (artifact_ids maps type → id).
                 if isinstance(val, dict):
                     for v in val.values():
                         if isinstance(v, str) and v in doc_ids:
-                            neighbours.add(v)
+                            neighbors.add(v)
                         elif isinstance(v, list):
-                            neighbours.update(x for x in v if x in doc_ids)
+                            neighbors.update(x for x in v if x in doc_ids)
                 elif isinstance(val, list):
                     for item in val:
                         if isinstance(item, str) and item in doc_ids:
-                            neighbours.add(item)
+                            neighbors.add(item)
 
             # 2. Inline artifact-ID tokens in body / title.
             for text_field in ("body", "content", "title"):
                 text = doc.get(text_field) or ""
-                neighbours.update(self._extract_ids_from_text(text, doc_ids))
+                neighbors.update(self._extract_ids_from_text(text, doc_ids))
 
             # Remove self-loops.
-            neighbours.discard(src)
+            neighbors.discard(src)
 
             # Register bidirectional edges.
-            for tgt in neighbours:
+            for tgt in neighbors:
                 self._adj[src].add(tgt)
                 self._adj[tgt].add(src)
 
@@ -303,8 +265,8 @@ class _ArtifactGraph:
     # Query
     # ------------------------------------------------------------------
 
-    def neighbours(self, doc_id: str) -> Set[str]:
-        """Return all direct neighbours of doc_id."""
+    def neighbors(self, doc_id: str) -> Set[str]:
+        """Return all direct neighbors of doc_id."""
         return set(self._adj.get(doc_id, set()))
 
     def expand(
@@ -326,7 +288,7 @@ class _ArtifactGraph:
             current_hop += 1
             next_frontier: Set[str] = set()
             for node in frontier:
-                for nbr in self.neighbours(node):
+                for nbr in self.neighbors(node):
                     if nbr not in visited and nbr not in set(seed_ids):
                         visited[nbr] = current_hop
                         next_frontier.add(nbr)
@@ -372,7 +334,7 @@ class GraphAugmentedRetriever:
     max_hops : int
         Graph expansion depth.  1–2 recommended; ≥3 adds noise.
     neighbour_boost_base : float
-        Multiplicative decay per hop.  0.5 means 1-hop neighbours get 50%
+        Multiplicative decay per hop.  0.5 means 1-hop neighbors get 50%
         of the connecting seed's score, 2-hop get 25%, etc.
     candidate_k : int
         Seeds fetched from base retriever before graph expansion.
@@ -493,47 +455,3 @@ class GraphAugmentedRetriever:
                 }
             )
         return results
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# build_retriever() PATCH
-# ─────────────────────────────────────────────────────────────────────────────
-# Copy-paste this function to REPLACE build_retriever() in eval_e2e.py.
-# It adds rrf / rrf-openai / rrf-bedrock / graph-* to the existing choices.
-#
-# def build_retriever(name: str, region: str = "us-east-1") -> Retriever:
-#     from retrieval_extensions import RRFRetriever, GraphAugmentedRetriever
-#
-#     # ── original retrievers ───────────────────────────────────────────────────
-#     if name == "bm25":
-#         return BM25Retriever()
-#     if name == "cohere":
-#         return CohereRetriever()
-#     if name == "cohere-bedrock":
-#         return BedrockCohereRetriever(region=region)
-#     if name == "openai":
-#         return OpenAIRetriever()
-#
-#     # ── RRF retrievers ────────────────────────────────────────────────────────
-#     if name == "rrf":
-#         return RRFRetriever([BM25Retriever(), CohereRetriever()])
-#     if name == "rrf-openai":
-#         return RRFRetriever([BM25Retriever(), OpenAIRetriever()])
-#     if name == "rrf-bedrock":
-#         return RRFRetriever([BM25Retriever(), BedrockCohereRetriever(region=region)])
-#
-#     # ── Graph-augmented retrievers ────────────────────────────────────────────
-#     if name == "graph-bm25":
-#         return GraphAugmentedRetriever(BM25Retriever())
-#     if name == "graph-cohere":
-#         return GraphAugmentedRetriever(CohereRetriever())
-#     if name == "graph-rrf":
-#         base = RRFRetriever([BM25Retriever(), CohereRetriever()])
-#         return GraphAugmentedRetriever(base)
-#
-#     raise ValueError(
-#         f"Unknown retriever: {name!r}. "
-#         "Choose bm25 | cohere | cohere-bedrock | openai | "
-#         "rrf | rrf-openai | rrf-bedrock | "
-#         "graph-bm25 | graph-cohere | graph-rrf"
-#     )

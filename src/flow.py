@@ -268,6 +268,7 @@ class ActiveIncident(BaseModel):
     causal_chain: Any = None
     recurrence_of: Optional[str] = None
     on_call: str = ""
+    actors: List[str] = []
 
 
 class SprintState(BaseModel):
@@ -932,10 +933,18 @@ class OrgForgeSimulation:
             self._clock.reset_to_business_start(ALL_NAMES)
             date_str = str(self.state.current_date.date())
             departures = self._lifecycle.process_departures(
-                self.state.day, date_str, self.state, self._clock
+                self.state.day,
+                date_str,
+                self.state,
+                self._clock,
+                ticket_assigner=self._ticket_assigner,
             )
             hires = self._lifecycle.process_hires(
-                self.state.day, date_str, self.state, self._clock
+                self.state.day,
+                date_str,
+                self.state,
+                self._clock,
+                ticket_assigner=self._ticket_assigner,
             )
 
             for inc in self.state.active_incidents:
@@ -984,7 +993,34 @@ class OrgForgeSimulation:
             if self._is_retro_day():
                 self._handle_retrospective()
 
-            self._advance_incidents()
+            _base_prob = CONFIG["simulation"].get("incident_base_prob", 0.15)
+            _cooldown = CONFIG["simulation"].get("incident_cooldown_days", 3)
+            days_since_incident = self.state.day - self.state.last_incident_day
+
+            _incident_triggers = CONFIG["simulation"].get(
+                "incident_triggers",
+                [
+                    "crash",
+                    "fail",
+                    "error",
+                    "latency",
+                    "timeout",
+                    "outage",
+                    "down",
+                    "spike",
+                ],
+            )
+            _theme_lower = self.state.daily_theme.lower()
+            _theme_triggered = any(x in _theme_lower for x in _incident_triggers)
+            _prob_triggered = random.random() < _base_prob
+
+            if (
+                not self.state.active_incidents
+                and days_since_incident > _cooldown
+                and (_theme_triggered or _prob_triggered)
+            ):
+                self.state.last_incident_day = self.state.day
+                self._handle_incident()
 
             self._normal_day.handle(self.state.org_day_plan)
             self._email_ingestor.generate_business_hours(state=self.state)
@@ -1018,34 +1054,7 @@ class OrgForgeSimulation:
                 if r.get("pattern") == "trust_building":
                     self._se_followup_days[r["followup_due_day"]] = r["target"]
 
-            _base_prob = CONFIG["simulation"].get("incident_base_prob", 0.15)
-            _cooldown = CONFIG["simulation"].get("incident_cooldown_days", 3)
-            days_since_incident = self.state.day - self.state.last_incident_day
-
-            _incident_triggers = CONFIG["simulation"].get(
-                "incident_triggers",
-                [
-                    "crash",
-                    "fail",
-                    "error",
-                    "latency",
-                    "timeout",
-                    "outage",
-                    "down",
-                    "spike",
-                ],
-            )
-            _theme_lower = self.state.daily_theme.lower()
-            _theme_triggered = any(x in _theme_lower for x in _incident_triggers)
-            _prob_triggered = random.random() < _base_prob
-
-            if (
-                not self.state.active_incidents
-                and days_since_incident > _cooldown
-                and (_theme_triggered or _prob_triggered)
-            ):
-                self.state.last_incident_day = self.state.day
-                self._handle_incident()
+            self._advance_incidents()
 
             self._embed_worker.drain()
 
@@ -1192,6 +1201,7 @@ class OrgForgeSimulation:
                 {
                     "dept": dept,
                     "status": {"$ne": "Done"},
+                    "created_at": {"$lte": timestamp_str},
                 }
             )
             dept_capacity = self._ticket_assigner._compute_capacity(members, self.state)
@@ -1690,14 +1700,26 @@ class OrgForgeSimulation:
 
     def _handle_incident(self):
         ticket_id = next_jira_id(self.state, self._registry, dept="Engineering_Backend")
-        root_cause = self._generate_root_cause()
-        on_call = self._select_domain_expert(root_cause, exclude="")
-
-        incident_start = self._clock.tick_system(min_mins=30, max_mins=240)
-        incident_start_iso = incident_start.isoformat()
         date_str = str(self.state.current_date.date())
 
-        self._clock.sync_to_system([on_call])
+        on_call = self._get_next_on_call(self.state.day)
+
+        system_fault = self._generate_root_cause()
+
+        incident_lead = self._select_domain_expert(system_fault, exclude=on_call)
+
+        eng_peer = next(
+            (
+                n
+                for n in LIVE_ORG_CHART.get(dept_of(incident_lead), [])
+                if n != incident_lead and n != on_call
+            ),
+            on_call,
+        )
+
+        self._clock.tick_system(min_mins=30, max_mins=240)
+        responders = [r for r in [on_call, incident_lead, eng_peer] if r]
+        incident_start_iso = self._clock.sync_to_system(responders).isoformat()
 
         rc_agent = make_agent(
             role=f"{on_call}, Senior On-Call Engineer",
@@ -1707,6 +1729,21 @@ class OrgForgeSimulation:
             ),
             llm=PLANNER_MODEL,
         )
+
+        signals_map = self._day_planner._extract_cross_signals(
+            self._mem, self.state.day, as_of_time=incident_start_iso
+        )
+
+        eng_dept_key = next(
+            (k for k in signals_map if "eng" in k.lower()), "Engineering"
+        )
+        recent_friction = signals_map.get(eng_dept_key, [])
+
+        friction_summary = "\n".join(
+            [f"- {s.event_type}: {s.summary}" for s in recent_friction]
+        )
+
+        tech_stack = self._mem.tech_stack_for_prompt()
 
         if self.state.system_health < 40:
             length_instruction = (
@@ -1725,9 +1762,11 @@ class OrgForgeSimulation:
         rc_task = Task(
             description=(
                 f"You are {on_call}. You are on-call and an incident just fired.\n\n"
+                f"RECENT ORG FRICTION & SIGNALS:\n{friction_summary}\n\n"
                 f"System health: {self.state.system_health}/100\n"
                 f"Today's org theme: {self.state.daily_theme}\n\n"
-                f"Write the root cause. Length: {length_instruction}\n"
+                f"Tech stack:\n{tech_stack}\n\n"
+                f"Write the root cause diagnosis based on this root cause {system_fault}. Length: {length_instruction}\n"
                 f"Reference a real system component, endpoint, or dependency. "
                 f"No preamble, no label — just the root cause."
             ),
@@ -1743,19 +1782,8 @@ class OrgForgeSimulation:
             Crew(agents=[rc_agent], tasks=[rc_task], verbose=False).kickoff()
         ).strip()
 
-        incident_lead = self._select_domain_expert(root_cause, exclude=on_call)
-
-        eng_peer = next(
-            (
-                n
-                for n in LIVE_ORG_CHART.get(dept_of(incident_lead), [])
-                if n != incident_lead and n != on_call
-            ),
-            on_call,
-        )
-
         detected_gaps = self._lifecycle.scan_for_knowledge_gaps(
-            text=root_cause,
+            text=system_fault,
             triggered_by=ticket_id,
             day=self.state.day,
             date_str=date_str,
@@ -1779,7 +1807,7 @@ class OrgForgeSimulation:
             )
 
         prior = self._recurrence_detector.find_prior_incident(
-            root_cause, self.state.day, ticket_id
+            system_fault, self.state.day, ticket_id
         )
         recurrence_of = prior.artifact_ids.get("jira") if prior else None
         recurrence_gap = (self.state.day - prior.day) if prior else None
@@ -1808,7 +1836,7 @@ class OrgForgeSimulation:
         escalation_actors = [n for n, _ in chain.chain]
 
         datadog_text = (
-            f"🚨 [CRITICAL] Anomaly detected: {root_cause[:80]}... "
+            f"🚨 [CRITICAL] Anomaly detected: {system_fault[:80]}... "
             f"Error rate spiked 400%. System health dropped to {self.state.system_health}."
         )
         pagerduty_text = (
@@ -1827,7 +1855,7 @@ class OrgForgeSimulation:
         chain_handler.append(datadog_thread)
         chain_handler.append(pagerduty_thread)
 
-        _rc_slug = root_cause[:80].rstrip(".,;")
+        _rc_slug = system_fault[:80].rstrip(".,;")
         _gap_tag = (
             f" [{gap_areas[0]} undocumented]" if involves_gap and gap_areas else ""
         )
@@ -1846,6 +1874,8 @@ class OrgForgeSimulation:
                 f"Write a Jira ticket description for this incident.\n\n"
                 f"COMPANY CONTEXT: {COMPANY_NAME} which {COMPANY_DESCRIPTION}\n"
                 f"Title: {title}\n"
+                f"System Fault: {system_fault}\n"
+                f"Tech Stack: {tech_stack}\n"
                 f"Root cause: {root_cause}\n"
                 f"Escalation path: {escalation_narrative}\n"
                 f"System health at incident open: {self.state.system_health}/100\n"
@@ -1956,7 +1986,7 @@ class OrgForgeSimulation:
             root_cause=root_cause,
             causal_chain=chain_handler,
             recurrence_of=recurrence_of,
-            on_call=on_call,
+            actors=responders,
         )
         self.state.active_incidents.append(inc)
         self.state.daily_incidents_opened += 1
@@ -1982,6 +2012,7 @@ class OrgForgeSimulation:
                 facts={
                     "title": title,
                     "root_cause": root_cause,
+                    "system_fault": system_fault,
                     "involves_gap": involves_gap,
                     "gap_areas": gap_areas,
                     "causal_chain": chain_handler.snapshot(),
@@ -2003,7 +2034,7 @@ class OrgForgeSimulation:
 
         self._crm.handle_incident_opened(
             incident_id=ticket_id,
-            component=root_cause[:80],
+            component=system_fault,
             health=self.state.system_health,
             timestamp=incident_start_iso,
             date_str=date_str,
@@ -2027,25 +2058,6 @@ class OrgForgeSimulation:
                 tags=["escalation", "incident"],
             )
         )
-
-        if involves_gap:
-            self._mem.log_event(
-                SimEvent(
-                    type="knowledge_gap_detected",
-                    timestamp=incident_start_iso,
-                    day=self.state.day,
-                    date=date_str,
-                    actors=[on_call, eng_peer],
-                    artifact_ids={ARTIFACT_KEY_JIRA: ticket_id},
-                    facts={
-                        "gap_areas": gap_areas or [LEGACY["name"]],
-                        "involves_gap": True,
-                        "gap_context": gap_context_str,
-                    },
-                    summary=f"Knowledge gap detected during {ticket_id}: {gap_context_str[:80]}",
-                    tags=["knowledge_gap"],
-                )
-            )
 
         self._record_daily_actor(on_call, incident_lead)
         self._record_daily_event("incident_opened")
@@ -2098,7 +2110,7 @@ class OrgForgeSimulation:
                     timestamp=cron_time_iso,
                 )
 
-                t = self._mem.get_ticket(inc.ticket_id)
+                t = self._mem.get_ticket(inc.ticket_id, as_of_time=cron_time_iso)
                 if t:
                     if pr["pr_id"] not in t.get("linked_prs", []):
                         t.setdefault("linked_prs", []).append(pr["pr_id"])
@@ -2115,7 +2127,7 @@ class OrgForgeSimulation:
                 inc.pr_id = pr["pr_id"]
                 if getattr(inc, "causal_chain", None):
                     inc.causal_chain.append(pr["pr_id"])
-                    t = self._mem.get_ticket(inc.ticket_id)
+                    t = self._mem.get_ticket(inc.ticket_id, as_of_time=cron_time_iso)
                     if t:
                         t["causal_chain"] = inc.causal_chain.snapshot()
                         t["updated_at"] = cron_time_iso
@@ -2137,7 +2149,10 @@ class OrgForgeSimulation:
             elif inc.stage == "fix_in_progress":
                 inc.stage = "review_pending"
                 if inc.pr_id:
-                    pr_doc = self._mem._prs.find_one({"pr_id": inc.pr_id}, {"_id": 0})
+                    pr_doc = self._mem._prs.find_one(
+                        {"pr_id": inc.pr_id, "created_at": {"$lte": cron_time_iso}},
+                        {"_id": 0},
+                    )
                     if pr_doc:
                         reviewers = pr_doc.get("reviewers", [])
                         for reviewer in reviewers:
@@ -2159,7 +2174,9 @@ class OrgForgeSimulation:
                 inc.stage = "resolved"
                 if inc.pr_id:
                     self._git.merge_pr(inc.pr_id)
-                    linked_ticket = self._mem.get_ticket(inc.ticket_id)
+                    linked_ticket = self._mem.get_ticket(
+                        inc.ticket_id, as_of_time=cron_time_iso
+                    )
                     if linked_ticket:
                         linked_ticket["status"] = "Done"
                         linked_ticket["updated_at"] = cron_time_iso
@@ -2248,7 +2265,7 @@ class OrgForgeSimulation:
                     timestamp=timestamp,
                     day=self.state.day,
                     date=str(self.state.current_date.date()),
-                    actors=[on_call, eng_peer],
+                    actors=inc.actors,
                     artifact_ids={"confluence": conf_id, "jira": inc.ticket_id},
                     facts={
                         "causal_chain": inc.causal_chain.snapshot(),
@@ -2289,6 +2306,13 @@ class OrgForgeSimulation:
             )
 
         return thread_id
+
+    def _get_next_on_call(self, day: int):
+        eng_dept_key = next((k for k in ORG_CHART if "eng" in k.lower()), "Engineering")
+        engineers = ORG_CHART.get(eng_dept_key, [])
+
+        index = day % len(engineers)
+        return engineers[index]
 
     def _generate_adhoc_confluence_page(
         self,
@@ -2489,6 +2513,7 @@ class OrgForgeSimulation:
             ("JIRA Tickets", str(self._mem._jira.count_documents({}))),
             ("Slack Threads", str(self._mem._slack.count_documents({}))),
             ("Git PRs", str(self._mem._prs.count_documents({}))),
+            ("Emails", str(self._mem._db["emails"].count_documents({}))),
             ("Incidents Resolved", str(len(self.state.resolved_incidents))),
             ("Embedded Artifacts", str(s["artifact_count"])),
             ("Employees Departed", str(len(self._lifecycle._departed))),
@@ -2506,8 +2531,12 @@ class OrgForgeSimulation:
                 self._mem._artifacts.find({"type": "confluence"}, _proj)
             ),
             "jira_tickets": list(self._mem._jira.find({}, {"_id": 0})),
+            "emails": list(self._mem._db["emails"].find({}, {"_id": 0})),
             "slack_threads": list(self._mem._slack.find({}, {"_id": 0})),
             "pr_registry": list(self._mem._prs.find({}, {"_id": 0})),
+            "sf_accounts": list(self._mem._db["sf_accounts"].find({}, {"_id": 0})),
+            "sf_opps": list(self._mem._db["sf_opps"].find({}, {"_id": 0})),
+            "zd_tickets": list(self._mem._db["zd_tickets"].find({}, {"_id": 0})),
             "resolved_incidents": self.state.resolved_incidents,
             "morale_history": self.state.morale_history,
             "system_health": self.state.system_health,
