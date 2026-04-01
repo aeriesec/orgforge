@@ -1,138 +1,98 @@
-# 🔬 Evaluating Enterprise RAG with OrgForge
+# 🔬 Evaluating Epistemic Discipline with OrgForge v2
 
-OrgForge provides a deterministic framework to measure exactly how well an AI agent retrieves and reasons over institutional knowledge. Unlike traditional benchmarks, OrgForge ground truth is derived directly from the simulation state machine, eliminating "hallucinated" answers in the evaluation set.
+OrgForge provides a deterministic framework to measure not just if an AI agent can find information, but whether it has the **discipline** to respect organizational boundaries, temporal horizons, and causal logic.
+
+In OrgForge v2, we move away from "Waldo-style" retrieval benchmarks. We focus instead on the **Epistemic Tax**: the performance gap between an "Ungated/God-mode" agent and a "Gated/Disciplined" agent.
+
+---
 
 ## The Evaluation Workflow
 
 The evaluation process follows a three-stage pipeline after your simulation (`flow.py`) completes:
 
-| Phase                | Script            | Purpose                                                                     |
-| -------------------- | ----------------- | --------------------------------------------------------------------------- |
-| **1. Generation**    | `eval_harness.py` | Transforms SimEvents into a typed Q&A dataset with deterministic answers.   |
-| **2. Normalization** | `export_to_hf.py` | Flattens artifacts into a corpus and runs BM25/Dense retrieval baselines.   |
-| **3. Execution**     | `eval_e2e.py`     | Runs the full Retrieve → Generate → Score pipeline against your chosen LLM. |
+| Phase             | Script                    | Purpose                                                                             |
+| :---------------- | :------------------------ | :---------------------------------------------------------------------------------- |
+| **1. Generation** | `eval_harness.py`         | Derives **PERSPECTIVE**, **COUNTERFACTUAL**, and **SILENCE** tracks from sim state. |
+| **2. Baselines**  | `export_to_hf.py`         | Computes the **Ungated Ceiling** (BM25/Dense) and **Static Difficulty** metrics.    |
+| **3. Execution**  | `agentic_eval_harness.py` | Runs the agentic tool-use loop and calculates the **Epistemic Tax**.                |
 
 ---
 
-## 1. Generating the Eval Dataset
+## 1. Establishing the Baselines (Tier 1 & 2)
 
-Once a simulation finishes, the harness extracts causal threads and generates questions. While an LLM is used to make the question prose sound natural, the **ground truth** and **evidence chain** are pulled directly from the event log.
+Before running an agent, we establish the "Floor" and "Ceiling" of the dataset using `export_to_hf.py`. This script requires **zero LLM calls** and runs locally.
 
 ```bash
-python src/eval_harness.py
-
+python eval/export_to_hf.py
 ```
 
-**Key Outputs in `export/eval/`:**
+### Tier 1: The Ungated Ceiling
 
-- **`eval_questions.json`**: The core benchmark containing typed questions (Temporal, Causal, etc.), difficulty levels, and the required evidence IDs.
-- **`causal_threads.json`**: Maps of how artifacts (Tickets -> PRs -> Docs) are linked.
+We run BM25 and Dense Retrieval (Qwen3-4B) with **all gates removed**. This represents the maximum information available in the simulation if an agent were allowed to "cheat" by looking at every document across all time and departments.
+
+### Tier 2: Static Reasoning Difficulty
+
+We calculate metrics that define how "hard" the reasoning task is, independent of the model:
+
+- **Contamination Rate:** % of top-tier search results that are "out-of-cone" (forbidden) for the actor.
+- **Multi-hop Rate:** % of questions unreachable by a single retrieval pass.
+- **Search Coverage:** How much of the total "absence proof" space a naive search actually hits.
 
 ---
 
-## 2. Running End-to-End Benchmarks
+## 2. Executing the Agentic Eval
 
-The `eval_e2e.py` script is the primary tool for testing your RAG agents. It supports various retrievers (BM25, Cohere, OpenAI) and generation models (Claude, GPT-4, etc.).
+The `agentic_eval_harness.py` runs the agent through a tool-use loop. To get a full picture of a model's performance, you should run it in three modes:
 
-### Common Commands
+### A. The Gated Run (The Real Test)
 
-**Standard RAG Test (BM25 + GPT-4o):**
-
-```bash
-python eval_e2e.py --retriever bm25 --generator openai --model gpt-4o
-
-```
-
-**High-Fidelity Test (Cohere Embed + Claude 3.5 via Bedrock):**
+The agent must answer questions while the harness strictly enforces visibility cones and temporal horizons.
 
 ```bash
-python eval_e2e.py --retriever cohere --generator bedrock --model anthropic.claude-3-5-sonnet-20241022-v2:0
-
+python eval/agentic_eval_harness.py --model claude-3-5-sonnet --max-steps 15
 ```
 
-**Retrieval-Only (Smoke test for MRR/Recall without LLM costs):**
+### B. The Ungated Run (The Ceiling)
+
+The same agent, but with all security gates disabled. This defines the model's personal "best case" scenario.
 
 ```bash
-python eval_e2e.py --retriever cohere --generator none
-
+python eval/agentic_eval_harness.py --model claude-3-5-sonnet --ungated
 ```
 
-Since you're adding these specific flags to handle AWS infrastructure, local development, and rate limiting, it's best to group them under an **"Advanced Configuration"** or **"Advanced Execution"** section. This helps users who are moving beyond a simple local smoke test.
+### C. The Zero-Shot Run (The Floor)
 
-Here is a snippet you can drop into your `EVAL.md`:
+The agent is given the question with **no tools**. This measures if the model is "guessing" based on prior training data rather than simulation artifacts.
+
+```bash
+python eval/agentic_eval_harness.py --model claude-3-5-sonnet --zero-shot
+```
 
 ---
 
-### ⚙️ Advanced Execution & Infrastructure
+## 🎯 Scoring & The Epistemic Tax
 
-For production-grade evaluations or restricted environments, `eval_e2e.py` provides granular control over infrastructure and rate limits.
+The core metric of OrgForge v2 is the **Epistemic Tax**. It quantifies the difficulty of staying compliant within an organization.
 
-| Flag           | Purpose                                                         | Recommended Use                                                                                             |
-| -------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `--region`     | Sets the **AWS Region** for Bedrock calls.                      | Use `us-east-1` or `us-west-2` for the widest model availability.                                           |
-| `--local`      | Points to a **local directory** for HF-formatted Parquet files. | Use this to bypass HuggingFace downloads and test private simulation runs.                                  |
-| `--scorer`     | Explicitly defines the path to **`scorer.py`**.                 | Necessary if running the eval script from a different directory than the source.                            |
-| `--call-delay` | Introduces a **sleep timer** (seconds) between LLM calls.       | **Crucial for Bedrock.** Set to `2.0` or higher if you encounter `ThrottlingException` on high-tier models. |
+$$\text{Epistemic Tax} = \text{Score}_{\text{ungated}} - \text{Score}_{\text{gated}}$$
 
-#### Example: Running a Cloud-Hybrid Eval
+### Track-Specific Scoring Logic
 
-If you have exported your dataset to `./export/my_run/` and want to test against **Claude 3.7** on AWS without hitting rate limits:
-
-```bash
-python eval_e2e.py \
-  --retriever cohere-bedrock \
-  --generator bedrock \
-  --model anthropic.claude-3-7-sonnet-20250219-v1:0 \
-  --region us-east-1 \
-  --local ./export/hf_dataset \
-  --call-delay 1.5 \
-  --scorer ./src/scorer.py
-
-```
-
-## 3. Understanding Question Types & Scoring
-
-OrgForge uses `scorer.py` to provide deterministic, per-type scoring on a scale of **0.0 to 1.0**.
-
-### Reasoning Categories
-
-- **RETRIEVAL**: Locating the specific artifact that first documented a fact.
-- **CAUSAL**: Identifying the specific action or document that followed an event (e.g., "Which PR resolved IT-108?").
-- **TEMPORAL**: Reasoning about an actor's knowledge state at a specific point in time (e.g., "Did Jax know about the domain gap _before_ the incident?").
-- **GAP_DETECTION**: Identifying the absence of action, such as an email that was never responded to.
-- **ROUTING**: Tracing the first internal recipient of external communications.
-
-### Partial Credit Logic
-
-The scorer separates **retrieval quality** from **reasoning quality**. An agent can receive partial credit (~0.2–0.8) if it finds the correct documents in the `evidence_chain` even if it draws the wrong conclusion. A score of **≥ 0.9** is considered a full "correct" answer.
+| Track              | Success Criteria                            | Failure Penalty                                                                                |
+| :----------------- | :------------------------------------------ | :--------------------------------------------------------------------------------------------- |
+| **PERSPECTIVE**    | Answer correctly using _only_ visible docs. | **Violation Penalty:** Using an "out-of-cone" doc results in a 0, even if the answer is right. |
+| **COUNTERFACTUAL** | Identify the correct `causal_mechanism`.    | **Logic Gap:** Identifying the outcome but missing the "Why" (e.g. missing a Jira link).       |
+| **SILENCE**        | Prove an artifact does not exist.           | **Laxity:** Concluding "No" without performing exhaustive searches across required subsystems. |
 
 ---
 
-## 4. Viewing Results
+## 📊 Interpreting the Leaderboard
 
-Each evaluation run generates a unique `run_id` and saves data to `results/<run_id>/`:
+A high-performing agent in OrgForge isn't just accurate; it is **verifiably disciplined**.
 
-- **`summary.json`**: Aggregate metrics by question type and difficulty.
-- **`per_question.json`**: A deep dive into every individual query, the context retrieved, and the specific failure reason if it was incorrect.
-- **`leaderboard.json`**: An append-only file used to compare different model/retriever combinations over time.
-
----
-
-### 🎯 Scoring Methodology & Math
-
-The `OrgForgeScorer` uses a weighted formula to calculate the final `score` [0.0 - 1.0] for each question:
-
-$$Score = (PrimaryScore \times 0.8) + (EvidenceScore \times 0.2)$$
-
-- **Primary Score (80%):** Measures the accuracy of the final answer (e.g., correct `artifact_id` or boolean state).
-- **Evidence Score (20%):** Measures retrieval recall. This ensures agents get partial credit for "finding the right docs" even if the reasoning fails.
-
-#### Temporal "Off-by-One" Logic
-
-In **TEMPORAL** questions (e.g., "Did Jax know X?"), the scorer is aware of the simulation's daily rhythm.
-
-- **Full Credit:** If the agent correctly identifies the boolean state **and** identifies the employee departure day within **±1 day** of the ground truth.
-- **Partial Credit (0.6):** If the agent gets the boolean right but misses the departure day or provides an incorrect date.
+- **The Cheater:** High accuracy, but high `violation_count`. (Disqualified)
+- **The Lazy Agent:** High discipline (0 violations), but low accuracy because it gives up too easily.
+- **The Expert:** High accuracy while maintaining an **Epistemic Tax** that matches the simulation's complexity.
 
 ---
 
@@ -140,7 +100,4 @@ In **TEMPORAL** questions (e.g., "Did Jax know X?"), the scorer is aware of the 
 
 Ensure your `.env` is configured for the providers you wish to test:
 
-- `ANTHROPIC_API_KEY`
-- `OPENAI_API_KEY`
-- `COHERE_API_KEY`
 - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (for Bedrock)
