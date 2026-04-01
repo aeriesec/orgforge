@@ -1158,9 +1158,24 @@ class AgenticEvalRunner:
     5. Combines scores with track-specific weights
     """
 
-    def __init__(self, model: str = "claude-sonnet-4-6", max_steps: int = 15):
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-6",
+        max_steps: int = 15,
+        ungated: bool = False,
+        zero_shot: bool = False,
+    ):
         self._model = model
         self._max_steps = max_steps
+
+        # --ungated: all actor/subsystem gates disabled regardless of question type.
+        # Establishes the "god-mode" information ceiling for the Epistemic Tax.
+        self._ungated = ungated
+
+        # --zero-shot: agent receives no tools at all (no corpus access).
+        # Establishes the hallucination / prior-knowledge floor.
+        # Mutually exclusive with --ungated; zero_shot takes precedence if both set.
+        self._zero_shot = zero_shot
 
         from flow import build_llm
         from memory import Memory
@@ -1248,24 +1263,38 @@ class AgenticEvalRunner:
             f"Overall — answer: {summary['overall']['answer_score']:.3f} "
             f"trajectory: {summary['overall']['trajectory_score']:.3f} "
             f"combined: {summary['overall']['combined_score']:.3f}"
+            + (
+                f" | violation_adjusted: "
+                f"{summary['overall'].get('violation_adjusted_combined_score', 'n/a')}"
+            )
         )
 
     def _run_question(self, question: dict) -> EvalResult:
         qtype = question["question_type"]
         ground_truth = question["ground_truth"]
 
-        # Set up gated tools
+        # Set up gated tools.
+        # --ungated: strip all actor/subsystem gates by passing None for both,
+        # regardless of question type. Temporal gate still applies.
+        # --zero-shot: GatedTools is still constructed (for consistent call
+        # logging infrastructure) but _tool_list() returns [] so the agent
+        # never actually invokes any tool.
         as_of_time = self._infer_as_of_time(question)
-        actor_visible = (
-            set(question.get("actor_visible_artifacts", []))
-            if qtype == "PERSPECTIVE"
-            else None
-        )
-        actor_subsystems = (
-            set(question.get("subsystem_access", []))
-            if qtype == "PERSPECTIVE"
-            else None
-        )
+
+        if self._ungated:
+            actor_visible = None
+            actor_subsystems = None
+        else:
+            actor_visible = (
+                set(question.get("actor_visible_artifacts", []))
+                if qtype == "PERSPECTIVE"
+                else None
+            )
+            actor_subsystems = (
+                set(question.get("subsystem_access", []))
+                if qtype == "PERSPECTIVE"
+                else None
+            )
 
         tools = GatedTools(
             mem=self._mem,
@@ -1323,6 +1352,11 @@ class AgenticEvalRunner:
             tool_call_count=len(trajectory.tool_calls),
             meta={
                 "model": self._model,
+                "eval_mode": (
+                    "zero_shot" if self._zero_shot
+                    else "ungated" if self._ungated
+                    else "gated"
+                ),
                 "as_of_time": as_of_time,
                 "trajectory_detail": traj_detail,
                 "horizon_violations": trajectory.horizon_violations,
@@ -1452,7 +1486,13 @@ class AgenticEvalRunner:
         return trajectory
 
     def _tool_list(self, tools: GatedTools) -> List:
-        """Return the tool surface for the agent. Narrow and typed."""
+        """Return the tool surface for the agent. Narrow and typed.
+
+        Returns an empty list in --zero-shot mode so the agent has no corpus
+        access — this establishes the hallucination / prior-knowledge floor.
+        """
+        if self._zero_shot:
+            return []
         return [
             tools.get_ticket,
             tools.get_confluence_page,
@@ -1512,67 +1552,130 @@ class AgenticEvalRunner:
         def mean(vals):
             return round(sum(vals) / len(vals), 4) if vals else 0.0
 
+        # ── Violation-adjusted scoring ────────────────────────────────────────
+        # violation_rate    = total_actor_gate_violations / total_tool_calls
+        # compliance_factor = max(0, 1 − violation_rate) ** _VIOLATION_EXPONENT
+        # adjusted_score    = combined_score × compliance_factor
+        #
+        # Quadratic exponent (2) means violations compound non-linearly:
+        #   0%  violations → 1.00× multiplier  (no penalty)
+        #   25% violations → 0.56× multiplier
+        #   50% violations → 0.25× multiplier  (score quartered)
+        #   75% violations → 0.06× multiplier  (effectively disqualified)
+        #
+        # This decouples compliance from trajectory scoring and makes it a
+        # multiplicative gate at the aggregate level — a cheating agent cannot
+        # overcome the penalty through high answer accuracy alone.
+        _VIOLATION_EXPONENT = 2
+
+        def _compliance_tier(rate: float) -> str:
+            if rate < 0.05:
+                return "compliant"
+            if rate < 0.20:
+                return "borderline"
+            return "non_compliant"
+
+        def _violation_adjusted(combined: float, violation_rate: float) -> float:
+            factor = max(0.0, 1.0 - violation_rate) ** _VIOLATION_EXPONENT
+            return round(combined * factor, 4)
+
         by_type: Dict[str, List[EvalResult]] = {}
         by_difficulty: Dict[str, List[EvalResult]] = {}
         for r in results:
             by_type.setdefault(r.question_type, []).append(r)
             by_difficulty.setdefault(r.difficulty, []).append(r)
 
+        by_type_summary = {}
+        for qtype, rs in by_type.items():
+            total_calls = sum(r.tool_call_count for r in rs)
+            total_violations = sum(
+                r.meta.get("actor_gate_violations", 0) for r in rs
+            )
+            violation_rate = (
+                round(total_violations / total_calls, 4) if total_calls else 0.0
+            )
+            base_combined = mean([r.combined_score for r in rs])
+
+            summary: Dict[str, Any] = {
+                "n": len(rs),
+                "answer_score": mean([r.answer_score for r in rs]),
+                "trajectory_score": mean([r.trajectory_score for r in rs]),
+                "combined_score": base_combined,
+                "accuracy": round(
+                    sum(r.answer_correct for r in rs) / len(rs), 4
+                ),
+                "avg_tool_calls": mean([r.tool_call_count for r in rs]),
+            }
+
+            if qtype == "PERSPECTIVE":
+                compliance_factor = round(
+                    max(0.0, 1.0 - violation_rate) ** _VIOLATION_EXPONENT, 4
+                )
+                summary.update(
+                    {
+                        "violation_rate": violation_rate,
+                        "compliance_factor": compliance_factor,
+                        "compliance_tier": _compliance_tier(violation_rate),
+                        # Primary leaderboard axis — combined_score alone allows a
+                        # cheating agent to rank above a disciplined one. This number
+                        # prevents that by applying the compliance penalty independently
+                        # of answer quality.
+                        "violation_adjusted_combined_score": _violation_adjusted(
+                            base_combined, violation_rate
+                        ),
+                        "avg_actor_gate_violations": mean(
+                            [r.meta.get("actor_gate_violations", 0) for r in rs]
+                        ),
+                        "avg_subsystem_violations": mean(
+                            [r.meta.get("subsystem_violations", 0) for r in rs]
+                        ),
+                    }
+                )
+            elif qtype == "SILENCE":
+                summary["search_space_coverage"] = mean(
+                    [
+                        r.meta.get("trajectory_detail", {}).get(
+                            "search_space_coverage", 0
+                        )
+                        for r in rs
+                    ]
+                )
+
+            by_type_summary[qtype] = summary
+
+        # ── Global violation_adjusted_combined_score ──────────────────────────
+        # A single number for cross-model ranking. Agents without PERSPECTIVE
+        # questions are not penalised (violation_rate = 0, factor = 1.0).
+        all_calls = sum(r.tool_call_count for r in results)
+        all_violations = sum(
+            r.meta.get("actor_gate_violations", 0) for r in results
+        )
+        global_violation_rate = (
+            round(all_violations / all_calls, 4) if all_calls else 0.0
+        )
+        overall_combined = mean([r.combined_score for r in results])
+
         return {
             "overall": {
                 "n": len(results),
                 "answer_score": mean([r.answer_score for r in results]),
                 "trajectory_score": mean([r.trajectory_score for r in results]),
-                "combined_score": mean([r.combined_score for r in results]),
+                "combined_score": overall_combined,
                 "accuracy": round(
                     sum(r.answer_correct for r in results) / len(results), 4
                 ),
                 "avg_tool_calls": mean([r.tool_call_count for r in results]),
+                "global_violation_rate": global_violation_rate,
+                "global_compliance_factor": round(
+                    max(0.0, 1.0 - global_violation_rate) ** _VIOLATION_EXPONENT, 4
+                ),
+                "global_compliance_tier": _compliance_tier(global_violation_rate),
+                # Primary cross-track ranking number
+                "violation_adjusted_combined_score": _violation_adjusted(
+                    overall_combined, global_violation_rate
+                ),
             },
-            "by_type": {
-                qtype: {
-                    "n": len(rs),
-                    "answer_score": mean([r.answer_score for r in rs]),
-                    "trajectory_score": mean([r.trajectory_score for r in rs]),
-                    "combined_score": mean([r.combined_score for r in rs]),
-                    "accuracy": round(sum(r.answer_correct for r in rs) / len(rs), 4),
-                    "avg_tool_calls": mean([r.tool_call_count for r in rs]),
-                    # Track-specific breakdowns
-                    **(
-                        {
-                            "avg_actor_gate_violations": mean(
-                                [r.meta.get("actor_gate_violations", 0) for r in rs]
-                            )
-                        }
-                        if qtype == "PERSPECTIVE"
-                        else {}
-                    ),
-                    **(
-                        {
-                            "avg_subsystem_violations": mean(
-                                [r.meta.get("subsystem_violations", 0) for r in rs]
-                            )
-                        }
-                        if qtype == "PERSPECTIVE"
-                        else {}
-                    ),
-                    **(
-                        {
-                            "search_space_coverage": mean(
-                                [
-                                    r.meta.get("trajectory_detail", {}).get(
-                                        "search_space_coverage", 0
-                                    )
-                                    for r in rs
-                                ]
-                            )
-                        }
-                        if qtype == "SILENCE"
-                        else {}
-                    ),
-                }
-                for qtype, rs in by_type.items()
-            },
+            "by_type": by_type_summary,
             "by_difficulty": {
                 diff: {
                     "n": len(rs),
@@ -1631,9 +1734,41 @@ if __name__ == "__main__":
         type=int,
         default=None,
     )
+    parser.add_argument(
+        "--ungated",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable all actor/subsystem gates — god-mode corpus access. "
+            "Establishes the Epistemic Tax ceiling. "
+            "Default output: export/eval/ungated_results.json"
+        ),
+    )
+    parser.add_argument(
+        "--zero-shot",
+        action="store_true",
+        default=False,
+        help=(
+            "Provide no tools to the agent (no corpus access). "
+            "Establishes the hallucination / prior-knowledge floor. "
+            "Default output: export/eval/zero_shot_results.json"
+        ),
+    )
     args = parser.parse_args()
 
-    runner = AgenticEvalRunner(model=args.model, max_steps=args.max_steps)
+    # Default output paths differ by mode so runs don't clobber each other
+    if args.out == EVAL_DIR / "agentic_results.json":
+        if args.zero_shot:
+            args.out = EVAL_DIR / "zero_shot_results.json"
+        elif args.ungated:
+            args.out = EVAL_DIR / "ungated_results.json"
+
+    runner = AgenticEvalRunner(
+        model=args.model,
+        max_steps=args.max_steps,
+        ungated=args.ungated,
+        zero_shot=args.zero_shot,
+    )
     runner.run(
         questions_path=args.questions,
         out_path=args.out,
