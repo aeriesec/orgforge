@@ -61,6 +61,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import argparse
 import yaml
 
+from eval_harness import _ARTIFACT_SUBSYSTEM
+
 logger = logging.getLogger("orgforge.agentic_eval")
 
 with open(Path(__file__).resolve().parent.parent / "config" / "config.yaml") as f:
@@ -256,7 +258,7 @@ class GatedTools:
         if self._question_type != "PERSPECTIVE":
             return False, False
 
-        from eval_harness import _ARTIFACT_SUBSYSTEM
+        
 
         subsystem = _ARTIFACT_SUBSYSTEM.get(doc_type, "default")
 
@@ -598,23 +600,57 @@ class PerspectiveScorer:
                     return True
                 if val.lower() in ("false", "no", "0"):
                     return False
-        # Try to find a boolean in free-text reasoning
+
+        # Try to find a boolean in free-text reasoning.
+        # IMPORTANT: check negative phrases FIRST and use full-phrase matching so
+        # that "did not have access" cannot shadow the later "had access" check —
+        # both would match under simple substring logic since "had access" is a
+        # substring of "did not have access". We resolve this by checking the
+        # negative patterns against the exact negated forms only, not as substrings
+        # of longer phrases.
         reasoning = str(answer.get("reasoning", answer.get("explanation", ""))).lower()
-        if any(
-            w in reasoning
-            for w in (
-                "could not have known",
-                "did not have access",
-                "was not visible",
-                "outside their",
-            )
-        ):
-            return False
-        if any(
-            w in reasoning
-            for w in ("could have known", "had access", "was visible", "in their")
-        ):
-            return True
+
+        # Negative indicators — listed as complete phrases, no substring ambiguity
+        _NEGATIVE_PHRASES = (
+            "could not have known",
+            "did not have access",
+            "does not have access",
+            "had no access",
+            "was not visible",
+            "not visible to",
+            "outside their visibility",
+            "outside their access",
+            "outside their cone",
+            "not in their subsystem",
+            "blocked from",
+            "no access to",
+        )
+
+
+        _POSITIVE_PHRASES = (
+            "could have known",
+            "would have known",
+            "did have access",    
+            "has access to",
+            "was visible to",
+            "visible to this actor",
+            "within their visibility",
+            "within their access",
+            "within their cone",
+            "in their subsystem",
+            "had direct access",
+            "had full access",
+        )
+
+        for phrase in _NEGATIVE_PHRASES:
+            if phrase in reasoning:
+                return False
+
+    
+        for phrase in _POSITIVE_PHRASES:
+            if phrase in reasoning:
+                return True
+            
         return None
 
 
@@ -756,10 +792,16 @@ class CounterfactualScorer:
         for call in calls:
             retrieved_ids.update(call.result_ids)
 
-        cause_id = ground_truth.get("cause_event_id", "")
-        effect_id = ground_truth.get("effect_event_id", "")
-        cause_identified = 1.0 if (cause_id and cause_id in retrieved_ids) else 0.0
-        effect_identified = 1.0 if (effect_id and effect_id in retrieved_ids) else 0.0
+        # Use artifact IDs from evidence_chain_artifacts, not synthetic event IDs.
+        # Synthetic event IDs (e.g. "evt_incident_opened_5_IT-108_alex") are internal
+        # keys that never appear in MongoDB documents. Agents retrieve documents by
+        # their actual artifact IDs (e.g. "IT-108"), so we must match on those instead.
+        evidence_artifacts = ground_truth.get("evidence_chain_artifacts", {})
+        cause_artifacts = set(evidence_artifacts.get("cause", []))
+        effect_artifacts = set(evidence_artifacts.get("effect", []))
+
+        cause_identified = 1.0 if (cause_artifacts and cause_artifacts & retrieved_ids) else 0.0
+        effect_identified = 1.0 if (effect_artifacts and effect_artifacts & retrieved_ids) else 0.0
 
         # Mechanism: did agent use keyword in its tool calls or final answer?
         gt_mechanism = ground_truth.get("causal_mechanism", "")
@@ -771,12 +813,17 @@ class CounterfactualScorer:
             1.0 if any(alias in agent_text for alias in aliases) else 0.0
         )
 
-        # Causal chain: did agent retrieve cause before effect?
+        # Causal chain: did agent retrieve a cause artifact before an effect artifact?
+        # Since we no longer have single cause_id/effect_id to index into call.result_ids,
+        # we find the FIRST call that returned any cause artifact and the FIRST that
+        # returned any effect artifact, then check ordering.
         cause_call_idx = next(
-            (i for i, c in enumerate(calls) if cause_id in c.result_ids), None
+            (i for i, c in enumerate(calls) if cause_artifacts & set(c.result_ids)),
+            None,
         )
         effect_call_idx = next(
-            (i for i, c in enumerate(calls) if effect_id in c.result_ids), None
+            (i for i, c in enumerate(calls) if effect_artifacts & set(c.result_ids)),
+            None,
         )
         causal_chain_complete = (
             1.0
@@ -819,11 +866,71 @@ class CounterfactualScorer:
                 return True
             if val.lower() in ("false", "no"):
                 return False
+
+        # Inspect free-text reasoning for outcome_changed signal.
+        #
+        # The original had two bugs:
+        #
+        # 1. "would not" was mapped to True (outcome DID change — the thing would
+        #    NOT have happened). This is semantically correct for counterfactuals
+        #    ("the incident would not have occurred") but the bare phrase is too
+        #    short — "this would not be my first choice" would also match.
+        #    Replaced with longer, unambiguous anchors.
+        #
+        # 2. "would have prevented" → True is correct but collides with
+        #    "nothing would have prevented" → should be False.
+        #    Fixed by checking the negated form first.
+        #
+        # 3. "no change" → False is a two-word phrase that can appear in
+        #    unrelated contexts ("no change in personnel"). Replaced with
+        #    longer anchors.
+        #
+        # Strategy: check negated/False-indicating phrases FIRST (longer, more
+        # specific), then check True-indicating phrases that are phrased to not
+        # overlap with any negated form above.
+
         reasoning = str(answer.get("reasoning", "")).lower()
-        if "would not" in reasoning or "would have prevented" in reasoning:
-            return True
-        if "would still" in reasoning or "no change" in reasoning:
-            return False
+
+        # False indicators — outcome did NOT change (removing cause = no difference)
+        _OUTCOME_UNCHANGED = (
+            "would still have occurred",
+            "would have happened regardless",
+            "outcome would not have changed",
+            "outcome would be the same",
+            "would not have been prevented",
+            "nothing would have prevented",
+            "no change in outcome",
+            "would have proceeded regardless",
+            "result would be unchanged",
+            "would still have taken place",
+        )
+
+        # True indicators — outcome WOULD change (removing cause = different result)
+        # Phrased to not be substrings of any _OUTCOME_UNCHANGED phrase above.
+        _OUTCOME_CHANGED = (
+            "would not have occurred",
+            "would have been prevented",
+            "would have been avoided",
+            "outcome would have changed",
+            "would have changed the outcome",
+            "would have been diagnosed faster",
+            "would not have escalated",
+            "would have been resolved",
+            "would not have happened",
+            "would have been different",
+            "causal chain would have been broken",
+        )
+
+        # Check False indicators first — they are more specific and longer
+        for phrase in _OUTCOME_UNCHANGED:
+            if phrase in reasoning:
+                return False
+
+        # Check True indicators second
+        for phrase in _OUTCOME_CHANGED:
+            if phrase in reasoning:
+                return True
+
         return None
 
 
@@ -879,21 +986,50 @@ class SilenceScorer:
             searched_ids.update(call.result_ids)
             searched_tool_args.append(str(call.arguments).lower())
 
-        # Search space coverage: fraction of expected_search_space hit
-        # Also count partial matches on path prefixes
+        def _normalize_search_term(s: str) -> str:
+            """
+            Extract the terminal component of a path-style search space entry.
+            e.g. "confluence/postmortems/IT-108" → "it-108"
+                 "slack/channels/incidents"       → "incidents"
+                 "IT-108"                         → "it-108"
+            """
+            return s.strip("/").split("/")[-1].lower()
+        
+        normalized_expected: Dict[str, str] = {
+            _normalize_search_term(e): e for e in expected_space
+        }
+
+        # Also normalize all tool arg strings and result IDs for matching.
+        normalized_tool_args: List[str] = [
+            arg.lower() for arg in searched_tool_args
+        ]
+        normalized_result_ids: Set[str] = {
+            _normalize_search_term(rid) for rid in searched_ids
+        }
+
         covered = set()
-        for expected in expected_space:
-            expected_lower = expected.lower()
-            if any(expected_lower in arg for arg in searched_tool_args):
-                covered.add(expected)
-            elif expected in searched_ids:
-                covered.add(expected)
+        for norm_term, original in normalized_expected.items():
+            # Primary match: terminal component appears anywhere in a tool arg string.
+            # This catches {"page_id": "IT-108"} matching "confluence/postmortems/IT-108"
+            # and {"query": "incidents"} matching "slack/channels/incidents".
+            if any(norm_term in arg for arg in normalized_tool_args):
+                covered.add(original)
+
+            # Secondary match: terminal component matches a normalized result ID.
+            # This catches cases where the agent retrieved the document directly
+            # and its ID is the terminal path component.
+            elif norm_term in normalized_result_ids:
+                covered.add(original)
+
+            # Tertiary match: the full original path appears verbatim in a tool arg.
+            # Preserves the original behaviour for agents that do pass full paths.
+            elif any(original.lower() in arg for arg in normalized_tool_args):
+                covered.add(original)
 
         search_space_coverage = (
             len(covered) / len(expected_space) if expected_space else 1.0
         )
 
-        # Correct absence conclusion: did agent explicitly state non-existence?
         conclusion_text = str(trajectory.final_answer.get("reasoning", "")).lower()
         conclusion_text += str(trajectory.final_answer.get("answer", "")).lower()
         explicit_negative = any(
@@ -948,20 +1084,60 @@ class SilenceScorer:
                 return True
             if val.lower() in ("false", "no", "not found", "does not exist", "absent"):
                 return False
+
         reasoning = str(answer.get("reasoning", "")).lower()
-        if any(
-            w in reasoning
-            for w in (
-                "does not exist",
-                "not created",
-                "no record",
-                "absent",
-                "not found",
-            )
-        ):
-            return False
-        if any(w in reasoning for w in ("exists", "was created", "found", "present")):
-            return True
+
+        # False indicators — artifact does NOT exist
+        # These are checked first and are long enough to be unambiguous.
+        _ABSENCE_PHRASES = (
+            "does not exist",
+            "did not exist",
+            "was not created",
+            "has not been created",
+            "no record exists",
+            "no record was found",
+            "could not be found",
+            "could not find",
+            "was not found",
+            "is not present",
+            "was not present",
+            "no evidence of",
+            "never created",
+            "not in the corpus",
+            "absent from",
+            "no postmortem",
+            "no ticket was",
+            "no confluence page",
+        )
+
+        # True indicators — artifact DOES exist
+        # Reworded so none are substrings of any _ABSENCE_PHRASES entry above.
+        _PRESENCE_PHRASES = (
+            "artifact exists",
+            "document exists",
+            "ticket exists",
+            "page exists",
+            "record exists",
+            "was successfully created",
+            "has been created",
+            "is present in",
+            "appears in the corpus",
+            "was located",
+            "has been found",
+            "confirmed to exist",
+            "did find",
+        )
+
+        # Check absence first — these are longer and more specific
+        for phrase in _ABSENCE_PHRASES:
+            if phrase in reasoning:
+                return False
+
+        # Check presence second — phrased to not overlap with any absence phrase
+        for phrase in _PRESENCE_PHRASES:
+            if phrase in reasoning:
+                return True
+
         return None
 
 
@@ -1314,10 +1490,8 @@ class AgenticEvalRunner:
     def _infer_as_of_time(self, question: dict) -> str:
         qtype = question.get("question_type", "")
         if qtype == "SILENCE":
-            # Full corpus — end of sim
-            max_day = max(
-                (e.day for e in self._mem.get_event_log(from_db=True)), default=22
-            )
+            events = self._mem.get_event_log(from_db=True)
+            max_day = max((e.day for e in events), default=1)
             return (_SIM_START + timedelta(days=max_day)).isoformat()
         if qtype == "PERSPECTIVE":
             return question.get("as_of_time", datetime.now().isoformat())

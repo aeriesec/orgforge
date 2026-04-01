@@ -1353,6 +1353,17 @@ class EvalQuestionGenerator:
 
     def _build_counterfactual_question(self, link: CausalLink) -> Optional[dict]:
 
+        cause_event = next(
+            (e for e in self._events
+             if self._synthetic_event_id(e) == link.cause_event_id),
+            None,
+        )
+        effect_event = next(
+            (e for e in self._events
+             if self._synthetic_event_id(e) == link.effect_event_id),
+            None,
+        )
+
         ground_truth = {
             "outcome_changed": link.outcome_changed,
             "causal_mechanism": link.link_type,
@@ -1365,6 +1376,14 @@ class EvalQuestionGenerator:
             "premise": link.counterfactual_premise,
             "outcome": link.counterfactual_outcome,
             "actors": link.actors,
+            "evidence_chain_artifacts": {
+                "cause": sorted(_safe_artifact_values(
+                    cause_event.artifact_ids if cause_event else {}
+                )),
+                "effect": sorted(_safe_artifact_values(
+                    effect_event.artifact_ids if effect_event else {}
+                )),
+            },
         }
 
         subsystems_str = ", ".join(sorted(link.subsystems_involved))
