@@ -53,12 +53,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+from statistics import mean
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 import argparse
+from config_loader import CONFIG
 import yaml
 
 from eval_harness import _ARTIFACT_SUBSYSTEM
@@ -71,7 +73,7 @@ with open(Path(__file__).resolve().parent.parent / "config" / "config.yaml") as 
 _SIM_CFG = _CFG.get("simulation", {})
 BASE = Path(_SIM_CFG.get("output_dir", "./export"))
 EVAL_DIR = BASE / "eval"
-_SIM_START = datetime.strptime(_CFG["simulation"]["start_date"], "%Y-%m-%d")
+_SIM_START = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
 
 # Per-track answer/trajectory weights
 _TRACK_WEIGHTS = {
@@ -114,6 +116,168 @@ _TOOL_SUBSYSTEM = {
     "search_artifacts": None,
 }
 
+_SUBSYSTEM_EVENT_TYPES: Dict[str, Set[str]] = {
+    "jira": {
+        "incident_opened",
+        "incident_resolved",
+        "ticket_progress",
+        "pr_review",
+        "sprint_planned",
+        "sprint_goal_updated",
+        "postmortem_created",
+    },
+    "slack": {
+        "standup",
+        "normal_day_slack",
+        "watercooler_chat",
+        "farewell_message",
+        "onboarding_session",
+        "warmup_1on1",
+        "morale_intervention",
+        "1on1_scheduled",
+    },
+    "confluence": {
+        "confluence_created",
+        "design_discussion",
+        "retrospective",
+        "leadership_sync",
+    },
+    "git": {
+        "pr_review",
+        "code_review_comment",
+    },
+    "email": {
+        "inbound_external_email",
+        "customer_email_routed",
+        "vendor_email_routed",
+        "hr_outbound_email",
+        "sales_outbound_email",
+        "email_dropped",
+        "hr_checkin",
+    },
+    "zoom": {
+        "zoom_meeting",
+        "design_discussion",
+        "vendor_meeting",
+        "async_question",
+        "deep_work_session",
+    },
+    "salesforce": {
+        "crm_touchpoint",
+        "crm_account_at_risk",
+        "customer_health_briefing",
+        "feature_request_from_sales",
+        "stability_update_to_sales",
+        "proactive_outreach_initiated",
+        "sf_deals_risk_flagged",
+    },
+    "zendesk": {
+        "zd_ticket_opened",
+        "zd_tickets_escalated",
+        "zd_tickets_resolved",
+        "customer_escalation",
+    },
+    "datadog": {
+        "dlp_alert",
+        "secret_detected",
+    },
+}
+
+# Sim-internal types never exposed to any actor
+_INTERNAL_EVENT_TYPES = {
+    "knowledge_gap_detected",
+    "escalation_chain",
+    "assignment_domain_mismatch",
+    "sf_ownership_lapsed",
+    "fix_in_progress",
+    "day_summary",
+    "employee_departed",
+    "employee_hired",
+    "external_contact_summarized",
+    "vendor_email_routed",
+    "secret_detected",
+}
+
+KNOWN_EVENT_TYPES = {
+    "incident_opened",
+    "incident_resolved",
+    "escalation_chain",
+    "fix_in_progress",
+    "postmortem_created",
+    "knowledge_gap_detected",
+    "standup",
+    "pr_review",
+    "ticket_progress",
+    "design_discussion",
+    "async_question",
+    "code_review_comment",
+    "deep_work_session",
+    "sprint_planned",
+    "retrospective",
+    "sprint_goal_updated",
+    "leadership_sync",
+    "feature_request_from_sales",
+    "stability_update_to_sales",
+    "hr_checkin",
+    "morale_intervention",
+    "1on1_scheduled",
+    "external_contact_summarized",
+    "vendor_meeting",
+    "customer_escalation",
+    "normal_day_slack",
+    "confluence_created",
+    "day_summary",
+    "employee_departed",
+    "employee_hired",
+    "onboarding_session",
+    "farewell_message",
+    "warmup_1on1",
+    "watercooler_chat",
+    "inbound_external_email",
+    "customer_email_routed",
+    "customer_escalation",
+    "vendor_email_routed",
+    "hr_outbound_email",
+    "email_dropped",
+    "dlp_alert",
+    "secret_detected",
+    "zoom_meeting",
+    "sales_outbound_email",
+    "proactive_outreach_initiated",
+    "zd_ticket_opened",
+    "zd_tickets_escalated",
+    "zd_tickets_resolved",
+    "sf_deals_risk_flagged",
+    "sf_ownership_lapsed",
+    "crm_touchpoint",
+    "crm_account_at_risk",
+    "customer_health_briefing",
+    "assignment_domain_mismatch",
+}
+
+_TEMPORAL_DRIFT_THRESHOLD_DAYS = 5
+
+
+def _business_day_to_date(start: datetime, n: int) -> datetime:
+    """Convert a 1-based business day counter to a calendar date."""
+    current = start
+    days_counted = 0
+    while days_counted < n:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            days_counted += 1
+    return current
+
+
+def _date_to_business_day(start: datetime, target: datetime) -> int:
+    count = 0
+    current = start
+    while current < target:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            count += 1
+    return count
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA CLASSES
@@ -127,6 +291,9 @@ class ToolCall:
     result_ids: List[str]
     result_types: List[str]
     timestamp_requested: Optional[str]
+    timestamp_applied: Optional[str]
+    temporal_drift_days: Optional[float]
+    temporal_drift_violation: bool
     horizon_violation: bool  # artifact timestamp > as_of_time
     actor_gate_violation: (
         bool  # artifact outside actor's visibility cone (PERSPECTIVE only)
@@ -159,6 +326,8 @@ class PerspectiveTrajectoryScore:
     epistemic_discipline: float  # 1.0 - (cone violations / total calls)
     subsystem_discipline: float  # 1.0 - (subsystem violations / total calls)
     horizon_discipline: float  # 1.0 - (horizon violations / total calls)
+    temporal_precision: float
+    temporal_drift_discipline: float
     conclusion_grounding: float  # did final answer cite in-cone artifacts?
     dead_end_recovery: float
     composite: float
@@ -233,19 +402,23 @@ class GatedTools:
         self._question_type = question.get("question_type", "")
         self._call_log: List[ToolCall] = []
 
+    def _gate_ts(self) -> str:
+        if self._question_type == "SILENCE":
+            trigger_day = self._question.get("trigger_day", 30)
+            return _business_day_to_date(_SIM_START, trigger_day).isoformat()
+        return self._as_of_time
+
     @property
     def call_log(self) -> List[ToolCall]:
         return self._call_log
 
     def _temporal_gate(self, doc: dict) -> bool:
-        if self._question_type == "SILENCE":
-            return True  # No temporal gate for silence
         ts = doc.get("timestamp") or doc.get("created") or doc.get("date")
         if not ts:
             return True
         try:
             return datetime.fromisoformat(str(ts)) <= datetime.fromisoformat(
-                self._as_of_time
+                self._gate_ts()
             )
         except (ValueError, TypeError):
             return True
@@ -257,8 +430,6 @@ class GatedTools:
         """
         if self._question_type != "PERSPECTIVE":
             return False, False
-
-        
 
         subsystem = _ARTIFACT_SUBSYSTEM.get(doc_type, "default")
 
@@ -281,6 +452,7 @@ class GatedTools:
         results: List[dict],
         t0: float,
         horizon_violation: bool = False,
+        timestamp_applied: Optional[str] = None,
     ) -> List[dict]:
         latency = (time.time() - t0) * 1000
         filtered = [r for r in results if self._temporal_gate(r)]
@@ -308,13 +480,31 @@ class GatedTools:
         ):
             subsystem_violation = True
 
+        requested = arguments.get("as_of_time")
+        drift = None
+        if requested and timestamp_applied:
+            try:
+                drift = (
+                    datetime.fromisoformat(timestamp_applied)
+                    - datetime.fromisoformat(requested)
+                ).days
+            except (ValueError, TypeError):
+                pass
+
+        temporal_drift_violation = (
+            drift is not None and drift < -_TEMPORAL_DRIFT_THRESHOLD_DAYS
+        )
+
         self._call_log.append(
             ToolCall(
                 tool_name=tool_name,
                 arguments=arguments,
                 result_ids=result_ids,
                 result_types=result_types,
-                timestamp_requested=arguments.get("as_of_time"),
+                timestamp_requested=requested,
+                timestamp_applied=timestamp_applied,
+                temporal_drift_days=drift,
+                temporal_drift_violation=temporal_drift_violation,
                 horizon_violation=horizon_violation,
                 actor_gate_violation=actor_gate_violation,
                 subsystem_violation=subsystem_violation,
@@ -327,133 +517,490 @@ class GatedTools:
     # ── Tool implementations ──────────────────────────────────────────────────
     # Each mirrors a real MongoDB query. The agent is given these as tools.
 
-    def get_ticket(self, ticket_id: str, as_of_time: Optional[str] = None) -> dict:
-        t0 = time.time()
-        doc = self._mem._db["jira"].find_one({"id": ticket_id}) or {}
-        return self._record(
-            "get_ticket",
-            {"ticket_id": ticket_id, "as_of_time": as_of_time},
-            [doc] if doc else [],
-            t0,
-        )
+    _COLLECTION_TS_FIELD = {
+        "jira": "created_at",
+        "jira_tickets": "created_at",
+        "confluence": "timestamp",
+        "slack": "timestamp",
+        "email": "timestamp",
+        "pr": "created_at",
+        "zd_ticket": "timestamp",
+        "sf_opp": "timestamp",
+        "sf_account": "timestamp",
+        "zoom": "timestamp",
+        "datadog": "timestamp",
+        "invoice": "timestamp",
+        "nps": "timestamp",
+    }
 
-    def get_confluence_page(
-        self, page_id: str, as_of_time: Optional[str] = None
-    ) -> dict:
+    def _build_query(
+        self,
+        base: dict,
+        doc_type: str = "",
+        id_field: str = "id",
+        agent_as_of_time: Optional[str] = None,
+    ) -> Tuple[Optional[dict], str]:
+        """
+        Constructs a MongoDB filter with temporal and actor gates applied.
+        base: the caller's own filter fields e.g. {"id": ticket_id}
+        doc_type: the artifact type for subsystem gate checking
+        """
+        ceiling = self._gate_ts()
+        if agent_as_of_time:
+            effective_ts = min(agent_as_of_time, ceiling)
+        else:
+            effective_ts = ceiling
+
+        query = {**base}
+
+        ts_field = self._COLLECTION_TS_FIELD.get(doc_type, "timestamp")
+        query[ts_field] = {"$lte": effective_ts}
+
+        if self._question_type == "PERSPECTIVE" and doc_type:
+            subsystem = _ARTIFACT_SUBSYSTEM.get(doc_type, "default")
+
+            if (
+                self._actor_subsystems
+                and subsystem not in self._actor_subsystems
+                and subsystem != "default"
+            ):
+                return None, effective_ts
+
+            if self._actor_visible:
+                query[id_field] = {"$in": list(self._actor_visible)}
+
+                if "id" in base:
+                    query[id_field] = (
+                        base["id"]
+                        if base["id"] in self._actor_visible
+                        else "__blocked__"
+                    )
+
+        return query, effective_ts
+
+    def get_ticket(self, ticket_id: str) -> dict:
         t0 = time.time()
-        doc = self._mem._db["confluence"].find_one({"id": page_id}) or {}
-        return self._record(
+        gate = self._gate_ts()
+        query = self._build_query({"id": ticket_id}, doc_type="jira")
+        if query is None:
+            self._record("get_ticket", {"ticket_id": ticket_id}, [], t0)
+            return {}
+
+        doc = self._mem._db["jira_tickets"].find_one(query) or {}
+
+        if doc:
+            comments = doc.get("comments", [])
+            doc["comments"] = [c for c in comments if c.get("created", "9999") <= gate]
+
+            created = doc.get("created_at", "9999")
+            in_progress_day = doc.get("in_progress_since")
+            in_review_day = doc.get("in_review_since")
+
+            def day_to_iso(day):
+                return (
+                    (_SIM_START + timedelta(days=day - 1)).isoformat()
+                    if day
+                    else "9999"
+                )
+
+            in_progress_dt = day_to_iso(in_progress_day)
+            in_review_dt = day_to_iso(in_review_day)
+            completed = (
+                doc.get("updated_at", "9999") if doc.get("status") == "Done" else "9999"
+            )
+
+            if completed <= gate:
+                derived_status = "Done"
+            elif in_review_dt <= gate:
+                derived_status = "In Review"
+            elif in_progress_dt <= gate:
+                derived_status = "In Progress"
+            else:
+                derived_status = "To Do"
+
+            doc["status"] = derived_status
+            if derived_status != "Done":
+                doc.pop("completion_artifact", None)
+
+            doc.pop("causal_chain", None)
+            doc.pop("updated_at", None)
+
+            if doc.get("linked_prs"):
+                visible_prs = []
+                for pr_id in doc["linked_prs"]:
+                    pr = self._mem._db["prs"].find_one(
+                        {"id": pr_id, "created_at": {"$lte": gate}}, {"id": 1}
+                    )
+                    if pr:
+                        visible_prs.append(pr_id)
+                doc["linked_prs"] = visible_prs
+
+            if in_progress_day:
+                if in_progress_dt > gate:
+                    doc.pop("in_progress_since", None)
+            if in_review_day:
+                if in_review_dt > gate:
+                    doc.pop("in_review_since", None)
+                    doc.pop("last_review_requested_day", None)
+
+        results = self._record(
+            "get_ticket", {"ticket_id": ticket_id}, [doc] if doc else [], t0
+        )
+        return results[0] if results else {}
+
+    def get_confluence_page(self, page_id: str) -> dict:
+        t0 = time.time()
+        query, effective_ts = self._build_query({"id": page_id}, doc_type="confluence")
+        if query is None:
+            self._record("get_confluence_page", {"page_id": page_id}, [], t0)
+            return {}
+        doc = self._mem._db["confluence"].find_one(query, {"_id": 0}) or {}
+        results = self._record(
             "get_confluence_page",
-            {"page_id": page_id, "as_of_time": as_of_time},
+            {"page_id": page_id},
             [doc] if doc else [],
             t0,
+            timestamp_applied=effective_ts,
         )
+        return results[0] if results else {}
 
-    def get_slack_thread(
-        self, thread_id: str, as_of_time: Optional[str] = None
-    ) -> List[dict]:
+    def get_slack_thread(self, thread_id: str) -> List[dict]:
         t0 = time.time()
-        docs = list(self._mem._db["slack"].find({"thread_id": thread_id}))
+        query, effective_ts = self._build_query(
+            {"thread_id": thread_id},
+            doc_type="slack",
+            id_field="thread_id",
+        )
+        if query is None:
+            return self._record("get_slack_thread", {"thread_id": thread_id}, [], t0)
+        docs = list(self._mem._db["slack"].find(query, {"_id": 0}))
         return self._record(
             "get_slack_thread",
-            {"thread_id": thread_id, "as_of_time": as_of_time},
+            {"thread_id": thread_id},
             docs,
             t0,
+            timestamp_applied=effective_ts,
         )
 
-    def get_email(self, email_id: str, as_of_time: Optional[str] = None) -> dict:
+    def get_email(self, email_id: str) -> dict:
         t0 = time.time()
-        doc = self._mem._db["emails"].find_one({"id": email_id}) or {}
-        return self._record(
+        query, effective_ts = self._build_query({"id": email_id}, doc_type="email")
+        if query is None:
+            self._record("get_email", {"email_id": email_id}, [], t0)
+            return {}
+        doc = self._mem._db["emails"].find_one(query, {"_id": 0}) or {}
+        results = self._record(
             "get_email",
-            {"email_id": email_id, "as_of_time": as_of_time},
+            {"email_id": email_id},
             [doc] if doc else [],
             t0,
+            timestamp_applied=effective_ts,
         )
+        return results[0] if results else {}
 
-    def get_pr(self, pr_id: str, as_of_time: Optional[str] = None) -> dict:
+    def get_pr(self, pr_id: str) -> dict:
         t0 = time.time()
-        doc = self._mem._db["prs"].find_one({"id": pr_id}) or {}
-        return self._record(
+        query, effective_ts = self._build_query({"id": pr_id}, doc_type="pr")
+        if query is None:
+            self._record("get_pr", {"pr_id": pr_id}, [], t0)
+            return {}
+        doc = self._mem._db["prs"].find_one(query, {"_id": 0}) or {}
+        results = self._record(
             "get_pr",
-            {"pr_id": pr_id, "as_of_time": as_of_time},
+            {"pr_id": pr_id},
             [doc] if doc else [],
             t0,
+            timestamp_applied=effective_ts,
         )
+        return results[0] if results else {}
 
-    def get_zd_ticket(self, ticket_id: str, as_of_time: Optional[str] = None) -> dict:
+    def get_zd_ticket(self, ticket_id: str) -> dict:
         t0 = time.time()
-        doc = self._mem._db["zendesk"].find_one({"id": ticket_id}) or {}
-        return self._record(
+        query, effective_ts = self._build_query({"id": ticket_id}, doc_type="zd_ticket")
+        if query is None:
+            self._record("get_zd_ticket", {"ticket_id": ticket_id}, [], t0)
+            return {}
+        doc = self._mem._db["zd_tickets"].find_one(query, {"_id": 0}) or {}
+        results = self._record(
             "get_zd_ticket",
-            {"ticket_id": ticket_id, "as_of_time": as_of_time},
+            {"ticket_id": ticket_id},
             [doc] if doc else [],
             t0,
+            timestamp_applied=effective_ts,
         )
+        return results[0] if results else {}
 
-    def get_sf_opportunity(self, opp_id: str, as_of_time: Optional[str] = None) -> dict:
+    def get_sf_opportunity(self, opp_id: str) -> dict:
         t0 = time.time()
-        doc = self._mem._db["salesforce_opps"].find_one({"id": opp_id}) or {}
-        return self._record(
+        query, effective_ts = self._build_query(
+            {"id": opp_id}, doc_type="sf_opportunity"
+        )
+        if query is None:
+            self._record("get_sf_opportunity", {"opp_id": opp_id}, [], t0)
+            return {}
+        doc = self._mem._db["salesforce_opps"].find_one(query, {"_id": 0}) or {}
+        results = self._record(
             "get_sf_opportunity",
-            {"opp_id": opp_id, "as_of_time": as_of_time},
+            {"opp_id": opp_id},
             [doc] if doc else [],
             t0,
+            timestamp_applied=effective_ts,
         )
+        return results[0] if results else {}
 
-    def get_sf_account(self, account_id: str, as_of_time: Optional[str] = None) -> dict:
+    def get_sf_account(self, account_id: str) -> dict:
         t0 = time.time()
-        doc = self._mem._db["salesforce_accounts"].find_one({"id": account_id}) or {}
-        return self._record(
+        query, effective_ts = self._build_query(
+            {"id": account_id}, doc_type="sf_account"
+        )
+        if query is None:
+            self._record("get_sf_account", {"account_id": account_id}, [], t0)
+            return {}
+        doc = self._mem._db["salesforce_accounts"].find_one(query, {"_id": 0}) or {}
+        results = self._record(
             "get_sf_account",
-            {"account_id": account_id, "as_of_time": as_of_time},
+            {"account_id": account_id},
             [doc] if doc else [],
             t0,
+            timestamp_applied=effective_ts,
         )
+        return results[0] if results else {}
 
-    def get_zoom_transcript(
-        self, transcript_id: str, as_of_time: Optional[str] = None
-    ) -> dict:
+    def get_zoom_transcript(self, transcript_id: str) -> dict:
         t0 = time.time()
-        doc = self._mem._db["zoom"].find_one({"id": transcript_id}) or {}
-        return self._record(
+        query, effective_ts = self._build_query({"id": transcript_id}, doc_type="zoom")
+        if query is None:
+            self._record(
+                "get_zoom_transcript", {"transcript_id": transcript_id}, [], t0
+            )
+            return {}
+
+        doc = (
+            self._mem._db["artifacts"].find_one(query, {"_id": 0, "embedding": 0}) or {}
+        )
+        if not doc:
+            self._record(
+                "get_zoom_transcript",
+                {"transcript_id": transcript_id},
+                [],
+                t0,
+                timestamp_applied=effective_ts,
+            )
+            return {}
+
+        date_str = doc.get("date", "")
+        md_path = BASE / "zoom" / date_str / f"{transcript_id}.md"
+        try:
+            doc["transcript"] = md_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            logger.warning(
+                f"[get_zoom_transcript] Transcript file not found: {md_path}"
+            )
+            doc["transcript"] = doc.get("content", "")
+
+        results = self._record(
             "get_zoom_transcript",
             {"transcript_id": transcript_id},
+            [doc],
+            t0,
+            timestamp_applied=effective_ts,
+        )
+        return results[0] if results else {}
+
+    def get_datadog_alert(self, alert_id: str) -> dict:
+        t0 = time.time()
+        effective_ts = self._gate_ts()
+
+        path = BASE / "datadog" / "alerts.jsonl"
+        if not path.exists():
+            self._record(
+                "get_datadog_alert",
+                {"alert_id": alert_id},
+                [],
+                t0,
+                timestamp_applied=effective_ts,
+            )
+            return {}
+
+        doc = None
+        with open(path) as f:
+            for line in f:
+                try:
+                    alert = json.loads(line)
+                    if alert.get("id") == alert_id:
+                        doc = alert
+                        break
+                except json.JSONDecodeError:
+                    continue
+
+        if not doc:
+            self._record(
+                "get_datadog_alert",
+                {"alert_id": alert_id},
+                [],
+                t0,
+                timestamp_applied=effective_ts,
+            )
+            return {}
+
+        if self._question_type != "SILENCE":
+            date_happened = doc.get("date_happened", 0)
+            if date_happened:
+                doc_ts = datetime.fromtimestamp(date_happened).isoformat()
+                if doc_ts > self._gate_ts():
+                    self._record(
+                        "get_datadog_alert",
+                        {"alert_id": alert_id},
+                        [],
+                        t0,
+                        timestamp_applied=effective_ts,
+                    )
+                    return {}
+
+        results = self._record("get_datadog_alert", {"alert_id": alert_id}, [doc], t0)
+        return results[0] if results else {}
+
+    def get_invoice(self, invoice_id: str) -> dict:
+        t0 = time.time()
+        effective_ts = self._gate_ts()
+
+        path = BASE / "invoices" / f"{invoice_id}.json"
+        if not path.exists():
+            self._record(
+                "get_invoice",
+                {"invoice_id": invoice_id},
+                [],
+                t0,
+                timestamp_applied=effective_ts,
+            )
+            return {}
+        doc = json.loads(path.read_text())
+
+        ts = doc.get("timestamp") or doc.get("date") or doc.get("created_at", "")
+        if self._question_type != "SILENCE" and ts and ts > effective_ts:
+            self._record(
+                "get_invoice",
+                {"invoice_id": invoice_id},
+                [],
+                t0,
+                timestamp_applied=effective_ts,
+            )
+            return {}
+
+        results = self._record(
+            "get_invoice",
+            {"invoice_id": invoice_id},
             [doc] if doc else [],
             t0,
+            timestamp_applied=effective_ts,
         )
+        return results[0] if results else {}
 
-    def get_datadog_alert(
-        self, alert_id: str, as_of_time: Optional[str] = None
-    ) -> dict:
+    def get_nps_response(self, account_name: str) -> dict:
         t0 = time.time()
-        doc = self._mem._db["datadog"].find_one({"id": alert_id}) or {}
-        return self._record(
-            "get_datadog_alert", {"alert_id": alert_id}, [doc] if doc else [], t0
-        )
+        effective_ts = self._gate_ts()
 
-    def get_invoice(self, invoice_id: str, as_of_time: Optional[str] = None) -> dict:
-        t0 = time.time()
-        doc = self._mem._db["invoices"].find_one({"id": invoice_id}) or {}
-        return self._record(
-            "get_invoice", {"invoice_id": invoice_id}, [doc] if doc else [], t0
+        fname = (
+            account_name.lower().replace(" ", "_").replace(".", "").replace(",", "")
+            + ".json"
         )
+        path = BASE / "nps" / "responses" / fname
+        if not path.exists():
+            self._record(
+                "get_nps_response",
+                {"account_name": account_name},
+                [],
+                t0,
+                timestamp_applied=effective_ts,
+            )
+            return {}
 
-    def get_nps_response(self, nps_id: str, as_of_time: Optional[str] = None) -> dict:
-        t0 = time.time()
-        doc = self._mem._db["nps"].find_one({"id": nps_id}) or {}
-        return self._record(
-            "get_nps_response", {"nps_id": nps_id}, [doc] if doc else [], t0
+        doc = json.loads(path.read_text())
+
+        ts = doc.get("timestamp") or doc.get("date") or doc.get("created_at", "")
+        if self._question_type != "SILENCE" and ts and ts > effective_ts:
+            self._record(
+                "get_nps_response",
+                {"account_name": account_name},
+                [],
+                t0,
+                timestamp_applied=effective_ts,
+            )
+            return {}
+
+        results = self._record(
+            "get_nps_response",
+            {"account_name": account_name},
+            [doc] if doc else [],
+            t0,
+            timestamp_applied=effective_ts,
         )
+        return results[0] if results else {}
 
     def get_events_for_day(
         self, day: int, event_type: Optional[str] = None
     ) -> List[dict]:
         t0 = time.time()
-        query: Dict = {"day": day}
+
+        if self._question_type == "SILENCE":
+            gate_day = self._question.get("trigger_day", 30)
+            gate_ts = (_SIM_START + timedelta(days=gate_day)).isoformat()
+        else:
+            gate_day = (datetime.fromisoformat(self._as_of_time) - _SIM_START).days + 1
+            gate_ts = self._as_of_time
+
+        if day > gate_day:
+            logger.warning(
+                f"[get_events_for_day] Day {day} requested but gate is Day {gate_day} — blocked"
+            )
+            return self._record(
+                "get_events_for_day", {"day": day, "event_type": event_type}, [], t0
+            )
+
+        query: Dict = {
+            "day": day,
+        }
+
+        print("timestamp")
+        print(query)
+
+        allowed_types: Set[str] = set()
+        for subsystem in self._actor_subsystems:
+            allowed_types.update(_SUBSYSTEM_EVENT_TYPES.get(subsystem, set()))
+
+        if not self._actor_subsystems:
+            allowed_types = set(KNOWN_EVENT_TYPES) - _INTERNAL_EVENT_TYPES
+
         if event_type:
+            if event_type in _INTERNAL_EVENT_TYPES:
+                logger.warning(
+                    f"[get_events_for_day] Internal event type requested: {event_type}"
+                )
+                return self._record(
+                    "get_events_for_day", {"day": day, "event_type": event_type}, [], t0
+                )
             query["type"] = event_type
-        docs = list(self._mem._db["events"].find(query))
+        else:
+            query["type"] = {"$in": list(allowed_types)}
+
+        docs = list(
+            self._mem._db["events"].find(
+                query,
+                {
+                    "_id": 0,
+                    "event_id": 1,
+                    "type": 1,
+                    "day": 1,
+                    "date": 1,
+                    "timestamp": 1,
+                    "actors": 1,
+                    "summary": 1,
+                    "artifact_ids": 1,
+                    "tags": 1,
+                },
+            )
+        )
+
         return self._record(
             "get_events_for_day", {"day": day, "event_type": event_type}, docs, t0
         )
@@ -461,32 +1008,96 @@ class GatedTools:
     def search_artifacts(
         self,
         query: str,
-        doc_types: Optional[List[str]] = None,
-        as_of_time: Optional[str] = None,
+        doc_type: str,
         actor: Optional[str] = None,
+        after_day: Optional[int] = None,
+        limit: int = 6,
     ) -> List[dict]:
-        """Semantic search across artifact collections."""
         t0 = time.time()
-        collections = doc_types or list(self._mem._db.list_collection_names())
-        results = []
-        for coll in collections:
-            try:
-                docs = list(
-                    self._mem._db[coll]
-                    .find(
-                        {"$text": {"$search": query}}, {"score": {"$meta": "textScore"}}
-                    )
-                    .sort([("score", {"$meta": "textScore"})])
-                    .limit(5)
+        effective_ts = self._gate_ts()
+        MAX_SEARCH_LIMIT = 15
+        limit = min(limit, MAX_SEARCH_LIMIT)
+
+        exact_doc = self._mem._db["artifacts"].find_one(
+            {"_id": query},
+            {
+                "embedding": 0,
+            },
+        )
+        if exact_doc:
+            ts_filter = {"timestamp": {"$lte": effective_ts}}
+            if after_day is not None:
+                floor_ts = _business_day_to_date(_SIM_START, after_day).isoformat()
+                ts_filter["timestamp"]["$gte"] = floor_ts
+            exact_doc_ts = exact_doc.get("timestamp", "")
+            if exact_doc_ts <= effective_ts and (
+                after_day is None or exact_doc_ts >= floor_ts
+            ):
+                return self._record(
+                    "search_artifacts",
+                    {
+                        "query": query,
+                        "doc_type": doc_type,
+                        "actor": actor,
+                        "after_day": after_day,
+                    },
+                    [exact_doc],
+                    t0,
+                    timestamp_applied=effective_ts,
                 )
-                results.extend(docs)
-            except Exception:
-                pass
+            return self._record(
+                "search_artifacts",
+                {
+                    "query": query,
+                    "doc_type": doc_type,
+                    "actor": actor,
+                    "after_day": after_day,
+                },
+                [],
+                t0,
+                timestamp_applied=effective_ts,
+            )
+
+        text_filter: dict = {
+            "$text": {"$search": query},
+            "timestamp": {"$lte": effective_ts},
+        }
+        if after_day is not None:
+            floor_ts = _business_day_to_date(_SIM_START, after_day).isoformat()
+            text_filter["timestamp"] = {
+                "$gte": floor_ts,
+                "$lte": effective_ts,
+            }
+        if doc_type:
+            text_filter["type"] = doc_type
+        if actor:
+            text_filter["metadata.author"] = actor
+
+        results = list(
+            self._mem._db["artifacts"]
+            .find(
+                text_filter,
+                {
+                    "content": 0,
+                    "embedding": 0,
+                    "score": {"$meta": "textScore"},
+                },
+            )
+            .sort([("score", {"$meta": "textScore"})])
+            .limit(limit)
+        )
+
         return self._record(
             "search_artifacts",
-            {"query": query, "doc_types": doc_types, "actor": actor},
+            {
+                "query": query,
+                "doc_type": doc_type,
+                "actor": actor,
+                "after_day": after_day,
+            },
             results,
             t0,
+            timestamp_applied=effective_ts,
         )
 
 
@@ -573,18 +1184,33 @@ class PerspectiveScorer:
 
         dead_end_recovery = dead_ends_recovered / dead_ends if dead_ends > 0 else 1.0
 
+        sim_days = CONFIG["simulation"].get("num_days", 60)
+        drifts = [
+            c.temporal_drift_days for c in calls if c.temporal_drift_days is not None
+        ]
+        temporal_precision = (
+            1.0 - mean(abs(d) / sim_days for d in drifts) if drifts else 1.0
+        )
+
+        drift_violations = sum(1 for c in calls if c.temporal_drift_violation)
+        temporal_drift_discipline = 1.0 - (drift_violations / n)
+
         composite = (
-            0.35 * epistemic_discipline
+            0.30 * epistemic_discipline
             + 0.25 * subsystem_discipline
             + 0.20 * conclusion_grounding
             + 0.10 * horizon_discipline
-            + 0.10 * dead_end_recovery
+            + 0.05 * temporal_precision
+            + 0.05 * temporal_drift_discipline
+            + 0.05 * dead_end_recovery
         )
 
         return PerspectiveTrajectoryScore(
             epistemic_discipline=round(epistemic_discipline, 4),
             subsystem_discipline=round(subsystem_discipline, 4),
             horizon_discipline=round(horizon_discipline, 4),
+            temporal_precision=round(temporal_precision, 4),
+            temporal_drift_discipline=round(temporal_drift_discipline, 4),  # new
             conclusion_grounding=round(conclusion_grounding, 4),
             dead_end_recovery=round(dead_end_recovery, 4),
             composite=round(composite, 4),
@@ -626,11 +1252,10 @@ class PerspectiveScorer:
             "no access to",
         )
 
-
         _POSITIVE_PHRASES = (
             "could have known",
             "would have known",
-            "did have access",    
+            "did have access",
             "has access to",
             "was visible to",
             "visible to this actor",
@@ -646,11 +1271,10 @@ class PerspectiveScorer:
             if phrase in reasoning:
                 return False
 
-    
         for phrase in _POSITIVE_PHRASES:
             if phrase in reasoning:
                 return True
-            
+
         return None
 
 
@@ -800,8 +1424,12 @@ class CounterfactualScorer:
         cause_artifacts = set(evidence_artifacts.get("cause", []))
         effect_artifacts = set(evidence_artifacts.get("effect", []))
 
-        cause_identified = 1.0 if (cause_artifacts and cause_artifacts & retrieved_ids) else 0.0
-        effect_identified = 1.0 if (effect_artifacts and effect_artifacts & retrieved_ids) else 0.0
+        cause_identified = (
+            1.0 if (cause_artifacts and cause_artifacts & retrieved_ids) else 0.0
+        )
+        effect_identified = (
+            1.0 if (effect_artifacts and effect_artifacts & retrieved_ids) else 0.0
+        )
 
         # Mechanism: did agent use keyword in its tool calls or final answer?
         gt_mechanism = ground_truth.get("causal_mechanism", "")
@@ -994,15 +1622,13 @@ class SilenceScorer:
                  "IT-108"                         → "it-108"
             """
             return s.strip("/").split("/")[-1].lower()
-        
+
         normalized_expected: Dict[str, str] = {
             _normalize_search_term(e): e for e in expected_space
         }
 
         # Also normalize all tool arg strings and result IDs for matching.
-        normalized_tool_args: List[str] = [
-            arg.lower() for arg in searched_tool_args
-        ]
+        normalized_tool_args: List[str] = [arg.lower() for arg in searched_tool_args]
         normalized_result_ids: Set[str] = {
             _normalize_search_term(rid) for rid in searched_ids
         }
@@ -1161,7 +1787,7 @@ class AgenticEvalRunner:
     def __init__(
         self,
         model: str = "claude-sonnet-4-6",
-        max_steps: int = 15,
+        max_steps: int = 5,
         ungated: bool = False,
         zero_shot: bool = False,
     ):
@@ -1353,8 +1979,10 @@ class AgenticEvalRunner:
             meta={
                 "model": self._model,
                 "eval_mode": (
-                    "zero_shot" if self._zero_shot
-                    else "ungated" if self._ungated
+                    "zero_shot"
+                    if self._zero_shot
+                    else "ungated"
+                    if self._ungated
                     else "gated"
                 ),
                 "as_of_time": as_of_time,
@@ -1387,27 +2015,92 @@ class AgenticEvalRunner:
             question_type=qtype,
         )
 
+        CAUSAL_LINK_TAXONOMY = {
+            "involves_gap": "incident ← knowledge gap (information was missing/undocumented)",
+            "recurrence_of": "incident ← prior unresolved incident (root cause was known but not fixed)",
+            "spawned_doc": "confluence ← design discussion (documentation resulted from a specific meeting)",
+            "email_dropped": "communication failure ← routing gap",
+            "sf_ownership_lapsed": "CRM gap ← employee departure",
+            "zd_escalation_source": "incident ← support ticket escalation",
+            "blocker_flagged": "blocker → delayed progress",
+            "incident_coordination": "incident → external contact",
+            "departure_reassignment": "departure → ticket/escalation shift",
+            "assignment_domain_mismatch": "planning mismatch → knowledge gap → incident",
+        }
+
+        taxonomy_str = "\n".join(
+            [f"- {k}: {v}" for k, v in CAUSAL_LINK_TAXONOMY.items()]
+        )
+        allowed_links = ", ".join(CAUSAL_LINK_TAXONOMY.keys())
+
         # Build output schema based on track
         output_schema = {
             "PERSPECTIVE": """{
-  "could_actor_have_known": <true|false>,
-  "reasoning": "<explanation>",
-  "evidence_artifacts": ["<artifact_id>", ...],
-  "blocked_subsystems": ["<subsystem>", ...]
-}""",
-            "COUNTERFACTUAL": """{
-  "outcome_changed": <true|false>,
-  "mechanism": "<causal mechanism description>",
-  "causal_mechanism": "<link_type>",
-  "actors": ["<actor_name>", ...],
-  "reasoning": "<explanation>"
-}""",
+            "could_actor_have_known": <true|false>,
+            "reasoning": "<explanation>",
+            "evidence_artifacts": ["<artifact_id>", ...],
+            "blocked_subsystems": ["<subsystem>", ...]
+            }""",
+            "COUNTERFACTUAL": f"""{{
+            "outcome_changed": <true|false>,
+            "mechanism": "<detailed causal mechanism description>",
+            "causal_mechanism": "<MUST be one of: {allowed_links}>",
+            "actors": ["<actor_name>", ...],
+            "reasoning": "<explanation>"
+            }}""",
             "SILENCE": """{
-  "exists": <true|false>,
-  "answer": "<yes|no>",
-  "reasoning": "<explanation of what you searched and what you found>"
-}""",
+            "exists": <true|false>,
+            "answer": "<yes|no>",
+            "reasoning": "<explanation of what you searched and what you found>"
+            }""",
         }[qtype]
+
+        _SEARCH_SPACE_HINTS = {
+            "confluence/general": "search Confluence general pages",
+            "confluence/retros": "search Confluence retrospectives",
+            "zendesk/queue": "search Zendesk tickets",
+            "zendesk/tickets": "search Zendesk tickets",
+            "zendesk/escalations": "check Zendesk escalations",
+            "slack/channels/engineering": "check the engineering Slack channel",
+            "slack/channels/digital-hq": "check the digital-hq Slack channel",
+            "slack/channels/incidents": "check the incidents Slack channel",
+            "slack/channels/general": "check the general Slack channel",
+            "slack/channels/support": "check the support Slack channel",
+            "zoom/transcripts": "search Zoom transcripts",
+            "git/merged-prs": "check merged pull requests",
+            "salesforce/opportunities": "search Salesforce opportunities",
+            "salesforce/accounts": "search Salesforce accounts",
+            "jira/incidents": "search Jira incident tickets",
+            "jira/reassignments": "check Jira for ticket reassignments",
+        }
+
+        space = question.get("expected_search_space", [])[:5]
+        hints = []
+        for entry in space:
+            hint = next(
+                (v for k, v in _SEARCH_SPACE_HINTS.items() if entry.startswith(k)), None
+            )
+            if hint:
+                hints.append(hint)
+            elif entry.startswith("export/emails/"):
+                continue
+            elif entry.startswith("export/"):
+                continue
+            else:
+                if entry.startswith("ext_email_") or entry.startswith("EMAIL-"):
+                    hints.append(f"call get_email with email_id='{entry}'")
+                elif entry.startswith("CONF-"):
+                    hints.append(f"call get_confluence_page with page_id='{entry}'")
+                elif entry.startswith("slack_"):
+                    hints.append(f"call get_slack_thread with thread_id='{entry}'")
+                elif entry.startswith("ENG-") or entry.startswith("IT-"):
+                    hints.append(f"call get_ticket with ticket_id='{entry}'")
+                elif entry.startswith("ZD-"):
+                    hints.append(f"call get_zd_ticket with ticket_id='{entry}'")
+                elif entry.startswith("PR-"):
+                    hints.append(f"call get_pr with pr_id='{entry}'")
+                else:
+                    hints.append(f"search for artifact '{entry}'")
 
         constraint_note = {
             "PERSPECTIVE": (
@@ -1419,13 +2112,16 @@ class AgenticEvalRunner:
             ),
             "COUNTERFACTUAL": (
                 "\n\nIMPORTANT: This is a counterfactual question. You must identify the explicit "
-                "causal link in the data — do not speculate. Find the cause event and the effect "
-                "event, then determine whether removing the cause would have changed the effect."
+                "causal link in the data — do not speculate. \n\n"
+                "You MUST categorize the link using one of the following labels:\n"
+                f"{taxonomy_str}\n\n"
+                "Find the cause event and the effect event, then determine whether "
+                "removing the cause would have changed the effect."
             ),
             "SILENCE": (
-                f"\n\nIMPORTANT: This is an absence question. You must search the corpus thoroughly "
-                f"before concluding. Check: {', '.join(question.get('expected_search_space', [])[:5])}. "
-                f"Only conclude absence after exhausting these sources. Do not guess."
+                "\n\nIMPORTANT: This is an absence question. You must search the corpus "
+                "thoroughly before concluding absence. Do not guess. "
+                "Show your work in the reasoning field — explain what you searched and what you found."
             ),
         }[qtype]
 
@@ -1438,6 +2134,7 @@ class AgenticEvalRunner:
             ),
             llm=self._llm,
             tools=self._tool_list(tools),
+            max_iter=self._max_steps,
         )
 
         task = Task(
@@ -1448,14 +2145,27 @@ class AgenticEvalRunner:
             ),
             expected_output="A JSON object matching the schema above. No preamble.",
             agent=agent,
-            max_iter=self._max_steps,
         )
 
         t_start = time.time()
         try:
-            raw = str(
-                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
-            ).strip()
+            raw_output = Crew(
+                agents=[agent],
+                tasks=[task],
+                verbose=True,
+                output_log_file="simulation.log",
+            ).kickoff()
+            if hasattr(raw_output, "raw"):
+                raw = str(raw_output.raw).strip()
+            elif isinstance(raw_output, list):
+                text_blocks = [
+                    b.get("text", "")
+                    for b in raw_output
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                raw = " ".join(text_blocks).strip()
+            else:
+                raw = str(raw_output).strip()
             final_answer = self._parse_structured_answer(raw)
         except Exception as exc:
             logger.warning(f"  Agent error: {exc}")
@@ -1486,28 +2196,223 @@ class AgenticEvalRunner:
         return trajectory
 
     def _tool_list(self, tools: GatedTools) -> List:
-        """Return the tool surface for the agent. Narrow and typed.
-
-        Returns an empty list in --zero-shot mode so the agent has no corpus
-        access — this establishes the hallucination / prior-knowledge floor.
-        """
         if self._zero_shot:
             return []
+
+        from crewai.tools import BaseTool
+        from pydantic import BaseModel, Field
+
+        class TicketInput(BaseModel):
+            ticket_id: str = Field(
+                ..., description="Jira ticket ID, e.g. 'ENG-42' or 'ORG-108'"
+            )
+
+        class GetTicket(BaseTool):
+            name: str = "get_ticket"
+            description: str = "Retrieve a Jira ticket by ID."
+            args_schema: type[BaseModel] = TicketInput
+            _tools: GatedTools
+
+            def _run(self, ticket_id: str) -> dict:
+                return tools.get_ticket(ticket_id)
+
+        class ConfluenceInput(BaseModel):
+            page_id: str = Field(
+                ..., description="Confluence page ID, e.g. 'CONF-ENG-007'"
+            )
+
+        class GetConfluencePage(BaseTool):
+            name: str = "get_confluence_page"
+            description: str = "Retrieve a Confluence page by ID."
+            args_schema: type[BaseModel] = ConfluenceInput
+
+            def _run(self, page_id: str) -> dict:
+                return tools.get_confluence_page(page_id)
+
+        class SlackInput(BaseModel):
+            thread_id: str = Field(
+                ...,
+                description="Slack thread ID, e.g. 'slack_dm_liam_sanjay_2026-03-02T13:37:00'",
+            )
+
+        class GetSlackThread(BaseTool):
+            name: str = "get_slack_thread"
+            description: str = "Retrieve a Slack thread by ID."
+            args_schema: type[BaseModel] = SlackInput
+
+            def _run(self, thread_id: str) -> list:
+                return tools.get_slack_thread(thread_id)
+
+        class EmailInput(BaseModel):
+            email_id: str = Field(
+                ..., description="Email artifact ID, e.g. 'ext_email_name_1_1'"
+            )
+
+        class GetEmail(BaseTool):
+            name: str = "get_email"
+            description: str = "Retrieve an email by ID."
+            args_schema: type[BaseModel] = EmailInput
+
+            def _run(self, email_id: str) -> dict:
+                return tools.get_email(email_id)
+
+        class PRInput(BaseModel):
+            pr_id: str = Field(..., description="Pull request ID, e.g. 'PR-88'")
+
+        class GetPR(BaseTool):
+            name: str = "get_pr"
+            description: str = "Retrieve a pull request by ID."
+            args_schema: type[BaseModel] = PRInput
+
+            def _run(self, pr_id: str) -> dict:
+                return tools.get_pr(pr_id)
+
+        class ZDInput(BaseModel):
+            ticket_id: str = Field(..., description="Zendesk ticket ID, e.g. 'ZD-55'")
+
+        class GetZDTicket(BaseTool):
+            name: str = "get_zd_ticket"
+            description: str = "Retrieve a Zendesk support ticket by ID."
+            args_schema: type[BaseModel] = ZDInput
+
+            def _run(self, ticket_id: str) -> dict:
+                return tools.get_zd_ticket(ticket_id)
+
+        class SFOppInput(BaseModel):
+            opp_id: str = Field(
+                ..., description="Salesforce opportunity ID, e.g. 'SF-OPP-12'"
+            )
+
+        class GetSFOpportunity(BaseTool):
+            name: str = "get_sf_opportunity"
+            description: str = "Retrieve a Salesforce opportunity by ID."
+            args_schema: type[BaseModel] = SFOppInput
+
+            def _run(self, opp_id: str) -> dict:
+                return tools.get_sf_opportunity(opp_id)
+
+        class SFAccountInput(BaseModel):
+            account_id: str = Field(
+                ..., description="Salesforce account ID, e.g. 'SF-ACC-7'"
+            )
+
+        class GetSFAccount(BaseTool):
+            name: str = "get_sf_account"
+            description: str = "Retrieve a Salesforce account by ID."
+            args_schema: type[BaseModel] = SFAccountInput
+
+            def _run(self, account_id: str) -> dict:
+                return tools.get_sf_account(account_id)
+
+        class ZoomInput(BaseModel):
+            transcript_id: str = Field(
+                ..., description="Zoom transcript ID, e.g. 'ZOOM-2026-03-15'"
+            )
+
+        class GetZoomTranscript(BaseTool):
+            name: str = "get_zoom_transcript"
+            description: str = "Retrieve a Zoom meeting transcript by ID."
+            args_schema: type[BaseModel] = ZoomInput
+
+            def _run(self, transcript_id: str) -> dict:
+                return tools.get_zoom_transcript(transcript_id)
+
+        class DatadogInput(BaseModel):
+            alert_id: str = Field(
+                ..., description="Datadog alert ID, e.g. 'DD-ALERT-3'"
+            )
+
+        class GetDatadogAlert(BaseTool):
+            name: str = "get_datadog_alert"
+            description: str = "Retrieve a Datadog alert by ID."
+            args_schema: type[BaseModel] = DatadogInput
+
+            def _run(self, alert_id: str) -> dict:
+                return tools.get_datadog_alert(alert_id)
+
+        class InvoiceInput(BaseModel):
+            invoice_id: str = Field(..., description="Invoice ID, e.g. 'INV-2026-001'")
+
+        class GetInvoice(BaseTool):
+            name: str = "get_invoice"
+            description: str = "Retrieve an invoice by ID."
+            args_schema: type[BaseModel] = InvoiceInput
+
+            def _run(self, invoice_id: str) -> dict:
+                return tools.get_invoice(invoice_id)
+
+        class NPSInput(BaseModel):
+            account_name: str = Field(..., description="Account name, e.g. 'Acme Corp'")
+
+        class GetNPSResponse(BaseTool):
+            name: str = "get_nps_response"
+            description: str = "Retrieve an NPS survey response by account name."
+            args_schema: type[BaseModel] = NPSInput
+
+            def _run(self, account_name: str) -> dict:
+                return tools.get_nps_response(account_name)
+
+        class EventsInput(BaseModel):
+            day: int = Field(..., description="Simulation day number, e.g. 1-30")
+            event_type: str = Field(
+                None, description="Optional event type filter, e.g. 'incident_opened'"
+            )
+
+        class GetEventsForDay(BaseTool):
+            name: str = "get_events_for_day"
+            description: str = "Retrieve all simulation events for a given day, optionally filtered by type."
+            args_schema: type[BaseModel] = EventsInput
+
+            def _run(self, day: int, event_type: str = None) -> list:
+                return tools.get_events_for_day(day, event_type)
+
+        class SearchInput(BaseModel):
+            query: str = Field(..., description="Artifact ID or keyword to search for.")
+            doc_type: str = Field(
+                None,
+                description="Filter by type, e.g. 'jira', 'confluence', 'slack', 'email', 'pr', 'zd_ticket', 'zoom'.",
+            )
+            actor: str = Field(None, description="Optional actor name to filter by")
+            after_day: int = Field(
+                None,
+                description=(
+                    "Only return artifacts created on or after this simulation day. "
+                    "Use this when checking whether something was created in response "
+                    "to a specific event."
+                ),
+            )
+
+        class SearchArtifacts(BaseTool):
+            name: str = "search_artifacts"
+            description: str = "Search for information when you do not have a specific ID. You MUST provide a specific search string in the 'query' argument."
+            args_schema: type[BaseModel] = SearchInput
+
+            def _run(
+                self,
+                query: str,
+                doc_type: str = "",
+                actor: str = "",
+                after_day: int = None,
+            ) -> list:
+                return tools.search_artifacts(
+                    query, doc_type, actor=actor, after_day=after_day
+                )
+
         return [
-            tools.get_ticket,
-            tools.get_confluence_page,
-            tools.get_slack_thread,
-            tools.get_email,
-            tools.get_pr,
-            tools.get_zd_ticket,
-            tools.get_sf_opportunity,
-            tools.get_sf_account,
-            tools.get_zoom_transcript,
-            tools.get_datadog_alert,
-            tools.get_invoice,
-            tools.get_nps_response,
-            tools.get_events_for_day,
-            tools.search_artifacts,
+            GetTicket(),
+            GetConfluencePage(),
+            GetSlackThread(),
+            GetEmail(),
+            GetPR(),
+            GetZDTicket(),
+            GetSFOpportunity(),
+            GetSFAccount(),
+            GetZoomTranscript(),
+            GetDatadogAlert(),
+            GetInvoice(),
+            GetNPSResponse(),
+            GetEventsForDay(),
+            SearchArtifacts(),
         ]
 
     def _parse_structured_answer(self, raw: str) -> Dict:
@@ -1532,7 +2437,7 @@ class AgenticEvalRunner:
         if qtype == "SILENCE":
             events = self._mem.get_event_log(from_db=True)
             max_day = max((e.day for e in events), default=1)
-            return (_SIM_START + timedelta(days=max_day)).isoformat()
+            return _business_day_to_date(_SIM_START, max_day).isoformat()
         if qtype == "PERSPECTIVE":
             return question.get("as_of_time", datetime.now().isoformat())
         if qtype == "COUNTERFACTUAL":
@@ -1546,7 +2451,7 @@ class AgenticEvalRunner:
                 except Exception:
                     pass
         day = question.get("day", question.get("event_day", 1))
-        return (_SIM_START + timedelta(days=day)).isoformat()
+        return _business_day_to_date(_SIM_START, day).isoformat()
 
     def _aggregate(self, results: List[EvalResult]) -> dict:
         def mean(vals):
@@ -1588,9 +2493,7 @@ class AgenticEvalRunner:
         by_type_summary = {}
         for qtype, rs in by_type.items():
             total_calls = sum(r.tool_call_count for r in rs)
-            total_violations = sum(
-                r.meta.get("actor_gate_violations", 0) for r in rs
-            )
+            total_violations = sum(r.meta.get("actor_gate_violations", 0) for r in rs)
             violation_rate = (
                 round(total_violations / total_calls, 4) if total_calls else 0.0
             )
@@ -1601,9 +2504,7 @@ class AgenticEvalRunner:
                 "answer_score": mean([r.answer_score for r in rs]),
                 "trajectory_score": mean([r.trajectory_score for r in rs]),
                 "combined_score": base_combined,
-                "accuracy": round(
-                    sum(r.answer_correct for r in rs) / len(rs), 4
-                ),
+                "accuracy": round(sum(r.answer_correct for r in rs) / len(rs), 4),
                 "avg_tool_calls": mean([r.tool_call_count for r in rs]),
             }
 
@@ -1647,9 +2548,7 @@ class AgenticEvalRunner:
         # A single number for cross-model ranking. Agents without PERSPECTIVE
         # questions are not penalised (violation_rate = 0, factor = 1.0).
         all_calls = sum(r.tool_call_count for r in results)
-        all_violations = sum(
-            r.meta.get("actor_gate_violations", 0) for r in results
-        )
+        all_violations = sum(r.meta.get("actor_gate_violations", 0) for r in results)
         global_violation_rate = (
             round(all_violations / all_calls, 4) if all_calls else 0.0
         )
@@ -1700,7 +2599,7 @@ if __name__ == "__main__":
     )
 
     parser = argparse.ArgumentParser(
-        description="OrgForge Agentic Eval Harness v2 — PERSPECTIVE, COUNTERFACTUAL, SILENCE"
+        description="OrgForge Agentic Eval Harness - PERSPECTIVE, COUNTERFACTUAL, SILENCE"
     )
     parser.add_argument(
         "--questions",
@@ -1720,7 +2619,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=15,
+        default=5,
         help="Max tool-use steps per question (SILENCE questions may need more)",
     )
     parser.add_argument(
