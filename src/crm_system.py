@@ -40,14 +40,12 @@ Public API (called from flow.py)
 ---------------------------------
   crm = CRMSystem.from_config(config, export_base, mem)
 
-  # Sim start — seeds SF accounts from contacts
-  crm.initialize_salesforce_accounts(contacts)
 
   # Pre-standup — called before DayPlannerOrchestrator.plan()
   crm_signals = crm.planner_context()        # injected alongside email_signals
 
   # Inbound email handling — called from ExternalEmailIngestor
-  zd_id = crm.handle_inbound_complaint(event_facts, timestamp, date_str, day)
+  zd_id = crm.handle_inbound_customer_email(event_facts, email_type, timestamp, date_str, day)
 
   # Incident lifecycle — called from _handle_incident() and _advance_incidents()
   crm.handle_incident_opened(incident_id, component, health, timestamp, date_str, day)
@@ -69,7 +67,8 @@ from pathlib import Path
 import random
 from typing import Dict, List, Optional
 
-from config_loader import COMPANY_NAME, CONFIG
+from config_loader import COMPANY_NAME
+from memory import SimEvent
 
 logger = logging.getLogger("orgforge.crm")
 
@@ -80,6 +79,32 @@ _ZD_PRIORITY_WEIGHTS = [0.2, 0.6, 0.15, 0.05]
 _ZD_CHANNELS = ["email", "web_widget", "api"]
 _ZD_CHANNEL_WEIGHTS = [0.7, 0.2, 0.1]
 
+# Email types that trigger a ZD ticket. feature_request goes to Product via
+# Slack FYI instead. positive_feedback needs no ticket.
+_ZD_TICKET_TYPES = frozenset(["complaint", "question", "general_inquiry"])
+
+# Probability that a given email type produces a ZD ticket.
+# Complaints always get one; others are gated so not every question
+# generates a ticket (realistic — not all customer questions need tracking).
+_ZD_TICKET_PROB: Dict[str, float] = {
+    "complaint": 1.0,
+    "question": 0.70,
+    "general_inquiry": 0.30,
+}
+
+# ZD ticket priority by email type.
+_ZD_PRIORITY_BY_EMAIL_TYPE: Dict[str, str] = {
+    "complaint": "High",
+    "question": "Normal",
+    "general_inquiry": "Low",
+}
+
+# ZD ticket type field by email type.
+_ZD_TYPE_BY_EMAIL_TYPE: Dict[str, str] = {
+    "complaint": "incident",
+    "question": "question",
+    "general_inquiry": "task",
+}
 
 _SF_TYPES = ["New Business", "Renewal", "Upsell/Cross-sell"]
 _SF_TYPE_WEIGHTS = [0.6, 0.25, 0.15]
@@ -103,12 +128,20 @@ class NullCRMSystem:
     never need to check ``if crm is not None``.
     """
 
-    def initialize_salesforce_accounts(self) -> None:
-        pass
-
     def planner_context(self) -> str:
         return ""
 
+    def handle_inbound_customer_email(
+        self,
+        event_facts: Dict,
+        email_type: str,
+        timestamp: str,
+        date_str: str,
+        day: int,
+    ) -> Optional[str]:
+        return None
+
+    # Keep old name as a no-op alias so any callers not yet updated don't break.
     def handle_inbound_complaint(
         self,
         event_facts: Dict,
@@ -126,6 +159,7 @@ class NullCRMSystem:
         timestamp: str,
         date_str: str,
         day: int,
+        root_cause: str = "",
     ) -> None:
         pass
 
@@ -172,23 +206,6 @@ class CRMSystem:
     and passed as a dependency to NormalDayHandler, ExternalEmailIngestor, and
     the incident handlers in flow.py.
     """
-
-    # Sales-intent keywords for outbound email classification.
-    # Kept narrow to avoid false positives on engineering or HR mail.
-    _SALES_KEYWORDS = {
-        "contract",
-        "renewal",
-        "proposal",
-        "following up",
-        "pricing",
-        "quote",
-        "demo",
-        "partnership",
-        "commercial",
-        "subscription",
-        "onboarding",
-        "account review",
-    }
 
     def __init__(self, config: Dict, export_base: Path, mem, planner_llm=None):
         crm_cfg = config.get("crm", {})
@@ -317,7 +334,7 @@ class CRMSystem:
                 self._sf_o.find(
                     {
                         "stage": {"$nin": ["Closed Won", "Closed Lost"]},
-                        "risk_notes": {"$not": {"$size": 0}},
+                        "risk_notes": {"$exists": True, "$ne": []},
                     },
                     {"_id": 0},
                 )
@@ -365,80 +382,41 @@ class CRMSystem:
 
         return "\n".join(lines) if lines else ""
 
-    def initialize_salesforce_accounts(self) -> None:
-        """
-        Runs once during genesis_phase(), before the daily loop starts.
-        Reads customer contacts from MongoDB and seeds SF accounts.
-        """
-        if not self._sf_on or not self._sf_cfg.get("seed_accounts", True):
-            return
+    # ─────────────────────────────────────────────────────────────────────────
+    # INBOUND EMAIL → ZENDESK
+    # ─────────────────────────────────────────────────────────────────────────
 
-        contacts = list(
-            self._mem._db["sim_config"].find(
-                {"_id": "inbound_email_sources", "category": "customer"}, {"_id": 0}
-            )
-        )
-
-        start_dt = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
-
-        for contact in contacts:
-            org_name = contact.get("org", "Unknown")
-            safe_id = org_name.upper().replace(" ", "").replace("-", "")
-            account_id = f"ACC-{safe_id}"
-
-            if self._sf_a.find_one({"account_id": account_id}):
-                continue
-
-            days_ago = random.randint(30, 730)
-            hours_ago = random.randint(0, 23)
-            mins_ago = random.randint(0, 59)
-            created_dt = start_dt - timedelta(
-                days=days_ago, hours=hours_ago, minutes=mins_ago
-            )
-
-            account = {
-                "account_id": account_id,
-                "name": org_name,
-                "primary_contact": contact.get("name", "Unknown Contact"),
-                "type": "Customer",
-                "industry": contact.get("industry", "Technology"),
-                "tier": contact.get(
-                    "tier",
-                    random.choices(
-                        ["Enterprise", "Mid-Market", "SMB"], weights=[0.2, 0.5, 0.3]
-                    )[0],
-                ),
-                "website": f"https://www.{org_name.lower().replace(' ', '')}.com",
-                "billing_region": contact.get(
-                    "billing_region",
-                    random.choices(["NA", "EMEA", "APAC"], weights=[0.6, 0.3, 0.1])[0],
-                ),
-                "arr": contact.get(
-                    "arr", random.choice([50000, 100000, 250000, 500000])
-                ),
-                "owner": contact.get("internal_liaison", "Unassigned"),
-                "created_at": created_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "risk_flag": False,
-            }
-            self._sf_a.insert_one({**account, "_seq": 0})
-            self._write(f"salesforce/accounts/{account_id}.json", account)
-            logger.info(f"[crm] SF account seeded: {account_id} ({org_name})")
-
-    def handle_inbound_complaint(
+    def handle_inbound_customer_email(
         self,
         event_facts: Dict,
+        email_type: str,
         timestamp: str,
         date_str: str,
         day: int,
     ) -> Optional[str]:
         """
-        Called by ExternalEmailIngestor when it processes a customer_complaint
-        email. Creates a ZD ticket in MongoDB + disk and embeds it so Product
-        planners see it the next morning.
+        Called by ExternalEmailIngestor for any routed inbound customer email
+        that warrants a ZD ticket. Creates a ticket in MongoDB + disk and
+        embeds it so Product planners see it the next morning.
 
-        Returns the new ticket_id (e.g. 'ZD-101') or None if ZD is disabled.
+        Which email types produce tickets, and at what probability:
+          complaint       → always  (priority: High,   type: incident)
+          question        → 70%     (priority: Normal,  type: question)
+          general_inquiry → 30%     (priority: Low,     type: task)
+          feature_request → never   (handled via Slack FYI to Product)
+          positive_feedback → never
+
+        Returns the new ticket_id (e.g. 'ZD-101') or None if ZD is disabled
+        or the email type / probability gate does not produce a ticket.
         """
         if not self._zd_on:
+            return None
+
+        if email_type not in _ZD_TICKET_TYPES:
+            return None
+
+        ticket_prob = _ZD_TICKET_PROB.get(email_type, 0.0)
+        if random.random() > ticket_prob:
             return None
 
         from memory import SimEvent
@@ -447,21 +425,27 @@ class CRMSystem:
         self._zd_counter += 1
         ticket_id = f"ZD-{seq}"
 
+        priority = _ZD_PRIORITY_BY_EMAIL_TYPE.get(email_type, "Normal")
+        zd_type = _ZD_TYPE_BY_EMAIL_TYPE.get(email_type, "question")
+
         ticket = {
             "ticket_id": ticket_id,
-            "type": "incident",
+            "type": zd_type,
             "status": "Open",
-            "priority": "Normal",
+            "priority": priority,
             "description": event_facts.get("body", "(See email body.)"),
+            "assignee_email": event_facts.get("liaison_email", "Unknown"),
             "requester": {
                 "name": event_facts.get("sender_name", "Customer"),
                 "email": event_facts.get("sender", "customer@unknown.com"),
                 "org_name": event_facts.get("sender_org", "Unknown"),
+                "email_id": event_facts.get("email", "Unknown"),
             },
-            "subject": event_facts.get("subject", "Customer complaint"),
+            "subject": event_facts.get("subject", "Customer inquiry"),
             "org_name": event_facts.get("sender_org", "Unknown"),
             "channel": "email",
-            "tags": ["support", "inbound", "needs_triage"],
+            "email_type": email_type,
+            "tags": ["support", "inbound", email_type, "needs_triage"],
             "satisfaction_rating": {"score": "unoffered"},
             "created_at": timestamp,
             "updated_at": timestamp,
@@ -494,6 +478,7 @@ class CRMSystem:
             metadata={
                 "ticket_id": ticket_id,
                 "org_name": ticket["org_name"],
+                "email_type": email_type,
                 "status": "Open",
             },
         )
@@ -510,15 +495,41 @@ class CRMSystem:
                     "ticket_id": ticket_id,
                     "subject": ticket["subject"],
                     "org_name": ticket["org_name"],
+                    "email_type": email_type,
+                    "priority": priority,
+                    "zd_type": zd_type,
                     "channel": "email",
                 },
-                summary=f"Zendesk ticket {ticket_id} opened: {ticket['subject']} ({ticket['org_name']})",
-                tags=["zendesk", "support", "customer_complaint"],
+                summary=(
+                    f"Zendesk ticket {ticket_id} opened [{email_type}]: "
+                    f"{ticket['subject']} ({ticket['org_name']})"
+                ),
+                tags=["zendesk", "support", email_type],
             )
         )
 
-        logger.info(f"[crm] ZD ticket opened: {ticket_id} ({ticket['org_name']})")
+        logger.info(
+            f"[crm] ZD ticket opened: {ticket_id} [{email_type}/{priority}] "
+            f"({ticket['org_name']})"
+        )
         return ticket_id
+
+    # Keep old name as a forwarding alias so any callers not yet updated
+    # continue to work. Defaults email_type to "complaint" for backward compat.
+    def handle_inbound_complaint(
+        self,
+        event_facts: Dict,
+        timestamp: str,
+        date_str: str,
+        day: int,
+    ) -> Optional[str]:
+        return self.handle_inbound_customer_email(
+            event_facts=event_facts,
+            email_type="complaint",
+            timestamp=timestamp,
+            date_str=date_str,
+            day=day,
+        )
 
     def _write_zd_comment(self, ticket_id: str, comment: Dict) -> None:
         """Write a single comment to disk under zendesk/comments/{ticket_id}/."""
@@ -563,6 +574,7 @@ class CRMSystem:
         timestamp: str,
         date_str: str,
         day: int,
+        root_cause: str = "",
     ) -> None:
         """
         Called immediately after _handle_incident() logs the incident_opened
@@ -575,10 +587,17 @@ class CRMSystem:
         SF path: when health < 60, appends a risk note to every open opportunity
         so Sales planners see the risk in their daily context.
         """
-        from memory import SimEvent
+
+        affected_orgs: List[str] = []
 
         if self._zd_on and self._zd_cfg.get("link_to_incidents", True):
-            open_tickets = list(self._zd.find({"status": "Open"}, {"_id": 0}))
+            affected_orgs = self._orgs_affected_by_incident(root_cause)
+
+            query = {"status": "Open"}
+            if affected_orgs:
+                query["org_name"] = {"$in": affected_orgs}
+
+            open_tickets = list(self._zd.find(query, {"_id": 0}))
             escalated_ids = []
 
             for t in open_tickets:
@@ -637,12 +656,11 @@ class CRMSystem:
                 )
 
         if self._sf_on and health < 60:
-            open_opps = list(
-                self._sf_o.find(
-                    {"stage": {"$nin": ["Closed Won", "Closed Lost"]}},
-                    {"_id": 0},
-                )
-            )
+            query = {"stage": {"$nin": ["Closed Won", "Closed Lost"]}}
+            if affected_orgs:
+                query["account_name"] = {"$in": affected_orgs}
+
+            open_opps = list(self._sf_o.find(query, {"_id": 0}))
             risk_note = (
                 f"Active SEV on {component} ({incident_id}) — "
                 f"system health {health}/100 — potential SLA impact."
@@ -934,6 +952,29 @@ class CRMSystem:
         )
 
         return touchpoint_facts
+
+    def _orgs_affected_by_incident(self, root_cause: str) -> List[str]:
+        """
+        Returns org names whose depends_on_components overlap with the
+        incident root_cause. Empty list = no filtering (fallback to all).
+        """
+        if not root_cause:
+            return []
+
+        doc = self._mem._db["sim_config"].find_one({"_id": "inbound_email_sources"})
+        if not doc or "sources" not in doc:
+            return []
+
+        rc_lower = root_cause.lower()
+        affected = []
+        for source in doc["sources"]:
+            if source.get("category", "").lower() != "customer":
+                continue
+            components = [c.lower() for c in source.get("depends_on_components", [])]
+            if any(comp in rc_lower for comp in components):
+                affected.append(source.get("org", ""))
+
+        return [o for o in affected if o]
 
     def get_best_open_opportunity(self, owner: str) -> Optional[Dict]:
         """

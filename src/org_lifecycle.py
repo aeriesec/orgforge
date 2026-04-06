@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 from agent_factory import make_agent
+from config_loader import CONFIG
 from crm_system import NullCRMSystem
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
@@ -169,14 +170,15 @@ class OrgLifecycleManager:
 
         if self._cfg.get("enable_random_attrition", False):
             prob = self._cfg.get("random_attrition_daily_prob", 0.01)
-            candidates = [
-                n
-                for n in list(self._all_names)
-                if n not in self._leads.values()
-                and n not in [d.name for d in self._departed]
-            ]
-            for candidate in candidates:
-                if random.random() < prob:
+            if random.random() < prob:
+                candidates = [
+                    n
+                    for n in list(self._all_names)
+                    if n not in self._leads.values()
+                    and n not in [d.name for d in self._departed]
+                ]
+                if candidates:
+                    candidate = random.choice(candidates)
                     dept = next(
                         (d for d, m in self._org_chart.items() if candidate in m),
                         "Unknown",
@@ -187,28 +189,25 @@ class OrgLifecycleManager:
                         if n not in self._leads.values()
                     ]
                     min_size = self._cfg.get("min_dept_size", 2)
-                    if len(dept_members) <= min_size:
-                        continue
-
-                    attrition_cfg = {
-                        "name": candidate,
-                        "reason": "voluntary",
-                        "knowledge_domains": [],
-                        "documented_pct": 0.5,
-                    }
-                    record = self._execute_departure(
-                        attrition_cfg,
-                        day,
-                        date_str,
-                        state,
-                        scheduled=False,
-                        clock=clock,
-                    )
-                    if record:
-                        departures.append(record)
-                        if ticket_assigner is not None:
-                            ticket_assigner.evict_engineer(record.name)
-                    break
+                    if len(dept_members) > min_size:
+                        attrition_cfg = {
+                            "name": candidate,
+                            "reason": "voluntary",
+                            "knowledge_domains": [],
+                            "documented_pct": 0.5,
+                        }
+                        record = self._execute_departure(
+                            attrition_cfg,
+                            day,
+                            date_str,
+                            state,
+                            scheduled=False,
+                            clock=clock,
+                        )
+                        if record:
+                            departures.append(record)
+                            if ticket_assigner is not None:
+                                ticket_assigner.evict_engineer(record.name)
 
         return departures
 
@@ -286,11 +285,10 @@ class OrgLifecycleManager:
                 continue
             self._domains_surfaced.add(gap_key)
 
-            gap_domains = (
-                record.knowledge_domains
-                if record.knowledge_domains
-                else ["undocumented expertise"]
-            )
+            gap_domains = record.knowledge_domains
+            if not gap_domains:
+                continue
+
             domain_label = ", ".join(gap_domains)
 
             # ── Pass 2: DomainRegistry cross-reference ─────────────────────
@@ -1038,13 +1036,6 @@ class OrgLifecycleManager:
         if name not in self._all_names:
             self._all_names.append(name)
 
-        self._personas[name] = {
-            "style": style,
-            "expertise": expertise,
-            "tenure": tenure,
-            "stress": 20,
-        }
-
         G.add_node(name, dept=dept, is_lead=False, external=False, hire_day=day)
         self._gd._stress[name] = 20
         self._gd._centrality_dirty = True
@@ -1136,17 +1127,23 @@ class OrgLifecycleManager:
         lag_days = backfill_cfg.get("lag_days", 14)
         hire_day = current_day + lag_days
 
-        name = self._generate_backfill_name(dept=record.dept, role=record.role)
-        if name is None:
+        persona = self._generate_backfill_persona(
+            dept=record.dept, role=record.role, departed_name=record.name
+        )
+        if persona is None:
             return
 
-        departed_persona = self._personas.get(record.name, {})
         backfill_hire = {
-            "name": backfill_cfg.get("name_prefix", "NewHire") + f"_{hire_day}",
+            "name": persona["name"],
             "dept": record.dept,
             "role": record.role,
-            "expertise": departed_persona.get("expertise", ["general"]),
-            "style": "still ramping up, asks frequent questions",
+            "expertise": persona.get("expertise", ["general"]),
+            "style": persona.get("style", "still ramping up, asks frequent questions"),
+            "social_role": persona.get("social_role", "The Newcomer"),
+            "typing_quirks": persona.get(
+                "typing_quirks", "Standard professional grammar."
+            ),
+            "pet_peeves": persona.get("pet_peeves", ""),
             "tenure": "new",
             "day": hire_day,
             "_backfill_for": record.name,
@@ -1159,49 +1156,88 @@ class OrgLifecycleManager:
             f"queued for Day {hire_day} (replacing {record.name})"
         )
 
-    def _generate_backfill_name(self, dept: str, role: str) -> Optional[str]:
+    def _generate_backfill_persona(
+        self, dept: str, role: str, departed_name: str
+    ) -> Optional[dict]:
         """
-        Ask the LLM for a single realistic first+last name for a new hire.
-        Retries up to 3 times if the name collides with an existing person.
-        Returns None if a unique name can't be produced — backfill is skipped.
+        Ask the LLM to generate a full persona for a backfill hire.
+        Includes name, style, social_role, typing_quirks, pet_peeves, and expertise.
+        Retries up to 3 times if the generated name collides with an existing person.
+        Returns None if a unique persona can't be produced — backfill is skipped.
         """
         if self._llm is None:
             return None
 
         forbidden = set(self._all_names) | {d.name for d in self._departed}
-        company = self._cfg.get("company_name", "the company")
+        company = CONFIG["simulation"]["company_name"]
+        departed_persona = self._personas.get(departed_name, {})
+        departed_expertise = departed_persona.get("expertise", ["general"])
 
         for attempt in range(3):
             try:
+                import json
                 from crewai import Task, Crew
 
                 agent = make_agent(
                     role="HR Coordinator",
-                    goal="Generate a realistic employee name.",
+                    goal="Generate a realistic new hire persona.",
                     backstory=(
                         f"You work in HR at {company}. "
-                        f"You are onboarding a new {role} for the {dept} team."
+                        f"You are onboarding a new {role} for the {dept} team "
+                        f"to replace {departed_name}, who recently left."
                     ),
                     llm=self._llm,
                 )
                 task = Task(
                     description=(
-                        f"Generate ONE realistic full name (first and last) for a new "
-                        f"{role} joining the {dept} team. "
-                        f"The name must not be any of: {sorted(forbidden)}. "
-                        f"Respond with ONLY the name — no punctuation, no explanation."
+                        f"Generate a realistic persona for a new {role} joining the {dept} team.\n"
+                        f"They are replacing {departed_name}, so their expertise should broadly "
+                        f"cover: {departed_expertise}, but with their own background and gaps.\n"
+                        f"The name must not be any of: {sorted(forbidden)}.\n\n"
+                        f"Respond with ONLY a JSON object — no explanation, no markdown fences:\n"
+                        f"{{\n"
+                        f'  "name": "First Last",\n'
+                        f'  "expertise": ["skill1", "skill2", "skill3"],\n'
+                        f'  "style": "one sentence describing how they work",\n'
+                        f'  "social_role": "The [Archetype]",\n'
+                        f'  "typing_quirks": "one or two sentences describing their written voice",\n'
+                        f'  "pet_peeves": "brief phrase"\n'
+                        f"}}"
                     ),
-                    expected_output="A single full name, e.g. 'Jordan Lee'.",
+                    expected_output="A JSON object with keys: name, expertise, style, social_role, typing_quirks, pet_peeves.",
                     agent=agent,
                 )
                 raw = str(
                     Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
                 ).strip()
 
-                name = " ".join(raw.split())
+                # Strip markdown fences if the LLM included them anyway
+                raw = (
+                    raw.strip()
+                    .removeprefix("```json")
+                    .removeprefix("```")
+                    .removesuffix("```")
+                    .strip()
+                )
+
+                try:
+                    persona = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"[lifecycle] Persona generation attempt {attempt + 1} "
+                        f"returned invalid JSON: {raw[:200]}"
+                    )
+                    continue
+
+                name = persona.get("name", "").strip()
+                name = " ".join(name.split())
                 name = "".join(c for c in name if c.isalpha() or c == " ").strip()
 
                 if not name or len(name.split()) < 2:
+                    logger.warning(
+                        f"[lifecycle] Persona generation attempt {attempt + 1} "
+                        f"produced an unusable name: '{name}'"
+                    )
                     continue
                 if name in forbidden:
                     logger.info(
@@ -1209,15 +1245,16 @@ class OrgLifecycleManager:
                     )
                     continue
 
-                return name
+                persona["name"] = name
+                return persona
 
             except Exception as e:
                 logger.warning(
-                    f"[lifecycle] Name generation attempt {attempt + 1} failed: {e}"
+                    f"[lifecycle] Persona generation attempt {attempt + 1} failed: {e}"
                 )
 
         logger.warning(
-            f"[lifecycle] Could not generate a unique backfill name for {dept} "
+            f"[lifecycle] Could not generate a unique backfill persona for {dept} "
             f"after 3 attempts. Backfill skipped."
         )
         return None

@@ -13,6 +13,6 @@ AGENT_DEFAULTS = {
 
 def make_agent(role: str, goal: str, backstory: str, llm, **kwargs) -> Agent:
     logging.getLogger("orgforge.agent_factory")
-    params = {**AGENT_DEFAULTS, "llm": llm}
+    params = {**AGENT_DEFAULTS, "llm": llm, "verbose": False}
     params.update(kwargs)
-    return Agent(role=role, goal=goal, backstory=backstory, verbose=False, **params)
+    return Agent(role=role, goal=goal, backstory=backstory, **params)

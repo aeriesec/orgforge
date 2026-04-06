@@ -216,7 +216,6 @@ KNOWN_EVENT_TYPES = {
     "incident_opened",
     "incident_resolved",
     "escalation_chain",
-    "fix_in_progress",
     "postmortem_created",
     "knowledge_gap_detected",
     "standup",
@@ -267,4 +266,10 @@ KNOWN_EVENT_TYPES = {
     "crm_account_at_risk",
     "customer_health_briefing",
     "assignment_domain_mismatch",
+    "feature_request_fyi",
+    "blocker_flagged",
+    "jira_ticket_created",
+    "org_collision",
+    "ticket_completion_email",
+    "mentoring",
 }

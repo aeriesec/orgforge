@@ -154,6 +154,7 @@ org_lifecycle:
       day: 12
       reason: "voluntary" # voluntary | layoff | performance
       role: "Senior Backend Engineer"
+      dept: "Engineering_Backend"
       knowledge_domains:
         - "auth-service"
         - "redis-cache"
@@ -164,6 +165,7 @@ org_lifecycle:
       day: 24
       reason: "layoff"
       role: "DevOps Engineer"
+      dept: "Engineering_Backend"
       knowledge_domains:
         - "kubernetes-deploy"
         - "terraform-infra"

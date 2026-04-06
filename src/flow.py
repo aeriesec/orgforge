@@ -117,6 +117,50 @@ def _patch_crewai_bedrock():
     except (ImportError, AttributeError) as e:
         logger.warning(f"[patch] Could not patch crewAI Bedrock provider: {e}")
 
+    try:
+        from crewai.agents.crew_agent_executor import CrewAgentExecutor
+        from crewai.utilities.string_utils import sanitize_tool_name
+
+        def patched_parse_native_tool_call(
+            self, tool_call: Any
+        ) -> tuple[str, str, str | dict] | None:
+            if hasattr(tool_call, "function"):
+                call_id = getattr(tool_call, "id", f"call_{id(tool_call)}")
+                func_name = sanitize_tool_name(tool_call.function.name)
+                return call_id, func_name, tool_call.function.arguments
+            if hasattr(tool_call, "function_call") and tool_call.function_call:
+                call_id = f"call_{id(tool_call)}"
+                func_name = sanitize_tool_name(tool_call.function_call.name)
+                func_args = (
+                    dict(tool_call.function_call.args)
+                    if tool_call.function_call.args
+                    else {}
+                )
+                return call_id, func_name, func_args
+            if hasattr(tool_call, "name") and hasattr(tool_call, "input"):
+                call_id = getattr(tool_call, "id", f"call_{id(tool_call)}")
+                func_name = sanitize_tool_name(tool_call.name)
+                return call_id, func_name, tool_call.input
+            if isinstance(tool_call, dict):
+                call_id = (
+                    tool_call.get("id")
+                    or tool_call.get("toolUseId")
+                    or f"call_{id(tool_call)}"
+                )
+                func_info = tool_call.get("function", {})
+                func_name = sanitize_tool_name(
+                    func_info.get("name", "") or tool_call.get("name", "")
+                )
+                # FIX: use None default so falsy check correctly falls through to input
+                func_args = func_info.get("arguments") or tool_call.get("input") or {}
+                return call_id, func_name, func_args
+            return None
+
+        CrewAgentExecutor._parse_native_tool_call = patched_parse_native_tool_call
+        logger.info("[patch] crewAI Bedrock tool arguments patch applied")
+    except (ImportError, AttributeError) as e:
+        logger.warning(f"[patch] Could not patch crewAI tool argument parser: {e}")
+
 
 _patch_crewai_bedrock()
 
@@ -269,6 +313,7 @@ class ActiveIncident(BaseModel):
     recurrence_of: Optional[str] = None
     on_call: str = ""
     actors: List[str] = []
+    contacted_customers: List[str] = []
 
 
 class SprintState(BaseModel):
@@ -959,9 +1004,14 @@ class OrgForgeSimulation:
             vendor_signals = self._email_ingestor.generate_pre_standup(state=self.state)
 
             if self.state.day > 1:
+                logger.info("[dim] Draining embedding queue[/dim]")
                 self._embed_worker.drain()
 
             crm_signals = self._crm.planner_context()
+
+            self.state.persona_stress = dict(self.graph_dynamics._stress)
+
+            on_call_today = self._get_next_on_call(self.state.day)
 
             org_plan = self._day_planner.plan(
                 self.state,
@@ -971,6 +1021,7 @@ class OrgForgeSimulation:
                 clock=self._clock,
                 email_signals=vendor_signals,
                 crm_summary=crm_signals,
+                on_call=on_call_today,
             )
             if org_plan is None:
                 logger.error(
@@ -1056,6 +1107,7 @@ class OrgForgeSimulation:
 
             self._advance_incidents()
 
+            logger.info("[dim] Draining embedding queue[/dim]")
             self._embed_worker.drain()
 
             serialized_incidents = []
@@ -1994,6 +2046,7 @@ class OrgForgeSimulation:
         triggered_contacts = self.graph_dynamics.relevant_external_contacts(
             event_type="incident_opened",
             system_health=self.state.system_health,
+            incident=inc,
         )
         for contact in triggered_contacts:
             self._handle_external_contact(inc, contact)
@@ -2039,6 +2092,7 @@ class OrgForgeSimulation:
             timestamp=incident_start_iso,
             date_str=date_str,
             day=self.state.day,
+            root_cause=root_cause,
         )
 
         self._mem.log_event(
@@ -2142,6 +2196,7 @@ class OrgForgeSimulation:
                 triggered_contacts = self.graph_dynamics.relevant_external_contacts(
                     event_type="fix_in_progress",
                     system_health=self.state.system_health,
+                    incident=inc,
                 )
                 for contact in triggered_contacts:
                     self._handle_external_contact(inc, contact)
@@ -2472,8 +2527,6 @@ class OrgForgeSimulation:
 
         self.graph_dynamics.decay_edges()
 
-        self.graph_dynamics.decay_edges()
-
         edge_changes = self.graph_dynamics.sync_crm_edge_weights(self._crm)
         if edge_changes:
             logger.debug(
@@ -2601,7 +2654,7 @@ class OrgForgeSimulation:
         liaison_dept = contact.get("internal_liaison", list(LEADS.keys())[0])
         liaison_name = LEADS.get(liaison_dept, next(iter(LEADS.values())))
         display_name = contact.get("display_name", contact["name"])
-        tone = contact.get("summary_tone", "professional")
+        tone = contact.get("tone", "professional")
         date_str = str(self.state.current_date.date())
 
         participants = [liaison_name, display_name]
@@ -2724,6 +2777,11 @@ class OrgForgeSimulation:
 
         self._record_daily_actor(liaison_name)
         self._record_daily_event("external_contact_summarized")
+
+        if contact.get("category", "").lower() == "customer":
+            org = contact.get("org", contact["name"])
+            if org not in inc.contacted_customers:
+                inc.contacted_customers.append(org)
 
         logger.info(
             f"    [cyan]🌐 External contact:[/cyan] {liaison_name} summarized "

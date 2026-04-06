@@ -978,6 +978,7 @@ class DayPlannerOrchestrator:
         lifecycle_context: str = "",
         email_signals: Optional[List["ExternalEmailSignal"]] = None,
         crm_summary: str = "",
+        on_call: str = "",
     ) -> OrgDayPlan:
         """
         Full planning pass for one day.
@@ -1001,7 +1002,7 @@ class DayPlannerOrchestrator:
             if dept not in LEADS:
                 continue
             sprint_contexts[dept] = self._ticket_assigner.build(
-                state, members, dept_name=dept
+                state, members, dept_name=dept, on_call=on_call
             )
 
         state.ticket_actors_today = {}

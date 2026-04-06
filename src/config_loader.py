@@ -47,6 +47,7 @@ DEPARTED_EMPLOYEES: Dict[str, Dict] = {
     gap["name"]: {
         "left": gap["left"],
         "role": gap["role"],
+        "dept": gap["dept"],
         "knew_about": gap["knew_about"],
         "documented_pct": gap["documented_pct"],
     }

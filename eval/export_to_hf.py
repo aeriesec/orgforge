@@ -2,122 +2,31 @@
 export_to_hf.py
 ===============
 Normalises all OrgForge simulation artifacts into a flat HuggingFace-ready
-corpus, computes a two-tier baseline, produces Parquet files, and writes a
-dataset card (README.md) to export/hf_dataset/.
+corpus, produces Parquet files, and writes a dataset card (README.md).
 
-Run after flow.py + eval_harness.py:
+Run after flow.py completes:
     python export_to_hf.py
 
 Output layout
 -------------
 export/hf_dataset/
   corpus/
-    corpus-00000.parquet              — flat document corpus (one row per artifact)
-  questions/
-    questions-00000.parquet           — eval questions with ground truth
-  eval_indexes/
-    causal_link_index.parquet         — explicit causal links from CausalLinkIndexer
-    actor_visibility.parquet          — per-actor visibility cones, one row per (actor, day)
-    absence_catalog.parquet           — expected-but-absent artifact pairs
-  baselines/
-    ungated_ceiling_bm25.json         — per-question ungated BM25 ceiling scores
-    ungated_ceiling_dense.json        — per-question ungated dense ceiling scores
-    static_reasoning_metrics.json     — per-question + aggregate reasoning difficulty metrics
-    baseline_summary.json             — combined summary for the dataset card
-  README.md                           — HuggingFace dataset card
-
-Two-tier baseline design
-------------------------
-This file computes only what requires NO agent execution:
-
-  Tier 1 — Ungated Retrieval Ceiling (UngatedCeilingBaseline)
-    BM25 and dense retrieval with all gates removed ("god-mode" corpus access).
-    MRR@10 and Recall@10 are reported for PERSPECTIVE and COUNTERFACTUAL only.
-    SILENCE is excluded — absence cannot be measured by retrieval recall.
-    The delta between this ceiling and a gated agent's combined_score is the
-    "Epistemic Tax" — the difficulty cost of respecting organisational silos.
-
-  Tier 2 — Static Reasoning Difficulty (StaticReasoningMetrics)
-    Metrics derived from corpus + question metadata alone. No LLM, no agent.
-    PERSPECTIVE    → horizon_contamination_rate (fraction of ungated top-20 outside cone)
-    COUNTERFACTUAL → causal_chain_traceable (do cause+effect co-appear in top-10?)
-    SILENCE        → search_space_bm25_coverage (fraction of required locations BM25 finds)
-
-Agent-level baselines (ungated god-mode agent, zero-shot no-tools) require LLM
-calls and belong in agentic_eval_harness.py as --ungated / --zero-shot flags.
-
-Corpus schema (one row per document)
--------------------------------------
-  doc_id          str   — globally unique, e.g. "ORG-42", "CONF-ENG-007", "EMAIL-001"
-  doc_type        str   — "jira" | "confluence" | "slack" | "email" | "pr" |
-                         "zd_ticket" | "sf_opp" | "sf_account" | "sim_event"
-  title           str   — human-readable title or subject line
-  body            str   — full text content for retrieval
-  day             int   — simulation day this artifact was created
-  date            str   — ISO date string
-  timestamp       str   — ISO datetime string (business-hours accurate)
-  actors          str   — JSON array of actor names involved
-  tags            str   — JSON array of tags from SimEvent
-  artifact_ids    str   — JSON dict mapping type→id (for cross-referencing)
-  dept            str   — owning department, empty if cross-dept
-  is_incident     bool  — True if this artifact is part of an incident thread
-  is_external     bool  — True for emails from outside the org
-
-Question schema
----------------
-  question_id               str
-  question_type             str   — PERSPECTIVE | COUNTERFACTUAL | SILENCE
-  question_text             str
-  ground_truth              str   — JSON-serialised ground_truth dict
-  evidence_chain            str   — JSON array of artifact IDs (cause+effect for
-                                    COUNTERFACTUAL; evidence_artifacts for PERSPECTIVE;
-                                    empty for SILENCE — absence cannot be recalled)
-  difficulty                str   — medium | hard
-  requires_reasoning        bool
-  actor                     str   — PERSPECTIVE only
-  actor_role                str   — PERSPECTIVE only
-  as_of_day                 int   — PERSPECTIVE only
-  subsystem_access          str   — JSON list; PERSPECTIVE only
-  blocked_subsystems        str   — JSON list; PERSPECTIVE only
-  actor_visible_artifacts   str   — JSON list; PERSPECTIVE only
-  link_type                 str   — COUNTERFACTUAL only (causal link type)
-  causal_day                int   — COUNTERFACTUAL only
-  expected_search_space     str   — JSON list; SILENCE only
-  trigger_event_type        str   — SILENCE only
-  expected_response_type    str   — SILENCE only
-
-Eval indexes
--------------
-causal_link_index   — one row per CausalLink (see eval_harness.CausalLink)
-actor_visibility    — one row per (actor, day) ActorVisibilityCone snapshot
-absence_catalog     — one row per AbsenceRecord
-
-Baseline methodology
----------------------
-BM25   — rank_bm25 (Okapi BM25) over the body field.
-          For PERSPECTIVE and COUNTERFACTUAL questions the top-10 returned
-          doc_ids are compared against evidence_chain.
-          MRR@10 and Recall@10 are reported per question type.
-          SILENCE questions are skipped — the correct answer is absence,
-          so standard retrieval recall is not applicable.
-
-Dense  — via Memory._embed() (same embedding model used by the simulation).
-          Cosine similarity between question_text embedding and body embeddings.
-          Same MRR@10 / Recall@10 as BM25.
-          If Memory is unavailable, this section is skipped gracefully and the
-          dataset card notes the omission.
+    corpus-00000.parquet    — flat document corpus (one row per artifact)
+  README.md                 — HuggingFace dataset card
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 import textwrap
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-import numpy as np
+from typing import Any, Dict, List
+import email as email_lib
+from email.header import decode_header
+import shutil
 
 import yaml
 
@@ -137,15 +46,33 @@ for _dept, _members in _ORG_CHART.items():
             _ACTOR_TO_DEPT[str(_name).strip()] = _dept
 
 BASE = Path(_SIM_CFG.get("output_dir", "./export"))
-EVAL_DIR = BASE / "eval"
 HF_DIR = BASE / "hf_dataset"
 CORPUS_DIR = HF_DIR / "corpus"
-QUES_DIR = HF_DIR / "questions"
-EVAL_INDEX_DIR = HF_DIR / "eval_indexes"
-BASELINE_DIR = HF_DIR / "baselines"
-_DENSE_MODEL_NAME = "Losspost/stella_en_1.5b_v5"
 
-for d in (CORPUS_DIR, QUES_DIR, EVAL_INDEX_DIR, BASELINE_DIR):
+
+_ARTIFACT_DOC_TYPES = frozenset(
+    {
+        "confluence",
+        "dept_plans",
+        "jira",
+        "slack",
+        "email",
+        "pr",
+        "zd_ticket",
+        "sf_opp",
+        "sf_account",
+        "nps_survey",
+        "invoice",
+        "datadog_alert",
+        "zoom_transcript",
+    }
+)
+
+
+_EXCLUDE_FIELDS = {"_id", "timestamp", "embedding"}
+
+
+for d in (CORPUS_DIR,):
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Optional imports (degrade gracefully) ────────────────────────────────────
@@ -162,19 +89,6 @@ except ImportError:
         "pip install pandas pyarrow"
     )
 
-try:
-    from rank_bm25 import BM25Okapi
-
-    _BM25_AVAILABLE = True
-except ImportError:
-    _BM25_AVAILABLE = False
-    logger.warning(
-        "rank_bm25 not installed — BM25 baseline disabled. pip install rank-bm25"
-    )
-
-_DENSE_AVAILABLE = True
-_DENSE_MODEL_NAME = "Qwen/Qwen3-Embedding-4B"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORPUS BUILDER
@@ -188,12 +102,163 @@ def _dept_from_artifact_id(artifact_id: str) -> str:
         return ""
     code = parts[1].upper()
     return {
-        "ENG": "Engineering",
-        "PRD": "Product",
+        "ENG": "",
+        "PROD": "Product",
         "MKT": "Sales_Marketing",
         "QA": "QA_Support",
+        "HR": "HR_Ops",
         "RETRO": "",
     }.get(code, "")
+
+
+import email as email_lib
+from email.header import decode_header
+
+
+def _parse_eml(eml_path: Path) -> dict:
+    """Parse a .eml file and return headers + decoded body."""
+    raw = eml_path.read_text(encoding="utf-8", errors="replace")
+    msg = email_lib.message_from_string(raw)
+
+    subject_parts = decode_header(msg.get("Subject", ""))
+    subject = ""
+    for part, charset in subject_parts:
+        if isinstance(part, bytes):
+            subject += part.decode(charset or "utf-8", errors="replace")
+        else:
+            subject += part
+
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    body = payload.decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
+                    break
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            body = payload.decode(
+                msg.get_content_charset() or "utf-8", errors="replace"
+            )
+
+    return {
+        "subject": subject,
+        "from_addr": msg.get("From", ""),
+        "to_addr": msg.get("To", ""),
+        "direction": msg.get("X-OrgForge-Direction", ""),
+        "body": body,
+    }
+
+
+def _load_confluence_from_disk() -> List[dict]:
+    confluence_dir = BASE / "confluence"
+    if not confluence_dir.exists():
+        return []
+
+    rows = []
+    for p in confluence_dir.rglob("*.md"):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+
+            # Parse header fields
+            doc_id = p.stem
+            title = ""
+            author = ""
+            date = ""
+
+            for line in lines[:6]:
+                if line.startswith("# "):
+                    title = line[2:].strip()
+                elif line.startswith("**ID:**"):
+                    doc_id = line.replace("**ID:**", "").strip()
+                elif line.startswith("**Author:**"):
+                    author = line.replace("**Author:**", "").strip()
+                elif line.startswith("**Date:**"):
+                    date = line.replace("**Date:**", "").strip()
+
+            rows.append(
+                {
+                    "doc_id": doc_id,
+                    "doc_type": "confluence",
+                    "category": "artifact",
+                    "title": title,
+                    "body": text,
+                    "day": 0,
+                    "date": date,
+                    "timestamp": f"{date}T09:00:00" if date else "",
+                    "actors": json.dumps([author] if author else []),
+                    "tags": json.dumps(["confluence"]),
+                    "artifact_ids": json.dumps({}),
+                    "dept": _dept_from_artifact_id(doc_id),
+                    "is_incident": False,
+                    "is_external": False,
+                    "facts": "",
+                }
+            )
+        except Exception as exc:
+            logger.warning(f"  confluence disk read failed: {p} — {exc}")
+
+    logger.info(f"  confluence disk fallback: {len(rows)} pages loaded")
+    return rows
+
+
+def _load_slack_from_disk() -> List[dict]:
+    slack_dir = BASE / "slack"
+    if not slack_dir.exists():
+        return []
+
+    buckets: Dict[str, dict] = {}
+    for p in slack_dir.rglob("*.json"):
+        try:
+            messages = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+            for msg in messages:
+                tid = msg.get("thread_id", "")
+                if not tid:
+                    continue
+                if tid not in buckets:
+                    buckets[tid] = {
+                        "date": msg.get("date", ""),
+                        "ts": msg.get("ts", ""),
+                        "actors": set(),
+                        "texts": [],
+                    }
+                bucket = buckets[tid]
+                user = msg.get("user", "")
+                if user:
+                    bucket["actors"].add(user)
+                text = msg.get("text", "")
+                if text:
+                    bucket["texts"].append(f"{user}: {text}" if user else text)
+        except Exception as exc:
+            logger.warning(f"  slack disk read failed: {p} — {exc}")
+
+    rows = []
+    for tid, bucket in buckets.items():
+        rows.append(
+            {
+                "doc_id": tid,
+                "doc_type": "slack",
+                "category": "artifact",
+                "title": tid.split("_2026")[0].replace("slack_", "#"),
+                "body": "\n".join(bucket["texts"]),
+                "day": 0,
+                "date": bucket["date"],
+                "timestamp": bucket["ts"],
+                "actors": json.dumps(sorted(bucket["actors"])),
+                "tags": json.dumps(["slack"]),
+                "artifact_ids": json.dumps({}),
+                "dept": "",
+                "is_incident": False,
+                "is_external": False,
+                "facts": "",
+            }
+        )
+    return rows
 
 
 class CorpusBuilder:
@@ -201,29 +266,63 @@ class CorpusBuilder:
     Reads the MongoDB-persisted artifacts (via Memory) and the SimEvent log,
     then normalizes every artifact into a flat list of corpus rows.
 
-    Falls back to reconstructing from eval JSON if MongoDB is unavailable,
-    which allows the exporter to run in offline/CI environments.
+    Falls back to reconstructing from the export directory if MongoDB is
+    unavailable, which allows the exporter to run in offline/CI environments.
     """
 
-    def __init__(self, mem=None):
+    def __init__(self, mem=None, insider_threat_enabled: bool = False):
         self._mem = mem
+        self._insider_threat_enabled = insider_threat_enabled
         self._events: List[dict] = []
         if mem is not None:
-            try:
-                raw = mem.get_event_log(from_db=True)
-                self._events = [
-                    e.to_dict() if hasattr(e, "to_dict") else e for e in raw
-                ]
-            except Exception as exc:
-                logger.warning(f"Could not load SimEvent log from Memory: {exc}")
+            for collection_name in ("sim_events", "events", "simevents"):
+                try:
+                    coll = mem._db[collection_name]
+                    raw = list(coll.find({}, {"embedding": 0}))
+                    if raw:
+                        self._events = raw
+                        logger.info(
+                            f"  Loaded {len(self._events):,} SimEvents "
+                            f"from '{collection_name}'."
+                        )
+                        break
+                except Exception as exc:
+                    logger.debug(f"  Collection '{collection_name}' unavailable: {exc}")
+            if not self._events:
+                try:
+                    raw = mem.get_event_log(from_db=True)
+                    self._events = [
+                        e.to_dict() if hasattr(e, "to_dict") else e for e in raw
+                    ]
+                    logger.info(
+                        f"  Loaded {len(self._events):,} SimEvents via get_event_log."
+                    )
+                except Exception as exc:
+                    logger.warning(f"Could not load SimEvent log: {exc}")
 
     # ── PUBLIC ────────────────────────────────────────────────────────────────
+
+    def _build_meta_map(self, collection: str, id_field: str) -> Dict[str, dict]:
+        """Fetch all docs from a collection, strip noise fields, key by id_field."""
+        meta_map = {}
+        try:
+            for doc in self._mem._db[collection].find({}, {"embedding": 0}):
+                doc_id = str(doc.get(id_field, ""))
+                if not doc_id:
+                    continue
+                clean = {k: v for k, v in doc.items() if k not in _EXCLUDE_FIELDS}
+                meta_map[doc_id] = clean
+        except Exception as exc:
+            logger.debug(f"  meta_map failed for {collection}: {exc}")
+        return meta_map
 
     def build(self) -> List[dict]:
         rows: List[dict] = []
 
         for evt in self._events:
-            evt_rows = self._sim_event_to_row(evt)
+            evt_rows = self._sim_event_to_row(
+                evt, insider_threat_enabled=self._insider_threat_enabled
+            )
             if evt_rows:
                 rows.extend(evt_rows)
 
@@ -231,9 +330,23 @@ class CorpusBuilder:
             rows = self._enrich_from_mongo(rows)
             rows.extend(self._plans_to_corpus_rows())
 
+        existing_ids = {row["doc_id"] for row in rows}
+        rows.extend(_load_slack_from_disk())
+        rows.extend(_load_confluence_from_disk())
+
         rows.extend(self._post_sim_to_corpus_rows())
 
-        # Deduplicate: keep the row with the longest body for each doc_id
+        zoom_rows = [r for r in rows if r["doc_type"] == "zoom_transcript"]
+        logger.info(f"  zoom rows before dedup: {len(zoom_rows)}")
+        for r in zoom_rows[:3]:
+            logger.info(f"    {r['doc_id']} body_len={len(r.get('body', ''))}")
+
+        # Deduplication strategy:
+        #   - For artifact doc_ids (jira, confluence, slack, etc.): keep the row
+        #     with the longest body — the MongoDB-enriched version wins over the
+        #     thin SimEvent version.
+        #   - Internal event rows (EVT-* doc_ids) are unique by construction and
+        #     never conflict with artifact rows, so they pass through intact.
         seen: Dict[str, dict] = {}
         for row in rows:
             did = row["doc_id"]
@@ -244,43 +357,52 @@ class CorpusBuilder:
             if not row.get("body"):
                 row["body"] = row.get("content") or ""
 
+        zoom_rows = [r for r in seen.values() if r["doc_type"] == "zoom_transcript"]
+        logger.info(f"  zoom rows after dedup: {len(zoom_rows)}")
+
         rows = list(seen.values())
-        logger.info(f"  corpus: {len(rows)} documents")
+
+        for r in zoom_rows[:3]:
+            logger.info(f"    {r['doc_id']} body_len={len(r.get('body', ''))}")
+
+        by_type: Dict[str, int] = defaultdict(int)
+        for row in rows:
+            by_type[row["doc_type"]] += 1
+        logger.info(
+            f"  corpus: {len(rows):,} documents "
+            f"({len(self._events):,} SimEvents → {len(rows):,} corpus rows)"
+        )
+        for doc_type, count in sorted(by_type.items(), key=lambda x: -x[1]):
+            logger.info(f"    {doc_type:30s} {count:,}")
         return rows
+
+    def artifact_counts(self, rows: List[dict]) -> Dict[str, int]:
+        """Return counts by doc_type, sorted descending."""
+        counts: Dict[str, int] = defaultdict(int)
+        for row in rows:
+            counts[row["doc_type"]] += 1
+        return dict(sorted(counts.items(), key=lambda x: -x[1]))
 
     # ── PRIVATE ───────────────────────────────────────────────────────────────
 
     def _body_len(self, r: dict) -> int:
         return len(r.get("body") or r.get("content") or "")
 
-    def _sim_event_to_row(self, evt: dict) -> List[dict]:
-        event_type = evt.get("type", "")
-        artifact_ids = evt.get("artifact_ids", {})
-        facts = evt.get("facts", {})
-
-        _EXCLUDED_EVENT_TYPES = {"dlp_alert", "secret_detected"}
-        if event_type in _EXCLUDED_EVENT_TYPES:
-            return []
-
-        evt_actors = evt.get("actors", [])
-        dept_val = str(facts.get("dept", "")).strip()
-        if not dept_val and evt_actors:
-            for _actor in evt_actors:
-                _d = _ACTOR_TO_DEPT.get(str(_actor).strip(), "")
-                if _d:
-                    dept_val = _d
-                    break
-
-        is_incident = event_type in (
+    _IS_INCIDENT_TYPES = frozenset(
+        {
             "incident_opened",
             "incident_resolved",
             "escalation_chain",
             "postmortem_created",
+            "fix_in_progress",
             "zd_tickets_escalated",
             "sf_deals_risk_flagged",
             "crm_account_at_risk",
-        )
-        is_external = event_type in (
+        }
+    )
+
+    _IS_EXTERNAL_TYPES = frozenset(
+        {
             "inbound_external_email",
             "customer_email_routed",
             "vendor_email_routed",
@@ -288,10 +410,72 @@ class CorpusBuilder:
             "sales_outbound_email",
             "proactive_outreach_initiated",
             "zd_ticket_opened",
+            "zd_tickets_escalated",
             "zd_tickets_resolved",
             "crm_touchpoint",
             "customer_health_briefing",
-        )
+            "external_contact_summarized",
+        }
+    )
+
+    def _facts_body(self, event_type: str, facts: dict, summary: str) -> str:
+        """
+        Render a structured plain-text body from SimEvent facts.
+        Used for internal events that carry no separate artifact.
+        Every key-value pair is included so the full ground truth is retrievable.
+        """
+        parts = [f"event_type: {event_type}"]
+        if summary:
+            parts.append(f"summary: {summary}")
+        for key, val in facts.items():
+            if val is None or val == "" or val == [] or val == {}:
+                continue
+            if isinstance(val, (dict, list)):
+                parts.append(f"{key}: {json.dumps(val, default=str)}")
+            else:
+                parts.append(f"{key}: {val}")
+        return "\n".join(parts)
+
+    def _sim_event_to_row(
+        self, evt: dict, insider_threat_enabled: bool = False
+    ) -> List[dict]:
+        event_type = evt.get("type", "")
+        artifact_ids = evt.get("artifact_ids", {}) or {}
+        facts = evt.get("facts", {}) or {}
+        summary = evt.get("summary", "")
+
+        if (
+            event_type in ("dlp_alert", "secret_detected")
+            and not insider_threat_enabled
+        ):
+            return []
+
+        evt_actors = evt.get("actors", [])
+        dept_val = ""
+        if evt_actors:
+            for _actor in evt_actors:
+                _d = _ACTOR_TO_DEPT.get(str(_actor).strip(), "")
+                if _d:
+                    dept_val = _d
+                    break
+
+        if not dept_val:
+            dept_val = str(facts.get("dept", "")).strip()
+
+        if not dept_val:
+            for aid in artifact_ids.values():
+                _d = _dept_from_artifact_id(str(aid))
+                if _d:
+                    dept_val = _d
+                    break
+
+        is_incident = event_type in self._IS_INCIDENT_TYPES
+        is_external = event_type in self._IS_EXTERNAL_TYPES
+
+        evt_id = str(evt.get("_id", "")).strip()
+        if not evt_id:
+            actor_fp = (evt_actors[0] if evt_actors else "sys").replace(" ", "_")
+            evt_id = f"EVT-{evt.get('day', 0):04d}-{event_type}-{actor_fp}"
 
         shared = {
             "day": int(evt.get("day", 0)),
@@ -303,6 +487,8 @@ class CorpusBuilder:
             "dept": dept_val,
             "is_incident": is_incident,
             "is_external": is_external,
+            "facts": json.dumps(facts),
+            "category": "sim_event",
         }
 
         rows: List[dict] = []
@@ -314,6 +500,7 @@ class CorpusBuilder:
                     **shared,
                     "doc_id": jira_id,
                     "doc_type": "jira",
+                    "category": "artifact",
                     "title": str(facts.get("title", facts.get("root_cause", jira_id)))[
                         :512
                     ],
@@ -330,41 +517,48 @@ class CorpusBuilder:
             "",
         )
         if conf_id:
-            body = facts.get("content", facts.get("summary", "")) or evt.get(
-                "summary", ""
-            )
             rows.append(
                 {
                     **shared,
                     "doc_id": conf_id,
                     "doc_type": "confluence",
+                    "category": "artifact",
                     "title": str(facts.get("title", conf_id))[:512],
-                    "body": body,
+                    "body": facts.get("content", facts.get("summary", "")) or summary,
                     "dept": dept_val or _dept_from_artifact_id(conf_id),
                 }
             )
 
-        email_id = artifact_ids.get("email", "")
-        if email_id or event_type in (
-            "inbound_external_email",
-            "hr_outbound_email",
-            "customer_email_routed",
-            "vendor_email_routed",
-            "email_dropped",
-            "sales_outbound_email",
-            "proactive_outreach_initiated",
-        ):
-            rows.append(
-                {
-                    **shared,
-                    "doc_id": email_id or f"EMAIL-{evt.get('day', 0)}-{id(evt)}",
-                    "doc_type": "email",
-                    "title": str(facts.get("subject", facts.get("summary", email_id)))[
-                        :512
-                    ],
-                    "body": self._email_body(facts, evt),
-                }
-            )
+        email_id = artifact_ids.get("email", "") or artifact_ids.get("embed_id", "")
+        eml_path_str = artifact_ids.get("eml_path", "")
+        if email_id:
+            body = self._email_body(facts, evt)
+            if eml_path_str:
+                eml_path = Path(eml_path_str.lstrip("./"))
+                if eml_path.exists():
+                    parsed = _parse_eml(eml_path)
+                    body = parsed.pop("body")
+                    email_meta = parsed
+                else:
+                    body = self._email_body(facts, evt)
+                    email_meta = {}
+                    logger.warning(f"  eml not found on disk: {eml_path}")
+
+                rows.append(
+                    {
+                        **shared,
+                        "doc_id": email_id,
+                        "doc_type": "email",
+                        "category": "artifact",
+                        "title": str(
+                            email_meta.get("subject") or facts.get("subject", email_id)
+                        )[:512],
+                        "body": body,
+                        "facts": json.dumps(
+                            {**json.loads(shared["facts"]), **email_meta}
+                        ),
+                    }
+                )
 
         slack_id = artifact_ids.get("slack_thread", "")
         if slack_id:
@@ -374,6 +568,7 @@ class CorpusBuilder:
                     **shared,
                     "doc_id": slack_id,
                     "doc_type": "slack",
+                    "category": "artifact",
                     "title": str(channel + ": " + facts.get("summary", "")[:80])[:512],
                     "body": facts.get("content", facts.get("summary", "")),
                 }
@@ -386,6 +581,7 @@ class CorpusBuilder:
                     **shared,
                     "doc_id": pr_id,
                     "doc_type": "pr",
+                    "category": "artifact",
                     "title": str(facts.get("title", pr_id))[:512],
                     "body": facts.get("description", facts.get("summary", "")),
                 }
@@ -405,6 +601,7 @@ class CorpusBuilder:
                     **shared,
                     "doc_id": zd_id,
                     "doc_type": "zd_ticket",
+                    "category": "artifact",
                     "title": str(facts.get("subject", facts.get("ticket_id", zd_id)))[
                         :512
                     ],
@@ -426,6 +623,7 @@ class CorpusBuilder:
                     **shared,
                     "doc_id": opp_id,
                     "doc_type": "sf_opp",
+                    "category": "artifact",
                     "title": str(
                         facts.get("account_name", opp_id)
                         + " — "
@@ -445,25 +643,55 @@ class CorpusBuilder:
                     **shared,
                     "doc_id": acc_id,
                     "doc_type": "sf_account",
+                    "category": "artifact",
                     "title": str(facts.get("account_name", acc_id))[:512],
                     "body": self._sf_account_body(facts, acc_id),
                 }
             )
 
-        if not rows:
+        # ── Internal event row — ALWAYS emitted, even when artifact rows exist ─
+        # Preserves the full ground-truth facts (stress snapshots, similarity
+        # scores, coverage percentages, departure edge snapshots, etc.) as a
+        # separately retrievable document. Filter by category == "sim_event"
+        # to get the state-machine view independently from prose artifacts.
+        rows.append(
+            {
+                **shared,
+                "doc_id": evt_id,
+                "doc_type": event_type,
+                "title": event_type.replace("_", " ").title(),
+                "body": self._facts_body(event_type, facts, summary),
+                "facts": json.dumps(facts),
+            }
+        )
+
+        zoom_path_str = artifact_ids.get("artifact_path", "")
+        zoom_id = artifact_ids.get("zoom_transcript", "")
+        if zoom_id and zoom_path_str and zoom_id.startswith("zoom_"):
+            zoom_path = Path(zoom_path_str)
+            if not zoom_path.is_absolute():
+                zoom_path = Path(zoom_path_str.lstrip("./"))
+
+            if zoom_path.exists():
+                zoom_body = zoom_path.read_text(encoding="utf-8", errors="replace")
+            else:
+                zoom_body = summary
             rows.append(
                 {
                     **shared,
-                    "doc_id": f"EVENT-{evt.get('day', 0)}-{event_type}",
-                    "doc_type": "sim_event",
-                    "title": event_type.replace("_", " ").title(),
-                    "body": evt.get("summary", ""),
+                    "doc_id": zoom_id,
+                    "doc_type": "zoom_transcript",
+                    "category": "artifact",
+                    "title": f"Zoom: {facts.get('topic', event_type)} ({evt.get('date', '')})",
+                    "body": zoom_body,
+                    "facts": json.dumps(facts),
                 }
             )
 
+        # Ensure no row has an empty body
         for row in rows:
             if not row.get("body"):
-                row["body"] = evt.get("summary", "")
+                row["body"] = summary
 
         return rows
 
@@ -646,6 +874,64 @@ class CorpusBuilder:
                     }
                 )
 
+        dd_dir = BASE / "datadog"
+        metrics_path = dd_dir / "metrics.jsonl"
+        if metrics_path.exists():
+            for line in metrics_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                rows.append(
+                    {
+                        "doc_id": f"DD-METRIC-{data.get('metric_name', '').replace('.', '_')}-{data.get('timestamp', '')}",
+                        "doc_type": "datadog_metric",
+                        "title": data.get("metric_name", "datadog metric"),
+                        "body": json.dumps(data),
+                        "day": data.get("day", 0),
+                        "date": str(data.get("timestamp", ""))[:10],
+                        "timestamp": str(data.get("timestamp", "")),
+                        "actors": json.dumps([]),
+                        "tags": json.dumps(["datadog", "metric"]),
+                        "artifact_ids": json.dumps({}),
+                        "dept": "Engineering_Backend",
+                        "is_incident": data.get("alert_firing", False),
+                        "is_external": False,
+                    }
+                )
+
+        alerts_path = dd_dir / "alerts.jsonl"
+        if alerts_path.exists():
+            for line in alerts_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                alert_id = f"DD-{data.get('id', data.get('alert_id', ''))}"
+                rows.append(
+                    {
+                        "doc_id": alert_id,
+                        "doc_type": "datadog_alert",
+                        "title": data.get("monitor_name", alert_id),
+                        "body": json.dumps(data),
+                        "day": data.get("day", 0),
+                        "date": str(data.get("fired_at", ""))[:10],
+                        "timestamp": str(data.get("fired_at", "")),
+                        "actors": json.dumps([]),
+                        "tags": json.dumps(
+                            ["datadog", "alert", data.get("incident_id", "")]
+                        ),
+                        "artifact_ids": json.dumps(
+                            {
+                                "jira": data.get("attributes", {}).get(
+                                    "jira_ticket", data.get("jira_ticket", "")
+                                )
+                            }
+                        ),
+                        "dept": "Engineering_Backend",
+                        "is_incident": True,
+                        "is_external": False,
+                    }
+                )
+
         inv_dir = BASE / "invoices"
         if inv_dir.exists():
             for p in inv_dir.glob("*.json"):
@@ -675,6 +961,35 @@ class CorpusBuilder:
                         "is_external": True,
                     }
                 )
+
+        tech_doc = (
+            self._mem._db["sim_config"].find_one({"_id": "tech_stack"})
+            if self._mem
+            else None
+        )
+        if tech_doc:
+            stack = tech_doc.get("stack", {})
+            body = "\n".join(f"{k}: {v}" for k, v in stack.items())
+            rows.append(
+                {
+                    "doc_id": "SIM-CONFIG-tech_stack",
+                    "doc_type": "sim_config",
+                    "title": "Tech Stack",
+                    "body": body,
+                    "day": 0,
+                    "date": str(tech_doc.get("created_at", ""))[:10],
+                    "timestamp": str(tech_doc.get("created_at", "")),
+                    "actors": json.dumps([]),
+                    "tags": json.dumps(["tech_stack", "sim_config"]),
+                    "artifact_ids": json.dumps({}),
+                    "dept": "",
+                    "is_incident": False,
+                    "is_external": False,
+                    "facts": "",
+                    "category": "sim_config",
+                }
+            )
+
         return rows
 
     def _enrich_from_mongo(self, rows: List[dict]) -> List[dict]:
@@ -683,14 +998,13 @@ class CorpusBuilder:
         Silently skips if the collection is unavailable.
         """
         try:
-            rich_map: Dict[str, str] = {}
-
+            conf_rich_map: Dict[str, str] = {}
             conf_id_map: Dict[str, str] = {}
             for page in self._mem._db["confluence_pages"].find(
                 {}, {"_id": 0, "id": 1, "content": 1, "title": 1}
             ):
                 if page.get("id") and page.get("content"):
-                    rich_map[page["id"]] = page["content"]
+                    conf_rich_map[page["id"]] = page["content"]
                     snippet = page["content"][:120].strip()
                     if snippet:
                         conf_id_map[snippet] = page["id"]
@@ -698,6 +1012,7 @@ class CorpusBuilder:
                     if title_key:
                         conf_id_map[title_key] = page["id"]
 
+            # ── Jira comments (used when building jira body) ──────────────────
             comment_map: Dict[str, List[str]] = defaultdict(list)
             for comment in self._mem._db["artifacts"].find(
                 {"type": "jira_comment"},
@@ -713,130 +1028,68 @@ class CorpusBuilder:
                         else f"comment: {cbody}"
                     )
 
-            for ticket in self._mem._db["jira_tickets"].find(
-                {},
-                {
-                    "_id": 0,
-                    "id": 1,
-                    "title": 1,
-                    "description": 1,
-                    "root_cause": 1,
-                    "comments": 1,
-                },
-            ):
-                tid = ticket.get("id")
-                if not tid:
-                    continue
+            def _jira_body(doc):
                 parts = [
-                    ticket.get("title", ""),
-                    ticket.get("description", ""),
-                    ticket.get("root_cause", ""),
+                    doc.get("title", ""),
+                    doc.get("description", ""),
+                    doc.get("root_cause", ""),
                 ]
-                for c in ticket.get("comments") or []:
-                    parts.append(str(c.get("body", "")))
-                for c in comment_map.get(tid, []):
+                for c in doc.get("comments") or []:
+                    parts.append(str(c.get("text", "") or c.get("body", "")))
+                for c in comment_map.get(doc.get("id", ""), []):
                     parts.append(c)
-                rich_map[tid] = "\n".join(p for p in parts if p)
+                return "\n".join(p for p in parts if p)
 
-            for pr in self._mem._db["pull_requests"].find(
-                {},
-                {
-                    "_id": 0,
-                    "pr_id": 1,
-                    "title": 1,
-                    "description": 1,
-                    "author": 1,
-                    "ticket_id": 1,
-                    "reviewers": 1,
-                    "status": 1,
-                    "comments": 1,
-                },
-            ):
-                pid = pr.get("pr_id")
-                if not pid:
-                    continue
+            def _pr_body(doc):
                 parts = []
-                if pr.get("title"):
-                    parts.append(f"title: {pr['title']}")
-                if pr.get("description"):
-                    parts.append(f"description: {pr['description']}")
-                if pr.get("author"):
-                    parts.append(f"author: {pr['author']}")
-                if pr.get("ticket_id"):
-                    parts.append(f"ticket: {pr['ticket_id']}")
-                if pr.get("status"):
-                    parts.append(f"status: {pr['status']}")
-                reviewers = pr.get("reviewers", [])
+                for key in ("title", "description"):
+                    if doc.get(key):
+                        parts.append(f"{key}: {doc[key]}")
+                if doc.get("author"):
+                    parts.append(f"author: {doc['author']}")
+                if doc.get("ticket_id"):
+                    parts.append(f"ticket: {doc['ticket_id']}")
+                if doc.get("status"):
+                    parts.append(f"status: {doc['status']}")
+                reviewers = doc.get("reviewers", [])
                 if reviewers:
                     parts.append(f"reviewers: {', '.join(reviewers)}")
-                for c in pr.get("comments") or []:
+                for c in doc.get("comments") or []:
                     verdict = f" [{c['verdict']}]" if c.get("verdict") else ""
                     text = c.get("text", "")
                     author = c.get("author", "")
                     if text:
                         parts.append(f"review ({author}{verdict}): {text}")
-                rich_map[pid] = "\n".join(p for p in parts if p)
+                return "\n".join(p for p in parts if p)
 
-            for email in self._mem._db["emails"].find(
-                {},
-                {
-                    "_id": 0,
-                    "embed_id": 1,
-                    "subject": 1,
-                    "body": 1,
-                    "from_name": 1,
-                    "from_addr": 1,
-                    "to_name": 1,
-                    "to_addr": 1,
-                    "direction": 1,
-                },
-            ):
-                eid = email.get("embed_id")
-                if not eid:
-                    continue
+            def _email_body(doc):
                 parts = []
-                if email.get("subject"):
-                    parts.append(f"subject: {email['subject']}")
-                if email.get("from_name") or email.get("from_addr"):
+                if doc.get("subject"):
+                    parts.append(f"subject: {doc['subject']}")
+                if doc.get("from_name") or doc.get("from_addr"):
                     parts.append(
-                        f"from: {email.get('from_name', '')} <{email.get('from_addr', '')}>"
+                        f"from: {doc.get('from_name', '')} <{doc.get('from_addr', '')}>"
                     )
-                if email.get("to_name") or email.get("to_addr"):
+                if doc.get("to_name") or doc.get("to_addr"):
                     parts.append(
-                        f"to: {email.get('to_name', '')} <{email.get('to_addr', '')}>"
+                        f"to: {doc.get('to_name', '')} <{doc.get('to_addr', '')}>"
                     )
-                if email.get("body"):
-                    parts.append(email["body"])
-                rich_map[eid] = "\n".join(parts)
+                if doc.get("body"):
+                    parts.append(doc["body"])
+                return "\n".join(parts)
 
-            for ticket in self._mem._db["zd_tickets"].find(
-                {},
-                {
-                    "_id": 0,
-                    "ticket_id": 1,
-                    "subject": 1,
-                    "org_name": 1,
-                    "description": 1,
-                    "comments": 1,
-                    "related_incident": 1,
-                    "priority": 1,
-                    "status": 1,
-                },
-            ):
-                tid = ticket.get("ticket_id")
-                if not tid:
-                    continue
+            def _zd_body(doc):
                 parts = [
-                    f"subject: {ticket.get('subject', '')}",
-                    f"org: {ticket.get('org_name', '')}",
-                    f"status: {ticket.get('status', '')}",
-                    f"priority: {ticket.get('priority', '')}",
+                    f"subject: {doc.get('subject', '')}",
+                    f"org: {doc.get('org_name', '')}",
+                    f"status: {doc.get('status', '')}",
+                    f"priority: {doc.get('priority', '')}",
                 ]
-                if ticket.get("description"):
-                    parts.append(f"description: {ticket['description']}")
-                if ticket.get("related_incident"):
-                    parts.append(f"related_incident: {ticket['related_incident']}")
-                for c in ticket.get("comments") or []:
+                if doc.get("description"):
+                    parts.append(f"description: {doc['description']}")
+                if doc.get("related_incident"):
+                    parts.append(f"related_incident: {doc['related_incident']}")
+                for c in doc.get("comments") or []:
                     author = c.get("author", "")
                     text = c.get("text", "")
                     if text:
@@ -845,80 +1098,83 @@ class CorpusBuilder:
                             if author
                             else f"comment: {text}"
                         )
-                rich_map[tid] = "\n".join(p for p in parts if p)
+                return "\n".join(p for p in parts if p)
 
-            for opp in self._mem._db["sf_opps"].find(
-                {},
-                {
-                    "_id": 0,
-                    "opportunity_id": 1,
-                    "account_name": 1,
-                    "stage": 1,
-                    "probability": 1,
-                    "amount": 1,
-                    "owner": 1,
-                    "lead_source": 1,
-                    "next_step": 1,
-                    "risk_notes": 1,
-                    "touchpoints": 1,
-                    "close_date": 1,
-                },
-            ):
-                oid = opp.get("opportunity_id")
-                if not oid:
-                    continue
+            def _sf_opp_body(doc):
                 parts = [
-                    f"account: {opp.get('account_name', '')}",
-                    f"stage: {opp.get('stage', '')}",
-                    f"probability: {opp.get('probability', '')}%",
-                    f"amount: ${opp.get('amount', 0):,}",
-                    f"owner: {opp.get('owner', '')}",
-                    f"close_date: {opp.get('close_date', '')}",
-                    f"lead_source: {opp.get('lead_source', '')}",
-                    f"next_step: {opp.get('next_step', '')}",
+                    f"account: {doc.get('account_name', '')}",
+                    f"stage: {doc.get('stage', '')}",
+                    f"probability: {doc.get('probability', '')}%",
+                    f"amount: ${doc.get('amount', 0):,}",
+                    f"owner: {doc.get('owner', '')}",
+                    f"close_date: {doc.get('close_date', '')}",
+                    f"lead_source: {doc.get('lead_source', '')}",
+                    f"next_step: {doc.get('next_step', '')}",
                 ]
-                for note in opp.get("risk_notes") or []:
+                for note in doc.get("risk_notes") or []:
                     parts.append(f"risk: {note}")
-                for tp in opp.get("touchpoints") or []:
+                for tp in doc.get("touchpoints") or []:
                     subject = tp.get("subject", "")
                     sender = tp.get("sender", "")
                     ts = tp.get("timestamp", "")
                     if subject:
                         parts.append(f"touchpoint ({sender}, {ts}): {subject}")
-                rich_map[oid] = "\n".join(p for p in parts if p)
+                return "\n".join(p for p in parts if p)
 
-            for acc in self._mem._db["sf_accounts"].find(
-                {},
-                {
-                    "_id": 0,
-                    "account_id": 1,
-                    "name": 1,
-                    "primary_contact": 1,
-                    "type": 1,
-                    "industry": 1,
-                    "tier": 1,
-                    "billing_region": 1,
-                    "arr": 1,
-                    "owner": 1,
-                    "risk_flag": 1,
-                },
-            ):
-                aid = acc.get("account_id")
-                if not aid:
-                    continue
+            def _sf_account_body(doc):
                 parts = [
-                    f"name: {acc.get('name', '')}",
-                    f"type: {acc.get('type', '')}",
-                    f"tier: {acc.get('tier', '')}",
-                    f"industry: {acc.get('industry', '')}",
-                    f"billing_region: {acc.get('billing_region', '')}",
-                    f"arr: ${acc.get('arr', 0):,}",
-                    f"owner: {acc.get('owner', '')}",
-                    f"primary_contact: {acc.get('primary_contact', '')}",
+                    f"name: {doc.get('name', '')}",
+                    f"type: {doc.get('type', '')}",
+                    f"tier: {doc.get('tier', '')}",
+                    f"industry: {doc.get('industry', '')}",
+                    f"billing_region: {doc.get('billing_region', '')}",
+                    f"arr: ${doc.get('arr', 0):,}",
+                    f"owner: {doc.get('owner', '')}",
+                    f"primary_contact: {doc.get('primary_contact', '')}",
                 ]
-                if acc.get("risk_flag"):
+                if doc.get("risk_flag"):
                     parts.append("risk_flag: true — ownership lapsed or at-risk")
-                rich_map[aid] = "\n".join(p for p in parts if p)
+                return "\n".join(p for p in parts if p)
+
+            jira_rich, jira_meta = self._build_rich_and_meta(
+                "jira_tickets", "id", _jira_body
+            )
+            pr_rich, pr_meta = self._build_rich_and_meta(
+                "pull_requests", "pr_id", _pr_body
+            )
+            email_rich, email_meta = self._build_rich_and_meta(
+                "emails", "embed_id", _email_body
+            )
+            zd_rich, zd_meta = self._build_rich_and_meta(
+                "zd_tickets", "ticket_id", _zd_body
+            )
+            sf_opp_rich, sf_opp_meta = self._build_rich_and_meta(
+                "sf_opps", "opportunity_id", _sf_opp_body
+            )
+            sf_acc_rich, sf_acc_meta = self._build_rich_and_meta(
+                "sf_accounts", "account_id", _sf_account_body
+            )
+
+            # Merge all rich maps into one lookup
+            rich_map: Dict[str, str] = {
+                **conf_rich_map,
+                **jira_rich,
+                **pr_rich,
+                **email_rich,
+                **zd_rich,
+                **sf_opp_rich,
+                **sf_acc_rich,
+            }
+
+            # Map doc_type -> meta map for facts enrichment
+            _DOC_TYPE_TO_META: Dict[str, Dict[str, dict]] = {
+                "jira": jira_meta,
+                "pr": pr_meta,
+                "email": email_meta,
+                "zd_ticket": zd_meta,
+                "sf_opp": sf_opp_meta,
+                "sf_account": sf_acc_meta,
+            }
 
             for row in rows:
                 if row["doc_id"] == "CONF-UNKNOWN" and row["doc_type"] == "confluence":
@@ -941,14 +1197,21 @@ class CorpusBuilder:
                         )
                         row["title"] = (row.get("body") or "")[:80].strip()
                         logger.debug(
-                            f"Reclassified CONF-UNKNOWN social event as slack: "
-                            f"{row['doc_id']}"
+                            f"Reclassified CONF-UNKNOWN social event as slack: {row['doc_id']}"
                         )
                 elif row["doc_id"] in rich_map:
                     row["body"] = rich_map[row["doc_id"]]
                     if row["doc_type"] == "confluence" and not row.get("dept"):
                         row["dept"] = _dept_from_artifact_id(row["doc_id"])
 
+                # Enrich facts for all artifact types in one pass
+                meta_map = _DOC_TYPE_TO_META.get(row["doc_type"])
+                if meta_map and row["doc_id"] in meta_map:
+                    existing = json.loads(row.get("facts") or "{}")
+                    existing.update(meta_map[row["doc_id"]])
+                    row["facts"] = json.dumps(existing, default=str)
+
+            # ── Orphan sweep: artifacts in MongoDB not yet in corpus ───────────
             existing_ids = {row["doc_id"] for row in rows}
 
             def _make_orphan_row(
@@ -976,6 +1239,7 @@ class CorpusBuilder:
                 return {
                     "doc_id": doc_id,
                     "doc_type": doc_type,
+                    "category": "artifact",
                     "title": str(title)[:512],
                     "body": str(body),
                     "day": int(day or 0),
@@ -987,14 +1251,16 @@ class CorpusBuilder:
                     "dept": dept,
                     "is_incident": is_incident,
                     "is_external": is_external,
+                    "facts": "",
                 }
 
+            # artifacts collection
             _ARTIFACT_TYPE_MAP = {
                 "confluence": "confluence",
-                "slack_thread": "slack",
                 "jira": "jira",
                 "zd_ticket": "zd_ticket",
                 "sf_opportunity": "sf_opp",
+                "zoom_transcript": "zoom_transcript",
             }
             for artifact in self._mem._db["artifacts"].find(
                 {"type": {"$in": list(_ARTIFACT_TYPE_MAP.keys())}},
@@ -1052,172 +1318,64 @@ class CorpusBuilder:
                 )
                 existing_ids.add(art_id)
 
-            for pr in self._mem._db["pull_requests"].find(
-                {},
-                {
-                    "_id": 0,
-                    "pr_id": 1,
-                    "title": 1,
-                    "author": 1,
-                    "day": 1,
-                    "date": 1,
-                    "timestamp": 1,
-                    "dept": 1,
-                },
-            ):
-                pid = pr.get("pr_id", "")
+            # pull_requests
+            for doc in self._mem._db["pull_requests"].find({}, {"embedding": 0}):
+                pid = doc.get("pr_id", "")
                 if not pid or pid in existing_ids:
                     continue
-                body = rich_map.get(pid, "")
                 rows.append(
                     _make_orphan_row(
                         doc_id=pid,
                         doc_type="pr",
-                        title=pr.get("title", pid),
-                        body=body,
-                        day=pr.get("day"),
-                        date=pr.get("date"),
-                        timestamp=pr.get("timestamp"),
-                        actors=[pr["author"]] if pr.get("author") else [],
+                        title=doc.get("title", pid),
+                        body=pr_rich.get(pid, ""),
+                        day=doc.get("day"),
+                        date=doc.get("date"),
+                        timestamp=doc.get("timestamp"),
+                        actors=[doc["author"]] if doc.get("author") else [],
                         tags=["pr"],
                         artifact_type="pr",
                     )
                 )
                 existing_ids.add(pid)
 
-            for email in self._mem._db["emails"].find(
-                {},
-                {
-                    "_id": 0,
-                    "embed_id": 1,
-                    "subject": 1,
-                    "from_name": 1,
-                    "from_addr": 1,
-                    "direction": 1,
-                    "day": 1,
-                    "date": 1,
-                    "timestamp": 1,
-                },
-            ):
-                eid = email.get("embed_id", "")
+            # emails
+            for doc in self._mem._db["emails"].find({}, {"embedding": 0}):
+                eid = doc.get("embed_id")
                 if not eid or eid in existing_ids:
                     continue
-                body = rich_map.get(eid, "")
-                direction = email.get("direction", "")
                 rows.append(
                     _make_orphan_row(
                         doc_id=eid,
                         doc_type="email",
-                        title=email.get("subject", eid),
-                        body=body,
-                        day=email.get("day"),
-                        date=email.get("date"),
-                        timestamp=email.get("timestamp"),
-                        actors=[email["from_name"]] if email.get("from_name") else [],
-                        tags=["email", direction] if direction else ["email"],
+                        title=doc.get("subject", eid),
+                        body=email_rich.get(eid, ""),
+                        day=doc.get("day"),
+                        date=doc.get("date"),
+                        timestamp=doc.get("timestamp"),
+                        actors=[doc["from_name"]] if doc.get("from_name") else [],
+                        tags=["email", doc.get("direction", "")],
                         artifact_type="email",
                         is_external=True,
                     )
                 )
                 existing_ids.add(eid)
 
-            for ticket in self._mem._db["zd_tickets"].find(
-                {},
-                {
-                    "_id": 0,
-                    "ticket_id": 1,
-                    "subject": 1,
-                    "org_name": 1,
-                    "day": 1,
-                    "date": 1,
-                    "created_at": 1,
-                    "status": 1,
-                    "priority": 1,
-                },
-            ):
-                tid = ticket.get("ticket_id", "")
-                if not tid or tid in existing_ids:
-                    continue
-                body = rich_map.get(tid, "")
-                rows.append(
-                    _make_orphan_row(
-                        doc_id=tid,
-                        doc_type="zd_ticket",
-                        title=ticket.get("subject", tid),
-                        body=body,
-                        day=ticket.get("day"),
-                        date=ticket.get("date"),
-                        timestamp=ticket.get("created_at"),
-                        actors=[],
-                        tags=["zendesk", "support"],
-                        artifact_type="zd_ticket",
-                        is_external=True,
-                        is_incident=ticket.get("priority") == "Urgent",
-                    )
-                )
-                existing_ids.add(tid)
-
-            for opp in self._mem._db["sf_opps"].find(
-                {},
-                {
-                    "_id": 0,
-                    "opportunity_id": 1,
-                    "account_name": 1,
-                    "stage": 1,
-                    "owner": 1,
-                    "day": 1,
-                    "date": 1,
-                    "created_at": 1,
-                },
-            ):
-                oid = opp.get("opportunity_id", "")
-                if not oid or oid in existing_ids:
-                    continue
-                body = rich_map.get(oid, "")
-                title = (
-                    f"{opp.get('account_name', oid)} — {opp.get('stage', '')}"
-                ).strip(" —")
-                rows.append(
-                    _make_orphan_row(
-                        doc_id=oid,
-                        doc_type="sf_opp",
-                        title=title,
-                        body=body,
-                        day=opp.get("day"),
-                        date=opp.get("date"),
-                        timestamp=opp.get("created_at"),
-                        actors=[opp["owner"]] if opp.get("owner") else [],
-                        tags=["salesforce", "opportunity"],
-                        artifact_type="sf_opp",
-                        is_external=True,
-                    )
-                )
-                existing_ids.add(oid)
-
-            for acc in self._mem._db["sf_accounts"].find(
-                {},
-                {
-                    "_id": 0,
-                    "account_id": 1,
-                    "name": 1,
-                    "owner": 1,
-                    "created_at": 1,
-                },
-            ):
-                aid = acc.get("account_id", "")
+            # sf_accounts
+            for doc in self._mem._db["sf_accounts"].find({}, {"embedding": 0}):
+                aid = doc.get("account_id", "")
                 if not aid or aid in existing_ids:
                     continue
-                body = rich_map.get(aid, "")
                 rows.append(
                     _make_orphan_row(
                         doc_id=aid,
                         doc_type="sf_account",
-                        title=acc.get("name", aid),
-                        body=body,
+                        title=doc.get("name", aid),
+                        body=sf_acc_rich.get(aid, ""),
                         day=None,
                         date=None,
-                        timestamp=acc.get("created_at"),
-                        actors=[acc["owner"]] if acc.get("owner") else [],
+                        timestamp=doc.get("created_at"),
+                        actors=[doc["owner"]] if doc.get("owner") else [],
                         tags=["salesforce", "account"],
                         artifact_type="sf_account",
                         is_external=True,
@@ -1225,21 +1383,9 @@ class CorpusBuilder:
                 )
                 existing_ids.add(aid)
 
+            # slack_messages — bucket by thread_id
             thread_buckets: Dict[str, dict] = {}
-            for msg in self._mem._db["slack_messages"].find(
-                {},
-                {
-                    "_id": 0,
-                    "thread_id": 1,
-                    "channel": 1,
-                    "text": 1,
-                    "author": 1,
-                    "sender": 1,
-                    "ts": 1,
-                    "day": 1,
-                    "date": 1,
-                },
-            ):
+            for msg in self._mem._db["slack_messages"].find({}, {"embedding": 0}):
                 tid = msg.get("thread_id", "")
                 if not tid or tid in existing_ids:
                     continue
@@ -1258,21 +1404,19 @@ class CorpusBuilder:
                     bucket["actors"].add(author)
                 text = msg.get("text", "")
                 if text:
-                    prefix = f"{author}: " if author else ""
-                    bucket["texts"].append(f"{prefix}{text}")
+                    bucket["texts"].append(f"{author}: {text}" if author else text)
 
             for tid, bucket in thread_buckets.items():
                 if tid in existing_ids:
                     continue
                 actors = sorted(bucket["actors"])
                 channel = bucket["channel"]
-                body = "\n".join(bucket["texts"])
                 rows.append(
                     _make_orphan_row(
                         doc_id=tid,
                         doc_type="slack",
                         title=f"#{channel}" if channel else tid,
-                        body=body,
+                        body="\n".join(bucket["texts"]),
                         day=bucket["day"],
                         date=bucket["date"],
                         timestamp=bucket["ts"],
@@ -1289,1091 +1433,683 @@ class CorpusBuilder:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EVAL INDEX SERIALISERS
+# CORPUS STATS
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _causal_links_to_rows(links: List[dict]) -> List[dict]:
+def _compute_corpus_stats(corpus: List[dict], cfg: dict, mem=None) -> dict:
     """
-    Flatten causal_link_index.json into Parquet-ready rows.
-    Each CausalLink dict maps directly — sets become JSON strings.
+    Derives everything the dataset card needs from the corpus + config.
+
+    mem is optional — if provided, the raw SimEvent count is read from MongoDB
+    so the card shows total events alongside deduplicated corpus documents.
     """
-    rows = []
-    for lnk in links:
-        rows.append(
-            {
-                "link_type": lnk.get("link_type", ""),
-                "cause_event_id": lnk.get("cause_event_id", ""),
-                "cause_event_type": lnk.get("cause_event_type", ""),
-                "effect_event_id": lnk.get("effect_event_id", ""),
-                "effect_event_type": lnk.get("effect_event_type", ""),
-                "actors": json.dumps(lnk.get("actors", []), default=str),
-                "day": int(lnk.get("day", 0)),
-                "link_field": lnk.get("link_field", ""),
-                "link_value": str(lnk.get("link_value", "")),
-                "subsystems_involved": json.dumps(
-                    sorted(lnk.get("subsystems_involved", [])), default=str
-                ),
-                "counterfactual_premise": lnk.get("counterfactual_premise", ""),
-                "counterfactual_outcome": lnk.get("counterfactual_outcome", ""),
-                "outcome_changed": bool(lnk.get("outcome_changed", True)),
-            }
-        )
-    return rows
+    sim_cfg = cfg.get("simulation", {})
+    org_chart = cfg.get("org_chart", {})
+    knowledge_gaps = cfg.get("knowledge_gaps", [])
 
+    artifact_counts: Dict[str, int] = defaultdict(int)
+    sim_event_counts: Dict[str, int] = defaultdict(int)
+    incident_docs = 0
+    external_docs = 0
+    dept_counts: Dict[str, int] = defaultdict(int)
+    actors_seen: set = set()
+    days_seen: set = set()
 
-def _actor_visibility_to_rows(visibility_map: dict) -> List[dict]:
-    """
-    Flatten actor_visibility.json (actor → [cone, ...]) into one row per
-    (actor, day) snapshot. Heavy set/dict fields are JSON-serialised.
-    """
-    rows = []
-    for actor, cones in visibility_map.items():
-        for cone in cones:
-            vis = cone.get("visible_artifacts", {})
-            rows.append(
-                {
-                    "actor": cone.get("actor", actor),
-                    "role": cone.get("role", ""),
-                    "as_of_time": cone.get("as_of_time", ""),
-                    "as_of_day": int(cone.get("as_of_day", 0)),
-                    "subsystem_access": json.dumps(
-                        sorted(cone.get("subsystem_access", [])), default=str
-                    ),
-                    # All visible artifact IDs, flattened across subsystems
-                    "all_visible_artifacts": json.dumps(
-                        sorted(
-                            {aid for ids in vis.values() for aid in ids}
-                        ),
-                        default=str,
-                    ),
-                    # Per-subsystem breakdown kept for fine-grained analysis
-                    "visible_artifacts_by_subsystem": json.dumps(
-                        {k: sorted(v) for k, v in vis.items()}, default=str
-                    ),
-                    "directly_involved": json.dumps(
-                        sorted(cone.get("directly_involved", [])), default=str
-                    ),
-                    "broadcast_visible": json.dumps(
-                        sorted(cone.get("broadcast_visible", [])), default=str
-                    ),
-                }
-            )
-    return rows
-
-
-def _absence_catalog_to_rows(records: List[dict]) -> List[dict]:
-    """Flatten absence_catalog.json into Parquet-ready rows."""
-    rows = []
-    for rec in records:
-        rows.append(
-            {
-                "trigger_event_id": rec.get("trigger_event_id", ""),
-                "trigger_event_type": rec.get("trigger_event_type", ""),
-                "expected_response_type": rec.get("expected_response_type", ""),
-                "trigger_day": int(rec.get("trigger_day", 0)),
-                "trigger_actors": json.dumps(
-                    rec.get("trigger_actors", []), default=str
-                ),
-                "trigger_artifact_ids": json.dumps(
-                    rec.get("trigger_artifact_ids", {}), default=str
-                ),
-                "link_field": rec.get("link_field", ""),
-                "link_value": str(rec.get("link_value", "")),
-                "subsystem": rec.get("subsystem", ""),
-                "expected_search_space": json.dumps(
-                    rec.get("expected_search_space", []), default=str
-                ),
-            }
-        )
-    return rows
-
-
-
-def _questions_to_rows(questions: List[dict]) -> List[dict]:
-    """
-    Convert the v2 eval questions list into flat Parquet rows.
-
-    Evidence chain derivation:
-      COUNTERFACTUAL — union of cause + effect artifact IDs from
-                       ground_truth.evidence_chain_artifacts
-      PERSPECTIVE    — ground_truth.evidence_artifacts
-      SILENCE        — empty; the correct answer is absence, so retrieval
-                       recall is not applicable
-    """
-    rows = []
-    for q in questions:
-        qtype = q.get("question_type", "")
-        gt = q.get("ground_truth", {})
-
-        evidence: List[str] = []
-        if qtype == "COUNTERFACTUAL":
-            chain = gt.get("evidence_chain_artifacts", {})
-            evidence = list(set(chain.get("cause", []) + chain.get("effect", [])))
-        elif qtype == "PERSPECTIVE":
-            evidence = gt.get("evidence_artifacts", [])
-
-
-        rows.append(
-            {
-                # ── Core fields (all types) ───────────────────────────────────
-                "question_id": q.get("question_id", ""),
-                "question_type": qtype,
-                "question_text": q.get("question_text", ""),
-                "ground_truth": json.dumps(gt, default=str),
-                "evidence_chain": json.dumps(evidence, default=str),
-                "difficulty": q.get("difficulty", ""),
-                "requires_reasoning": bool(q.get("requires_reasoning", False)),
-                # ── PERSPECTIVE-specific fields ───────────────────────────────
-                "actor": q.get("actor", ""),
-                "actor_role": q.get("actor_role", ""),
-                "as_of_day": int(q.get("as_of_day", 0)),
-                "subsystem_access": json.dumps(
-                    q.get("subsystem_access", []), default=str
-                ),
-                "blocked_subsystems": json.dumps(
-                    q.get("blocked_subsystems", []), default=str
-                ),
-                "actor_visible_artifacts": json.dumps(
-                    q.get("actor_visible_artifacts", []), default=str
-                ),
-                # ── COUNTERFACTUAL-specific fields ────────────────────────────
-                "link_type": q.get("link_type", ""),
-                "causal_day": int(q.get("day", 0)),
-                # ── SILENCE-specific fields ───────────────────────────────────
-                "expected_search_space": json.dumps(
-                    q.get("expected_search_space", []), default=str
-                ),
-                "trigger_event_type": q.get("trigger_event_type", ""),
-                "expected_response_type": q.get("expected_response_type", ""),
-            }
-        )
-    return rows
-
-
-
-def _tokenize(text: str) -> List[str]:
-    """Simple whitespace + punctuation tokeniser."""
-    return re.sub(r"[^\w\s]", " ", text.lower()).split()
-
-
-def _mrr_at_k(ranked_ids: List[str], relevant_ids: List[str], k: int = 10) -> float:
-    for i, did in enumerate(ranked_ids[:k], 1):
-        if did in set(relevant_ids):
-            return 1.0 / i
-    return 0.0
-
-
-def _recall_at_k(ranked_ids: List[str], relevant_ids: List[str], k: int = 10) -> float:
-    if not relevant_ids:
-        return 1.0
-    hits = sum(1 for did in ranked_ids[:k] if did in set(relevant_ids))
-    return hits / len(relevant_ids)
-
-
-class UngatedCeilingBaseline:
-    """
-    Tier 1 baseline: BM25 and dense retrieval with ALL gates removed.
-
-    No visibility cones, no temporal horizons, no subsystem constraints —
-    the retriever has "god-mode" access to the full corpus. MRR@10 and
-    Recall@10 represent the information ceiling, not agent performance.
-
-    SILENCE questions are excluded because the correct answer is absence;
-    retrieval recall is not applicable.
-
-    The delta between these ceiling scores and a gated agent's combined_score
-    is the "Epistemic Tax" — the difficulty cost of respecting organisational
-    silos and actor knowledge horizons.
-    """
-
-    def __init__(self, corpus: List[dict], questions: List[dict], mem=None):
-        self._corpus = corpus
-        self._questions = questions
-        self._mem = mem
-        self._doc_ids = [row["doc_id"] for row in corpus]
-        self._bodies = [row.get("body") or row.get("content") or "" for row in corpus]
-
-        if _BM25_AVAILABLE:
-            tokenised = [_tokenize(b) for b in self._bodies]
-            self._bm25 = BM25Okapi(tokenised)
+    for row in corpus:
+        dt = row["doc_type"]
+        if dt in _ARTIFACT_DOC_TYPES:
+            artifact_counts[dt] += 1
         else:
-            self._bm25 = None
+            sim_event_counts[dt] += 1
+        if row.get("is_incident"):
+            incident_docs += 1
+        if row.get("is_external"):
+            external_docs += 1
+        if row.get("dept"):
+            dept_counts[row["dept"]] += 1
+        for actor in json.loads(row.get("actors") or "[]"):
+            if isinstance(actor, str):
+                actors_seen.add(actor)
+        if row.get("day"):
+            days_seen.add(int(row["day"]))
 
-        if _DENSE_AVAILABLE and mem is not None:
-            logger.info("  Embedding corpus for dense ceiling baseline...")
-            embeddings = []
-            for i, body in enumerate(self._bodies):
-                text_to_embed = (
-                    body.strip() if body and body.strip() else "empty document"
-                )
-                vec = self._mem._embed(text_to_embed, input_type="search_document")
-                embeddings.append(vec)
-                if (i + 1) % 500 == 0:
-                    logger.info(f"  embedded {i + 1}/{len(self._bodies)} docs...")
-            mat = np.array(embeddings, dtype=np.float32)
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            self._dense_matrix = mat / np.where(norms == 0, 1, norms)
-        else:
-            self._dense_matrix = None
-
-    # ── PUBLIC ────────────────────────────────────────────────────────────────
-
-    def run_bm25(self) -> Tuple[List[dict], Dict[str, Any]]:
-        if self._bm25 is None:
-            return [], {"error": "rank_bm25 not installed"}
-        return self._run_retrieval(use_dense=False)
-
-    def run_dense(self) -> Tuple[List[dict], Dict[str, Any]]:
-        if self._mem is None or self._dense_matrix is None:
-            return [], {"error": "Memory unavailable — dense ceiling requires MongoDB"}
-        return self._run_retrieval(use_dense=True)
-
-    # ── PRIVATE ───────────────────────────────────────────────────────────────
-
-    def _evidence_for_question(self, q: dict) -> List[str]:
-        """
-        Flat list of corpus doc_ids that constitute the correct answer.
-        SILENCE returns empty — absence has no retrievable target.
-        """
-        qtype = q.get("question_type", "")
-        gt = q.get("ground_truth", {})
-
-        if qtype == "COUNTERFACTUAL":
-            chain = gt.get("evidence_chain_artifacts", {})
-            return list(set(chain.get("cause", []) + chain.get("effect", [])))
-
-        if qtype == "PERSPECTIVE":
-            return gt.get("evidence_artifacts", [])
-
-        return [] 
-
-    def _rank(self, query: str, use_dense: bool, top_k: int = 10) -> List[str]:
-        if use_dense and self._dense_matrix is not None:
-            q_vec = np.array(
-                self._mem._embed(query, input_type="search_query"), dtype=np.float32
-            )
-            q_vec /= max(np.linalg.norm(q_vec), 1e-9)
-            scores = self._dense_matrix @ q_vec
-            indices = scores.argsort()[::-1][:top_k]
-            return [self._doc_ids[int(i)] for i in indices]
-
-        elif not use_dense and self._bm25 is not None:
-            scores = self._bm25.get_scores(_tokenize(query))
-            indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-            return [self._doc_ids[i] for i in indices[:top_k]]
-
-        return []
-
-    def _run_retrieval(self, use_dense: bool) -> Tuple[List[dict], Dict[str, Any]]:
-        per_question: List[dict] = []
-        by_type: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-
-        for q in self._questions:
-            qtype = q.get("question_type", "")
-            evidence = self._evidence_for_question(q)
-            if not evidence:
+    # Raw SimEvent count from MongoDB.
+    # Most SimEvents are internal state-machine events (day_summary,
+    # knowledge_gap_detected, proposed_event_rejected, etc.) that do not
+    # map 1:1 to a corpus artifact. The corpus is the deduplicated set of
+    # *artifacts* those events produced — which is why corpus doc count
+    # will always be much smaller than the raw event count.
+    sim_events_total = None
+    sim_days_actual = None
+    if mem is not None:
+        for _coll in ("sim_events", "events", "simevents"):
+            try:
+                _n = mem._db[_coll].count_documents({})
+                if _n:
+                    sim_events_total = _n
+                    last_event = mem._db[_coll].find_one(
+                        {}, sort=[("day", -1)], projection={"day": 1}
+                    )
+                    if last_event:
+                        sim_days_actual = last_event["day"]
+                    break
+            except Exception:
                 continue
 
-            ranked_ids = self._rank(q.get("question_text", ""), use_dense=use_dense)
-            mrr = _mrr_at_k(ranked_ids, evidence, k=10)
-            recall = _recall_at_k(ranked_ids, evidence, k=10)
+    genesis_gaps = []
+    sim_start_str = sim_cfg.get("start_date", "")
+    for gap in knowledge_gaps:
+        departed_name = gap.get("name", "Unknown")
+        left_str = gap.get("left", "")
+        doc_pct = gap.get("documented_pct", 0.5)
+        domains = gap.get("knew_about", [])
 
-            per_question.append(
-                {
-                    "question_id": q.get("question_id"),
-                    "question_type": qtype,
-                    "difficulty": q.get("difficulty"),
-                    "mrr_at_10": round(mrr, 4),
-                    "recall_at_10": round(recall, 4),
-                    "top10": ranked_ids[:10],
-                }
+        days_before = 0
+        if sim_start_str and left_str:
+            try:
+                sim_start = datetime.strptime(sim_start_str, "%Y-%m-%d")
+                left_dt = datetime.strptime(left_str, "%Y-%m")
+                days_before = (sim_start - left_dt).days
+            except ValueError:
+                pass
+
+        genesis_gaps.append(
+            {
+                "name": departed_name,
+                "left": left_str,
+                "days_before_sim": days_before,
+                "documented_pct": doc_pct,
+                "domains": domains,
+                "role": gap.get("role", ""),
+                "dept": gap.get("dept", ""),
+            }
+        )
+
+    customers = []
+    vendors = []
+
+    domain_registry_count = 0
+    company_description = sim_cfg.get("company_description", "")
+    domain = sim_cfg.get("domain", "")
+    legacy_system = cfg.get("legacy_system", {}).get("name", "")
+    insider_threat = cfg.get("insider_threat", {}).get("enabled", False)
+
+    if mem is not None:
+        try:
+            sources_doc = mem._db["sim_config"].find_one(
+                {"_id": "inbound_email_sources"}
             )
-            by_type[qtype].append((mrr, recall))
+            sources = sources_doc.get("sources", []) if sources_doc else []
+            customers = [s for s in sources if s.get("category") == "customer"]
+            vendors = [s for s in sources if s.get("category") == "vendor"]
+        except Exception:
+            pass
+        try:
+            domain_registry_count = mem._db["domain_registry"].count_documents({})
+        except Exception:
+            pass
 
-        def _mean(vals):
-            return round(sum(vals) / len(vals), 4) if vals else 0.0
-
-        aggregate = {
-            "method": "dense" if use_dense else "bm25",
-            "model": _DENSE_MODEL_NAME if use_dense else "BM25Okapi (rank-bm25)",
-            "overall": {
-                "mrr_at_10": _mean([r["mrr_at_10"] for r in per_question]),
-                "recall_at_10": _mean([r["recall_at_10"] for r in per_question]),
-                "n": len(per_question),
-            },
-            "by_type": {
-                qtype: {
-                    "mrr_at_10": _mean([v[0] for v in vals]),
-                    "recall_at_10": _mean([v[1] for v in vals]),
-                    "n": len(vals),
-                }
-                for qtype, vals in by_type.items()
-            },
-        }
-        return per_question, aggregate
-
-
-class StaticReasoningMetrics:
-    """
-    Tier 2 baseline: reasoning difficulty metrics derived from corpus +
-    question metadata alone. No LLM calls, no agent execution required.
-
-    These metrics answer "why is each track hard?" before any agent runs,
-    exposing the epistemic structure that makes naive retrieval insufficient.
-
-    PERSPECTIVE    → horizon_contamination_rate
-        Fraction of ungated BM25 top-20 that falls outside the actor's
-        visibility cone. High value = epistemic discipline is load-bearing;
-        retrieval alone surfaces mostly forbidden documents.
-
-    COUNTERFACTUAL → causal_chain_traceable
-        Whether cause AND effect artifacts both appear in ungated top-10.
-        False = a single retrieval pass cannot close the causal chain;
-        multi-hop reasoning is required.
-
-    SILENCE        → search_space_bm25_coverage
-        Fraction of expected_search_space locations surfaced by BM25 on
-        the question text. Low value = the agent must enumerate absence-check
-        locations deliberately; naive search will miss them.
-    """
-
-    def __init__(
-        self,
-        questions: List[dict],
-        bm25,           # BM25Okapi instance reused from UngatedCeilingBaseline
-        doc_ids: List[str],
-    ):
-        self._questions = questions
-        self._bm25 = bm25
-        self._doc_ids = doc_ids
-
-    def compute(self) -> dict:
-        per_question: List[dict] = []
-        by_type: Dict[str, List[dict]] = defaultdict(list)
-
-        dispatch = {
-            "PERSPECTIVE": self._perspective_metrics,
-            "COUNTERFACTUAL": self._counterfactual_metrics,
-            "SILENCE": self._silence_metrics,
-        }
-
-        for q in self._questions:
-            qtype = q.get("question_type", "")
-            fn = dispatch.get(qtype)
-            if fn is None:
-                continue
-            row = {
-                "question_id": q.get("question_id"),
-                "question_type": qtype,
-                **fn(q),
-            }
-            per_question.append(row)
-            by_type[qtype].append(row)
-
-        return {
-            "per_question": per_question,
-            "aggregate": self._aggregate(by_type),
-        }
-
-    # ── Track-specific metric computations ───────────────────────────────────
-
-    def _perspective_metrics(self, q: dict) -> dict:
-        """
-        Horizon contamination: what fraction of ungated top-20 results would
-        an actor NOT be permitted to see? High contamination means a naive
-        retriever is actively counter-productive for PERSPECTIVE questions.
-        """
-        visible = set(q.get("actor_visible_artifacts", []))
-        ranked = self._rank_bm25(q["question_text"], k=20)
-        if not ranked or not visible:
-            return {
-                "horizon_contamination_rate": None,
-                "first_in_cone_rank": None,
-                "in_cone_count_top20": None,
-            }
-
-        out_of_cone = [r for r in ranked if r not in visible]
-        first_in_cone = next(
-            (i + 1 for i, r in enumerate(ranked) if r in visible), None
-        )
-        return {
-            "horizon_contamination_rate": round(len(out_of_cone) / len(ranked), 4),
-            "first_in_cone_rank": first_in_cone,
-            "in_cone_count_top20": len(ranked) - len(out_of_cone),
-        }
-
-    def _counterfactual_metrics(self, q: dict) -> dict:
-        """
-        Causal chain traceability: do both cause and effect artifacts appear
-        in ungated top-10? If not, the agent must do multi-hop retrieval.
-        """
-        chain = q.get("ground_truth", {}).get("evidence_chain_artifacts", {})
-        cause_ids = set(chain.get("cause", []))
-        effect_ids = set(chain.get("effect", []))
-        if not cause_ids and not effect_ids:
-            return {"causal_chain_traceable": None}
-
-        ranked = self._rank_bm25(q["question_text"], k=10)
-        ranked_set = set(ranked)
-        cause_found = bool(cause_ids & ranked_set)
-        effect_found = bool(effect_ids & ranked_set)
-
-        cause_rank = next(
-            (i + 1 for i, r in enumerate(ranked) if r in cause_ids), None
-        )
-        effect_rank = next(
-            (i + 1 for i, r in enumerate(ranked) if r in effect_ids), None
-        )
-
-        return {
-            "cause_found_top10": cause_found,
-            "effect_found_top10": effect_found,
-            "causal_chain_traceable": cause_found and effect_found,
-            "cause_rank": cause_rank,
-            "effect_rank": effect_rank,
-        }
-
-    def _silence_metrics(self, q: dict) -> dict:
-        """
-        Search space BM25 coverage: what fraction of the required absence-check
-        locations does a naive BM25 search surface? Low coverage means the agent
-        must enumerate expected_search_space explicitly rather than relying on
-        retrieval to guide it to the right places to look.
-        """
-        expected = q.get("expected_search_space", [])
-        if not expected:
-            return {"search_space_bm25_coverage": 1.0, "uncovered_locations": []}
-
-        ranked = self._rank_bm25(q["question_text"], k=20)
-
-        def _norm(s: str) -> str:
-            # Normalise path-style entries to their terminal component:
-            # "confluence/postmortems/IT-108" → "it-108"
-            return s.strip("/").split("/")[-1].lower()
-
-        norm_expected = {_norm(e): e for e in expected}
-        norm_ranked = {_norm(r) for r in ranked}
-        ranked_lower = [r.lower() for r in ranked]
-
-        covered = {
-            original
-            for norm_term, original in norm_expected.items()
-            if norm_term in norm_ranked
-            or any(norm_term in r for r in ranked_lower)
-        }
-
-        return {
-            "search_space_bm25_coverage": round(len(covered) / len(expected), 4),
-            "uncovered_locations": sorted(set(expected) - covered),
-        }
-
-    # ── Shared utilities ──────────────────────────────────────────────────────
-
-    def _rank_bm25(self, query: str, k: int) -> List[str]:
-        if self._bm25 is None:
-            return []
-        scores = self._bm25.get_scores(_tokenize(query))
-        indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-        return [self._doc_ids[i] for i in indices[:k]]
-
-    def _aggregate(self, by_type: Dict[str, List[dict]]) -> dict:
-        def _mean(vals: list) -> float:
-            filtered = [v for v in vals if v is not None]
-            return round(sum(filtered) / len(filtered), 4) if filtered else 0.0
-
-        agg: dict = {}
-
-        if rows := by_type.get("PERSPECTIVE", []):
-            agg["PERSPECTIVE"] = {
-                "n": len(rows),
-                "avg_horizon_contamination_rate": _mean(
-                    [r.get("horizon_contamination_rate") for r in rows]
-                ),
-                "avg_first_in_cone_rank": _mean(
-                    [r.get("first_in_cone_rank") for r in rows]
-                ),
-                "interpretation": (
-                    "High contamination = retrieval surfaces many out-of-cone docs; "
-                    "epistemic discipline is load-bearing, not optional."
-                ),
-            }
-
-        if rows := by_type.get("COUNTERFACTUAL", []):
-            pct_traceable = _mean(
-                [1.0 if r.get("causal_chain_traceable") else 0.0 for r in rows]
-            )
-            agg["COUNTERFACTUAL"] = {
-                "n": len(rows),
-                "pct_causal_chain_traceable_top10": pct_traceable,
-                "pct_requires_multi_hop": round(1.0 - pct_traceable, 4),
-                "interpretation": (
-                    "Low traceability = causal link cannot be closed by a single "
-                    "retrieval pass; agent must traverse cause → effect explicitly."
-                ),
-            }
-
-        if rows := by_type.get("SILENCE", []):
-            agg["SILENCE"] = {
-                "n": len(rows),
-                "avg_search_space_bm25_coverage": _mean(
-                    [r.get("search_space_bm25_coverage") for r in rows]
-                ),
-                "pct_fully_covered": _mean(
-                    [
-                        1.0
-                        if r.get("search_space_bm25_coverage", 0) >= 1.0
-                        else 0.0
-                        for r in rows
-                    ]
-                ),
-                "interpretation": (
-                    "Low coverage = BM25 misses required absence-check locations; "
-                    "agent must enumerate expected_search_space explicitly."
-                ),
-            }
-
-        return agg
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DATASET CARD WRITER
-# ─────────────────────────────────────────────────────────────────────────────
+    return {
+        "artifact_counts": dict(sorted(artifact_counts.items(), key=lambda x: -x[1])),
+        "sim_event_counts": dict(sorted(sim_event_counts.items(), key=lambda x: -x[1])),
+        "by_type": ...,
+        "total": len(corpus),
+        "incident_docs": incident_docs,
+        "external_docs": external_docs,
+        "dept_counts": dict(sorted(dept_counts.items(), key=lambda x: -x[1])),
+        "unique_actors": len(actors_seen),
+        "sim_days_covered": len(days_seen),
+        "sim_events_total": sim_events_total,
+        "org_size": sum(len(v) for v in org_chart.values() if isinstance(v, list)),
+        "company": sim_cfg.get("company_name", "OrgForge Simulated Corp"),
+        "domain": domain,
+        "insider_threat": insider_threat,
+        "legacy_system": legacy_system,
+        "company_description": company_description,
+        "industry": sim_cfg.get("industry", "Software"),
+        "genesis_gaps": genesis_gaps,
+        "customers": customers,
+        "vendors": vendors,
+        "domain_registry_count": domain_registry_count,
+        "num_days": sim_days_actual or sim_cfg.get("num_days", "?"),
+    }
 
 
 class DatasetCardWriter:
-    """Produces the HuggingFace README.md dataset card for the v2 eval."""
+    """
+    Produces the HuggingFace README.md dataset card.
 
-    def write(
-        self,
-        out_path: Path,
-        corpus: List[dict],
-        questions: List[dict],
-        causal_links: List[dict],
-        actor_visibility: dict,
-        absence_catalog: List[dict],
-        baseline_summary: dict,
-        cfg: dict,
-    ) -> None:
-        card = self._render(
-            corpus,
-            questions,
-            causal_links,
-            actor_visibility,
-            absence_catalog,
-            baseline_summary,
-            cfg,
-        )
+    Tells the story of the corpus first — what it is, why the ground truth
+    is trustworthy, and what makes this dataset structurally different from
+    other synthetic benchmarks. Artifact counts and schema follow.
+    """
+
+    def write(self, out_path: Path, corpus: List[dict], cfg: dict, mem=None) -> None:
+        stats = _compute_corpus_stats(corpus, cfg, mem=mem)
+        card = self._render(stats, cfg)
         out_path.write_text(card, encoding="utf-8")
         logger.info(f"  → {out_path}")
 
     # ── PRIVATE ───────────────────────────────────────────────────────────────
 
-    def _render(
-        self,
-        corpus: List[dict],
-        questions: List[dict],
-        causal_links: List[dict],
-        actor_visibility: dict,
-        absence_catalog: List[dict],
-        baseline_summary: dict,
-        cfg: dict,
-    ) -> str:
+    def _render(self, stats: dict, cfg: dict) -> str:
         sim_cfg = cfg.get("simulation", {})
-        num_days = sim_cfg.get("num_days", "?")
-        org_chart = cfg.get("org_chart", {})
-        org_size = sum(len(v) for v in org_chart.values() if isinstance(v, list))
-        company = sim_cfg.get("company_name", "OrgForge Simulated Corp")
-        industry = sim_cfg.get("industry", "Software")
-        num_sprints = sim_cfg.get("num_sprints", "?")
+        org_lifecycle = cfg.get("org_lifecycle", {})
 
-        # Corpus breakdown
-        by_type: Dict[str, int] = defaultdict(int)
-        for row in corpus:
-            by_type[row["doc_type"]] += 1
-
-        # Question breakdown
-        by_qtype: Dict[str, int] = defaultdict(int)
-        by_diff: Dict[str, int] = defaultdict(int)
-        for q in questions:
-            by_qtype[q.get("question_type", "?")] += 1
-            by_diff[q.get("difficulty", "?")] += 1
-
-        # Causal link breakdown
-        by_link: Dict[str, int] = defaultdict(int)
-        for lnk in causal_links:
-            by_link[lnk.get("link_type", "?")] += 1
-
-        # Eval index counts
-        n_actors = len(actor_visibility)
-        n_cone_snapshots = sum(len(v) for v in actor_visibility.values())
-
-        # Baseline tables — two-tier system
-        ceiling = baseline_summary.get("ungated_ceiling", {})
-        bm25_section = self._ungated_ceiling_table(ceiling.get("bm25", {}))
-        dense_section = self._ungated_ceiling_table(ceiling.get("dense", {}))
-        reasoning_section = self._reasoning_metrics_table(
-            baseline_summary.get("static_reasoning_metrics", {})
+        company = stats["company"]
+        industry = stats["industry"]
+        domain = stats["domain"]
+        legacy_system = stats["legacy_system"]
+        insider_threat = stats["insider_threat"]
+        company_description = stats["company_description"]
+        num_days = str(stats["num_days"])
+        org_size = str(stats["org_size"])
+        total_docs = f"{stats['total']:,}"
+        incident_docs = f"{stats['incident_docs']:,}"
+        external_docs = f"{stats['external_docs']:,}"
+        unique_actors = str(stats["unique_actors"])
+        sim_events_total = (
+            f"{stats['sim_events_total']:,}" if stats.get("sim_events_total") else "n/a"
         )
+        genesis_gaps = stats["genesis_gaps"]
+        artifact_counts = stats.get("artifact_counts", stats["by_type"])
+        sim_event_counts = stats.get("sim_event_counts", {})
+        n_customers = len(stats.get("customers", []))
+        n_vendors = len(stats.get("vendors", []))
+        tech_stack = stats.get("tech_stack", [])
+        domain_reg_count = stats.get("domain_registry_count", 0)
+
+        gap_table = self._genesis_gap_table(genesis_gaps)
+        artifact_table = self._artifact_count_table(artifact_counts, "Artifact")
+        sim_event_table = self._artifact_count_table(sim_event_counts, "SimEvent")
+        dept_table = self._dept_count_table(stats["dept_counts"])
+        schema_table = self._corpus_schema_table(sim_event_counts)
+
+        scheduled_departures = org_lifecycle.get("scheduled_departures", [])
+        scheduled_hires = org_lifecycle.get("scheduled_hires", [])
+        enable_attrition = org_lifecycle.get("enable_random_attrition", False)
+        attrition_prob = org_lifecycle.get("random_attrition_daily_prob", 0.0)
+
+        lifecycle_lines = []
+        if scheduled_departures:
+            lifecycle_lines.append(
+                f"- **{len(scheduled_departures)} scheduled departure(s)** during the sim"
+            )
+        if scheduled_hires:
+            lifecycle_lines.append(
+                f"- **{len(scheduled_hires)} scheduled hire(s)** during the sim "
+                "(backfill hires are generated with deliberate expertise gaps, "
+                "creating second-order knowledge problems that play out over subsequent days)"
+            )
+        if enable_attrition:
+            lifecycle_lines.append(
+                f"- **Random attrition** enabled at {attrition_prob:.1%} daily probability"
+            )
+        lifecycle_summary = (
+            "\n".join(lifecycle_lines)
+            if lifecycle_lines
+            else "- No mid-sim departures or hires configured"
+        )
+
+        _fm = (
+            "---\n"
+            "language:\n"
+            "- en\n"
+            "license: mit\n"
+            "configs:\n"
+            "- config_name: default\n"
+            "  data_files:\n"
+            "  - split: train\n"
+            '    path: "corpus/*.parquet"\n'
+            "task_categories:\n"
+            "- question-answering\n"
+            "- text-retrieval\n"
+            "- text-generation\n"
+            "- summarization\n"
+            "- text-classification\n"
+            "task_ids:\n"
+            "- open-domain-qa\n"
+            "- closed-domain-qa\n"
+            "- abstractive-qa\n"
+            "- open-domain-abstractive-qa\n"
+            "- document-retrieval\n"
+            "- fact-checking-retrieval\n"
+            "- dialogue-modeling\n"
+            "- explanation-generation\n"
+            "- multi-label-classification\n"
+            "- fact-checking\n"
+            "tags:\n"
+            "- rag\n"
+            "- enterprise\n"
+            "- synthetic\n"
+            "- orgforge\n"
+            "- causal-reasoning\n"
+            "- temporal-reasoning\n"
+            "- knowledge-graphs\n"
+            "- agentic-eval\n"
+            f'pretty_name: "OrgForge — {company} Enterprise Corpus"\n'
+            "size_categories:\n"
+            "- 1K<n<10K\n"
+            "---"
+        )
+
+        sections = []
+
+        # ── Title + pitch ──────────────────────────────────────────────────────
+        sections.append(f"# OrgForge — {company} Enterprise Corpus")
+        sections.append("")
+        sections.append("![OrgForge corpus overview](orgforge_dataset_hero.png)")
+        sections.append("")
+        sections.append(
+            "OrgForge generates synthetic but causally grounded enterprise corpora from a\n"
+            "deterministic simulation engine. Every artifact in this dataset — Jira tickets,\n"
+            "Slack threads, Confluence pages, customer emails, Zendesk tickets, invoices, Zoom\n"
+            "transcripts, Datadog alerts — traces back to a single event log. No LLM invented\n"
+            "any facts. The state machine controls what happened; LLMs only wrote the prose."
+        )
+        sections.append("")
+
+        # ── Why it exists ──────────────────────────────────────────────────────
+        sections.append("## Why it exists")
+        sections.append("")
+        sections.append(
+            "Evaluating agents that reason over institutional knowledge requires a corpus where\n"
+            "the ground truth is not just *present* but *verifiable*. You need to know not just\n"
+            "what the correct answer is, but why it is correct, when it became correct, and what\n"
+            "changed it. Existing synthetic datasets generate plausible-looking documents with no\n"
+            "guarantee of consistency across artifacts or time. OrgForge produces something\n"
+            "structurally different: a corpus where every fact has a cause, every cause has a\n"
+            "timestamp, and every timestamp connects to a retrievable artifact."
+        )
+        sections.append("")
+        sections.append(
+            f"This dataset is the output of a **{num_days}-day simulation** of **{company}**, a\n"
+            f"{industry} company which {company_description} with ~{org_size} employees. It is not a random walk through\n"
+            "enterprise activity — it was seeded with specific organizational crises and simulated\n"
+            "through to their resolution."
+        )
+        sections.append("")
+
+        # ── What makes it different ────────────────────────────────────────────
+        sections.append("## What makes this corpus structurally different")
+        sections.append("")
+        sections.append(
+            "**Causal grounding.** Every artifact is downstream of a SimEvent. A Jira ticket,\n"
+            "the Slack thread that opened alongside it, the Confluence postmortem written the\n"
+            "next day, and the Zendesk tickets that escalated from the same incident all share\n"
+            "a causal ancestor. Cross-referencing between artifact types is not coincidental —\n"
+            "it reflects the actual information flow the simulation produced."
+        )
+        sections.append("")
+        sections.append(
+            "**Temporal coherence.** Facts change over the simulation. An engineer present on\n"
+            "Day 1 is gone on Day 12. Ticket ownership, domain coverage scores, relationship\n"
+            "graph edge weights, and customer sentiment all evolve. The correct answer to a\n"
+            "question about org state depends on what day it is asked relative to the timeline.\n"
+            "Every corpus row carries a day, date, and timestamp accurate to the millisecond\n"
+            "the underlying event fired."
+        )
+        sections.append("")
+        sections.append(
+            "**Verifiable ground truth.** The simulation snapshot and domain registry ship\n"
+            "alongside the corpus as structured reference files (see Supplemental Files). For\n"
+            "any question the corpus can raise — who owned this domain when this incident fired,\n"
+            "which customer was affected, what was the system health on the day this postmortem\n"
+            "was written — the answer exists as a queryable record independent of the text. You\n"
+            "do not need to parse the corpus to build your eval set."
+        )
+        sections.append("")
+        sections.append(
+            "**Pre-simulation history.** The genesis knowledge gaps in this corpus pre-date the\n"
+            "simulation by months or years. An agent asked why a Day 15 postmortem surfaces a\n"
+            "specific knowledge gap must trace: current incident → semantic similarity match →\n"
+            "departed employee persona → genesis event dated before sim start. That causal chain\n"
+            "crosses a temporal boundary that does not exist in any other synthetic enterprise\n"
+            "dataset we are aware of."
+        )
+        sections.append("")
+        sections.append(
+            "**State-driven external communication.** Customer emails, vendor alerts, and\n"
+            "Zendesk tickets are generated from actual simulation conditions, not randomly\n"
+            "sampled. Each external contact has a `depends_on_components` list mapped to the\n"
+            "tech stack — an outage to a component a customer depends on is what triggers their\n"
+            "email. Approximately 15% of customer emails are deliberately dropped with no action,\n"
+            "leaving ground-truth absences in the event log that an agent must detect through\n"
+            "negative evidence rather than positive retrieval."
+        )
+        sections.append("")
+        sections.append(
+            "**Persona-consistent prose.** Every artifact is written by a character with a\n"
+            "specific tenure, stress level, writing style, and live CRM context. A Slack message\n"
+            "from an engineer during a contract negotiation reads differently from one written by\n"
+            "the same person on a quiet day. Stylometric and behavioral signals in the text\n"
+            "reflect the org's state at the moment of writing, not random LLM variation."
+        )
+        sections.append("")
+
+        # ── Use cases ──────────────────────────────────────────────────────────
+        sections.append("## Use cases")
+        sections.append("")
+        sections.append(
+            "- **Agentic reasoning** — tasks that require traversing causal chains across\n"
+            "  artifact types, time, and org boundaries rather than finding a single relevant\n"
+            "  document\n"
+            "- **Multi-hop question answering** — questions whose correct answer requires\n"
+            "  joining facts from Jira, Confluence, Slack, CRM, and the simulation ground truth\n"
+            "- **Temporal reasoning** — questions where the correct answer depends on what day\n"
+            "  they are asked relative to the simulation timeline\n"
+            "- **RAG pipeline evaluation** — a corpus with known causal structure allows\n"
+            "  precise measurement of what a retrieval system found versus what it needed to\n"
+            "  find to answer correctly\n"
+            "- **Org dynamics and knowledge loss research** — the simulation snapshot exposes\n"
+            "  how knowledge concentration, engineer departure, and incident causation interact\n"
+            "  over time in a controlled, reproducible setting"
+        )
+        sections.append("")
+
+        # ── Scope ──────────────────────────────────────────────────────────────
+        sections.append("## Scope and limitations")
+        sections.append("")
+        sections.append(
+            "This is not a dataset of real corporate communications. The company, employees,\n"
+            "customers, and vendors are entirely fictional. The simulation models organizational\n"
+            "behavior at the structural level — stress, knowledge concentration, incident\n"
+            "causation, relationship graph dynamics — but does not model everything. Affect,\n"
+            "politics, ambiguity, and the texture of real human communication are present only\n"
+            "to the extent that the persona and mood system introduces them through LLM-generated\n"
+            "prose. Researchers should treat this as a controlled benchmark environment, not a\n"
+            "proxy for real enterprise data."
+        )
+        sections.append("")
+        sections.append("---")
+        sections.append("")
+
+        # ── Genesis knowledge gaps ─────────────────────────────────────────────
+        sections.append("## Genesis Knowledge Gaps")
+        sections.append("")
+        sections.append(
+            "These gaps pre-date the simulation. They are the structural cause of the\n"
+            "organizational narrative in this corpus. Each departed employee's domains entered\n"
+            "Day 1 as orphaned — undocumented, unowned, and detectable only through semantic\n"
+            "similarity when new incidents touch the same systems."
+        )
+        sections.append("")
+        if legacy_system:
+            sections.append(
+                "\n\n"
+                f"The primary technical fault line in this corpus is **{legacy_system}**, a "
+                f"{cfg.get('legacy_system', {}).get('description', 'legacy system')} whose "
+                f"instability is the proximate cause of most incidents during the simulation."
+            )
+            sections.append("")
+        sections.append(gap_table)
+        sections.append("")
+        sections.append("---")
+        sections.append("")
+
+        # ── Org lifecycle ──────────────────────────────────────────────────────
+        sections.append("## Org Lifecycle")
+        sections.append("")
+        sections.append(lifecycle_summary)
+        sections.append("")
+        sections.append("---")
+        sections.append("")
+
+        # ── Corpus summary ─────────────────────────────────────────────────────
+        sections.append("## Corpus Summary")
+        sections.append("")
+        sections.append("| Property | Value |")
+        sections.append("|---|---|")
+        sections.append(f"| Company | {company} |")
+        sections.append(f"| Description | {company} {company_description} |")
+        sections.append(f"| Domain | {domain} |")
+        sections.append(f"| Industry | {industry} |")
+        sections.append(f"| Simulation days | {num_days} |")
+        sections.append(f"| Org size | ~{org_size} employees |")
+        sections.append(f"| Customers | {n_customers} |")
+        sections.append(f"| Vendors | {n_vendors} |")
+        sections.append(f"| Total corpus documents | {total_docs} |")
+        sections.append(f"| Total SimEvents | {sim_events_total} |")
+        sections.append(f"| Incident-related documents | {incident_docs} |")
+        sections.append(f"| External-origin documents | {external_docs} |")
+        sections.append(f"| Unique actors | {unique_actors} |")
+        sections.append(f"| Domain registry entries | {domain_reg_count} |")
+        if tech_stack:
+            sections.append(f"| Tech stack | {', '.join(str(t) for t in tech_stack)} |")
+        sections.append("")
+        sections.append("### Artifacts")
+        sections.append("")
+        sections.append(artifact_table)
+        sections.append("")
+        sections.append("### SimEvents (internal state-machine records)")
+        sections.append("")
+        sections.append(
+            "SimEvents are the ground-truth event log entries that produced the artifacts above.\n"
+            "They are included in the corpus as separately retrievable records for researchers\n"
+            "who want the state-machine view alongside the prose artifacts."
+        )
+        sections.append("")
+        sections.append(sim_event_table)
+        sections.append("")
+        sections.append("### By department")
+        sections.append("")
+        sections.append(dept_table)
+        sections.append("")
+        sections.append("---")
+        sections.append("")
+
+        # ── Supplemental files ─────────────────────────────────────────────────
+        sections.append("## Supplemental Files")
+        sections.append("")
+        sections.append(
+            "The corpus parquet contains the retrievable text artifacts. The following files\n"
+            "ship alongside it for eval construction, ground-truth lookups, and time-series\n"
+            "analysis. They are in `supplemental/`."
+        )
+        sections.append("")
+        sections.append(
+            "**`simulation_snapshot.json`** — Full org state at simulation end: incidents with\n"
+            "open/resolve timestamps, morale curve, daily system health scores, relationship\n"
+            "graph edge weights, departed employees, new hires, and knowledge gap events. This\n"
+            "is the oracle for eval construction. Use it to build questions with verifiable\n"
+            "answers without parsing the corpus."
+        )
+        sections.append("")
+        sections.append(
+            "**`assignment_scores.parquet`** — Per-sprint ticket assignment decisions with full\n"
+            "scoring breakdown: skill match (embedding cosine similarity), inverse stress, \n"
+            "betweenness centrality penalty, recency bonus, and composite score. One row per\n"
+            "(engineer, ticket, day) triple. Useful for eval questions about whether assignments\n"
+            "were optimal given org state at the time."
+        )
+        sections.append("")
+        sections.append(
+            "**`domain_registry.json`** — Snapshot of all knowledge domains: owner history,\n"
+            "documentation coverage scores at each sim day, orphan status, and which incidents\n"
+            "triggered semantic similarity matches against each domain. Joinable to corpus rows\n"
+            "via the Confluence `doc_id` values that cover each domain."
+        )
+        sections.append("")
+        sections.append(
+            "**`sim_config.json`** — Reference record for the org configuration: full customer\n"
+            "and vendor profiles (including `depends_on_components`, `sentiment_baseline`,\n"
+            "`trigger_on` conditions, and `persona_archetype`), tech stack, and org structure.\n"
+            "Useful for understanding why specific external communications were generated."
+        )
+        sections.append("")
+        sections.append(
+            "**`datadog_metrics.parquet`** — Time-series telemetry at 15-minute intervals\n"
+            "across the simulation. Schema: `timestamp`, `metric_name`, `value`, `day`,\n"
+            "`alert_firing` (bool). Kept separate from the corpus because individual metric\n"
+            "ticks are not retrievable text documents. Datadog *alerts* are in the main corpus\n"
+            "as `doc_type: datadog_alert` and link back to incidents via `artifact_ids`."
+        )
+        sections.append("")
+        sections.append("---")
+        sections.append("")
+
+        # ── Schema ─────────────────────────────────────────────────────────────
+        sections.append("## Corpus Schema")
+        sections.append("")
+        sections.append(
+            "Stored in `corpus/corpus-00000.parquet`. One row per document."
+        )
+        sections.append("")
+        sections.append(schema_table)
+        sections.append("")
+        sections.append("---")
+        sections.append("")
+
+        # ── Usage ──────────────────────────────────────────────────────────────
+        sections.append("## Usage")
+        sections.append("")
+        sections.append("```python")
+        sections.append("from datasets import load_dataset")
+        sections.append("import json")
+        sections.append("")
+        sections.append('ds = load_dataset("aeriesec/orgforge")')
+        sections.append('corpus = ds["train"]')
+        sections.append("")
+        sections.append("# All incident-related documents")
+        sections.append('incidents = corpus.filter(lambda x: x["is_incident"])')
+        sections.append("")
+        sections.append("# All artifacts of a specific type")
+        sections.append('jira    = corpus.filter(lambda x: x["doc_type"] == "jira")')
+        sections.append(
+            'zoom    = corpus.filter(lambda x: x["doc_type"] == "zoom_transcript")'
+        )
+        sections.append(
+            'alerts  = corpus.filter(lambda x: x["doc_type"] == "datadog_alert")'
+        )
+        sections.append("")
+        sections.append("# All documents involving a specific actor")
+        sections.append("actor_docs = corpus.filter(")
+        sections.append('    lambda x: "Jordan" in json.loads(x["actors"])')
+        sections.append(")")
+        sections.append("")
+        sections.append("# All documents from a specific sim day")
+        sections.append('day_5 = corpus.filter(lambda x: x["day"] == 5)')
+        sections.append("")
+        sections.append(
+            "# Cross-reference: find the Confluence postmortem linked to a Jira ticket"
+        )
+        sections.append("def get_linked(corpus, doc_id, link_type):")
+        sections.append('    source = [r for r in corpus if r["doc_id"] == doc_id][0]')
+        sections.append(
+            '    linked_id = json.loads(source["artifact_ids"]).get(link_type, "")'
+        )
+        sections.append('    return [r for r in corpus if r["doc_id"] == linked_id]')
+        sections.append("```")
+        sections.append("")
+        sections.append(
+            "The `artifact_ids` column is a JSON dict linking each document to related\n"
+            "artifacts produced from the same SimEvent. An incident ticket will carry\n"
+            "references to the Slack thread, PR, Confluence postmortem, and Datadog alert\n"
+            "that share its causal ancestor, allowing full chain reconstruction without\n"
+            "text matching."
+        )
+        sections.append("")
+        sections.append("---")
+        sections.append("")
+
+        # ── Citation + license ─────────────────────────────────────────────────
+        sections.append("## Citation")
+        sections.append("")
+        sections.append("If you use the OrgForge methodology or simulator, cite the paper:")
+        sections.append("")
+        sections.append("```bibtex")
+        sections.append("@misc{flynt2026orgforge,")
+        sections.append("  title     = {OrgForge: A Multi-Agent Simulation Framework for Verifiable Synthetic Corporate Corpora},")
+        sections.append("  author    = {Jeffrey Flynt},")
+        sections.append("  year      = {2026},")
+        sections.append("  url       = {https://arxiv.org/abs/2603.14997},")
+        sections.append("  note      = {arXiv:2603.14997}")
+        sections.append("}")
+        sections.append("```")
+        sections.append("")
+        sections.append("If you use this dataset directly, cite the dataset:")
+        sections.append("")
+        sections.append("```bibtex")
+        sections.append("@misc{flynt2026orgforgedata,")
+        sections.append(f"  title     = {{OrgForge — {company} Enterprise Corpus}},")
+        sections.append("  author    = {Jeffrey Flynt},")
+        sections.append("  year      = {2026},")
+        sections.append("  url       = {https://huggingface.co/datasets/aeriesec/orgforge},")
+        sections.append("  note      = {Dataset generated by the OrgForge simulator}")
+        sections.append("}")
+        sections.append("```")
+        sections.append("")
+        sections.append("## License")
+        sections.append("")
+        sections.append(
+            "MIT. The simulation engine that produced this dataset is independently\n"
+            "licensed under MIT; see the [OrgForge repository](https://github.com/aeriesec/orgforge)\n"
+            "for details."
+        )
+
+        _body = "\n".join(sections)
+        return _fm + "\n" + _body
+
+    def _genesis_gap_table(self, gaps: List[dict]) -> str:
+        if not gaps:
+            return "> No genesis knowledge gaps configured for this simulation."
+
+        header = (
+            "| Former owner | Role | Departed | Days before sim | "
+            "Documented at departure | Domains |\n"
+            "|---|---|---|---|---|---|\n"
+        )
+        rows = []
+        for gap in gaps:
+            domains_str = ", ".join(f"`{d}`" for d in gap["domains"])
+            rows.append(
+                f"| {gap['name']} | {gap.get('role', '')} | {gap.get('left', '')} "
+                f"| {gap['days_before_sim']} | {int(gap['documented_pct'] * 100)}% "
+                f"| {domains_str} |"
+            )
+        return header + "\n".join(rows)
+
+    def _artifact_count_table(self, by_type: Dict[str, int], type: str) -> str:
+        header = f"| {type} | Count |\n|---|---|\n"
+        rows = [f"| `{doc_type}` | {count:,} |" for doc_type, count in by_type.items()]
+        return header + "\n".join(rows)
+
+    def _dept_count_table(self, dept_counts: Dict[str, int]) -> str:
+        if not dept_counts:
+            return "> Department breakdown unavailable."
+        header = "| Department | Documents |\n|---|---|\n"
+        rows = [
+            f"| {dept} | {count:,} |" for dept, count in dept_counts.items() if dept
+        ]
+        return header + "\n".join(rows)
+
+    def _corpus_schema_table(self, sim_event_counts: Dict[str, int] = None) -> str:
+        if sim_event_counts:
+            sim_event_types = " \\| ".join(f"`{t}`" for t in sim_event_counts)
+        else:
+            sim_event_types = "`sim_event` \\| *(see corpus for full list)*"
+
+        artifact_types = " \\| ".join(f"`{t}`" for t in sorted(_ARTIFACT_DOC_TYPES))
 
         return textwrap.dedent(f"""\
-        ---
-        language:
-        - en
-        license: mit
-        configs:
-        - config_name: default
-            data_files:
-            - split: train
-                path: "**/*.parquet"
-        task_categories:
-        - question-answering
-        - text-retrieval
-        task_ids:
-        - extractive-qa
-        - document-retrieval
-        tags:
-        - rag
-        - enterprise
-        - synthetic
-        - orgforge
-        - causal-reasoning
-        - temporal-reasoning
-        - epistemic-reasoning
-        - agentic-eval
-        pretty_name: "OrgForge Enterprise Agentic RAG Benchmark"
-        size_categories:
-        - 1K<n<10K
-        ---
-
-        # OrgForge Enterprise Agentic RAG Benchmark
-
-        > A synthetic but causally-grounded benchmark for evaluating agentic RAG
-        > systems against realistic enterprise knowledge bases — with explicit
-        > trajectory scoring for epistemic discipline, causal reasoning, and
-        > absence verification.
-
-        ## Dataset Summary
-
-        This dataset was produced by **OrgForge**, an event-driven organisation
-        simulator that generates weeks of realistic enterprise activity — JIRA
-        tickets, Confluence pages, Slack threads, zoom transcripts, emails, PRs, Zendesk tickets,
-        and Salesforce records — in a controlled, reproducible way.
-
-        All ground-truth answers are derived **deterministically** from the
-        simulation's event log via three purpose-built indexes:
-        - **Actor visibility cones** — what each actor could have known at each moment
-        - **Causal link index** — explicit cause→effect relationships encoded by the sim
-        - **Absence catalog** — expected-but-absent artifacts confirmed by the state machine
-
-        No LLM invented any answer. LLMs only wrote question prose.
-
-        | Property | Value |
-        |---|---|
-        | Company | {company} |
-        | Industry | {industry} |
-        | Simulation days | {num_days} |
-        | Sprints simulated | {num_sprints} |
-        | Org size (engineers + staff) | ~{org_size} |
-        | Total corpus documents | {len(corpus):,} |
-        | Total eval questions | {len(questions):,} |
-        | Causal links indexed | {len(causal_links):,} |
-        | Actors with visibility cones | {n_actors} |
-        | Visibility cone snapshots | {n_cone_snapshots:,} |
-        | Absence records | {len(absence_catalog):,} |
-
-        ## Corpus
-
-        Each document represents a real artifact produced by the simulation.
-        Stored in `corpus/corpus-00000.parquet`.
-
-        | Artifact type | Count |
-        |---|---|
-        {self._table_rows(by_type)}
-
-        ### Corpus Schema
-
         | Column | Type | Description |
         |---|---|---|
-        | `doc_id` | str | Unique artifact ID (e.g. `IT-042`, `CONF-ENG-007`) |
-        | `doc_type` | str | `jira`, `confluence`, `slack`, `email`, `pr`, `zd_ticket`, `sf_opp`, `sf_account`, `sim_event` |
-        | `title` | str | Human-readable title or subject |
-        | `body` | str | Full retrievable text |
-        | `day` | int | Simulation day (1-indexed) |
-        | `date` | str | ISO date |
-        | `timestamp` | str | ISO datetime (business-hours-accurate) |
-        | `actors` | str | JSON list of actor names |
-        | `tags` | str | JSON list of semantic tags |
-        | `artifact_ids` | str | JSON dict of cross-references |
-        | `dept` | str | Owning department |
-        | `is_incident` | bool | True if part of an incident thread |
-        | `is_external` | bool | True for inbound external content |
-
-        ## Eval Questions
-
-        Questions are in `questions/questions-00000.parquet`.
-
-        | Question type | Count |
-        |---|---|
-        {self._table_rows(by_qtype)}
-
-        | Difficulty | Count |
-        |---|---|
-        {self._table_rows(by_diff)}
-
-        ### Question Tracks
-
-        | Track | Description | Score weights (answer / trajectory) |
-        |---|---|---|
-        | `PERSPECTIVE` | Could actor X have known about event Y as of Day N, given their subsystem access? | 0.40 / 0.60 |
-        | `COUNTERFACTUAL` | If condition X had been different, would outcome Y have occurred? | 0.50 / 0.50 |
-        | `SILENCE` | Was artifact X actually created in response to trigger Y? (correct answer: no) | 0.30 / 0.70 |
-
-        #### PERSPECTIVE
-        Scored primarily on **epistemic discipline**: did the agent stay within the
-        actor's visibility cone and access only permitted subsystems? Trajectory
-        weight (0.60) exceeds answer weight (0.40) because using out-of-cone
-        artifacts to reach the correct answer is still a failure mode.
-
-        #### COUNTERFACTUAL
-        Requires identifying the **explicit causal link** encoded by the simulation
-        (`involves_gap`, `recurrence_of`, `spawned_doc`, `email_dropped`,
-        `sf_ownership_lapsed`, `zd_escalation_source`, `blocker_flagged`,
-        `incident_coordination`, `departure_reassignment`). No inference — the
-        link must be traceable to real artifacts.
-
-        #### SILENCE
-        Tests **absence-of-evidence reasoning**. Trajectory weight is highest
-        (0.70) because a correct "no" answer reached without searching
-        `expected_search_space` scores 0 on trajectory even if the boolean
-        is right. The agent must demonstrate it checked the right places.
-
-        > **Retrieval baselines** are reported for PERSPECTIVE and COUNTERFACTUAL
-        > only. SILENCE questions test absence — standard retrieval recall is not
-        > applicable because the correct answer is that the artifact does not exist.
-
-        ### Question Schema
-
-        | Column | Type | Description |
-        |---|---|---|
-        | `question_id` | str | Unique question identifier |
-        | `question_type` | str | `PERSPECTIVE`, `COUNTERFACTUAL`, or `SILENCE` |
-        | `question_text` | str | Natural-language question |
-        | `ground_truth` | str | JSON-serialised answer dict |
-        | `evidence_chain` | str | JSON list of artifact IDs (empty for SILENCE) |
-        | `difficulty` | str | `medium` or `hard` |
-        | `requires_reasoning` | bool | Always True — all tracks require multi-step reasoning |
-        | `actor` | str | PERSPECTIVE: actor whose knowledge horizon is tested |
-        | `actor_role` | str | PERSPECTIVE: actor's role slug |
-        | `as_of_day` | int | PERSPECTIVE: knowledge horizon day |
-        | `subsystem_access` | str | PERSPECTIVE: JSON list of accessible subsystems |
-        | `blocked_subsystems` | str | PERSPECTIVE: JSON list of blocked subsystems |
-        | `actor_visible_artifacts` | str | PERSPECTIVE: JSON list of all visible artifact IDs |
-        | `link_type` | str | COUNTERFACTUAL: causal link type |
-        | `causal_day` | int | COUNTERFACTUAL: day the causal link was established |
-        | `expected_search_space` | str | SILENCE: JSON list of artifact paths agent must check |
-        | `trigger_event_type` | str | SILENCE: event type that should have triggered the response |
-        | `expected_response_type` | str | SILENCE: artifact/event type that was never created |
-
-        ## Eval Indexes
-
-        Stored in `eval_indexes/`. These are the ground-truth indexes that back
-        question generation — useful for building custom eval harnesses.
-
-        ### causal_link_index.parquet
-
-        One row per explicit causal link found in the simulation.
-
-        | Column | Type | Description |
-        |---|---|---|
-        | `link_type` | str | One of the causal link types above |
-        | `cause_event_id` | str | Synthetic event ID of the cause |
-        | `cause_event_type` | str | Event type of the cause |
-        | `effect_event_id` | str | Synthetic event ID of the effect |
-        | `effect_event_type` | str | Event type of the effect |
-        | `actors` | str | JSON list of involved actor names |
-        | `day` | int | Simulation day the link was established |
-        | `counterfactual_premise` | str | Natural-language "if X had been different" |
-        | `counterfactual_outcome` | str | Natural-language "then Y would have..." |
-        | `outcome_changed` | bool | Always True — removing cause changes outcome |
-
-        | Link type | Count |
-        |---|---|
-        {self._table_rows(by_link)}
-
-        ### actor_visibility.parquet
-
-        One row per (actor, day) snapshot.
-
-        | Column | Type | Description |
-        |---|---|---|
-        | `actor` | str | Actor name |
-        | `role` | str | Role slug |
-        | `as_of_day` | int | Snapshot day |
-        | `subsystem_access` | str | JSON list of accessible subsystems |
-        | `all_visible_artifacts` | str | JSON list of all artifact IDs visible to this actor on this day |
-        | `visible_artifacts_by_subsystem` | str | JSON dict (subsystem → artifact IDs) |
-        | `directly_involved` | str | JSON list of artifacts where actor was in event.actors |
-        | `broadcast_visible` | str | JSON list of artifacts visible via broadcast channel |
-
-        ### absence_catalog.parquet
-
-        One row per expected-but-absent artifact pair.
-
-        | Column | Type | Description |
-        |---|---|---|
-        | `trigger_event_id` | str | Event that should have triggered a response |
-        | `trigger_event_type` | str | Type of trigger event |
-        | `expected_response_type` | str | Type of artifact that was never created |
-        | `trigger_day` | int | Day the trigger event fired |
-        | `expected_search_space` | str | JSON list of artifact paths agent must check |
-
-        ## Baselines and Reasoning Difficulty
-
-        OrgForge uses a **two-tier baseline** system, computed entirely from
-        corpus metadata — no agent execution required.
-
-        - **Tier 1 (Ungated Retrieval Ceiling):** What is the information ceiling
-          if all gates are removed? This is "god-mode" retrieval, and the gap
-          between it and a gated agent's score is the **Epistemic Tax**.
-        - **Tier 2 (Static Reasoning Difficulty):** Why is each track hard,
-          independent of any agent? These metrics characterise the epistemic
-          structure before any model runs.
-
-        Agent-level baselines (ungated god-mode agent, zero-shot no-tools)
-        require LLM calls and are available as flags in `agentic_eval_harness.py`:
-        `--ungated` and `--zero-shot`.
-
-        ---
-
-        ### Tier 1 — Ungated Retrieval Ceiling
-
-        BM25 and dense retrieval with **no gates**: no visibility cones, no
-        temporal horizons, no subsystem constraints ("god-mode" corpus access).
-
-        The **Epistemic Tax** for a track is:
-
-        ```
-        epistemic_tax = ceiling_mrr@10 − gated_agent_combined_score
-        ```
-
-        A high tax on `PERSPECTIVE` means the question set heavily penalises
-        using information the actor was never supposed to have.
-
-        #### BM25 (Okapi BM25 via rank-bm25)
-
-        {bm25_section}
-
-        #### Dense Retrieval (`{_DENSE_MODEL_NAME}`)
-
-        {dense_section}
-
-        ---
-
-        ### Tier 2 — Static Reasoning Difficulty Metrics
-
-        Computed from corpus metadata and question ground-truth alone — no agents,
-        no LLM calls required. These metrics characterise the epistemic structure
-        of each question before any agent touches it.
-
-        {reasoning_section}
-
-        ---
-
-        ### How to beat these baselines
-
-        | Track | To beat the ceiling... |
-        |---|---|
-        | `PERSPECTIVE` | Achieve a `violation_adjusted_combined_score` above the ceiling MRR@10 **while** keeping `avg_actor_gate_violations` near 0. High score + high violations = the agent is cheating. |
-        | `COUNTERFACTUAL` | Correctly identify the `causal_mechanism` for questions where `pct_requires_multi_hop = 1.0` — these cannot be answered by retrieval alone. |
-        | `SILENCE` | Cover `expected_search_space` exhaustively before concluding. `avg_search_space_bm25_coverage` shows how little a naive search covers — the agent must enumerate the rest deliberately. |
-
-        ---
-
-        ## Agentic Evaluation
-
-        Use `agentic_eval_harness.py` to run a gated agent against the full
-        question set. The harness enforces temporal and actor visibility gates
-        per question type, logs the complete tool-call trajectory, and scores
-        both answer quality and trajectory quality.
-
-        ```bash
-        # Standard gated evaluation
-        python agentic_eval_harness.py \\
-            --questions export/eval/eval_questions.json \\
-            --out export/eval/agentic_results.json \\
-            --model claude-sonnet-4-6 \\
-            --max-steps 15
-
-        # Ungated god-mode agent — establishes the Epistemic Tax denominator
-        python agentic_eval_harness.py \\
-            --ungated \\
-            --out export/eval/ungated_results.json
-
-        # Zero-shot — no tools, no corpus — establishes the hallucination floor
-        python agentic_eval_harness.py \\
-            --zero-shot \\
-            --out export/eval/zero_shot_results.json
-        ```
-
-        ## Leaderboard
-
-        Submissions are ranked by `violation_adjusted_combined_score` on the
-        **PERSPECTIVE** track. This is the primary axis because PERSPECTIVE is
-        the only track with a hard behavioral constraint (actor visibility cone)
-        that a capable-but-undisciplined agent can violate while still scoring
-        high on raw accuracy.
-
-        ### Ranking Formula
-
-        ```
-        violation_rate                = total_actor_gate_violations / total_tool_calls
-        compliance_factor             = max(0, 1 − violation_rate) ** 2
-        violation_adjusted_score      = combined_score × compliance_factor
-        ```
-
-        The quadratic exponent means violations compound non-linearly:
-
-        | Violation rate | Compliance factor | Effective score discount |
-        |---|---|---|
-        | 0% (fully compliant) | 1.00 | None |
-        | 10% | 0.81 | 19% |
-        | 25% | 0.56 | 44% |
-        | 50% | 0.25 | 75% |
-        | 75% | 0.06 | 94% |
-
-        ### Compliance Tiers
-
-        | Tier | Violation rate | Meaning |
-        |---|---|---|
-        | `compliant` | < 5% | Agent demonstrates genuine epistemic discipline |
-        | `borderline` | 5–20% | Agent occasionally accesses out-of-cone information |
-        | `non_compliant` | > 20% | Agent is effectively operating in god-mode on PERSPECTIVE |
-
-        > `combined_score` is still reported for reference but **must not** be
-        > used as the primary ranking key. A model scoring 0.90 combined with a
-        > 50% violation rate has a `violation_adjusted_combined_score` of 0.225
-        > and belongs in `non_compliant` — below a model scoring 0.70 combined
-        > with 0% violations (`violation_adjusted_combined_score` = 0.70, tier:
-        > `compliant`).
-
-        ## Citation
-
-        ```bibtex
-        @misc{{orgforge2026,
-          title  = {{OrgForge: A Multi-Agent Simulation Framework for Verifiable Synthetic Corporate Corpora}},
-          author = {{Jeffrey Flynt}},
-          year   = {{2026}},
-          note   = {{Synthetic benchmark generated by the OrgForge simulator v2}}
-        }}
-        ```
-
-        ## License
-
-        MIT. The simulation engine that produced this dataset is independently
-        licensed; see the OrgForge repository for details.
-        """)
-
-    def _table_rows(self, d: Dict[str, int]) -> str:
-        return "\n        ".join(
-            f"| `{k}` | {v:,} |" for k, v in sorted(d.items(), key=lambda x: -x[1])
-        )
-
-    def _ungated_ceiling_table(self, summary: dict) -> str:
-        """Renders the Tier 1 ungated retrieval ceiling table."""
-        if "error" in summary:
-            return f"> ⚠️ Ceiling unavailable: {summary['error']}"
-        if not summary:
-            return "> Ceiling not run."
-
-        model = summary.get("model", "?")
-        overall = summary.get("overall", {})
-        by_type = summary.get("by_type", {})
-
-        lines = [
-            f"Model: `{model}`",
-            "",
-            "| Question type | MRR@10 | Recall@10 | N |",
-            "|---|---|---|---|",
-            (
-                f"| **Overall** | **{overall.get('mrr_at_10', '?')}** "
-                f"| **{overall.get('recall_at_10', '?')}** "
-                f"| **{overall.get('n', '?')}** |"
-            ),
-        ]
-        for qtype, metrics in sorted(by_type.items()):
-            lines.append(
-                f"| {qtype} | {metrics.get('mrr_at_10', '?')} "
-                f"| {metrics.get('recall_at_10', '?')} "
-                f"| {metrics.get('n', '?')} |"
-            )
-        lines += [
-            "",
-            "> SILENCE questions excluded — absence cannot be measured by retrieval recall.",
-            "> **Epistemic Tax** = this ceiling MRR@10 − your gated agent's `violation_adjusted_combined_score`.",
-        ]
-        return "\n        ".join(lines)
-
-    def _reasoning_metrics_table(self, static_metrics: dict) -> str:
-        """Renders the Tier 2 static reasoning difficulty table."""
-        if not static_metrics:
-            return "> Static reasoning metrics not computed."
-
-        lines = [
-            "| Track | Metric | Value | Interpretation |",
-            "|---|---|---|---|",
-        ]
-
-        if p := static_metrics.get("PERSPECTIVE"):
-            lines += [
-                (
-                    f"| `PERSPECTIVE` | `avg_horizon_contamination_rate` "
-                    f"| {p.get('avg_horizon_contamination_rate', '?')} "
-                    f"| Fraction of ungated top-20 outside actor's visibility cone |"
-                ),
-                (
-                    f"| `PERSPECTIVE` | `avg_first_in_cone_rank` "
-                    f"| {p.get('avg_first_in_cone_rank', '?')} "
-                    f"| Mean rank of first permitted doc — lower is easier |"
-                ),
-            ]
-
-        if cf := static_metrics.get("COUNTERFACTUAL"):
-            lines += [
-                (
-                    f"| `COUNTERFACTUAL` | `pct_causal_chain_traceable_top10` "
-                    f"| {cf.get('pct_causal_chain_traceable_top10', '?')} "
-                    f"| Fraction where cause+effect co-appear in ungated top-10 |"
-                ),
-                (
-                    f"| `COUNTERFACTUAL` | `pct_requires_multi_hop` "
-                    f"| {cf.get('pct_requires_multi_hop', '?')} "
-                    f"| Fraction unreachable by a single retrieval pass |"
-                ),
-            ]
-
-        if s := static_metrics.get("SILENCE"):
-            lines += [
-                (
-                    f"| `SILENCE` | `avg_search_space_bm25_coverage` "
-                    f"| {s.get('avg_search_space_bm25_coverage', '?')} "
-                    f"| Fraction of required absence-check locations BM25 surfaces |"
-                ),
-                (
-                    f"| `SILENCE` | `pct_fully_covered` "
-                    f"| {s.get('pct_fully_covered', '?')} "
-                    f"| Questions where BM25 covers the entire search space |"
-                ),
-            ]
-
-        lines += [
-            "",
-            "> **Reading these metrics:** High contamination + low traceability + low coverage",
-            "> means the question set demands genuine reasoning over retrieval luck. A gated",
-            "> agent that outperforms the ungated ceiling on `PERSPECTIVE` questions is actively",
-            "> exercising epistemic discipline — it is refusing correct-but-forbidden information.",
-        ]
-        return "\n        ".join(lines)
+        | `doc_id` | str | Unique artifact ID (e.g. `IT-042`, `CONF-ENG-007`, `PR-031`) |
+        | `doc_type` | str | Artifact: {artifact_types} — SimEvent: {sim_event_types} |
+        | `category` | str | `artifact` \\| `sim_event` \\| `sim_config` |
+        | `title` | str | Human-readable title or subject line |
+        | `body` | str | Full text content |
+        | `day` | int | Simulation day this artifact was created (1-indexed) |
+        | `date` | str | ISO date string |
+        | `timestamp` | str | ISO datetime, business-hours-accurate to the millisecond |
+        | `actors` | str | JSON list of actor names involved |
+        | `tags` | str | JSON list of semantic tags from the SimEvent |
+        | `artifact_ids` | str | JSON dict of cross-references to related artifacts by type |
+        | `dept` | str | Owning department; empty if cross-department |
+        | `is_incident` | bool | True if this artifact is part of a P1/P2 incident thread |
+        | `is_external` | bool | True for artifacts originating outside the org (emails, Zendesk, NPS, invoices) |
+        | `facts` | str | JSON dict of raw SimEvent facts; populated for SimEvent rows, empty string for artifact rows |""")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2381,7 +2117,7 @@ class DatasetCardWriter:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _write_parquet(rows: List[dict], out_dir: Path, stem: str = "part-00000") -> None:
+def _write_parquet(rows: List[dict], out_dir: Path, stem: str = "corpus-00000") -> None:
     if not _PARQUET_AVAILABLE:
         out_path = out_dir / f"{stem}.json"
         with open(out_path, "w") as f:
@@ -2411,164 +2147,135 @@ def _write_parquet(rows: List[dict], out_dir: Path, stem: str = "part-00000") ->
 
 class HFExporter:
     """
-    Orchestrates the full v2 export pipeline:
+    Orchestrates the corpus export pipeline:
       1. Build corpus from SimEvent log + MongoDB
-      2. Load v2 eval data (eval_questions.json + the three eval indexes)
-      3. Compute two-tier baselines (ungated retrieval ceiling + static reasoning metrics)
-      4. Write Parquet files for corpus, questions, and eval indexes
-      5. Write dataset card (README.md)
+      2. Write corpus Parquet
+      3. Write dataset card (README.md)
     """
 
-    def run(self) -> None:
-        logger.info("[bold cyan]📦 HuggingFace dataset export v2 starting…[/bold cyan]")
+    def _write_hero_image(self, out_dir: Path) -> None:
+        src = Path(__file__).resolve().parent / "orgforge_dataset_hero.png"
+        if src.exists():
+            shutil.copy2(src, HF_DIR / "orgforge_dataset_hero.png")
+            logger.info("  → orgforge_dataset_hero.png")
+        else:
+            logger.warning(
+                "  orgforge_dataset_hero.png not found next to script — skipping"
+            )
 
-        # 1. Memory (optional — degrade gracefully)
+    def _write_supplemental(self, mem, out_dir: Path) -> None:
+        supp_dir = out_dir / "supplemental"
+        supp_dir.mkdir(parents=True, exist_ok=True)
+
+        snap_src = BASE / "simulation_snapshot.json"
+        if snap_src.exists():
+            shutil.copy2(snap_src, supp_dir / "simulation_snapshot.json")
+            logger.info(f"  → supplemental/simulation_snapshot.json")
+        else:
+            logger.warning("  simulation_snapshot.json not found — skipping")
+
+        if mem is not None:
+            try:
+                registry = list(mem._db["domain_registry"].find({}, {"embedding": 0}))
+                if registry:
+                    (supp_dir / "domain_registry.json").write_text(
+                        json.dumps(registry, indent=2, default=str)
+                    )
+                    logger.info(
+                        f"  → supplemental/domain_registry.json ({len(registry)} domains)"
+                    )
+            except Exception as exc:
+                logger.warning(f"  domain_registry export failed: {exc}")
+
+        dd_metrics = BASE / "datadog" / "metrics.jsonl"
+        if dd_metrics.exists() and _PARQUET_AVAILABLE:
+            rows = [
+                json.loads(l) for l in dd_metrics.read_text().splitlines() if l.strip()
+            ]
+            if rows:
+                _write_parquet(rows, supp_dir, stem="datadog_metrics")
+                logger.info(
+                    f"  → supplemental/datadog_metrics.parquet ({len(rows):,} rows)"
+                )
+        elif dd_metrics.exists():
+            shutil.copy2(dd_metrics, supp_dir / "datadog_metrics.jsonl")
+            logger.info(f"  → supplemental/datadog_metrics.jsonl (parquet unavailable)")
+
+        try:
+            scores = list(
+                mem._db["assignment_scores"].find({}, {"_id": 0, "embedding": 0})
+            )
+            if scores and _PARQUET_AVAILABLE:
+                _write_parquet(scores, supp_dir, stem="assignment_scores")
+                logger.info(
+                    f"  → supplemental/assignment_scores.parquet ({len(scores):,} rows)"
+                )
+        except Exception as exc:
+            logger.warning(f"  assignment_scores export failed: {exc}")
+
+        try:
+            sim_config_docs = list(mem._db["sim_config"].find({}, {"_id": 1}))
+            if sim_config_docs:
+                sim_config_out = {}
+                for doc in mem._db["sim_config"].find({}):
+                    key = str(doc.pop("_id"))
+                    sim_config_out[key] = doc
+                (supp_dir / "sim_config.json").write_text(
+                    json.dumps(sim_config_out, indent=2, default=str)
+                )
+                logger.info(f"  → supplemental/sim_config.json")
+        except Exception as exc:
+            logger.warning(f"  sim_config export failed: {exc}")
+
+    def run(self) -> None:
+        logger.info("📦 OrgForge HuggingFace export starting…")
+
         mem = None
         try:
             from memory import Memory
 
             mem = Memory()
-            logger.info("  Connected to MongoDB Memory.")
+            logger.info("  Connected to MongoDB.")
         except Exception as exc:
             logger.warning(
-                f"  Memory unavailable ({exc}). Corpus will derive from eval JSON only."
+                f"  Memory unavailable ({exc}). Corpus will derive from SimEvent log only."
             )
 
-        # 2. Corpus
-        corpus_builder = CorpusBuilder(mem)
+        insider_threat_enabled = _CFG.get("insider_threat", {}).get("enabled", False)
+        corpus_builder = CorpusBuilder(
+            mem, insider_threat_enabled=insider_threat_enabled
+        )
         corpus = corpus_builder.build()
         if not corpus:
             logger.warning("  Empty corpus — check that flow.py has run first.")
+            return
 
-        # 3. Load v2 eval data
-        questions_path = EVAL_DIR / "eval_questions.json"
-        causal_links_path = EVAL_DIR / "causal_link_index.json"
-        actor_vis_path = EVAL_DIR / "actor_visibility.json"
-        absence_path = EVAL_DIR / "absence_catalog.json"
+        counts = corpus_builder.artifact_counts(corpus)
+        logger.info("  Artifact counts:")
+        for doc_type, count in counts.items():
+            logger.info(f"    {doc_type:30s} {count:,}")
 
-        q_data = (
-            json.loads(questions_path.read_text()) if questions_path.exists() else {}
-        )
-        raw_questions = (
-            q_data.get("questions", []) if isinstance(q_data, dict) else q_data
-        )
-        # Filter to the three v2 tracks only (guard against mixed-version files)
-        questions = [
-            q
-            for q in raw_questions
-            if q.get("question_type") in ("PERSPECTIVE", "COUNTERFACTUAL", "SILENCE")
-        ]
-
-        causal_links = (
-            json.loads(causal_links_path.read_text())
-            if causal_links_path.exists()
-            else []
-        )
-        actor_visibility = (
-            json.loads(actor_vis_path.read_text()) if actor_vis_path.exists() else {}
-        )
-        absence_catalog = (
-            json.loads(absence_path.read_text()) if absence_path.exists() else []
-        )
-
-        logger.info(
-            f"  {len(questions)} eval questions loaded "
-            f"({sum(1 for q in questions if q.get('question_type') == 'PERSPECTIVE')} PERSPECTIVE, "
-            f"{sum(1 for q in questions if q.get('question_type') == 'COUNTERFACTUAL')} COUNTERFACTUAL, "
-            f"{sum(1 for q in questions if q.get('question_type') == 'SILENCE')} SILENCE)"
-        )
-        logger.info(
-            f"  {len(causal_links)} causal links, "
-            f"{len(actor_visibility)} actors, "
-            f"{len(absence_catalog)} absence records loaded"
-        )
-
-        # 4. Two-tier baselines
-        # ──────────────────────────────────────────────────────────────────────
-        # Tier 1: ungated retrieval ceiling — BM25 and dense with no gates.
-        # Tier 2: static reasoning difficulty — computed from metadata alone,
-        #         reuses the already-built BM25 index to avoid double work.
-        ceiling_runner = UngatedCeilingBaseline(corpus, questions, mem=mem)
-        bm25_per_q, bm25_agg = ceiling_runner.run_bm25()
-        dense_per_q, dense_agg = ceiling_runner.run_dense()
-
-        static_metrics = StaticReasoningMetrics(
-            questions=questions,
-            bm25=ceiling_runner._bm25,       # reuse the already-built index
-            doc_ids=ceiling_runner._doc_ids,
-        )
-        reasoning_output = static_metrics.compute()
-
-        baseline_summary = {
-            "ungated_ceiling": {"bm25": bm25_agg, "dense": dense_agg},
-            "static_reasoning_metrics": reasoning_output["aggregate"],
-        }
-
-        (BASELINE_DIR / "ungated_ceiling_bm25.json").write_text(
-            json.dumps(bm25_per_q, indent=2, default=str)
-        )
-        (BASELINE_DIR / "ungated_ceiling_dense.json").write_text(
-            json.dumps(dense_per_q, indent=2, default=str)
-        )
-        (BASELINE_DIR / "static_reasoning_metrics.json").write_text(
-            json.dumps(reasoning_output, indent=2, default=str)
-        )
-        (BASELINE_DIR / "baseline_summary.json").write_text(
-            json.dumps(baseline_summary, indent=2, default=str)
-        )
-        logger.info(f"  → baselines written to {BASELINE_DIR}")
-
-        # 5. Parquet — corpus + questions + eval indexes
         _write_parquet(corpus, CORPUS_DIR, "corpus-00000")
-        _write_parquet(_questions_to_rows(questions), QUES_DIR, "questions-00000")
-        _write_parquet(
-            _causal_links_to_rows(causal_links),
-            EVAL_INDEX_DIR,
-            "causal_link_index",
-        )
-        _write_parquet(
-            _actor_visibility_to_rows(actor_visibility),
-            EVAL_INDEX_DIR,
-            "actor_visibility",
-        )
-        _write_parquet(
-            _absence_catalog_to_rows(absence_catalog),
-            EVAL_INDEX_DIR,
-            "absence_catalog",
-        )
 
-        # 6. Dataset card
+        self._write_supplemental(mem, HF_DIR)
+
+        self._write_hero_image(HF_DIR)
+
         DatasetCardWriter().write(
             out_path=HF_DIR / "README.md",
             corpus=corpus,
-            questions=questions,
-            causal_links=causal_links,
-            actor_visibility=actor_visibility,
-            absence_catalog=absence_catalog,
-            baseline_summary=baseline_summary,
             cfg=_CFG,
+            mem=mem,
         )
 
-        bm25_overall = bm25_agg.get("overall", {})
-        dense_overall = dense_agg.get("overall", {})
-        srm = reasoning_output["aggregate"]
         logger.info(
-            f"[green]✓ Export v2 complete.[/green] "
-            f"Output: {HF_DIR}  |  "
-            f"Ceiling BM25 MRR@10: {bm25_overall.get('mrr_at_10', 'n/a')}  |  "
-            f"Ceiling Dense MRR@10: {dense_overall.get('mrr_at_10', 'n/a')}  |  "
-            f"PERSPECTIVE contamination: "
-            f"{srm.get('PERSPECTIVE', {}).get('avg_horizon_contamination_rate', 'n/a')}  |  "
-            f"COUNTERFACTUAL multi-hop: "
-            f"{srm.get('COUNTERFACTUAL', {}).get('pct_requires_multi_hop', 'n/a')}  |  "
-            f"SILENCE BM25 coverage: "
-            f"{srm.get('SILENCE', {}).get('avg_search_space_bm25_coverage', 'n/a')}"
+            f"✓ Export complete. Output: {HF_DIR}  |  "
+            f"Total documents: {len(corpus):,}  |  "
+            f"Types: {len(counts)}"
         )
 
 
 if __name__ == "__main__":
-    import logging
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",

@@ -49,118 +49,172 @@ def initialize(config, planner_llm, reset=False):
     return mem
 
 
+# genesis.py — replace seed_external_sources entirely
+
+
 def seed_external_sources(mem: Memory, planner_llm):
-    """Generates the 15 external vendors/customers and saves to MongoDB."""
     if mem.get_inbound_email_sources():
         return
 
     logger.info("[cyan]🌐 Generating inbound email sources...[/cyan]")
-
     tech_stack = mem.tech_stack_for_prompt()
-    dept_str = ", ".join(LEADS.keys())
 
+    vendors = _generate_vendor_sources(mem, planner_llm, tech_stack)
+    customers = _generate_customer_sources(mem, planner_llm, tech_stack)
+
+    sources = vendors + customers
+    if len(sources) < 10:
+        raise SystemExit("[genesis] ❌ Too few sources generated. Aborting.")
+
+    mem.save_inbound_email_sources(sources)
+    logger.info(
+        f"[genesis] ✅ Seeded {len(sources)} sources ({len(vendors)}V + {len(customers)}C)."
+    )
+    for s in sources:
+        logger.info(
+            f"    [dim]→ [{s['category']}] {s['name']} "
+            f"({s['internal_liaison']}) triggers={s['trigger_on']}[/dim]"
+        )
+
+
+def _generate_vendor_sources(mem: Memory, planner_llm, tech_stack: str) -> List[dict]:
+    dept_str = ", ".join(LEADS.keys())
     all_names = [name for members in ORG_CHART.values() for name in members]
 
     agent = make_agent(
         role="Enterprise IT Architect",
-        goal=f"Design the realistic external email ecosystem for {COMPANY_NAME} which {COMPANY_DESCRIPTION}.",
+        goal=f"Design the vendor email ecosystem for {COMPANY_NAME}.",
         backstory=(
-            f"You are an experienced enterprise architect who understands "
-            f"communication patterns between a {INDUSTRY} company and its "
-            f"vendors, customers, and partners."
+            f"You map communication patterns between a {INDUSTRY} company "
+            f"and its technology vendors."
         ),
         llm=planner_llm,
     )
-
     task = Task(
         description=(
-            f"Generate 15 realistic inbound email sources. EXACTLY 8 must be 'customer' category, and 7 must be 'vendor' category.\n"
-            f"TECH STACK: {tech_stack}\n"
-            f"DEPARTMENTS: {dept_str}\n"
-            f"DEPARTMENTAL LIAISON LOGIC (Assign Liaisons Based on These Rules):\n"
-            f"  - Engineering_Backend: Responsible for Infrastructure (AWS), Databases (TitanDB), Source Control (GitHub), and Monitoring.\n"
-            f"  - Engineering_Mobile: Responsible for React Native and mobile platform issues.\n"
-            f"  - Product: Responsible for project management (Jira) and feature roadmaps.\n"
-            f"  - Sales_Marketing: Responsible for payment/data vendors (e.g., Stripe) and Customer communication.\n"
-            f"  - QA_Support: Responsible for CI/CD (Jenkins) and testing tool alerts.\n"
-            f"  - HR_Ops: Responsible for legal, compliance, and payroll vendors.\n\n"
-            f"Rules:\n"
-            f"  - HUMAN NAMES: The 'first_name' and 'last_name' field MUST be a realistic human name representing the Point of Contact (e.g., 'Marcus Thorne').\n"
-            f"  - NO DUPLICATE NAMES: Ensure no new generated names overlap with these: {all_names}.\n"
-            f"  - PERSONA DICT: Include a nested 'persona' object with 'typing_quirks' (string), 'social_role' (string, matching contact_role), and 'expertise' (array of strings).\n"
-            f"  - ADHERENCE: Use ONLY vendors that appear in the TECH STACK above. If Jira is listed, never use Trello.\n"
-            f"  - FIRMOGRAPHICS (Customers ONLY): Include 'industry' (e.g. Financial Services), 'tier' (Enterprise, Mid-Market, SMB), 'billing_region' (NA, EMEA, APAC), 'billing_city', 'billing_state' (2-letter code if US), 'billing_country', and 'arr' (e.g. 50000, 120000, 350000).\n"
-            f"  - STRATEGIC (Customers ONLY): Include 'is_lighthouse' (bool), 'expansion_potential' (int 1-10), and 'contract_renewal_date' (ISO Date string).\n"
-            f"  - TECHNICAL (Vendors ONLY): Include 'integration_complexity' (Low, Med, High) and 'version_in_use' (e.g., 'v2 Beta', 'Legacy').\n"
-            f"  - HEALTH SENSITIVITY: Include 'trigger_health_threshold' (int 0-100). Scale: Infrastructure/Enterprise (85-98), SMB/Standard Vendors (70-85).\n"
-            f"  - PERSONA: Include 'contact_role' (e.g. VP Engineering, Procurement) and 'persona_archetype' (e.g. The Champion, The Skeptic, The Bureaucrat).\n"
-            f"  - DYNAMICS: Include 'expected_sla_hours' (int: 2, 4, 24, 48), 'cadence' (daily, weekly, bi-weekly, reactive), and 'timezone_offset' (int: -8 to +8).\n"
-            f"  - RELATIONSHIP: Include 'sentiment_baseline' (float 0.0 to 1.0) and 'history_summary' (1 short sentence mapping the history).\n"
-            f"  - TOPICS: Provide 3-5 hyper-specific topics (e.g., 'GitHub Actions Runner Timeout' or 'Stripe API 402 Payment Required').\n"
-            f"  - CATEGORY: exactly 'vendor' or 'customer'.\n"
-            f"  - TRIGGER_ON: array of 'always', 'incident', 'low_health'.\n"
-            f"  - TONE: formal | technical | frustrated | urgent | friendly.\n\n"
-            f"Raw JSON array only — no preamble, no markdown fences:\n"
-            f"[\n"
-            f'  {{"name":"GitHub","org":"GitHub Inc.","first_name":"Jake","last_name": "Smith","org":"GitHub Inc.","email":"j.smith@github.com",'
-            f'"category":"vendor","internal_liaison":"Engineering_Backend",'
-            f'"contact_role":"Senior Technical Account Manager","persona_archetype":"The Technical Expert",'
-            f'"trigger_on":["incident", "low_health"],"trigger_health_threshold":95,'
-            f'"expected_sla_hours":4,"cadence":"reactive","timezone_offset":-8,'
-            f'"integration_complexity":"High","version_in_use":"Enterprise Cloud",'
-            f'"sentiment_baseline":0.8,"history_summary":"Solid uptime, but API rate limits frequently cause friction.",'
-            f'"tone":"technical","topics":["Webhooks failing with 5xx","Pull Request comment API latency"]}},\n'
-            f'  {{"name":"GlobalFinance","org":"GlobalFinance Corp","email":"cto@globalfinance.com",'
-            f'"category":"customer","internal_liaison":"Sales_Marketing",'
-            f'"contact_role":"CTO","persona_archetype":"The Skeptic",'
-            f'"persona": {{"typing_quirks": "terse, lowercase heavy, fast responses", "social_role": "CTO", "expertise": ["enterprise architecture", "security compliance"]}},'
-            f'"trigger_on":["always","incident"],"trigger_health_threshold":90,'
-            f'"expected_sla_hours":2,"cadence":"weekly","timezone_offset":-5,'
-            f'"is_lighthouse":true,"expansion_potential":8,"contract_renewal_date":"2026-12-01T00:00:00Z",'
-            f'"sentiment_baseline":0.4,"history_summary":"Demanding enterprise client, currently evaluating competitors for next year.",'
-            f'"tone":"formal","topics":["SLA reporting","Contract renewal"],"industry":"Financial Services",'
-            f'"tier":"Enterprise","billing_region":"NA","billing_city":"New York","billing_state":"NY","billing_country":"USA","arr":250000}}\n'
-            f"]"
+            f"Generate exactly 7 vendor email sources for {COMPANY_NAME}, "
+            f"a {INDUSTRY} company that {COMPANY_DESCRIPTION}.\n\n"
+            f"TECH STACK (use ONLY vendors that appear here):\n{tech_stack}\n\n"
+            f"DEPARTMENTS: {dept_str}\n\n"
+            f"LIAISON RULES — assign internal_liaison based on what the vendor provides:\n"
+            f"  - Infrastructure, cloud, hosting, databases, source control, monitoring → Engineering_Backend\n"
+            f"  - Mobile platform tools, SDKs → Engineering_Mobile\n"
+            f"  - Project management tools (Jira, etc.) → Product\n"
+            f"  - CI/CD, testing tools → QA_Support\n"
+            f"  - Payment processing, billing → Sales_Marketing\n"
+            f"  - Legal, compliance, payroll → HR_Ops\n\n"
+            f"NO DUPLICATE NAMES with: {all_names}\n\n"
+            f"Each vendor must include:\n"
+            f"  - name, org, first_name, last_name, email\n"
+            f'  - category: exactly "vendor"\n'
+            f"  - internal_liaison: one of [{dept_str}] per rules above\n"
+            f"  - contact_role, persona_archetype\n"
+            f"  - persona: {{typing_quirks, social_role, expertise[]}}\n"
+            f"  - trigger_on: array of 'always', 'incident', 'low_health'\n"
+            f"  - trigger_health_threshold: int 85-98 for infra, 70-85 for standard\n"
+            f"  - tone: formal | technical | urgent\n"
+            f"  - topics: 3-5 specific to what this vendor provides\n"
+            f"  - integration_complexity: Low | Med | High\n"
+            f"  - version_in_use: e.g. 'Enterprise Cloud', 'v2 Beta'\n"
+            f"  - expected_sla_hours, cadence, timezone_offset\n"
+            f"  - sentiment_baseline: float 0.0-1.0\n"
+            f"  - history_summary: 1 short sentence\n\n"
+            f"Raw JSON array only — no preamble, no markdown fences."
         ),
-        expected_output=f"Raw JSON array of {_DEFAULT_SOURCE_COUNT} source objects.",
+        expected_output="Raw JSON array of 7 vendor objects.",
         agent=agent,
     )
 
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            logger.info(
-                f"[genesis] Generating external sources (Attempt {attempt}/{_MAX_RETRIES})..."
-            )
-            result = str(Crew(agents=[agent], tasks=[task]).kickoff()).strip()
-
-            sources = _parse_sources(result)
-
-            if isinstance(sources, list) and len(sources) >= 10:
-                mem.save_inbound_email_sources(sources)
-
-                logger.info(f"[genesis] ✅ Successfully seeded {len(sources)} sources.")
-                for s in sources:
-                    logger.info(
-                        f"    [dim]→ [{s['category']}] {s['name']} "
-                        f"({s['internal_liaison']}) triggers={s['trigger_on']}[/dim]"
-                    )
-                return
-
-            raise ValueError("Incomplete or malformed list returned.")
-
+            raw = str(Crew(agents=[agent], tasks=[task]).kickoff()).strip()
+            sources = _parse_sources(raw)
+            vendors = [s for s in sources if s.get("category") == "vendor"]
+            if len(vendors) >= 5:
+                return vendors
+            raise ValueError(f"Only {len(vendors)} vendors parsed")
         except Exception as e:
-            logger.warning(f"[genesis] ⚠ Attempt {attempt} failed: {e}")
+            logger.warning(f"[genesis] Vendor attempt {attempt} failed: {e}")
             if attempt == _MAX_RETRIES:
-                logger.error(
-                    "[genesis] ❌ All retries failed. Simulation cannot start without ground truth."
-                )
-                raise SystemExit(1)
+                raise SystemExit("[genesis] ❌ Vendor generation failed.")
+    return []
 
-    pass
+
+def _generate_customer_sources(mem: Memory, planner_llm, tech_stack: str) -> List[dict]:
+    all_names = [name for members in ORG_CHART.values() for name in members]
+
+    agent = make_agent(
+        role="VP of Customer Success",
+        goal=f"Design the customer ecosystem for {COMPANY_NAME}.",
+        backstory=(
+            f"You understand how {INDUSTRY} customers use "
+            f"{COMPANY_NAME}'s platform and what they depend on."
+        ),
+        llm=planner_llm,
+    )
+    task = Task(
+        description=(
+            f"Generate exactly 8 customer email sources for {COMPANY_NAME}, "
+            f"a {INDUSTRY} company that {COMPANY_DESCRIPTION}.\n\n"
+            f"TECH STACK (for depends_on_components only — customers never see this):\n{tech_stack}\n\n"
+            f"INTERNAL_LIAISON: For ALL customers, set to 'Sales_Marketing'. No exceptions.\n\n"
+            f"NO DUPLICATE NAMES with: {all_names}\n\n"
+            f"Each customer must include:\n"
+            f"  - name (a realistic human name), org, first_name, last_name, email\n"
+            f'  - category: exactly "customer"\n'
+            f'  - internal_liaison: "Sales_Marketing"\n'
+            f"  - contact_role, persona_archetype (The Champion, The Skeptic, The Bureaucrat, etc.)\n"
+            f"  - persona: {{typing_quirks, social_role, expertise[]}}\n"
+            f"  - trigger_on: array of 'always', 'incident', 'low_health'\n"
+            f"  - trigger_health_threshold: int (Enterprise=88-98, Mid-Market=80-90, SMB=70-85)\n"
+            f"  - tone: formal | friendly | frustrated | urgent\n"
+            f"  - topics: 3-5 hyper-specific to what THIS customer uses the platform for — "
+            f"written from their perspective, no internal tech names\n"
+            f"  - industry, tier (Enterprise|Mid-Market|SMB), billing_region (NA|EMEA|APAC), "
+            f"billing_city, billing_state, billing_country, arr\n"
+            f"  - is_lighthouse (bool), expansion_potential (1-10), contract_renewal_date (ISO)\n"
+            f"  - expected_sla_hours, cadence, timezone_offset\n"
+            f"  - sentiment_baseline: float 0.0-1.0\n"
+            f"  - history_summary: 1 short sentence\n\n"
+            f"  - DEPENDS_ON_COMPONENTS: Array of 2-4 exact technology/component names "
+            f"extracted from the TECH STACK above that power what this customer uses. "
+            f"Use the specific product names as they appear in the stack "
+            f"(e.g., 'Kafka', 'PostgreSQL', 'TitanDB', 'React Native', 'Redis'). "
+            f"NOT category keys like 'database' or 'infra'. "
+            f"A cycling team relying on live data might depend on ['Kafka', 'TitanDB', 'React Native']. "
+            f"A clinic using historical reports might depend on ['PostgreSQL', 'S3']. "
+            f"These MUST match real names from the tech stack.\n\n"
+            f"  - AFFECTED_BY: Array of 2-4 capability strings describing end-user outcomes "
+            f"this customer depends on. NOT internal tech names. "
+            f"e.g., ['real-time athlete metrics', 'GPS tracking sync', 'historical performance reports']\n\n"
+            f"  - SYMPTOM_LANGUAGE: 1-2 sentences in the customer's own voice describing "
+            f"how an outage would affect THEM. Reflects their industry, persona_archetype, and tone. "
+            f"NEVER mention internal system names.\n\n"
+            f"Ensure diversity: mix tiers, regions, industries, and sentiment levels. "
+            f"At least 2 should have sentiment_baseline < 0.6.\n\n"
+            f"Raw JSON array only — no preamble, no markdown fences."
+        ),
+        expected_output="Raw JSON array of 8 customer objects.",
+        agent=agent,
+    )
+
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            raw = str(Crew(agents=[agent], tasks=[task]).kickoff()).strip()
+            sources = _parse_sources(raw)
+            customers = [s for s in sources if s.get("category") == "customer"]
+            if len(customers) >= 6:
+                return customers
+            raise ValueError(f"Only {len(customers)} customers parsed")
+        except Exception as e:
+            logger.warning(f"[genesis] Customer attempt {attempt} failed: {e}")
+            if attempt == _MAX_RETRIES:
+                raise SystemExit("[genesis] ❌ Customer generation failed.")
+    return []
 
 
 def seed_tech_stack(mem: Memory, planner_llm):
-    """Generates the tech stack ground truth and saves to Confluence."""
+    """Generates the tech stack ground truth."""
     if mem._artifacts.find_one({"type": "tech_stack"}):
         return
 
@@ -209,6 +263,12 @@ def seed_tech_stack(mem: Memory, planner_llm):
 
     mem.save_tech_stack(stack)
     logger.info(f"[confluence] ✓ Tech stack established: {list(stack.keys())}")
+
+    mem._db["artifacts"].create_index(
+        [("title", "text"), ("content", "text")],
+        name="artifacts_text_search",
+        weights={"title": 3, "content": 1},
+    )
 
     pass
 
@@ -296,6 +356,9 @@ def seed_crm_accounts(mem: Memory):
         sentiment = contact.get("sentiment_baseline", 0.8)
         is_risky = True if sentiment < 0.5 else False
 
+        liaison_dept = contact.get("internal_liaison", "Unassigned")
+        liaison_person = LEADS.get(liaison_dept, liaison_dept)
+
         account = {
             "account_id": account_id,
             "name": org_name,
@@ -303,7 +366,7 @@ def seed_crm_accounts(mem: Memory):
             "primary_contact_name": f"{contact.get('first_name', 'First Name')} {contact.get('last_name', 'Last Name')}",
             "primary_contact_email": contact.get("email", ""),
             "contact_role": contact.get("contact_role", "Unknown"),
-            "owner": contact.get("internal_liaison", "Unassigned"),
+            "owner": liaison_person,
             "industry": contact.get("industry", "Technology"),
             "tier": tier if tier != "Unknown" else None,
             "employee_count": random.randint(*emp_range),
@@ -539,7 +602,15 @@ def _parse_sources(raw: str) -> List[dict]:
             "trigger_on",
             "topics",
         }
-        return [s for s in parsed if required.issubset(s.keys())]
+        valid = []
+        for s in parsed:
+            if not required.issubset(s.keys()):
+                continue
+            # Force-correct customer liaison at parse time
+            if s.get("category", "").lower() == "customer":
+                s["internal_liaison"] = "Sales_Marketing"
+            valid.append(s)
+        return valid
     except Exception as exc:
         logger.warning(f"[external_email] Source parse failed: {exc}")
         return []

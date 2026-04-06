@@ -134,17 +134,32 @@ def test_customer_email_dropped_probability(mock_random, ingestor, mock_state):
     Verifies that customer emails are dropped and logged correctly when they
     fall within the 15% drop probability window.
     """
-
     mock_random.return_value = 0.10
 
-    ingestor._sources = [
-        {
-            "name": "Acme Corp",
-            "category": "customer",
-            "trigger_on": ["always"],
-            "topics": ["complaint"],
-        }
-    ]
+    source = {
+        "name": "Acme Corp",
+        "org": "Acme Corp",
+        "first_name": "Acme",
+        "last_name": "Contact",
+        "email": "contact@acme.com",
+        "category": "customer",
+        "internal_liaison": "Sales",
+        "trigger_on": ["always"],
+        "topics": ["complaint"],
+        "tone": "frustrated",
+    }
+
+    ingestor._derive_customer_email_signals = MagicMock(
+        return_value=[
+            {
+                "source": source,
+                "email_type": "complaint",
+                "trigger": "Test: forced signal for drop probability verification",
+                "symptom": "",
+                "topic": "bug",
+            }
+        ]
+    )
 
     dummy_signal = ExternalEmailSignal(
         source_name="Acme",

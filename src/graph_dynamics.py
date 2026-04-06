@@ -276,18 +276,26 @@ class GraphDynamics:
         )
         return hops + suffix
 
+    def _incident_affects_customer(self, incident, source: dict) -> bool:
+        components = [c.lower() for c in source.get("depends_on_components", [])]
+        if not components:
+            return False
+        root_cause = (getattr(incident, "root_cause", "") or "").lower()
+        if not root_cause:
+            return False
+        return any(comp in root_cause for comp in components)
+
     def relevant_external_contacts(
         self,
         event_type: str,
         system_health: int,
+        incident=None,
     ) -> List[dict]:
         """
-        Returns external contact config entries that should be triggered
-        given the current event type and system health.
-        Called from _advance_incidents() to decide whether to generate
-        an external contact summary.
+        Returns external contacts that should be triggered.
+        Customers are only included when their depends_on_components
+        overlap with the incident root cause.
         """
-
         doc = self._mem._db["sim_config"].find_one({"_id": "inbound_email_sources"})
         if not doc or "sources" not in doc:
             return []
@@ -295,6 +303,11 @@ class GraphDynamics:
         triggered = []
         for contact in doc["sources"]:
             triggers = contact.get("trigger_on", [])
+            is_customer = contact.get("category", "").lower() == "customer"
+
+            if is_customer and incident is not None:
+                if not self._incident_affects_customer(incident, contact):
+                    continue
 
             if "always" in triggers:
                 triggered.append(contact)
@@ -306,7 +319,8 @@ class GraphDynamics:
                 triggered.append(contact)
                 continue
 
-            if "low_health" in triggers and system_health < 80:
+            threshold = contact.get("trigger_health_threshold", 80)
+            if "low_health" in triggers and system_health < threshold:
                 triggered.append(contact)
 
         return triggered

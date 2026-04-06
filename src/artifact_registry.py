@@ -394,7 +394,9 @@ class ArtifactRegistry:
             TicketSummary with a .for_prompt() method for prompt injection
         """
         comments = ticket.get("comments", [])
-        created_day = ticket.get("created_day", current_day)
+        created_day = ticket.get(
+            "created_day", ticket.get("in_progress_since", current_day)
+        )
         was_blocked = any(
             any(
                 kw in c.get("text", "").lower()

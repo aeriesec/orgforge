@@ -90,7 +90,7 @@ class TicketAssigner:
         self._precompute_engineer_vectors()
 
     def build(
-        self, state, dept_members: List[str], dept_name: str = ""
+        self, state, dept_members: List[str], dept_name: str = "", on_call: str = ""
     ) -> SprintContext:
         """
         Main entry point.  Call once per department, before DepartmentPlanner.plan().
@@ -101,7 +101,7 @@ class TicketAssigner:
           • in_progress_ids    — tickets already "In Progress"
           • capacity_by_member — {name: available_hrs} for every dept member
         """
-        capacity = self._compute_capacity(dept_members, state)
+        capacity = self._compute_capacity(dept_members, state, on_call=on_call)
 
         open_tickets = self._mem.get_open_tickets_for_dept(
             dept_members, dept_name=dept_name
@@ -155,17 +155,18 @@ class TicketAssigner:
             in_review=in_review,
         )
 
-    def _compute_capacity(self, members: List[str], state) -> Dict[str, float]:
+    def _compute_capacity(
+        self, members: List[str], state, on_call: str = ""
+    ) -> Dict[str, float]:
         """
         Available hours per engineer, mirroring EngineerDayPlan.capacity_hrs
         so the two systems stay in sync.
         """
-        on_call_name = self._config.get("on_call_engineer")
         capacity: Dict[str, float] = {}
         for name in members:
             stress = self._gd._stress.get(name, 30)
             base = 6.0
-            if name == on_call_name:
+            if name == on_call:
                 base -= 1.5
             if stress > 80:
                 base -= 2.0
@@ -216,7 +217,7 @@ class TicketAssigner:
         n_eng = len(members)
         n_tkt = len(tickets)
         cost = np.zeros((n_eng, n_tkt))
-
+        assignment_scores = []
         for i, eng in enumerate(members):
             stress = self._gd._stress.get(eng, 30)
             stress_score = 1.0 - (stress / 100)
@@ -228,6 +229,19 @@ class TicketAssigner:
                 recency = 1.2 if ticket["id"] in ticket_history.get(eng, set()) else 1.0
                 score = skill * stress_score * cent_factor * recency
                 cost[i][j] = -score
+
+                assignment_scores.append(
+                    {
+                        "day": state.day,
+                        "engineer": eng,
+                        "ticket_id": tickets[j]["id"],
+                        "skill_score": self._skill_score(eng, tickets[j]),
+                        "stress_score": 1.0 - (self._gd._stress.get(eng, 30) / 100),
+                        "centrality_factor": 1.0 - (centrality.get(eng, 0.0) * 0.3),
+                        "composite_score": -cost[i][j],
+                        "was_assigned": False,  # update after linear_sum_assignment
+                    }
+                )
 
         row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -245,6 +259,8 @@ class TicketAssigner:
                 assigned_eng_load[eng] += est_hrs
             else:
                 logger.debug(f"[assigner] {eng} over capacity, skipping {tkt['id']}")
+
+        self._mem._db["assignment_scores"].insert_many(assignment_scores)
 
         return result
 

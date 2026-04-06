@@ -8,6 +8,8 @@
 
 ### A deterministic corporate simulator for generating ground-truth ecosystems and evaluating enterprise AI agents
 
+![OrgForge corpus overview](orgforge_hero.png)
+
 OrgForge simulates weeks of realistic enterprise activity — Confluence pages, JIRA tickets, Slack threads, Git PRs, Zoom transcripts, Zendesk tickets, Salesforce records, emails, and server telemetry — grounded in an event-driven state machine so LLMs can't hallucinate facts out of sequence.
 
 The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, forcing deterministic incident handoffs, ticket reassignments, and CRM ownership lapses. Knowledge gaps surface when under-documented systems break. New hires build their internal network through simulated collaboration. Stress propagates through a live, weighted social graph. Every artifact reflects the exact state of the org at the moment it was written.
@@ -35,7 +37,6 @@ The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, f
 - [How the Event Bus Works](#how-the-event-bus-works)
 - [Memory Requirements](#memory-requirements)
 - [Project Structure](#project-structure)
-- [Evaluation & Benchmarking](#-evaluation--benchmarking)
 - [Roadmap](#roadmap)
 - [Adding a New Artifact Type](#adding-a-new-artifact-type)
 - [Contributing](#contributing)
@@ -377,18 +378,6 @@ orgforge/
 ├── ARCHITECTURE.md
 └── CONTRIBUTING.md
 ```
-
----
-
-### 🧪 Evaluation & Benchmarking
-
-OrgForge includes a full-stack evaluation harness to measure how well AI agents retrieve and reason over the generated corporate data.
-
-- **Deterministic Ground Truth**: All answers are derived from the simulation’s state machine, not LLM hallucinations.
-- **Multi-Hop Reasoning**: Test agents on causal, temporal, and gap-detection questions.
-- **End-to-End Testing**: Use `eval_e2e.py` to run full RAG pipelines against providers like AWS Bedrock, OpenAI, and Cohere.
-
-For detailed instructions on generating eval sets, running benchmarks, and interpreting scores, see **[EVAL.md](#EVAL.md)**.
 
 ---
 

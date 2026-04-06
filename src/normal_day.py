@@ -28,6 +28,13 @@ from utils.persona_utils import persona_utils
 
 logger = logging.getLogger("orgforge.normalday")
 
+_ASYNC_DOC_PROB: Dict[str, float] = {
+    "resolved": 0.20,
+    "escalated": 0.30,
+    "uncertain": 0.10,
+    "unresolved": 0.05,
+}
+
 
 class NormalDayHandler:
     def __init__(
@@ -128,8 +135,10 @@ class NormalDayHandler:
                         and not distraction_fired
                         and idx == distraction_index
                     ):
-                        self._trigger_watercooler_chat(eng_plan.name, date_str)
                         penalty_hours = random.uniform(0.16, 0.25)
+                        self._trigger_watercooler_chat(
+                            eng_plan.name, date_str, penalty_hours=penalty_hours
+                        )
                         item.estimated_hrs += penalty_hours
                         self._clock.advance_actor(eng_plan.name, penalty_hours)
                         distraction_fired = True
@@ -1610,10 +1619,7 @@ class NormalDayHandler:
         doc_hint = (
             "Note: the following internal documentation exists and may be "
             "referenced naturally in this conversation:\n"
-            + "\n".join(
-                f"  - '{e['title']}' (written by {e['author']}, day {e['day']})"
-                for e in relevant_experts
-            )
+            + "\n".join(f"  - '{e['title']}' day {e['day']})" for e in relevant_experts)
             if relevant_experts
             else ""
         )
@@ -1758,9 +1764,9 @@ class NormalDayHandler:
             full_text = " ".join(m["text"] for m in messages)
             self._score_and_apply_sentiment(full_text, all_actors, self._vader)
 
+        classification = None
         if self._lifecycle and messages:
-            thread_text = " ".join(m["text"] for m in messages)
-            self._assess_async_thread_gap(
+            classification = self._assess_async_thread_gap(
                 messages=messages,
                 topic=ticket_title,
                 asker=asker,
@@ -1768,6 +1774,35 @@ class NormalDayHandler:
                 ticket_id=ticket_id,
                 date_str=date_str,
                 timestamp=meeting_time_iso,
+            )
+
+        conf_id = None
+        if classification and messages:
+            conf_id = self._maybe_spawn_async_confluence(
+                classification=classification,
+                topic=ticket_title,
+                asker=asker,
+                participants=all_actors,
+                messages=messages,
+                thread_id=thread_id,
+                ticket_id=ticket_id,
+                date_str=date_str,
+                timestamp=meeting_time_iso,
+            )
+
+        if conf_id:
+            self._mem._events.update_one(
+                {
+                    "type": "async_question",
+                    "artifact_ids.slack_thread": thread_id,
+                    "day": self._state.day,
+                },
+                {
+                    "$set": {
+                        "facts.spawned_doc": True,
+                        "artifact_ids.confluence": conf_id,
+                    }
+                },
             )
 
         self._gd.record_slack_interaction(all_actors)
@@ -1849,6 +1884,13 @@ class NormalDayHandler:
             conf_id = self._create_design_doc_stub(
                 initiator, participants, item.description, ctx, date_str, stub_messages
             )
+            if conf_id:
+                self._update_domain_registry_on_doc(
+                    domain_hint=item.description,
+                    author=initiator,
+                    participants=participants,
+                    coverage_boost=0.12,
+                )
 
         facts = {
             "topic": item.description,
@@ -2556,6 +2598,7 @@ class NormalDayHandler:
             logger.warning(f"[sales_email] JSON parse failed for {ticket_id}: {exc}")
             subject = f"Following up — {account_name}"
             body = clean
+            new_stage = stage_label
 
         sender_addr = f"{assignee.lower().replace(' ', '.')}@{self._domain}"
         out_dir = Path(self._base) / "emails" / "outbound" / date_str
@@ -2932,7 +2975,9 @@ class NormalDayHandler:
         # on incident days and strategic docs on calm ones.
         self._confluence.write_adhoc_page()
 
-    def _trigger_watercooler_chat(self, target_actor: str, date_str: str) -> None:
+    def _trigger_watercooler_chat(
+        self, target_actor: str, date_str: str, penalty_hours: float
+    ) -> None:
         """Injects non-work chatter, pulling the target actor away from their work."""
         if target_actor not in self._graph:
             return
@@ -3083,7 +3128,11 @@ class NormalDayHandler:
                     date=date_str,
                     actors=participants,
                     artifact_ids={"slack_thread": thread_id, "slack_path": slack_path},
-                    facts={"topic": topic, "message_count": len(messages)},
+                    facts={
+                        "topic": topic,
+                        "message_count": len(messages),
+                        "penalty_hours": penalty_hours,
+                    },
                     summary=f"{target_actor} got distracted chatting about {topic} with {len(participants) - 1} others.",
                     tags=["watercooler", "slack", "distraction"],
                 )
@@ -3102,7 +3151,7 @@ class NormalDayHandler:
         ticket_id: Optional[str],
         date_str: str,
         timestamp: str,
-    ) -> None:
+    ) -> Optional[dict]:
         """
         Classify whether an async Q&A thread reveals a genuine knowledge gap
         vs a routine question that got answered.
@@ -3194,6 +3243,12 @@ class NormalDayHandler:
                     tags=["knowledge_gap", "slack", "async_question"],
                 )
             )
+
+        return {
+            "outcome": outcome,
+            "gap_domain": gap_domain,
+            "evidence": evidence,
+        }
 
     def _last_turn_desc(
         self,
@@ -3547,6 +3602,169 @@ class NormalDayHandler:
             f"({len(turns)} turns, {len(participants)} attendees)[/dim]"
         )
         return file_path, transcript_id
+
+    def _maybe_spawn_async_confluence(
+        self,
+        classification: dict,
+        topic: str,
+        asker: str,
+        participants: List[str],
+        messages: List[dict],
+        thread_id: str,
+        ticket_id: Optional[str],
+        date_str: str,
+        timestamp: str,
+    ) -> Optional[str]:
+        """
+        Probability-gated Confluence page spawn from an async Q&A thread.
+
+        Resolved threads produce "TIL" / "How-To" pages. Gap threads produce
+        "What We Know So Far" stub pages. Both update the DomainRegistry so
+        documentation_coverage recovers organically over time.
+
+        Returns the confluence page ID if spawned, else None.
+        """
+        if self._confluence is None:
+            return None
+
+        outcome = classification.get("outcome", "resolved")
+        gap_domain = classification.get("gap_domain", "")
+
+        prob = (
+            self._config["simulation"]
+            .get("async_doc_prob", {})
+            .get(outcome, _ASYNC_DOC_PROB.get(outcome, 0.0))
+        )
+
+        if random.random() >= prob:
+            return None
+
+        responder_msg_counts: Dict[str, int] = {}
+        for m in messages:
+            if m["user"] != asker:
+                responder_msg_counts[m["user"]] = responder_msg_counts.get(
+                    m["user"], 0
+                ) + len(m.get("text", ""))
+        doc_author = (
+            max(responder_msg_counts, key=responder_msg_counts.get)
+            if responder_msg_counts
+            else asker
+        )
+
+        write_delay_hours = random.uniform(0.5, 1.5)
+        doc_time, _ = self._clock.advance_actor(doc_author, hours=write_delay_hours)
+        doc_timestamp = doc_time.isoformat()
+
+        conf_id = self._create_design_doc_stub(
+            author=doc_author,
+            participants=participants,
+            topic=topic,
+            ctx="",
+            date_str=date_str,
+            slack_transcript=messages,
+        )
+        if not conf_id:
+            return None
+
+        self._mem.log_event(
+            SimEvent(
+                type="confluence_created",
+                timestamp=doc_timestamp,
+                day=self._state.day,
+                date=date_str,
+                actors=[doc_author] + [p for p in participants if p != doc_author],
+                artifact_ids={
+                    "confluence": conf_id,
+                    "slack_thread": thread_id,
+                    "jira": ticket_id or "",
+                },
+                facts={
+                    "source": "async_thread",
+                    "source_thread": thread_id,
+                    "topic": topic,
+                    "gap_domain": gap_domain or topic,
+                    "outcome_at_write_time": outcome,
+                    "author": doc_author,
+                },
+                summary=(
+                    f"{doc_author} wrote Confluence page '{conf_id}' documenting "
+                    f"'{topic}' after async Q&A thread ({outcome})."
+                ),
+                tags=["confluence", "async_question", "documentation"],
+            )
+        )
+
+        self._update_domain_registry_on_doc(
+            domain_hint=gap_domain or topic,
+            author=doc_author,
+            participants=participants,
+            coverage_boost=0.10 if outcome == "resolved" else 0.05,
+        )
+
+        logger.info(
+            f"    [dim]📄 {doc_author} documented '{topic}' → {conf_id} "
+            f"(async thread {outcome})[/dim]"
+        )
+        return conf_id
+
+    def _update_domain_registry_on_doc(
+        self,
+        domain_hint: str,
+        author: str,
+        participants: List[str],
+        coverage_boost: float = 0.10,
+    ) -> None:
+        """
+        When a Confluence page is written that covers a domain, bump the
+        DomainRegistry's documentation_coverage and add contributors to
+        known_by.
+
+        Uses system_tags fuzzy matching so "clarify branch protection" hits
+        the "branch_protection" registry entry.
+        """
+        if not domain_hint:
+            return
+
+        tokens = set(
+            t for t in domain_hint.lower().replace("-", " ").split() if len(t) >= 3
+        )
+        if not tokens:
+            return
+
+        matched_docs = list(
+            self._mem._db["domain_registry"].find(
+                {"system_tags": {"$in": list(tokens)}}
+            )
+        )
+
+        for doc in matched_docs:
+            old_coverage = doc.get("documentation_coverage", 0.0)
+            new_coverage = min(1.0, round(old_coverage + coverage_boost, 3))
+
+            new_known = set(doc.get("known_by", []))
+            new_known.add(author)
+            for p in participants:
+                if p in self._all_names:
+                    new_known.add(p)
+
+            update: dict = {
+                "$set": {
+                    "documentation_coverage": new_coverage,
+                    "last_updated_day": self._state.day,
+                    "known_by": sorted(new_known),
+                },
+            }
+
+            if doc.get("primary_owner") is None and author in self._all_names:
+                update["$set"]["primary_owner"] = author
+
+            self._mem._db["domain_registry"].update_one({"_id": doc["_id"]}, update)
+
+            logger.info(
+                f"    [dim]📊 DomainRegistry '{doc['domain']}': "
+                f"coverage {int(old_coverage * 100)}% → {int(new_coverage * 100)}%, "
+                f"known_by now includes {author}[/dim]"
+            )
 
     def _save_md(self, path: str, content: str) -> None:
         import os

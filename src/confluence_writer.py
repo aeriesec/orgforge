@@ -389,8 +389,10 @@ class ConfluenceWriter:
 
         Returns the registered conf_id, or None on failure.
         """
+
         conf_id = self._registry.next_id("ENG")
-        artifact_time, _ = self._clock.advance_actor(author, hours=0.5)
+        write_delay_hours = random.uniform(0.5, 1.5)
+        artifact_time, _ = self._clock.advance_actor(author, hours=write_delay_hours)
         timestamp = artifact_time.isoformat()
 
         chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
@@ -408,8 +410,6 @@ class ConfluenceWriter:
             "Unknown",
         )
 
-        # Pull live domain registry context for orphaned domains so the LLM
-        # knows it's writing about an underdocumented area
         orphaned_domain_context = ""
         all_domains = list(
             self._mem._db["domain_registry"].find({"primary_owner": None})
@@ -603,13 +603,13 @@ class ConfluenceWriter:
                 actors=participants,
                 artifact_ids={
                     "confluence": conf_ids[0],
-                    "spawned_tickets": json.dumps(created_ticket_ids),
+                    "spawned_tickets": created_ticket_ids,
                 },
                 facts={
                     "title": f"Design: {topic[:80]}",
                     "type": "design_doc",
                     "spawned_tickets": created_ticket_ids,
-                    "causal_chain": chain.snapshot(),  # ← add this
+                    "causal_chain": chain.snapshot(),
                     "author_domain_fit": metadata.get("author_domain_fit", "high"),
                     "gap_classification": metadata.get("gap_classification", "none"),
                     "domains_updated": _updated_domains,
@@ -836,10 +836,8 @@ class ConfluenceWriter:
         Returns list of all conf_ids created (parent + children).
         """
 
-        # 1. Strip any CONF-* references that aren't registered yet
         clean_content = self._registry.strip_broken_references(raw_content)
 
-        # 2. Chunk into focused child pages (or single page if short enough)
         pages: List[ConfluencePage] = self._registry.chunk_into_pages(
             parent_id=conf_id,
             parent_title=title,
@@ -1195,7 +1193,6 @@ class ConfluenceWriter:
         """
         topic_lower = topic.lower()
 
-        # First try live registry — preferred source
         all_domains = list(
             self._mem._db["domain_registry"].find({"primary_owner": None})
         )
@@ -1215,7 +1212,6 @@ class ConfluenceWriter:
                     f"{former}. Only ~{pct}% documented.{known_str}"
                 )
 
-        # Fallback to static config if domain not in registry (e.g. pre-registry data)
         departed = self._config.get("knowledge_gaps", [])
         for emp in departed:
             hits = [k for k in emp.get("knew_about", []) if k.lower() in topic_lower]

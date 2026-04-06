@@ -745,7 +745,7 @@ class DatadogWriter:
 
             alert = {
                 # Datadog Events API schema fields
-                "id": f"evt_{uuid.uuid4().hex[:12]}",
+                "id": iid,
                 "title": f"[P1] {monitor_name}",
                 "text": (
                     f"## Alert\n\n"
@@ -927,9 +927,10 @@ def _batch_alert_names(
     return result
 
 
-def run(export_dir: Path, use_llm: bool = True) -> None:
+def run(export_dir: Path, use_llm: bool = True, only: Optional[set] = None) -> None:
     logger.info("[post_sim] Starting post-simulation artifact generation...")
 
+    only = only or {"nps", "invoices", "datadog"}
     mem = Memory()
     events = mem.get_event_log(from_db=True)
     start_date = datetime.strptime(CONFIG["simulation"]["start_date"], "%Y-%m-%d")
@@ -945,54 +946,67 @@ def run(export_dir: Path, use_llm: bool = True) -> None:
         f"{len(idx.health_by_day)} health snapshots."
     )
 
-    logger.info("[post_sim] → NPS surveys")
-    nps_writer = NPSWriter(idx, export_dir, start_date, max_days)
-    responses = nps_writer.build_responses()
+    responses = []
+    invoices = []
+    alerts = []
 
-    logger.info("[post_sim] → Invoices")
-    inv_writer = InvoiceWriter(idx, export_dir, start_date, max_days, mem)
-    invoices = inv_writer.build_invoices()
+    if "nps" in only:
+        logger.info("[post_sim] → NPS surveys")
+        nps_writer = NPSWriter(idx, export_dir, start_date, max_days)
+        responses = nps_writer.build_responses()
 
-    logger.info("[post_sim] → Datadog metrics")
-    dd_writer = DatadogWriter(idx, export_dir, start_date, max_days)
-    dd_writer.build_metrics()
-    alerts = dd_writer.build_alerts()
+    if "invoices" in only:
+        logger.info("[post_sim] → Invoices")
+        inv_writer = InvoiceWriter(idx, export_dir, start_date, max_days, mem)
+        invoices = inv_writer.build_invoices()
 
-    if use_llm and (responses or idx.incidents):
-        logger.info("[post_sim] → LLM batch 1/2: NPS verbatim comments")
-        try:
-            from flow import WORKER_MODEL
+    if "datadog" in only:
+        logger.info("[post_sim] → Datadog metrics")
+        dd_writer = DatadogWriter(idx, export_dir, start_date, max_days)
+        dd_writer.build_metrics()
+        alerts = dd_writer.build_alerts()
 
-            nps_comments = _batch_nps_comments(responses, WORKER_MODEL)
-            for r in responses:
-                r["verbatim_comment"] = nps_comments.get(
-                    r["response_id"],
-                    _nps_placeholder(r),
+    if use_llm:
+        if "nps" in only and responses:
+            logger.info("[post_sim] → LLM batch 1/2: NPS verbatim comments")
+            try:
+                from flow import WORKER_MODEL
+
+                nps_comments = _batch_nps_comments(responses, WORKER_MODEL)
+                for r in responses:
+                    r["verbatim_comment"] = nps_comments.get(
+                        r["response_id"], _nps_placeholder(r)
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[post_sim] NPS LLM call failed ({e}) — using placeholders"
                 )
-        except Exception as e:
-            logger.warning(f"[post_sim] NPS LLM call failed ({e}) — using placeholders")
-            for r in responses:
-                r["verbatim_comment"] = _nps_placeholder(r)
+                for r in responses:
+                    r["verbatim_comment"] = _nps_placeholder(r)
 
-        logger.info("[post_sim] → LLM batch 2/2: Datadog alert monitor names")
-        try:
-            from flow import WORKER_MODEL
+        if "datadog" in only and idx.incidents:
+            logger.info("[post_sim] → LLM batch 2/2: Datadog alert monitor names")
+            try:
+                from flow import WORKER_MODEL
 
-            monitor_names = _batch_alert_names(idx.incidents, WORKER_MODEL)
-            alerts = dd_writer.build_alerts(monitor_names)
-        except Exception as e:
-            logger.warning(
-                f"[post_sim] Alert names LLM call failed ({e}) — using root causes"
-            )
+                monitor_names = _batch_alert_names(idx.incidents, WORKER_MODEL)
+                alerts = dd_writer.build_alerts(monitor_names)
+            except Exception as e:
+                logger.warning(
+                    f"[post_sim] Alert names LLM call failed ({e}) — using root causes"
+                )
     else:
         if not use_llm:
             logger.info("[post_sim] LLM calls skipped (--no-llm).")
         for r in responses:
             r["verbatim_comment"] = _nps_placeholder(r)
 
-    nps_writer.write(responses)
-    inv_writer.write(invoices)
-    dd_writer.write_alerts(alerts)
+    if "nps" in only:
+        nps_writer.write(responses)
+    if "invoices" in only:
+        inv_writer.write(invoices)
+    if "datadog" in only:
+        dd_writer.write_alerts(alerts)
 
     logger.info(
         f"[post_sim] Done. "
@@ -1051,6 +1065,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip the two optional LLM calls and use deterministic placeholders.",
     )
+    parser.add_argument(
+        "--only",
+        nargs="+",
+        choices=["nps", "invoices", "datadog"],
+        help="Only regenerate specific artifact types.",
+    )
     args = parser.parse_args()
 
-    run(export_dir=args.export_dir, use_llm=not args.no_llm)
+    run(
+        export_dir=args.export_dir,
+        use_llm=not args.no_llm,
+        only=set(args.only) if args.only else None,
+    )

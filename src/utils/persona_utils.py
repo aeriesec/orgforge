@@ -5,6 +5,16 @@ from utils.helpers import dept_of_name
 
 logger = logging.getLogger("orgforge.persona_utils")
 
+DEPARTMENT_EXPERTISE_DEFAULTS = {
+    "Engineering_Backend": ["general backend", "code review", "documentation"],
+    "Engineering_Mobile": ["general mobile", "testing", "tickets"],
+    "Product": ["requirements", "stakeholder updates", "roadmap admin"],
+    "Sales_Marketing": ["CRM hygiene", "outreach", "reporting"],
+    "HR_Ops": ["scheduling", "documentation", "vendor comms"],
+    "Design": ["asset delivery", "feedback cycles", "figma"],
+    "QA_Support": ["test cases", "bug triage", "customer comms"],
+}
+
 
 class PersonaUtils:
     def __init__(self):
@@ -44,16 +54,21 @@ class PersonaUtils:
         name_to_history = {}
 
         for name in name_list:
-            p = PERSONAS.get(name, DEFAULT_PERSONA)
+            p = PERSONAS.get(name) or DEFAULT_PERSONA
             stress = graph_dynamics._stress.get(name, 30) if graph_dynamics else 30
             quirks = p.get("typing_quirks", "standard professional grammar")
             tenure = p.get("tenure", "mid")
-            expertise = (
-                ", ".join(str(e) for e in p.get("expertise", [])[:3])
-                or "general engineering"
+            dept = dept_of_name(name)
+
+            expertise = ", ".join(
+                str(e) for e in p.get("expertise", [])[:3]
+            ) or ", ".join(
+                DEPARTMENT_EXPERTISE_DEFAULTS.get(
+                    dept, ["cross-functional communication"]
+                )
             )
             social_role = p.get("social_role", "Contributor")
-            dept = dept_of_name(name)
+
             interests = (
                 ", ".join(
                     str(i) for i in (p.get("interests") or p.get("expertise", []))[:3]

@@ -6,6 +6,31 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.3.3] — 2026-04-05
+
+### Added
+
+- **Assignment Score Telemetry (`src/ticket_assigner.py`)**: The ticket assigner now records per-assignment scoring breakdowns (skill, stress, centrality, composite) into a MongoDB `assignment_scores` collection for downstream analysis.
+- **Department Expertise Defaults (`src/utils/persona_utils.py`)**: Added a `DEPARTMENT_EXPERTISE_DEFAULTS` map so personas without explicit expertise lists fall back to sensible department-level defaults rather than a generic "general engineering" placeholder.
+- **Departure Department Field (`config/config.yaml`)**: `org_lifecycle` departure entries now include a `dept` field, making ownership handoff tracking more precise during engineer exits.
+- **Selective Artifact Regeneration (`eval/export_to_hf.py`)**: Added an `--only` CLI flag to selectively regenerate specific artifact types (`nps`, `invoices`, `datadog`) without a full corpus rebuild.
+
+### Changed
+
+- **On-Call Capacity Propagation (`src/ticket_assigner.py`)**: On-call status is now passed dynamically into `_compute_capacity` via an `on_call` parameter instead of being read from a static config key, keeping capacity calculations consistent with the runtime rotation.
+- **Persona Fallback Logic (`src/utils/persona_utils.py`)**: Switched persona lookup from `PERSONAS.get(name, DEFAULT_PERSONA)` to `PERSONAS.get(name) or DEFAULT_PERSONA` to correctly handle personas with falsy but present entries.
+
+### Removed
+
+- **Agentic Eval Harness (`eval/agentic_eval_harness.py`)**: Removed the standalone agentic evaluation harness (2,676 lines). Evaluation logic is now consolidated elsewhere.
+- **Standalone Eval Docs (`EVAL.md`, `README.md`)**: Removed the `EVAL.md` file and the corresponding Evaluation & Benchmarking section from `README.md`. Evaluation documentation will be maintained separately.
+
+### Fixed
+
+- **External Email Drop Test (`tests/test_external_email.py`)**: Refactored the customer email drop probability test to use a fully-specified source fixture and a mocked `_derive_customer_email_signals`, replacing the brittle direct `_sources` injection.
+
+---
+
 ## [v1.3.2] — 2026-03-31
 
 ### Added

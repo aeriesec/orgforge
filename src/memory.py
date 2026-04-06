@@ -92,6 +92,7 @@ class SimEvent:
     facts: Dict[str, Any]
     summary: str
     tags: List[str] = field(default_factory=list)
+    mongo_id: Optional[str] = field(default=None)
 
     def to_embed_text(self) -> str:
         return (
@@ -118,6 +119,7 @@ class SimEvent:
             facts=d.get("facts", {}),
             summary=d.get("summary", ""),
             tags=d.get("tags", []),
+            mongo_id=d.get("_id"),
         )
 
 
@@ -935,7 +937,7 @@ class Memory:
             if as_of_time:
                 query["timestamp"] = {"$lte": as_of_time}
 
-            raw = self._events.find(query, {"_id": 0}).sort("timestamp", 1)
+            raw = self._events.find(query).sort("timestamp", 1)
             return [SimEvent.from_dict(r) for r in raw]
 
         log = self._event_log

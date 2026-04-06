@@ -11,6 +11,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -18,7 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent_factory import make_agent
 from causal_chain_handler import CausalChainHandler
-from config_loader import COMPANY_DESCRIPTION
 from crm_system import NullCRMSystem
 from crewai import Crew, Task
 import json_repair
@@ -76,11 +76,23 @@ def _get_stage_probability(stage: str) -> int:
 
 _PROB_CUSTOMER_REPLY = 0.30
 
-
 _PROB_NON_COMPLAINT_SALES_FYI = 0.35
 
+# Email types that trigger a ZD ticket via handle_inbound_customer_email.
+# feature_request → Slack FYI to Product only (no ticket).
+# positive_feedback → no ticket.
+_ZD_TICKET_TYPES = frozenset(["complaint", "question", "general_inquiry"])
 
+# Kept for any import sites not yet updated; mirrors _ZD_TICKET_TYPES.
 _COMPLAINT_EMAIL_TYPES = frozenset(["complaint"])
+
+# Probability gate per email type — complaints always get a ticket,
+# others are sampled so not every question floods the ZD queue.
+_ZD_TICKET_PROB: dict = {
+    "complaint": 1.0,
+    "question": 0.70,
+    "general_inquiry": 0.30,
+}
 
 
 @dataclass
@@ -203,25 +215,32 @@ class ExternalEmailIngestor:
 
     def generate_business_hours(self, state) -> List[ExternalEmailSignal]:
         """
-        Customer emails arriving 09:00–16:30.
-        Each non-dropped email triggers: Sales Slack ping → Product decision → optional JIRA.
-        Dropped emails (~15%) are logged as "email_dropped" SimEvents.
-        Returns all signals (dropped + routed) for tomorrow's CrossDeptSignal extraction.
+        Customer emails arriving 09:00-16:30, driven entirely by simulation state.
+
+        Emails are only generated when there is a real reason for a customer to
+        reach out -- active incidents affecting their capabilities, stale deals,
+        upcoming renewals, or expansion interest. Random probability firing is
+        intentionally removed; silence is the correct output when nothing warrants
+        an email.
+
+        Dropped emails (~15%) are still modelled for eval ground truth.
+        Returns all signals (dropped + routed).
         """
         self._ensure_sources_loaded()
-        signals: List[ExternalEmailSignal] = []
-        has_incident = bool(state.active_incidents)
 
-        for source in self._sources or []:
-            if source.get("category") != "customer":
-                continue
-            if not self._should_fire(
-                source.get("trigger_on", ["always"]), state.system_health, has_incident
-            ):
-                continue
-            topic = random.choice(source.get("topics", ["general update"]))
+        derived = self._derive_customer_email_signals(state)
+        signals: List[ExternalEmailSignal] = []
+
+        for item in derived:
             signal = self._generate_email(
-                source, topic, state, hour_range=(9, 16), category="customer"
+                source=item["source"],
+                topic=item["topic"],
+                state=state,
+                hour_range=(9, 16),
+                category="customer",
+                email_type=item["email_type"],
+                symptom=item.get("symptom", ""),
+                trigger_context=item.get("trigger", ""),
             )
             if not signal:
                 continue
@@ -231,7 +250,7 @@ class ExternalEmailIngestor:
                 self._log_dropped_email(signal, state)
                 logger.info(
                     f"    [dim yellow]📭 Dropped (no action): "
-                    f'{signal.source_name} → "{signal.subject[:50]}"[/dim yellow]'
+                    f'{signal.source_name} -> "{signal.subject[:50]}"[/dim yellow]'
                 )
             else:
                 self._route_customer_email(signal, state)
@@ -245,6 +264,15 @@ class ExternalEmailIngestor:
                 f"  [cyan]📬 {n_routed} customer email(s) routed, "
                 f"{n_dropped} dropped[/cyan]"
             )
+        elif derived:
+            logger.info(
+                "  [dim]📭 No customer emails fired today (all signals suppressed)[/dim]"
+            )
+        else:
+            logger.info(
+                "  [dim]📭 No customer email signals derived from state today[/dim]"
+            )
+
         return signals
 
     def generate_hr_outbound(self, state) -> None:
@@ -265,57 +293,6 @@ class ExternalEmailIngestor:
                     continue
                 self._send_hr_outbound(hire, hr_lead, days_until, state, date_str)
                 hire["_hr_email_sent"] = True
-
-    """ def _route_customer_email(self, signal: ExternalEmailSignal, state) -> None:
-        date_str = str(state.current_date.date())
-        sales_lead = self._leads.get(
-            signal.internal_liaison, next(iter(self._leads.values()))
-        )
-        product_dept = next((d for d in self._leads if "product" in d.lower()), None)
-        product_lead = self._leads.get(product_dept, sales_lead)
-
-        thread_id = self._sales_pings_product(
-            signal, sales_lead, product_lead, state, date_str
-        )
-        if thread_id:
-            signal.causal_chain.append(thread_id)
-
-        is_high = signal.tone in ("frustrated", "urgent") or (
-            state.system_health < 70 and "stability" in signal.topic.lower()
-        )
-        if is_high and random.random() < _PROB_CUSTOMER_JIRA:
-            ticket_id = self._product_opens_jira(signal, product_lead, state, date_str)
-            if ticket_id:
-                signal.causal_chain.append(ticket_id)
-
-        reply_id = self._send_customer_reply(
-            signal, sales_lead, is_high, state, date_str
-        )
-        if reply_id:
-            signal.causal_chain.append(reply_id)
-
-        self._mem.log_event(
-            SimEvent(
-                type="customer_email_routed",
-                timestamp=signal.timestamp_iso,
-                day=state.day,
-                date=date_str,
-                actors=[signal.source_name, sales_lead, product_lead],
-                artifact_ids={"email": signal.embed_id},
-                facts={
-                    "source": signal.source_name,
-                    "subject": signal.subject,
-                    "high_priority": is_high,
-                    "causal_chain": signal.causal_chain.snapshot(),
-                },
-                summary=(
-                    f"Customer email from {signal.source_name} routed: "
-                    f"{sales_lead} → {product_lead}"
-                    + (" [JIRA opened]" if len(signal.causal_chain) > 2 else "")
-                ),
-                tags=["email", "customer", "routed", "causal_chain"],
-            )
-        ) """
 
     def _sales_pings_product(
         self, signal, sales_lead, product_lead, state, date_str
@@ -485,6 +462,7 @@ class ExternalEmailIngestor:
         date_str = str(state.current_date.date())
         recipient = self._find_expert_for_topic(signal.topic, signal.internal_liaison)
 
+        linked_incident_ticket_id = None
         for inc in state.active_incidents:
             if any(
                 kw in signal.topic.lower()
@@ -492,6 +470,7 @@ class ExternalEmailIngestor:
                 if len(kw) > 4
             ):
                 inc.causal_chain.append(signal.embed_id)
+                linked_incident_ticket_id = inc.ticket_id
                 logger.info(
                     f"    [dim]🔗 Vendor email appended to {inc.ticket_id} chain[/dim]"
                 )
@@ -506,6 +485,16 @@ class ExternalEmailIngestor:
         if ack_id:
             signal.causal_chain.append(ack_id)
 
+        facts = {
+            "vendor": signal.source_name,
+            "topic": signal.topic,
+            "routed_to": recipient,
+            "causal_chain": signal.causal_chain.snapshot(),
+        }
+
+        if linked_incident_ticket_id:
+            facts["linked_incident"] = linked_incident_ticket_id
+
         self._mem.log_event(
             SimEvent(
                 type="vendor_email_routed",
@@ -514,12 +503,7 @@ class ExternalEmailIngestor:
                 date=date_str,
                 actors=[signal.source_name, recipient],
                 artifact_ids={"email": signal.embed_id},
-                facts={
-                    "vendor": signal.source_name,
-                    "topic": signal.topic,
-                    "routed_to": recipient,
-                    "causal_chain": signal.causal_chain.snapshot(),
-                },
+                facts=facts,
                 summary=f"Vendor email from {signal.source_name} routed to {recipient}",
                 tags=["email", "vendor", "routed"],
             )
@@ -812,20 +796,21 @@ class ExternalEmailIngestor:
             day=state.day,
         )
 
-        self._crm.process_outbound_email(
-            email_data={
-                "sender": sales_lead,
-                "recipient": signal.source_name,
-                "sender_org": self._company_name,
-                "recipient_org": signal.source_org,
-                "subject": subject,
-                "stage": crm_stage,
-                "embed_id": embed_id,
-            },
-            timestamp=reply_time.isoformat(),
-            date_str=date_str,
-            day=state.day,
-        )
+        if not is_high:
+            self._crm.process_outbound_email(
+                email_data={
+                    "sender": sales_lead,
+                    "recipient": signal.source_name,
+                    "sender_org": self._company_name,
+                    "recipient_org": signal.source_org,
+                    "subject": subject,
+                    "stage": crm_stage,
+                    "embed_id": embed_id,
+                },
+                timestamp=reply_time.isoformat(),
+                date_str=date_str,
+                day=state.day,
+            )
 
         _exfil_path = self._threat.inject_email(
             eml_path=str(eml_path),
@@ -1074,8 +1059,20 @@ class ExternalEmailIngestor:
         state,
         hour_range: Tuple[int, int],
         category: str,
+        email_type: str = "general_inquiry",
+        symptom: str = "",
+        trigger_context: str = "",
     ) -> Optional[Any]:
+        """
+        Generates a single inbound email from an external contact.
 
+        For customers: outputs JSON so email_type is declared at generation time
+        (not classified post-hoc), no tech_ctx is injected, and the prompt uses
+        first-person sender framing grounded in the derived signal context.
+
+        For vendors: keeps plain SUBJECT/---/body format with tech_ctx so engineers
+        can reference infrastructure specifics.
+        """
         source_first_name = source["first_name"]
         source_name = source_first_name
         source_last_name = source["last_name"]
@@ -1085,17 +1082,6 @@ class ExternalEmailIngestor:
         liaison_name = self._leads.get(liaison_dept, next(iter(self._leads.values())))
         tone = source.get("tone", "professional")
         date_str = str(state.current_date.date())
-
-        tech_stack = self._mem.tech_stack_for_prompt()
-        tech_ctx = (
-            (
-                f"\nCOMPANY TECH STACK:\n{tech_stack}\n"
-                f"CONSTRAINT: If referencing the company's current infrastructure or code, restrict it to the stack above. "
-                f"You may reference outside technologies ONLY if suggesting a migration, offering a new service, or making a competitive recommendation."
-            )
-            if tech_stack
-            else ""
-        )
 
         email_ts = state.current_date.replace(
             hour=random.randint(*hour_range),
@@ -1108,33 +1094,111 @@ class ExternalEmailIngestor:
         )
 
         agent = make_agent(
-            role=f"Representative from {source_org}",
-            goal=f"Write a realistic email about: {topic}.",
+            role=f"{source_first_name} {source_last_name}, {source.get('contact_role', 'representative')} at {source_org}",
+            goal=f"Write a realistic inbound email to {self._company_name}.",
             backstory=backstory,
             llm=self._worker_llm,
         )
-        task = Task(
-            description=(
-                f"Email from {source_first_name} {source_last_name} at {source_org} to {liaison_name} at {self._company_name} which {COMPANY_DESCRIPTION} "
-                f"about: {topic}.\nTone: {tone}. Health: {state.system_health}/100."
-                f"{tech_ctx}\n\n"
-                f"COMPANY CONTEXT: {self._company_name} is {self._company_desc}. "
-                f"Ground your email in this reality.\n\n"
-                f"Format:\nSUBJECT: <subject>\n---\n<body, 3-6 sentences, under 120 words>"
-            ),
-            expected_output="SUBJECT: <subject>\n---\n<body>",
-            agent=agent,
-        )
 
-        try:
-            raw = str(
-                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
-            ).strip()
-        except Exception as exc:
-            logger.warning(f"[external_email] LLM failed for {source_name}: {exc}")
-            return None
+        if category == "customer":
+            # Customers never see our tech stack. They experience symptoms.
+            # symptom_context is the customer-facing description of their problem;
+            # trigger_context tells the LLM why this email is being sent today.
+            symptom_hint = f"\nSITUATION: {symptom}" if symptom else ""
+            email_type_hint = {
+                "complaint": "You are writing to report a problem you are experiencing. Describe the business impact on your organisation. Do NOT name or guess at internal systems.",
+                "question": "You are following up on a business matter or asking for clarification. Be specific to your situation.",
+                "feature_request": "You are requesting a capability or improvement that would benefit your team.",
+                "positive_feedback": "You are writing to share positive feedback or a success story.",
+                "general_inquiry": "You have a general question or comment.",
+            }.get(
+                email_type, "Write a professional email relevant to your relationship."
+            )
 
-        subject, body = self._parse_email_output(raw, topic)
+            task = Task(
+                description=(
+                    f"You are {source_first_name} {source_last_name}, {source.get('contact_role', 'a representative')} at {source_org}.\n"
+                    f"You are writing an email to {liaison_name} at {self._company_name}.\n"
+                    f"Tone: {tone}.{symptom_hint}\n\n"
+                    f"INTENT: {email_type_hint}\n\n"
+                    f"IMPORTANT: Write entirely from your perspective as a customer. "
+                    f"Describe only what you observe or experience — never reference {self._company_name}'s internal systems, "
+                    f"infrastructure, or technology by name. You don't know what's running under the hood.\n\n"
+                    f"Respond ONLY with a JSON object. No preamble, no markdown fences:\n"
+                    f"{{\n"
+                    f'  "subject": "<email subject>",\n'
+                    f'  "body": "<email body, 3-6 sentences, under 120 words>",\n'
+                    f'  "email_type": "<exactly one of: complaint, question, feature_request, positive_feedback, general_inquiry>"\n'
+                    f"}}"
+                ),
+                expected_output='JSON with "subject", "body", and "email_type" keys.',
+                agent=agent,
+            )
+
+            try:
+                raw = str(
+                    Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+                ).strip()
+                parsed = json_repair.loads(raw)
+                if isinstance(parsed, list) and parsed:
+                    parsed = parsed[0]
+                if not isinstance(parsed, dict):
+                    raise ValueError("LLM did not return a dict")
+                subject = parsed.get("subject", f"Re: {topic}").strip()
+                body = parsed.get("body", "").strip()
+                resolved_email_type = (
+                    parsed.get("email_type", email_type).strip().lower()
+                )
+                if resolved_email_type not in _VALID_EMAIL_TYPES:
+                    resolved_email_type = email_type
+                if not body:
+                    raise ValueError("Empty body")
+            except Exception as exc:
+                logger.warning(
+                    f"[external_email] Customer email LLM failed for {source_name}: {exc}"
+                )
+                return None
+
+        else:
+            # Vendors: plain text, tech_ctx injected, first-person framing
+            tech_stack = self._mem.tech_stack_for_prompt()
+            tech_ctx = (
+                (
+                    f"\nCOMPANY TECH STACK (for your reference):\n{tech_stack}\n"
+                    f"Restrict references to the company's infrastructure to this stack only. "
+                    f"You may reference outside technologies only if alerting about an integration issue, "
+                    f"suggesting a migration, or offering a new service."
+                )
+                if tech_stack
+                else ""
+            )
+            resolved_email_type = "general_inquiry"
+
+            task = Task(
+                description=(
+                    f"You are {source_first_name} {source_last_name} from {source_org}.\n"
+                    f"Write an email to {liaison_name} at {self._company_name} about: {topic}.\n"
+                    f"Tone: {tone}. Their system health: {state.system_health}/100."
+                    f"{tech_ctx}\n\n"
+                    f"Write as yourself — do not describe the email, write it.\n"
+                    f"Format:\nSUBJECT: <subject>\n---\n<body, 3-6 sentences, under 120 words>"
+                ),
+                expected_output="SUBJECT: <subject>\n---\n<body>",
+                agent=agent,
+            )
+
+            try:
+                raw = str(
+                    Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+                ).strip()
+            except Exception as exc:
+                logger.warning(
+                    f"[external_email] Vendor email LLM failed for {source_name}: {exc}"
+                )
+                return None
+
+            subject, body = self._parse_email_output(raw, topic)
+
         embed_id = (
             f"ext_email_{source_name.lower().replace(' ', '_')}"
             f"_{state.day}_{hour_range[0]}"
@@ -1155,7 +1219,7 @@ class ExternalEmailIngestor:
             id=embed_id,
             type="email",
             title=subject,
-            content=f"From: {source_name} ({source_org})\n\n{body}",
+            content=f"From: {source_first_name} {source_last_name} ({source_org})\n\n{body}",
             day=state.day,
             date=date_str,
             timestamp=email_ts.isoformat(),
@@ -1167,8 +1231,51 @@ class ExternalEmailIngestor:
                 "liaison": liaison_name,
                 "tone": tone,
                 "direction": "inbound",
+                "email_type": resolved_email_type,
             },
         )
+
+        facts = {
+            "source": source_name,
+            "org": source_org,
+            "category": category,
+            "topic": topic,
+            "subject": subject,
+            "liaison": liaison_name,
+            "liaison_dept": liaison_dept,
+            "tone": tone,
+            "email_type": resolved_email_type,
+            "body_preview": body[:200],
+        }
+
+        chain = CausalChainHandler(root_id=embed_id)
+        zd_ticket_id = None
+
+        if category == "customer" and resolved_email_type in _ZD_TICKET_TYPES:
+            zd_ticket_id = self._crm.handle_inbound_customer_email(
+                event_facts={
+                    "subject": subject,
+                    "body": body[:500],
+                    "sender_org": source_org,
+                    "sender": source_addr,
+                    "sender_name": f"{source_first_name} {source_last_name}",
+                    "email": embed_id,
+                    "liaison_email": self._email_of(liaison_name),
+                },
+                email_type=resolved_email_type,
+                timestamp=email_ts.isoformat(),
+                date_str=date_str,
+                day=state.day,
+            )
+            if zd_ticket_id:
+                logger.info(
+                    f"    [dim]🔗 ZD ticket {zd_ticket_id} [{resolved_email_type}] "
+                    f"linked to email from {source_name}[/dim]"
+                )
+
+        facts["causal_chain"] = chain.snapshot()
+        if zd_ticket_id:
+            chain.append(zd_ticket_id)
 
         self._mem.log_event(
             SimEvent(
@@ -1178,53 +1285,17 @@ class ExternalEmailIngestor:
                 date=date_str,
                 actors=[source_name, liaison_name],
                 artifact_ids={"email": embed_id, "eml_path": str(eml_path)},
-                facts={
-                    "source": source_name,
-                    "org": source_org,
-                    "category": category,
-                    "topic": topic,
-                    "subject": subject,
-                    "liaison": liaison_name,
-                    "liaison_dept": liaison_dept,
-                    "tone": tone,
-                    "body_preview": body[:200],
-                },
-                summary=f'Inbound [{category}] email from {source_name}: "{subject}"',
-                tags=["email", "inbound", category, source_name.lower()],
+                facts=facts,
+                summary=f'Inbound [{category}/{resolved_email_type}] email from {source_name}: "{subject}"',
+                tags=[
+                    "email",
+                    "inbound",
+                    category,
+                    resolved_email_type,
+                    source_name.lower(),
+                ],
             )
         )
-
-        zd_ticket_id = None
-        email_type = "general_inquiry"
-
-        if category == "customer":
-            email_type = self._classify_customer_email(
-                subject=subject,
-                body=body,
-                source_name=source_name,
-                tone=tone,
-            )
-            logger.debug(
-                f"    [dim]🔍 Email classified as '{email_type}': "
-                f"{source_name} — {subject[:50]}[/dim]"
-            )
-
-            if email_type in _COMPLAINT_EMAIL_TYPES:
-                zd_ticket_id = self._crm.handle_inbound_complaint(
-                    event_facts={
-                        "subject": subject,
-                        "body": body[:500],
-                        "sender_org": source_org,
-                    },
-                    timestamp=email_ts.isoformat(),
-                    date_str=date_str,
-                    day=state.day,
-                )
-                if zd_ticket_id:
-                    logger.info(
-                        f"    [dim]🔗 ZD ticket {zd_ticket_id} linked to complaint from "
-                        f"{source_name}[/dim]"
-                    )
 
         artifact_ids: Dict[str, Any] = {"email": embed_id, "eml_path": str(eml_path)}
         if zd_ticket_id:
@@ -1247,71 +1318,19 @@ class ExternalEmailIngestor:
             category=category,
             eml_path=str(eml_path),
             causal_chain=CausalChainHandler(root_id=embed_id),
-            facts={"subject": subject, "topic": topic, "org": source_org},
+            facts={
+                "subject": subject,
+                "topic": topic,
+                "org": source_org,
+                "email_type": resolved_email_type,
+            },
         )
 
-        signal.facts["email_type"] = email_type
+        signal.facts["email_type"] = resolved_email_type
         if zd_ticket_id:
             signal.facts["zd_ticket_id"] = zd_ticket_id
 
         return signal
-
-    def _classify_customer_email(
-        self,
-        subject: str,
-        body: str,
-        source_name: str,
-        tone: str,
-    ) -> str:
-        """
-        Classify an inbound customer email into one of five categories using a
-        single, lightweight LLM call.
-        """
-        agent = make_agent(
-            role="Email Classifier",
-            goal="Classify a customer email into exactly one category.",
-            backstory=(
-                "You are a triage assistant. You read customer emails and output "
-                "a single classification label. You never explain your reasoning."
-            ),
-            llm=self._worker_llm,
-        )
-        task = Task(
-            description=(
-                f"Classify the following customer email.\n\n"
-                f"Subject: {subject}\n"
-                f"Body: {body[:600]}\n\n"
-                f"Output ONLY a JSON object with a single key 'email_type'.\n"
-                f"The value must be EXACTLY one of:\n"
-                f"  complaint, question, feature_request, positive_feedback, general_inquiry\n\n"
-                f"Definitions:\n"
-                f"  complaint        — customer reports a problem, outage, bug, or unmet SLA\n"
-                f"  question         — customer asks how something works or for clarification\n"
-                f"  feature_request  — customer requests new or changed functionality\n"
-                f"  positive_feedback — customer compliments the product or team\n"
-                f"  general_inquiry  — anything that does not fit the above\n\n"
-                f'Example output: {{"email_type": "complaint"}}\n'
-                f"No preamble. No explanation. Output only the JSON object."
-            ),
-            expected_output='{"email_type": "<one of the five categories>"}',
-            agent=agent,
-        )
-
-        try:
-            raw = str(
-                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
-            ).strip()
-            parsed = json_repair.loads(raw)
-            if isinstance(parsed, dict):
-                result = parsed.get("email_type", "").strip().lower()
-                if result in _VALID_EMAIL_TYPES:
-                    return result
-        except Exception as exc:
-            logger.warning(f"[external_email] Email classification LLM failed: {exc}")
-
-        if tone in ("frustrated", "urgent"):
-            return "complaint"
-        return "general_inquiry"
 
     def _generate_customer_reply_email(
         self,
@@ -1700,21 +1719,27 @@ class ExternalEmailIngestor:
         self, signal: Any, state, email_type: str = "general_inquiry"
     ) -> None:
         """
-        Lightweight routing for non-complaint customer emails.
+        Routing for non-complaint customer emails.
 
-        Sales replies directly to the customer — no Slack ping to Product,
-        no JIRA ticket. For feature_request emails, a low-probability (~35%)
-        FYI message is posted in #product so the team is aware without being
-        formally escalated.
+        Questions and general_inquiries may produce a ZD ticket (probability-
+        gated via _ZD_TICKET_PROB in crm_system — 70% and 30% respectively).
+        The ticket is already created upstream in _generate_email before this
+        method is called, so we just append it to the causal chain if present.
 
-        This preserves causal chain integrity: the reply is appended to the
-        chain, and the SimEvent type distinguishes these emails from complaints
-        so eval agents can verify the correct branching behaviour.
+        Feature requests get a low-probability (~35%) FYI to #product.
+        Positive feedback gets a direct reply only — no ticket, no escalation.
+
+        Sales replies to all non-complaint emails directly.
         """
         date_str = str(state.current_date.date())
         sales_lead = self._leads.get(
             signal.internal_liaison, next(iter(self._leads.values()))
         )
+
+        # Append pre-created ZD ticket to causal chain if present
+        zd_ticket_id = signal.facts.get("zd_ticket_id")
+        if zd_ticket_id:
+            signal.causal_chain.append(zd_ticket_id)
 
         fyi_thread_id = None
         if (
@@ -1746,12 +1771,14 @@ class ExternalEmailIngestor:
                     "subject": signal.subject,
                     "email_type": email_type,
                     "high_priority": False,
+                    "zd_ticket_id": zd_ticket_id,
                     "fyi_sent": fyi_thread_id is not None,
                     "causal_chain": signal.causal_chain.snapshot(),
                 },
                 summary=(
                     f"{email_type.replace('_', ' ').title()} from {signal.source_name} "
-                    f"handled by {sales_lead} (no escalation)"
+                    f"handled by {sales_lead}"
+                    + (f" [ZD-{zd_ticket_id}]" if zd_ticket_id else "")
                     + (" [FYI sent to Product]" if fyi_thread_id else "")
                 ),
                 tags=["email", "customer", email_type, "routed", "causal_chain"],
@@ -1935,6 +1962,197 @@ class ExternalEmailIngestor:
             if t == "low_health" and system_health < _HEALTH_THRESHOLD:
                 return True
         return False
+
+    def _incident_affects_customer(self, incident, source: dict) -> bool:
+        return self._gd._incident_affects_customer(incident, source)
+
+    def _derive_customer_email_signals(self, state) -> List[dict]:
+        """
+        Inspects simulation state and CRM data to derive a list of grounded
+        customer email signals. Each signal represents a real reason a customer
+        would reach out — not a random probability fire.
+
+        Returns a list of dicts, each with:
+            source        — the full source record from inbound_email_sources
+            email_type    — complaint | question | feature_request | positive_feedback | general_inquiry
+            trigger       — human-readable reason string for LLM context
+            symptom       — customer-facing symptom description (no internal tech names)
+            topic         — topic string passed to _generate_email
+
+        Signal priority (highest to lowest):
+          1. Active incident that affects this customer → complaint
+          2. Open opp at Negotiation/Review stale > 3 days → question (customer follows up)
+          3. Contract renewal within 60 days → question (renewal conversation)
+          4. Opp has risk_notes → question or complaint depending on sentiment
+          5. High expansion_potential (>= 8) + healthy system → feature_request
+        """
+        self._ensure_sources_loaded()
+        signals: List[dict] = []
+        date_str = str(state.current_date.date())
+
+        customer_sources = [
+            s for s in (self._sources or []) if s.get("category") == "customer"
+        ]
+
+        for source in customer_sources:
+            org_name = source.get("org", "")
+            sentiment = source.get("sentiment_baseline", 0.8)
+            tone = source.get("tone", "formal")
+
+            # ── Signal 1: Active incident affecting this customer ────────────
+            for incident in state.active_incidents:
+                # Skip if already contacted proactively via _handle_external_contact
+                if org_name in getattr(incident, "contacted_customers", []):
+                    continue
+                if not self._gd._incident_affects_customer(incident, source):
+                    continue
+
+                symptom = source.get(
+                    "symptom_language",
+                    "We are experiencing issues accessing your platform and wanted to follow up.",
+                )
+                signals.append(
+                    {
+                        "source": source,
+                        "email_type": "complaint",
+                        "trigger": f"Active incident {incident.ticket_id} affecting platform capabilities this customer depends on",
+                        "symptom": symptom,
+                        "topic": symptom,
+                        "incident_id": incident.ticket_id,
+                    }
+                )
+                break
+
+            else:
+                # ── Signal 2: Stale deal at Negotiation/Review ───────────────
+                opp = None
+                if hasattr(self._crm, "_sf_o"):
+                    opp = self._crm._sf_o.find_one(
+                        {
+                            "account_name": org_name,
+                            "stage": "Negotiation/Review",
+                        },
+                        {"_id": 0, "_seq": 0},
+                    )
+
+                if opp:
+                    touchpoints = opp.get("touchpoints", [])
+                    last_touch = (
+                        touchpoints[-1].get("timestamp", "") if touchpoints else ""
+                    )
+                    days_stale = 0
+                    if last_touch:
+                        try:
+                            last_dt = datetime.fromisoformat(
+                                last_touch.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            days_stale = (
+                                state.current_date.replace(tzinfo=None) - last_dt
+                            ).days
+                        except ValueError:
+                            pass
+
+                    if days_stale >= 3:
+                        topic = (
+                            "Following up on our proposal — checking in on next steps"
+                        )
+                        signals.append(
+                            {
+                                "source": source,
+                                "email_type": "question",
+                                "trigger": f"Open deal {opp['opportunity_id']} at Negotiation/Review, no touchpoint in {days_stale} days",
+                                "symptom": "",
+                                "topic": topic,
+                            }
+                        )
+                        continue
+
+                # ── Signal 3: Contract renewal within 60 days ────────────────
+                renewal_str = source.get("contract_renewal_date", "")
+                if renewal_str:
+                    try:
+                        renewal_dt = datetime.fromisoformat(
+                            renewal_str.replace("Z", "+00:00")
+                        ).replace(tzinfo=None)
+                        days_to_renewal = (
+                            renewal_dt - state.current_date.replace(tzinfo=None)
+                        ).days
+                        if 0 < days_to_renewal <= 60:
+                            topic = "Upcoming contract renewal — wanted to discuss terms and our roadmap needs"
+                            signals.append(
+                                {
+                                    "source": source,
+                                    "email_type": "question",
+                                    "trigger": f"Contract renewal in {days_to_renewal} days",
+                                    "symptom": "",
+                                    "topic": topic,
+                                }
+                            )
+                            continue
+                    except ValueError:
+                        pass
+
+                # ── Signal 4: Opp has risk notes + low sentiment ─────────────
+                if hasattr(self._crm, "_sf_o"):
+                    risky_opp = self._crm._sf_o.find_one(
+                        {
+                            "account_name": org_name,
+                            "stage": {"$nin": ["Closed Won", "Closed Lost"]},
+                            "risk_notes": {"$not": {"$size": 0}},
+                        },
+                        {"_id": 0, "_seq": 0},
+                    )
+                    if risky_opp and sentiment < 0.6:
+                        topic = "Wanted to discuss some concerns we have about platform reliability"
+                        signals.append(
+                            {
+                                "source": source,
+                                "email_type": "complaint"
+                                if sentiment < 0.45
+                                else "question",
+                                "trigger": f"Risky deal {risky_opp['opportunity_id']} + low sentiment ({sentiment})",
+                                "symptom": "",
+                                "topic": topic,
+                            }
+                        )
+                        continue
+
+                # ── Signal 5: High expansion potential + healthy system ───────
+                if (
+                    source.get("expansion_potential", 0) >= 8
+                    and state.system_health >= 80
+                    and random.random() < 0.25  # not every day — keep it sparse
+                ):
+                    topic = "Exploring additional use cases and features for our team"
+                    signals.append(
+                        {
+                            "source": source,
+                            "email_type": "feature_request",
+                            "trigger": f"High expansion potential ({source.get('expansion_potential')}) + healthy system",
+                            "symptom": "",
+                            "topic": topic,
+                        }
+                    )
+
+                # ── Signal 6: Chronically low sentiment — unprompted complaint ─
+                # Unhappy customers complain regardless of active incidents.
+                # Fires independently of all other signals as a baseline floor.
+                elif sentiment < 0.45 and random.random() < 0.15:
+                    topic = source.get("topics", ["platform reliability concerns"])[0]
+                    signals.append(
+                        {
+                            "source": source,
+                            "email_type": "complaint",
+                            "trigger": f"Chronically low sentiment ({sentiment:.2f}) — unprompted complaint",
+                            "symptom": source.get(
+                                "symptom_language",
+                                "We've been experiencing ongoing issues and wanted to follow up.",
+                            ),
+                            "topic": topic,
+                        }
+                    )
+
+        return signals
 
     def _persona_hint(self, name: str) -> str:
         p = self._personas.get(name, {})
