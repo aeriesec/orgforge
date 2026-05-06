@@ -32,6 +32,7 @@ from pymongo.operations import SearchIndexModel
 import requests
 import shutil
 from pathlib import Path
+from provider_config import openai_labelbox_config
 
 logger = logging.getLogger("orgforge.memory")
 
@@ -43,6 +44,18 @@ OLLAMA_HOST = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "ollama")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "mxbai-embed-large")
 EMBED_DIMS = int(os.environ.get("EMBED_DIMS", "1024"))
+
+
+def _current_embed_provider() -> str:
+    return os.environ.get("EMBED_PROVIDER", EMBED_PROVIDER)
+
+
+def _current_embed_model() -> str:
+    return os.environ.get("EMBED_MODEL", EMBED_MODEL)
+
+
+def _current_embed_dims() -> int:
+    return int(os.environ.get("EMBED_DIMS", str(EMBED_DIMS)))
 
 
 _SKIP_EMBED_TYPES = {
@@ -232,7 +245,7 @@ class OpenAIEmbedder(BaseEmbedder):
             logger.error(f"[memory] ⚠️  OpenAI init failed: {e}")
             self._ok = False
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str, input_type: str = "search_document") -> List[float]:
         if not self._ok:
             return self._fallback(text)
         try:
@@ -244,6 +257,84 @@ class OpenAIEmbedder(BaseEmbedder):
             return resp.data[0].embedding
         except Exception as e:
             logger.error(f"[memory] OpenAI embedding failed: {e}")
+            return self._fallback(text)
+
+
+class OpenAILabelboxEmbedder(BaseEmbedder):
+    """
+    Generates embeddings through Labelbox's OpenAI-compatible model gateway.
+    Requires OPENAI_LABELBOX_API_KEY, OPENAI_LABELBOX_BASE_URL, and
+    OPENAI_LABELBOX_DEFAULT_HEADERS.
+    """
+
+    def __init__(self, model: str = EMBED_MODEL, dims: int = EMBED_DIMS):
+        super().__init__(dims)
+        self._model = model
+        try:
+            from openai import OpenAI
+
+            cfg = openai_labelbox_config()
+            if not cfg.api_key:
+                raise ValueError("OPENAI_LABELBOX_API_KEY is not set")
+            if not cfg.default_headers:
+                raise ValueError("OPENAI_LABELBOX_DEFAULT_HEADERS is not set")
+
+            max_retries = int(os.environ.get("OPENAI_LABELBOX_EMBED_MAX_RETRIES", "0"))
+            timeout = float(os.environ.get("OPENAI_LABELBOX_EMBED_TIMEOUT", "30"))
+            self._request_timeout = timeout
+            self._failure_threshold = int(
+                os.environ.get("OPENAI_LABELBOX_EMBED_FAILURE_THRESHOLD", "3")
+            )
+            self._consecutive_failures = 0
+            self._client = OpenAI(
+                api_key=cfg.api_key,
+                base_url=cfg.base_url,
+                default_headers=cfg.default_headers,
+                max_retries=max_retries,
+                timeout=timeout,
+            )
+            self._ok = True
+            logger.info(
+                "[memory] OpenAI/Labelbox embedder ready (%s, %s dims, %s, retries=%s, timeout=%ss)",
+                model,
+                dims,
+                cfg.base_url,
+                max_retries,
+                timeout,
+            )
+        except ImportError:
+            logger.error(
+                "[memory] ⚠️  openai package not installed. Run: pip install openai"
+            )
+            self._ok = False
+        except Exception as e:
+            logger.error(f"[memory] ⚠️  OpenAI/Labelbox init failed: {e}")
+            self._ok = False
+
+    def embed(self, text: str, input_type: str = "search_document") -> List[float]:
+        if not self._ok:
+            return self._fallback(text)
+        try:
+            resp = self._client.embeddings.create(
+                model=self._model,
+                input=text[:8191],
+                dimensions=self.dims,
+                timeout=self._request_timeout,
+            )
+            self._consecutive_failures = 0
+            return resp.data[0].embedding
+        except Exception as e:
+            logger.error(f"[memory] OpenAI/Labelbox embedding failed: {e}")
+            self._consecutive_failures += 1
+            if (
+                self._failure_threshold > 0
+                and self._consecutive_failures >= self._failure_threshold
+            ):
+                self._ok = False
+                logger.error(
+                    "[memory] OpenAI/Labelbox embeddings disabled after %s consecutive failures; using deterministic fallback for this run.",
+                    self._consecutive_failures,
+                )
             return self._fallback(text)
 
 
@@ -373,22 +464,29 @@ class BedrockEmbedder(BaseEmbedder):
 # EMBEDDER FACTORY
 # ─────────────────────────────────────────────
 def build_embedder(
-    provider: str = EMBED_PROVIDER,
-    model: str = EMBED_MODEL,
-    dims: int = EMBED_DIMS,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    dims: Optional[int] = None,
     **kwargs,
 ) -> BaseEmbedder:
     """
     Return the correct embedder for the active quality_preset.
 
     provider values:
-      "ollama"  → OllamaEmbedder  (local_gpu preset)
-      "openai"  → OpenAIEmbedder  (cloud preset, OPENAI_API_KEY required)
-      "bedrock" → BedrockEmbedder (cloud preset, AWS credentials required)
+      "ollama"          → OllamaEmbedder  (local_gpu preset)
+      "openai"          → OpenAIEmbedder  (OPENAI_API_KEY required)
+      "openai_labelbox" → OpenAILabelboxEmbedder (Labelbox gateway)
+      "bedrock"         → BedrockEmbedder (AWS credentials required)
     """
+    provider = provider or _current_embed_provider()
+    model = model or _current_embed_model()
+    dims = dims or _current_embed_dims()
+
     provider = provider.lower()
     if provider == "openai":
         return OpenAIEmbedder(model=model, dims=dims)
+    if provider == "openai_labelbox":
+        return OpenAILabelboxEmbedder(model=model, dims=dims)
     if provider == "bedrock":
         region = kwargs.get(
             "aws_region", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -473,7 +571,7 @@ class Memory:
                 {
                     "type": "vector",
                     "path": "embedding",
-                    "numDimensions": EMBED_DIMS,
+                    "numDimensions": self._embedder.dims,
                     "similarity": "dotProduct",
                     "quantization": "scalar",
                 },
@@ -1562,6 +1660,43 @@ class Memory:
             f"Do not answer the topic — describe what the document would cover.\n\n"
             f"Topic: {raw_query}\n\nPassage:"
         )
+
+        provider = os.environ.get("ORGFORGE_MODEL_PROVIDER") or _current_embed_provider()
+        if provider == "openai_labelbox":
+            return self._rewrite_query_openai_labelbox(prompt, raw_query)
+        if provider != "bedrock":
+            return raw_query
+
+        return self._rewrite_query_bedrock(prompt, raw_query)
+
+    def _rewrite_query_openai_labelbox(self, prompt: str, raw_query: str) -> str:
+        try:
+            from openai import OpenAI
+
+            cfg = openai_labelbox_config()
+            client = OpenAI(
+                api_key=cfg.api_key,
+                base_url=cfg.base_url,
+                default_headers=cfg.default_headers,
+            )
+            model = os.environ.get("ORGFORGE_REWRITE_MODEL", "openai/gpt-4o")
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=256,
+            )
+            rewritten = (response.choices[0].message.content or "").strip()
+
+            logger.debug(
+                f"[memory] query rewrite: '{raw_query[:60]}' → '{rewritten[:80]}'"
+            )
+            return rewritten if rewritten else raw_query
+        except Exception as e:
+            logger.warning(f"[memory] _rewrite_query failed: {e} — using raw query")
+            return raw_query
+
+    def _rewrite_query_bedrock(self, prompt: str, raw_query: str) -> str:
         try:
             client = boto3.client("bedrock-runtime", region_name="us-east-1")
 
@@ -1604,8 +1739,8 @@ class Memory:
             "artifact_count": self._artifacts.count_documents({}),
             "event_count": self._events.count_documents({}),
             "event_log_len": len(self._event_log),
-            "embed_provider": EMBED_PROVIDER,
-            "embed_model": EMBED_MODEL,
+            "embed_provider": _current_embed_provider(),
+            "embed_model": _current_embed_model(),
             "embed_dims": self._embedder.dims,
             "embedder_ok": embedder_ok,
             "mongodb_ok": True,

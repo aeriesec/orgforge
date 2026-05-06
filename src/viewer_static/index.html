@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OrgForge Dataset Viewer</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand">
+          <div class="brand-mark">OF</div>
+          <div>
+            <h1>OrgForge</h1>
+            <p>Enterprise seed data</p>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-item active" data-view="overview">Overview</button>
+          <button class="nav-item" data-view="inbox">Inbox</button>
+          <button class="nav-item" data-view="slack">Slack</button>
+          <button class="nav-item" data-view="jira">Jira</button>
+          <button class="nav-item" data-view="docs">Docs & Meetings</button>
+          <button class="nav-item" data-view="crm">CRM</button>
+          <button class="nav-item" data-view="org">Org State</button>
+          <button class="nav-item" data-view="timeline">Timeline</button>
+          <button class="nav-item" data-view="raw">Raw Data</button>
+          <button class="nav-item" data-view="search">Search</button>
+        </nav>
+
+        <div class="source-box">
+          <span class="source-label">Database</span>
+          <strong id="sourceDb">Loading</strong>
+          <span class="source-label">Export Root</span>
+          <code id="sourceExport">Loading</code>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Synthetic Enterprise Environment</p>
+            <h2 id="viewTitle">Overview</h2>
+          </div>
+          <div class="topbar-actions">
+            <select id="dbSelect" aria-label="Database"></select>
+            <button id="refreshButton" class="primary-button">Refresh</button>
+          </div>
+        </header>
+
+        <section id="errorBanner" class="error-banner hidden"></section>
+
+        <section id="overviewView" class="view active-view">
+          <div id="metricGrid" class="metric-grid"></div>
+          <div id="appCards" class="app-card-grid"></div>
+          <div class="two-column">
+            <section class="panel">
+              <div class="panel-header">
+                <h3>Collection Inventory</h3>
+                <span id="collectionCount" class="muted"></span>
+              </div>
+              <div id="collectionInventory" class="inventory-list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-header">
+                <h3>Data Shape</h3>
+                <span class="muted">Top breakdowns</span>
+              </div>
+              <div id="breakdownGrid" class="breakdown-grid"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="inboxView" class="view">
+          <div class="toolbar">
+            <div class="field grow">
+              <label for="inboxQuery">Search Inbox</label>
+              <input id="inboxQuery" type="search" placeholder="sender, customer, subject, body..." />
+            </div>
+            <button id="inboxSearchButton" class="secondary-button">Apply</button>
+          </div>
+          <div class="app-three-pane mail-layout">
+            <section class="panel list-panel">
+              <div class="panel-header">
+                <h3>Email Threads</h3>
+                <span id="inboxMeta" class="muted"></span>
+              </div>
+              <div id="inboxThreadList" class="record-list"></div>
+            </section>
+            <section class="panel detail-panel wide">
+              <div class="panel-header">
+                <h3 id="inboxThreadTitle">Select a thread</h3>
+                <span id="inboxThreadMeta" class="muted"></span>
+              </div>
+              <div id="inboxMessages" class="message-stack"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="slackView" class="view">
+          <div class="toolbar">
+            <div class="field grow">
+              <label for="slackQuery">Search Slack</label>
+              <input id="slackQuery" type="search" placeholder="channel, person, thread text..." />
+            </div>
+            <button id="slackSearchButton" class="secondary-button">Apply</button>
+          </div>
+          <div class="app-three-pane slack-layout">
+            <section class="panel list-panel compact">
+              <div class="panel-header">
+                <h3>Channels</h3>
+                <span id="slackChannelMeta" class="muted"></span>
+              </div>
+              <div id="slackChannelList" class="record-list"></div>
+            </section>
+            <section class="panel list-panel">
+              <div class="panel-header">
+                <h3 id="slackThreadPanelTitle">Threads</h3>
+                <span id="slackThreadMeta" class="muted"></span>
+              </div>
+              <div id="slackThreadList" class="record-list"></div>
+            </section>
+            <section class="panel detail-panel">
+              <div class="panel-header">
+                <h3 id="slackMessageTitle">Messages</h3>
+                <span id="slackMessageMeta" class="muted"></span>
+              </div>
+              <div id="slackMessages" class="message-stack"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="jiraView" class="view">
+          <div class="toolbar">
+            <div class="field grow">
+              <label for="jiraQuery">Search Jira</label>
+              <input id="jiraQuery" type="search" placeholder="ticket, department, assignee, vendor..." />
+            </div>
+            <button id="jiraSearchButton" class="secondary-button">Apply</button>
+          </div>
+          <div id="jiraSummary" class="mini-metric-row"></div>
+          <div id="jiraBoard" class="kanban-board"></div>
+          <section class="panel below-panel">
+            <div class="panel-header">
+              <h3 id="jiraDetailTitle">Select a ticket</h3>
+              <button id="copyTicketButton" class="secondary-button small">Copy JSON</button>
+            </div>
+            <pre id="jiraDetail" class="json-view short"></pre>
+          </section>
+        </section>
+
+        <section id="docsView" class="view">
+          <div class="toolbar">
+            <div class="field grow">
+              <label for="docsQuery">Search Docs and Meetings</label>
+              <input id="docsQuery" type="search" placeholder="Project Titan, QA, participants, domain..." />
+            </div>
+            <button id="docsSearchButton" class="secondary-button">Apply</button>
+          </div>
+          <div id="docsSummary" class="mini-metric-row"></div>
+          <div class="split-view">
+            <section class="panel list-panel">
+              <div class="panel-header">
+                <h3>Documents</h3>
+                <span id="docsMeta" class="muted"></span>
+              </div>
+              <div id="docsList" class="record-list"></div>
+            </section>
+            <section class="panel detail-panel">
+              <div class="panel-header">
+                <h3 id="docReaderTitle">Select a document</h3>
+                <span id="docReaderMeta" class="muted"></span>
+              </div>
+              <div id="docReader" class="file-preview"></div>
+            </section>
+          </div>
+          <section class="panel below-panel">
+            <div class="panel-header">
+              <h3>Knowledge Domains</h3>
+              <span id="domainsMeta" class="muted"></span>
+            </div>
+            <div id="domainGrid" class="domain-grid"></div>
+          </section>
+        </section>
+
+        <section id="crmView" class="view">
+          <div class="toolbar">
+            <div class="field grow">
+              <label for="crmQuery">Search CRM</label>
+              <input id="crmQuery" type="search" placeholder="account, owner, region, opportunity..." />
+            </div>
+            <button id="crmSearchButton" class="secondary-button">Apply</button>
+          </div>
+          <div id="crmSummary" class="mini-metric-row"></div>
+          <div class="split-view">
+            <section class="panel list-panel">
+              <div class="panel-header">
+                <h3>Accounts</h3>
+                <span id="crmMeta" class="muted"></span>
+              </div>
+              <div id="accountList" class="record-list"></div>
+            </section>
+            <section class="panel detail-panel">
+              <div class="panel-header">
+                <h3 id="accountDetailTitle">Select an account</h3>
+                <span id="accountDetailMeta" class="muted"></span>
+              </div>
+              <div id="accountDetail" class="detail-content"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="orgView" class="view">
+          <div class="toolbar">
+            <div class="field grow">
+              <label for="orgQuery">Search Org State</label>
+              <input id="orgQuery" type="search" placeholder="department, person, domain, plan..." />
+            </div>
+            <button id="orgSearchButton" class="secondary-button">Apply</button>
+          </div>
+          <div id="orgSummary" class="mini-metric-row"></div>
+          <div class="two-column">
+            <section class="panel">
+              <div class="panel-header">
+                <h3>Department Plans</h3>
+                <span id="deptPlanMeta" class="muted"></span>
+              </div>
+              <div id="deptPlanList" class="record-list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-header">
+                <h3>People and Knowledge</h3>
+                <span class="muted">Stress, relationships, domains</span>
+              </div>
+              <div id="orgInsightGrid" class="org-grid"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="timelineView" class="view">
+          <div class="toolbar">
+            <div class="field">
+              <label for="timelineTypeSelect">Event Type</label>
+              <select id="timelineTypeSelect">
+                <option value="">All event types</option>
+              </select>
+            </div>
+            <div class="field grow">
+              <label for="timelineQuery">Search Timeline</label>
+              <input id="timelineQuery" type="search" placeholder="actor, ticket, summary, fact..." />
+            </div>
+            <button id="timelineSearchButton" class="secondary-button">Apply</button>
+          </div>
+          <div id="timelineList" class="timeline-list"></div>
+        </section>
+
+        <section id="rawView" class="view">
+          <div class="raw-tabs">
+            <button class="raw-tab active" data-raw-tab="collections">Collections</button>
+            <button class="raw-tab" data-raw-tab="files">Files</button>
+          </div>
+          <div id="rawCollections" class="raw-pane active-raw-pane">
+            <div class="toolbar">
+              <div class="field">
+                <label for="collectionSelect">Collection</label>
+                <select id="collectionSelect"></select>
+              </div>
+              <div class="field grow">
+                <label for="collectionQuery">Filter</label>
+                <input id="collectionQuery" type="search" placeholder="title, summary, status, person..." />
+              </div>
+              <button id="collectionSearchButton" class="secondary-button">Apply</button>
+            </div>
+            <div class="split-view">
+              <section class="panel list-panel">
+                <div class="panel-header">
+                  <h3 id="documentsTitle">Documents</h3>
+                  <span id="documentsMeta" class="muted"></span>
+                </div>
+                <div id="documentList" class="record-list"></div>
+              </section>
+              <section class="panel detail-panel">
+                <div class="panel-header">
+                  <h3 id="documentDetailTitle">Select a document</h3>
+                  <button id="copyDocumentButton" class="secondary-button small">Copy JSON</button>
+                </div>
+                <pre id="documentDetail" class="json-view"></pre>
+              </section>
+            </div>
+          </div>
+          <div id="rawFiles" class="raw-pane">
+            <div class="toolbar">
+              <div class="field">
+                <label for="fileKindSelect">Kind</label>
+                <select id="fileKindSelect">
+                  <option value="">All files</option>
+                </select>
+              </div>
+              <div class="field grow">
+                <label for="fileQuery">Filter</label>
+                <input id="fileQuery" type="search" placeholder="jira, confluence, customer, path..." />
+              </div>
+              <button id="fileSearchButton" class="secondary-button">Apply</button>
+            </div>
+            <div class="split-view">
+              <section class="panel list-panel">
+                <div class="panel-header">
+                  <h3>Export Files</h3>
+                  <span id="filesMeta" class="muted"></span>
+                </div>
+                <div id="fileList" class="record-list"></div>
+              </section>
+              <section class="panel detail-panel">
+                <div class="panel-header">
+                  <h3 id="fileDetailTitle">Select a file</h3>
+                  <button id="copyFileButton" class="secondary-button small">Copy Text</button>
+                </div>
+                <div id="fileDetail" class="file-preview"></div>
+              </section>
+            </div>
+          </div>
+        </section>
+
+        <section id="searchView" class="view">
+          <div class="search-hero">
+            <label for="globalSearchInput">Search MongoDB and exported artifacts</label>
+            <div class="search-row">
+              <input id="globalSearchInput" type="search" placeholder="Try Project Titan, Laura, OAuth, QA, customer..." />
+              <button id="globalSearchButton" class="primary-button">Search</button>
+            </div>
+          </div>
+          <div id="searchResults" class="search-results"></div>
+        </section>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

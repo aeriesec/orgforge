@@ -21,6 +21,7 @@ The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, f
 - [Why Does This Exist?](#why-does-this-exist)
 - [What the Output Looks Like](#what-the-output-looks-like)
 - [What Gets Generated](#what-gets-generated)
+- [Viewing Generated Data](#viewing-generated-data)
 - [Architecture & Mechanics](#architecture--mechanics)
 - [The Departure Cascade](#the-departure-cascade)
 - [Insider Threat Simulation](#insider-threat-simulation)
@@ -28,7 +29,8 @@ The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, f
   - [Setup Options](#setup-options)
   - [Option 1 — Everything in Docker](#option-1--everything-in-docker-recommended)
   - [Option 2 — Local Ollama, Docker for MongoDB Only](#option-2--local-ollama-docker-for-mongodb-only)
-  - [Option 3 — Cloud Preset](#option-3--cloud-preset-aws-bedrock--openai)
+  - [Option 3 — OpenAI via Labelbox](#option-3--openai-via-labelbox)
+  - [Option 4 — Cloud Preset](#option-4--cloud-preset-aws-bedrock--openai)
   - [Running on AWS EC2](#running-on-aws-ec2)
 - [Configuration](#configuration)
   - [Quality Presets](#quality-presets)
@@ -114,6 +116,37 @@ A default 22-day simulation produces:
 | `simulation_snapshot.json` | Full state: incidents, morale curve, system health, relationship graph, departed employees, new hires, knowledge gap events |
 | `simulation.log`           | Complete chronological system and debug logs for the entire run                                                             |
 
+## Viewing Generated Data
+
+OrgForge includes a local dashboard for inspecting generated seed data before moving it into another enterprise-app environment. It reads the MongoDB collections and the exported files side by side.
+
+For a normal repo export:
+
+```bash
+docker compose up -d mongodb viewer
+```
+
+Open `http://localhost:8765`.
+
+For a one-off run with a custom database or export directory:
+
+```bash
+python src/viewer.py \
+  --db orgforge_e2e_1778005848 \
+  --export-dir /private/tmp/orgforge_e2e_1778005848
+```
+
+The viewer has app-shaped views for the generated enterprise surfaces:
+
+- Inbox: email threads first, then ordered messages in each thread
+- Slack: channels and DMs, then threads, then ordered messages
+- Jira: workflow board with ticket details
+- Docs & Meetings: Confluence pages, Zoom transcripts, and knowledge-domain coverage
+- CRM: Salesforce accounts, opportunities, touchpoints, and related email
+- Org State: department plans, stress, relationships, departures, and domain ownership
+- Timeline: the ground-truth event log for causal inspection
+- Raw Data: direct MongoDB collection and export-file browser for debugging
+
 ---
 
 ## Architecture & Mechanics
@@ -197,7 +230,28 @@ docker compose up mongodb orgforge
 
 > **Linux note:** `host.docker.internal` requires Docker Desktop, or the `extra_hosts: host-gateway` entry in `docker-compose.yaml` (already included).
 
-### Option 3 — Cloud Preset (AWS Bedrock + OpenAI)
+### Option 3 — OpenAI via Labelbox
+
+Routes planner agents, worker agents, and embeddings through Labelbox's OpenAI-compatible model gateway.
+
+Set `quality_preset: "openai_labelbox"` in `config.yaml`, then:
+
+```bash
+# .env
+OPENAI_LABELBOX_API_KEY=...
+OPENAI_LABELBOX_BASE_URL=https://models.labelbox.com/api/v1/models/litellm/v1
+OPENAI_LABELBOX_DEFAULT_HEADERS='{"x-labelbox-context":"{\"tag\":\"foundry_litellm_test_openai\",\"project_id\":\"test_cuid\"}"}'
+EMBED_PROVIDER=openai_labelbox
+EMBED_MODEL=openai/text-embedding-3-large
+EMBED_DIMS=1024
+```
+
+```bash
+pip install openai
+docker compose up mongodb orgforge
+```
+
+### Option 4 — Cloud Preset (AWS Bedrock + OpenAI)
 
 Best output quality. Uses Claude Sonnet for document generation, Llama 3.1 8B on Bedrock for high-volume worker calls, and OpenAI `text-embedding-3-large` for embeddings.
 
@@ -241,13 +295,14 @@ For `Llama 3.3 70B` entirely locally, use a `g5.2xlarge` or `g5.12xlarge` with t
 ### Quality Presets
 
 ```yaml
-quality_preset: "local_gpu" # local_gpu | cloud
+quality_preset: "openai_labelbox" # local_gpu | cloud | openai_labelbox
 ```
 
 | Preset      | Planner                     | Worker                | Embeddings             | Best For                 |
 | ----------- | --------------------------- | --------------------- | ---------------------- | ------------------------ |
 | `local_gpu` | llama3.3:70b-instruct-q4_KM | llama3.1:8b-instruct  | mxbai-embed-large      | High-fidelity local runs |
 | `cloud`     | Claude Sonnet (Bedrock)     | llama3.1:8b (Bedrock) | text-embedding-3-large | Best output quality      |
+| `openai_labelbox` | openai/gpt-4o via Labelbox | openai/gpt-4o via Labelbox | openai/text-embedding-3-large via Labelbox | OpenAI-compatible gateway |
 
 ### Key Config Fields
 

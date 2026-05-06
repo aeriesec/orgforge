@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 from dataclasses import asdict as _asdict
@@ -876,13 +877,19 @@ class OrgCoordinator:
             if col:
                 actors = col.get("actors", [])
                 if actors:
+                    priority_raw = col.get("priority", 1)
+                    try:
+                        priority = int(priority_raw)
+                    except (TypeError, ValueError):
+                        match = re.search(r"-?\d+", str(priority_raw))
+                        priority = int(match.group(0)) if match else 1
                     collision_events.append(
                         ProposedEvent(
                             event_type=col.get("event_type", "leadership_sync"),
                             actors=actors,
                             rationale=col.get("rationale", ""),
                             facts_hint=col.get("facts_hint", {}),
-                            priority=int(col.get("priority", 1)),
+                            priority=priority,
                             artifact_hint=col.get("artifact_hint"),
                         )
                     )

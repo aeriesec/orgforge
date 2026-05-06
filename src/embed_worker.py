@@ -11,7 +11,7 @@ Architecture
 ------------
 - A ThreadPoolExecutor processes embed tasks concurrently from a Queue.
 - Concurrency is tuned via EMBED_WORKER_CONCURRENCY (default: 8 for Infinity,
-  1 for Ollama which is serial anyway).
+  1 for Ollama and gateway-backed OpenAI providers).
 - The main sim loop calls enqueue() instead of mem.embed_artifact() directly.
 - Before any vector search (context_for_prompt, recall, search_events) the
   caller must call drain() to flush pending embeds — this ensures causal
@@ -59,12 +59,20 @@ logger = logging.getLogger("orgforge.embed_worker")
 _SENTINEL = None
 
 # How many embed HTTP calls to run in parallel.
-# - Infinity:  8–16 is a good starting point on a Xeon 6975P; Infinity's
-#              dynamic batching coalesces concurrent requests server-side so
-#              you get throughput gains without hammering the network.
-# - Ollama:    Keep at 1 — Ollama serialises embeds internally anyway and
-#              parallel requests just queue up in its HTTP layer.
-_DEFAULT_CONCURRENCY = int(os.environ.get("EMBED_WORKER_CONCURRENCY", "8"))
+# - Infinity:  8-16 is a good starting point on a Xeon 6975P; Infinity's
+#              dynamic batching coalesces concurrent requests server-side.
+# - Ollama and gateway-backed OpenAI providers: keep low to avoid provider
+#              retry storms during end-of-day drains.
+_PROVIDER_DEFAULT_CONCURRENCY = {
+    "ollama": 1,
+    "openai_labelbox": 1,
+}
+_DEFAULT_CONCURRENCY = int(
+    os.environ.get(
+        "EMBED_WORKER_CONCURRENCY",
+        str(_PROVIDER_DEFAULT_CONCURRENCY.get(os.environ.get("EMBED_PROVIDER"), 8)),
+    )
+)
 
 
 class EmbedWorker:

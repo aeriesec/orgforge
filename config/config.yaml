@@ -7,7 +7,7 @@
 
 # ── QUALITY PRESET ────────────────────────────────────────────
 # Controls which model profile is active.
-# Options: "local_gpu" | "cloud"
+# Options: "local_gpu" | "cloud" | "openai_labelbox"
 #
 #   local_gpu  — for machines with a CUDA/Metal GPU running Ollama.
 #                Significantly faster; same offline/private guarantee.
@@ -16,7 +16,11 @@
 #                Best output quality. Requires AWS credentials and
 #                OPENAI_API_KEY. Use for production dataset generation.
 #
-quality_preset: "cloud"
+#   openai_labelbox — OpenAI models through Labelbox's LiteLLM-compatible
+#                     gateway for both agent LLMs and embeddings.
+#                     Requires OPENAI_LABELBOX_* environment variables.
+#
+quality_preset: "openai_labelbox"
 
 model_presets:
   local_gpu:
@@ -37,6 +41,14 @@ model_presets:
     aws_region: "us-east-2"
     embed_provider: "ollama"
     embed_model: "mxbai-embed-large"
+    embed_dims: 1024
+
+  openai_labelbox:
+    provider: "openai_labelbox"
+    planner: "openai/gpt-4o"
+    worker: "openai/gpt-4o"
+    embed_provider: "openai_labelbox"
+    embed_model: "openai/text-embedding-3-large"
     embed_dims: 1024
 
 # ── SIMULATION ────────────────────────────────────────────────

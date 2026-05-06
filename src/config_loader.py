@@ -7,6 +7,7 @@ Single source of truth for all constants.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -16,10 +17,14 @@ import yaml
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
 
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
-EXPORT_DIR = PROJECT_ROOT / "export"
-
-EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+_CONFIG_PATH_ENV = os.environ.get("ORGFORGE_CONFIG_PATH")
+CONFIG_PATH = (
+    Path(_CONFIG_PATH_ENV).expanduser()
+    if _CONFIG_PATH_ENV
+    else PROJECT_ROOT / "config" / "config.yaml"
+)
+if not CONFIG_PATH.is_absolute():
+    CONFIG_PATH = PROJECT_ROOT / CONFIG_PATH
 
 
 with open(CONFIG_PATH, "r") as _f:
@@ -30,12 +35,19 @@ if _data is None:
 
 CONFIG: Dict[str, Any] = _data
 
+_EXPORT_DIR_RAW = CONFIG["simulation"].get("output_dir", str(PROJECT_ROOT / "export"))
+EXPORT_DIR = Path(_EXPORT_DIR_RAW).expanduser()
+if not EXPORT_DIR.is_absolute():
+    EXPORT_DIR = PROJECT_ROOT / EXPORT_DIR
+
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 COMPANY_NAME = CONFIG["simulation"]["company_name"]
 COMPANY_DOMAIN = CONFIG["simulation"]["domain"]
 COMPANY_DESCRIPTION = CONFIG["simulation"]["company_description"]
 INDUSTRY = CONFIG["simulation"].get("industry", "technology")
-BASE = CONFIG["simulation"].get("output_dir", str(EXPORT_DIR))
+BASE = str(EXPORT_DIR)
 ORG_CHART = CONFIG["org_chart"]
 LEADS = CONFIG["leads"]
 PERSONAS = CONFIG["personas"]

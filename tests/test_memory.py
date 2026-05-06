@@ -22,6 +22,50 @@ def test_embedder_fallback_mechanism():
     assert vec1 != vec3
 
 
+def test_rewrite_query_uses_openai_labelbox_provider(monkeypatch, make_test_memory):
+    """HyDE query rewriting must use the configured Labelbox OpenAI gateway."""
+    import sys
+    from types import SimpleNamespace
+
+    fake_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="Relevant docs cover auth migration.")
+            )
+        ]
+    )
+    fake_create = MagicMock(return_value=fake_response)
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
+    fake_openai_cls = MagicMock(return_value=fake_client)
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=fake_openai_cls))
+    monkeypatch.setenv("ORGFORGE_MODEL_PROVIDER", "openai_labelbox")
+    monkeypatch.setenv("ORGFORGE_REWRITE_MODEL", "openai/gpt-4o")
+    monkeypatch.setenv("OPENAI_LABELBOX_API_KEY", "lb-key")
+    monkeypatch.setenv(
+        "OPENAI_LABELBOX_BASE_URL",
+        "https://models.labelbox.com/api/v1/models/litellm/v1",
+    )
+    monkeypatch.setenv(
+        "OPENAI_LABELBOX_DEFAULT_HEADERS",
+        '{"x-labelbox-context":"{\\"tag\\":\\"t\\",\\"project_id\\":\\"p\\"}"}',
+    )
+
+    rewritten = make_test_memory._rewrite_query("authentication migration")
+
+    fake_openai_cls.assert_called_once_with(
+        api_key="lb-key",
+        base_url="https://models.labelbox.com/api/v1/models/litellm/v1",
+        default_headers={"x-labelbox-context": '{"tag":"t","project_id":"p"}'},
+    )
+    fake_create.assert_called_once()
+    assert fake_create.call_args.kwargs["model"] == "openai/gpt-4o"
+    assert fake_create.call_args.kwargs["messages"][0]["role"] == "user"
+    assert rewritten == "Relevant docs cover auth migration."
+
+
 def test_memory_recall_pipeline_filters():
     """Verifies Memory.recall builds the correct MongoDB aggregation pipeline with filters."""
     from memory import Memory

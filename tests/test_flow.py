@@ -733,3 +733,30 @@ def test_build_llm_ollama_branch():
         MockOllama.assert_called_with(
             model="mock-planner", base_url="http://localhost:11434"
         )
+
+
+def test_build_llm_openai_labelbox_branch():
+    labelbox_params = {
+        "api_key": "lb-key",
+        "base_url": "https://models.labelbox.com/api/v1/models/litellm/v1",
+        "extra_headers": {"x-labelbox-context": '{"tag":"t","project_id":"p"}'},
+    }
+    with (
+        patch("flow._PROVIDER", "openai_labelbox"),
+        patch("flow._PRESET", {"planner": "openai/gpt-4o"}),
+        patch("flow.openai_labelbox_litellm_params", return_value=labelbox_params),
+        patch(
+            "flow.openai_labelbox_litellm_model",
+            return_value="openai/openai/gpt-4o",
+        ),
+        patch("crewai.LLM") as MockLLM,
+    ):
+        from flow import build_llm
+
+        build_llm("planner")
+        MockLLM.assert_called_with(
+            model="openai/openai/gpt-4o",
+            temperature=0.7,
+            max_tokens=16384,
+            **labelbox_params,
+        )

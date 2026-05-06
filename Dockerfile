@@ -2,7 +2,7 @@
 # Runs flow.py (simulation) and email_gen.py (emails).
 #
 # Build args:
-#   INSTALL_CLOUD_DEPS=true   installs boto3, langchain-aws, openai
+#   INSTALL_CLOUD_DEPS=true   installs extra AWS Bedrock dependencies
 #                             required for quality_preset: "cloud"
 #                             default: false (keeps image lean for local presets)
 #

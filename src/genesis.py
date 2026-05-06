@@ -36,7 +36,7 @@ def initialize(config, planner_llm, reset=False):
     mem = Memory()
 
     if reset:
-        mem.reset(export_dir=config.get("base_dir", "export"))
+        mem.reset(export_dir=config.get("base_dir") or BASE)
         logger.info("[genesis] 🧹 Database and exports wiped.")
 
     logger.info("[genesis] 🚀 Seeding corporate ground truth...")
@@ -54,6 +54,19 @@ def initialize(config, planner_llm, reset=False):
 
 def seed_external_sources(mem: Memory, planner_llm):
     if mem.get_inbound_email_sources():
+        return
+
+    configured_sources = CONFIG.get("external_contacts") or []
+    if configured_sources:
+        mem.save_inbound_email_sources(configured_sources)
+        logger.info(
+            f"[genesis] ✅ Seeded {len(configured_sources)} configured inbound sources."
+        )
+        for s in configured_sources:
+            logger.info(
+                f"    [dim]→ [{s['category']}] {s['name']} "
+                f"({s['internal_liaison']}) triggers={s['trigger_on']}[/dim]"
+            )
         return
 
     logger.info("[cyan]🌐 Generating inbound email sources...[/cyan]")
@@ -215,7 +228,20 @@ def _generate_customer_sources(mem: Memory, planner_llm, tech_stack: str) -> Lis
 
 def seed_tech_stack(mem: Memory, planner_llm):
     """Generates the tech stack ground truth."""
-    if mem._artifacts.find_one({"type": "tech_stack"}):
+    if mem.get_tech_stack() or mem._artifacts.find_one({"type": "tech_stack"}):
+        return
+
+    configured_stack = CONFIG.get("tech_stack") or {}
+    if configured_stack:
+        mem.save_tech_stack(configured_stack)
+        logger.info(
+            f"[confluence] ✓ Configured tech stack established: {list(configured_stack.keys())}"
+        )
+        mem._db["artifacts"].create_index(
+            [("title", "text"), ("content", "text")],
+            name="artifacts_text_search",
+            weights={"title": 3, "content": 1},
+        )
         return
 
     logger.info("[genesis] Generating tech stack...")

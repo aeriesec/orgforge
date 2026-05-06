@@ -1,0 +1,843 @@
+# OrgForge scenario: VeloMind / Atlas One launch readiness.
+
+quality_preset: "openai_labelbox"
+
+model_presets:
+  local_gpu:
+    provider: "ollama"
+    planner: "ollama/llama3.3:70b"
+    worker: "ollama/llama3.1:8b-instruct"
+    base_url: "http://localhost:11434"
+    embed_provider: "ollama"
+    embed_model: "mxbai-embed-large"
+    embed_dims: 1024
+
+  cloud:
+    provider: "bedrock"
+    planner: "bedrock/openai.gpt-oss-120b-1:0"
+    worker: "bedrock/openai.gpt-oss-120b-1:0"
+    aws_region: "us-east-2"
+    embed_provider: "ollama"
+    embed_model: "mxbai-embed-large"
+    embed_dims: 1024
+
+  openai_labelbox:
+    provider: "openai_labelbox"
+    planner: "openai/gpt-4o"
+    worker: "openai/gpt-4o"
+    embed_provider: "openai_labelbox"
+    embed_model: "openai/text-embedding-3-large"
+    embed_dims: 1024
+
+simulation:
+  company_name: "VeloMind"
+  industry: "micromobility and AI hardware"
+  company_description: "builds Atlas One, an AI-powered electric bicycle with adaptive pedal assist, range prediction, safety telemetry, dealer dashboards, and over-the-air firmware updates."
+  domain: "velomind.co"
+  output_dir: "./export/velomind_30d"
+  db_name: "orgforge_velomind_30d"
+  max_days: 30
+  start_date: "2026-04-25"
+
+  adhoc_confluence_prob: 0.28
+  aws_alert_prob: 0.35
+  snyk_alert_prob: 0.15
+  sprint_tickets_per_planning: 5
+  max_incident_email_threads: 4
+  new_hire: "Omar"
+  new_hire_dept: "Engineering_Backend"
+  sprint_length_days: 10
+  incident_base_prob: 0.18
+  incident_cooldown_days: 2
+  incident_triggers:
+    - "TS-17B cold-start assist delay"
+    - "BAT-042 cold-weather range estimate miss"
+    - "OTA retry storm on weak garage Wi-Fi"
+    - "dealer dashboard held-unit visibility gap"
+    - "incident upload missing torque_sensor_revision"
+
+morale:
+  initial: 0.72
+  daily_decay: 0.965
+  good_day_recovery: 0.02
+  intervention_threshold: 0.55
+
+legacy_system:
+  name: "SmartAssist v2"
+  project_name: "Atlas One Launch Readiness"
+  description: "Atlas One's adaptive pedal assist, firmware safety gates, range prediction pipeline, and launch telemetry stack."
+  aws_alert_message: "Atlas One telemetry ingestion latency and OTA retry volume are above launch readiness thresholds."
+
+genesis_docs:
+  technical:
+    count: 4
+    id_prefix: "ENG"
+  business:
+    count: 3
+    id_prefix: "GTM"
+
+sprint_goal_template: "Close Atlas One launch gates for {legacy_system}"
+
+sales_accounts:
+  - "Golden Gate Cycles"
+  - "Bay Trail Outfitters"
+  - "Civic Loop Mobility"
+  - "Oakland Courier Collective"
+  - "Northstar Ventures"
+  - "Trailhead Capital"
+  - "Blue Line Logistics"
+  - "Urban Glide Seattle"
+
+product_page: "Atlas One"
+
+roles:
+  on_call_engineer: "Engineering_Firmware"
+  incident_commander: "QA_Support"
+  hr_lead: "HR_Ops"
+  postmortem_writer: "Engineering_Backend"
+  sprint_email_sender: "Product"
+  sales_email_sender: "Sales_Marketing"
+  scrum_master: "Product"
+  ceo: "CEO"
+
+knowledge_gaps:
+  - name: "Nikhil"
+    left: "2025-11"
+    dept: "Engineering_Firmware"
+    role: "Former Controls Architect"
+    knew_about:
+      - "TS-17A calibration envelope"
+      - "SmartAssist hill-start ramp logic"
+      - "torque_sensor_revision telemetry contract"
+      - "F_TORQUE_STALE safety case"
+    documented_pct: 0.35
+  - name: "Irene"
+    left: "2025-12"
+    dept: "Engineering_Backend"
+    role: "Former Battery Data Engineer"
+    knew_about:
+      - "BAT-042 cold impedance curves"
+      - "range estimator training exclusions"
+      - "service-mode ride filters"
+      - "reviewed safety incident dashboard"
+    documented_pct: 0.40
+
+org_chart:
+  CEO: ["Maya"]
+  Product: ["Aria", "Claire"]
+  Engineering_Backend: ["Grant", "Noah", "Eli"]
+  Engineering_Mobile: ["Sofia"]
+  Engineering_Hardware: ["Amara", "Tomas", "Lena", "Priya"]
+  Engineering_Firmware: ["Kenji"]
+  Sales_Marketing: ["Ben", "June"]
+  HR_Ops: ["Lucas"]
+  QA_Support: ["Zoe", "Rafael", "Hannah"]
+
+leads:
+  CEO: "Maya"
+  Product: "Aria"
+  Engineering_Backend: "Grant"
+  Engineering_Mobile: "Sofia"
+  Engineering_Hardware: "Amara"
+  Engineering_Firmware: "Kenji"
+  Sales_Marketing: "Ben"
+  HR_Ops: "Lucas"
+  QA_Support: "Zoe"
+
+org_lifecycle:
+  scheduled_departures:
+    - name: "Priya"
+      day: 14
+      reason: "voluntary"
+      role: "Controls Safety Engineer"
+      dept: "Engineering_Hardware"
+      knowledge_domains:
+        - "TS-17B cold-start compensation"
+        - "SmartAssist first-week aggressiveness cap"
+        - "F_TORQUE_STALE launch gate"
+      documented_pct: 0.45
+  scheduled_hires:
+    - name: "Omar"
+      day: 7
+      dept: "Engineering_Backend"
+      role: "Telemetry Platform Engineer"
+      expertise: ["FastAPI", "Kafka", "TimescaleDB", "incident upload schemas"]
+      style: "careful, schema-first, asks for sample payloads before code"
+      social_role: "The Contract Clarifier"
+      typing_quirks: "Omar writes numbered questions, cites exact field names, and refuses to call an API change done until the migration path is written down."
+      tenure: "new"
+    - name: "Imani"
+      day: 18
+      dept: "Engineering_Hardware"
+      role: "Battery Validation Engineer"
+      expertise: ["battery impedance", "cold chamber testing", "supplier qualification", "launch holds"]
+      style: "practical lab operator with crisp acceptance criteria"
+      social_role: "The Bench Reality Check"
+      typing_quirks: "Imani writes short lab notes with measured values and never treats a vendor statement as evidence until she has a chamber run."
+      tenure: "new"
+  enable_random_attrition: false
+  random_attrition_daily_prob: 0.0
+
+tech_stack:
+  database: "PostgreSQL for accounts, inventory, and rider profiles; TimescaleDB for ride telemetry; S3 for raw ride packets and safety exports."
+  backend_language: "Python FastAPI for cloud APIs, Go workers for telemetry ingestion, and C for embedded firmware."
+  frontend_language: "TypeScript React for the dealer dashboard and internal launch readiness tools."
+  mobile: "React Native for the Atlas rider and dealer companion app, with BLE pairing and OTA firmware orchestration."
+  infra: "AWS ECS, IoT Core, S3, Lambda, and Terraform-managed VPCs; production-like staging is intentionally small and easy to overload."
+  message_queue: "Kafka for ride telemetry streams plus Redis for OTA retry coordination and short-lived app sessions."
+  source_control: "Gitea repos for firmware, cloud-api, mobile-app, ml-pipeline, and hardware-test-rig."
+  ci_cd: "Gitea Actions plus a hardware bench runner that posts cold-start validation artifacts back to launch tickets."
+  monitoring: "Datadog, Sentry, CloudWatch, and PagerDuty for app, API, telemetry, and OTA incidents."
+  notable_quirks: "Incident uploads still omit torque_sensor_revision, dealer service-mode rides can leak into activation metrics, and OTA retry state is split between the app and backend."
+
+external_contacts:
+  - name: "Dana Volkov"
+    org: "Borealis Sensors"
+    first_name: "Dana"
+    last_name: "Volkov"
+    email: "dana.volkov@borealissensors.example.com"
+    category: "vendor"
+    internal_liaison: "Engineering_Hardware"
+    contact_role: "Account Director"
+    persona_archetype: "The Defensive Supplier"
+    persona:
+      typing_quirks: "Formal, precise, and quick to quote compatibility language."
+      social_role: "The Contractualist"
+      expertise: ["torque sensors", "supplier ECO process", "cold calibration"]
+    trigger_on: ["always", "incident", "low_health"]
+    trigger_health_threshold: 92
+    tone: "formal"
+    topics: ["TS-17B ECO package", "cold-start calibration tolerance", "replacement lot timing", "sensor supply concentration"]
+    integration_complexity: "High"
+    version_in_use: "TS-17B pilot lot"
+    expected_sla_hours: 24
+    cadence: "weekly"
+    timezone_offset: -7
+    sentiment_baseline: 0.48
+    history_summary: "Shipped TS-17B as a form-fit-function substitution before VeloMind received the ECO notice."
+
+  - name: "Wei Han"
+    org: "VoltEdge Cells"
+    first_name: "Wei"
+    last_name: "Han"
+    email: "wei.han@voltedgecells.example.com"
+    category: "vendor"
+    internal_liaison: "Engineering_Hardware"
+    contact_role: "Battery Programs Lead"
+    persona_archetype: "The Options Broker"
+    persona:
+      typing_quirks: "Gives dates, lot numbers, and cost tradeoffs in compact paragraphs."
+      social_role: "The Supplier Planner"
+      expertise: ["BAT-042", "BAT-044", "cold impedance", "air freight"]
+    trigger_on: ["always", "low_health"]
+    trigger_health_threshold: 88
+    tone: "technical"
+    topics: ["BAT-042 cold impedance", "BAT-044 replacement packs", "air freight timing", "battery lot traceability"]
+    integration_complexity: "Med"
+    version_in_use: "BAT-042 / BAT-044"
+    expected_sla_hours: 24
+    cadence: "twice weekly"
+    timezone_offset: -7
+    sentiment_baseline: 0.64
+    history_summary: "Can swap BAT-042 with BAT-044 by May 12 if VeloMind pays expedited freight."
+
+  - name: "Paige Turner"
+    org: "Kinetic Frames"
+    first_name: "Paige"
+    last_name: "Turner"
+    email: "paige.turner@kineticframes.example.com"
+    category: "vendor"
+    internal_liaison: "Engineering_Hardware"
+    contact_role: "Manufacturing Program Manager"
+    persona_archetype: "The Process Owner"
+    persona:
+      typing_quirks: "Writes manufacturing updates as checklists with tooling callouts."
+      social_role: "The Fixture Pragmatist"
+      expertise: ["frame assembly", "harness strain relief", "dealer repair kits"]
+    trigger_on: ["always"]
+    trigger_health_threshold: 82
+    tone: "technical"
+    topics: ["harness strain relief rev C", "dealer repair guide photos", "pick tool availability", "front rack headlight bracket"]
+    integration_complexity: "Med"
+    version_in_use: "Atlas pilot frame rev C"
+    expected_sla_hours: 48
+    cadence: "weekly"
+    timezone_offset: -7
+    sentiment_baseline: 0.76
+    history_summary: "Owns frame and harness manufacturing readiness for pilot repairs."
+
+  - name: "Luis Reyes"
+    org: "Fremont Pilot Works"
+    first_name: "Luis"
+    last_name: "Reyes"
+    email: "luis.reyes@fremontpilotworks.example.com"
+    category: "vendor"
+    internal_liaison: "Engineering_Firmware"
+    contact_role: "Pilot Line Manager"
+    persona_archetype: "The Line Realist"
+    persona:
+      typing_quirks: "Blunt, operational, and focused on whether a fixture exists on the line."
+      social_role: "The Throughput Guardian"
+      expertise: ["pilot assembly", "acceptance testing", "cold-start fixtures"]
+    trigger_on: ["always", "incident"]
+    trigger_health_threshold: 86
+    tone: "urgent"
+    topics: ["TS-17B cold-start fixture", "120-second bench run minimum", "receiving checklist updates", "pilot line reject criteria"]
+    integration_complexity: "High"
+    version_in_use: "Oakland/Fremont pilot line"
+    expected_sla_hours: 12
+    cadence: "daily during launch"
+    timezone_offset: -7
+    sentiment_baseline: 0.58
+    history_summary: "Cannot validate TS-17B at cold start until VeloMind ships the updated fixture protocol."
+
+  - name: "Atlas App Alerts"
+    org: "VeloMind App Alerts"
+    first_name: "Atlas"
+    last_name: "Alerts"
+    email: "app-alerts@velomind.co"
+    category: "vendor"
+    internal_liaison: "Engineering_Mobile"
+    contact_role: "Automated Monitoring Feed"
+    persona_archetype: "The Alarm Bell"
+    persona:
+      typing_quirks: "Machine-generated alert summaries with top dimensions and thresholds."
+      social_role: "The Paging System"
+      expertise: ["OTA retries", "app release health", "Sentry alerting"]
+    trigger_on: ["incident", "low_health"]
+    trigger_health_threshold: 94
+    tone: "urgent"
+    topics: ["OTA retry volume", "app 0.9.2 weak Wi-Fi failures", "duplicate support tickets", "firmware artifact download loops"]
+    integration_complexity: "High"
+    version_in_use: "app 0.9.2 / OTA 0.9.4"
+    expected_sla_hours: 4
+    cadence: "event-driven"
+    timezone_offset: -7
+    sentiment_baseline: 0.50
+    history_summary: "Raised the 4x OTA retry storm alert that increased support queue load."
+
+  - name: "Peter Chen"
+    org: "Greenway Insurance"
+    first_name: "Peter"
+    last_name: "Chen"
+    email: "peter.chen@greenwayinsurance.example.com"
+    category: "vendor"
+    internal_liaison: "QA_Support"
+    contact_role: "Risk Partnerships Lead"
+    persona_archetype: "The Risk Framer"
+    persona:
+      typing_quirks: "Asks for definitions, evidence links, and incident classifications before giving guidance."
+      social_role: "The Underwriting Lens"
+      expertise: ["safety incident definitions", "rider risk", "insurance partnerships"]
+    trigger_on: ["incident"]
+    trigger_health_threshold: 80
+    tone: "formal"
+    topics: ["near-miss classification", "reviewed safety incidents", "rider loaner process", "dealer demo risk"]
+    integration_complexity: "Low"
+    version_in_use: "launch risk review"
+    expected_sla_hours: 48
+    cadence: "as needed"
+    timezone_offset: -5
+    sentiment_baseline: 0.70
+    history_summary: "Needs clean reviewed-incident definitions before launch insurance language is finalized."
+
+  - name: "Marta Silva"
+    org: "Golden Gate Cycles"
+    first_name: "Marta"
+    last_name: "Silva"
+    email: "marta.silva@goldengatecycles.example.com"
+    category: "customer"
+    internal_liaison: "Sales_Marketing"
+    contact_role: "Operations Manager"
+    persona_archetype: "The Deadline-Driven Dealer"
+    persona:
+      typing_quirks: "Friendly but direct, always asks for exact serial counts and dates."
+      social_role: "The Dealer Operator"
+      expertise: ["dealer training", "service staffing", "inventory planning"]
+    trigger_on: ["always", "incident", "low_health"]
+    trigger_health_threshold: 95
+    tone: "urgent"
+    topics: ["May 8 training bike count", "held unit visibility", "mechanic staffing", "truthful demo readiness"]
+    industry: "Specialty bicycle retail"
+    tier: "Enterprise"
+    billing_region: "NA"
+    billing_city: "San Francisco"
+    billing_state: "CA"
+    billing_country: "US"
+    arr: 144000
+    is_lighthouse: true
+    expansion_potential: 9
+    contract_renewal_date: "2026-06-15T00:00:00Z"
+    expected_sla_hours: 8
+    cadence: "daily during launch"
+    timezone_offset: -7
+    sentiment_baseline: 0.42
+    history_summary: "Expects 12 demo units but several assigned bikes are held for TS-17B and BAT-042 review."
+    depends_on_components: ["React Native", "PostgreSQL", "TimescaleDB", "Gitea"]
+    affected_by: ["dealer dashboard inventory visibility", "safe demo bike availability", "training schedule confidence"]
+    symptom_language: "We planned staff training around 12 Atlas bikes, but the dashboard only shows part of the story. If units are held, we need the truthful list today."
+
+  - name: "Chris Ng"
+    org: "Bay Trail Outfitters"
+    first_name: "Chris"
+    last_name: "Ng"
+    email: "chris.ng@baytrailoutfitters.example.com"
+    category: "customer"
+    internal_liaison: "Sales_Marketing"
+    contact_role: "Owner"
+    persona_archetype: "The Flexible Skeptic"
+    persona:
+      typing_quirks: "Short, practical emails with clear tradeoffs."
+      social_role: "The Partner Who Can Bend"
+      expertise: ["dealer demos", "local rider acquisition", "staff reputation"]
+    trigger_on: ["always", "low_health"]
+    trigger_health_threshold: 84
+    tone: "friendly"
+    topics: ["phased demo plan", "two safe units", "upgrade timeline", "held unit explanations"]
+    industry: "Outdoor retail"
+    tier: "Mid-Market"
+    billing_region: "NA"
+    billing_city: "Oakland"
+    billing_state: "CA"
+    billing_country: "US"
+    arr: 52000
+    is_lighthouse: false
+    expansion_potential: 7
+    contract_renewal_date: "2026-08-01T00:00:00Z"
+    expected_sla_hours: 24
+    cadence: "weekly"
+    timezone_offset: -7
+    sentiment_baseline: 0.68
+    history_summary: "Can accept a phased demo if the first two bikes are safe and the rest have a credible timeline."
+    depends_on_components: ["React Native", "PostgreSQL", "Kafka"]
+    affected_by: ["dealer demo scheduling", "safe unit release", "inventory export accuracy"]
+    symptom_language: "We can start small, but we need a timeline we can repeat to staff without looking sloppy."
+
+  - name: "Nora Keen"
+    org: "Civic Loop Mobility"
+    first_name: "Nora"
+    last_name: "Keen"
+    email: "nora.keen@civicloop.example.org"
+    category: "customer"
+    internal_liaison: "Sales_Marketing"
+    contact_role: "Procurement Director"
+    persona_archetype: "The Bureaucrat"
+    persona:
+      typing_quirks: "Formal, asks for bundled assumptions and audit-friendly numbers."
+      social_role: "The Public Buyer"
+      expertise: ["municipal procurement", "service contracts", "fleet maintenance"]
+    trigger_on: ["always"]
+    trigger_health_threshold: 82
+    tone: "formal"
+    topics: ["25-bike municipal pilot", "maintenance-included pricing", "battery replacement assumptions", "field service visits"]
+    industry: "Municipal mobility"
+    tier: "Enterprise"
+    billing_region: "NA"
+    billing_city: "Sacramento"
+    billing_state: "CA"
+    billing_country: "US"
+    arr: 310000
+    is_lighthouse: true
+    expansion_potential: 8
+    contract_renewal_date: "2026-07-20T00:00:00Z"
+    expected_sla_hours: 48
+    cadence: "weekly"
+    timezone_offset: -7
+    sentiment_baseline: 0.74
+    history_summary: "Evaluating a 25-bike commuter pilot with maintenance bundled into the proposal."
+    depends_on_components: ["PostgreSQL", "TimescaleDB", "S3", "React Native"]
+    affected_by: ["maintenance cost assumptions", "battery replacement policy", "fleet reporting"]
+    symptom_language: "Before we can advance the pilot, we need pricing that includes service visits and clear battery replacement assumptions."
+
+  - name: "Sam Rivas"
+    org: "Oakland Courier Collective"
+    first_name: "Sam"
+    last_name: "Rivas"
+    email: "sam.rivas@oaklandcouriers.example.net"
+    category: "customer"
+    internal_liaison: "Product"
+    contact_role: "Fleet Coordinator"
+    persona_archetype: "The Rider Advocate"
+    persona:
+      typing_quirks: "Warm, concrete, and protective of rider agency."
+      social_role: "The Quote Source"
+      expertise: ["courier workflows", "cargo handling", "launch storytelling"]
+    trigger_on: ["always", "low_health"]
+    trigger_health_threshold: 76
+    tone: "friendly"
+    topics: ["launch quote wording", "adaptive assist expectations", "cargo ride feedback", "rider agency"]
+    industry: "Urban logistics"
+    tier: "SMB"
+    billing_region: "NA"
+    billing_city: "Oakland"
+    billing_state: "CA"
+    billing_country: "US"
+    arr: 38000
+    is_lighthouse: true
+    expansion_potential: 7
+    contract_renewal_date: "2026-09-15T00:00:00Z"
+    expected_sla_hours: 24
+    cadence: "biweekly"
+    timezone_offset: -7
+    sentiment_baseline: 0.84
+    history_summary: "Gave a strong launch quote that needed product-approved language to avoid autonomy claims."
+    depends_on_components: ["React Native", "TimescaleDB", "Kafka"]
+    affected_by: ["assist predictability", "rider safety positioning", "cargo route range confidence"]
+    symptom_language: "Our riders like the assist, but the language needs to make clear the rider stays in control."
+
+  - name: "Iris Mah"
+    org: "Northstar Ventures"
+    first_name: "Iris"
+    last_name: "Mah"
+    email: "iris.mah@northstarventures.example.com"
+    category: "customer"
+    internal_liaison: "Sales_Marketing"
+    contact_role: "Partner"
+    persona_archetype: "The Diligence Hawk"
+    persona:
+      typing_quirks: "Concise questions, asks for evidence not optimism."
+      social_role: "The Investor Auditor"
+      expertise: ["Series A diligence", "supply risk", "pilot metrics"]
+    trigger_on: ["always", "incident", "low_health"]
+    trigger_health_threshold: 90
+    tone: "formal"
+    topics: ["supplier concentration memo", "reviewed safety incidents", "activation metric definition", "TS-17B mitigation timeline"]
+    industry: "Venture capital"
+    tier: "Enterprise"
+    billing_region: "NA"
+    billing_city: "San Francisco"
+    billing_state: "CA"
+    billing_country: "US"
+    arr: 8500000
+    is_lighthouse: true
+    expansion_potential: 10
+    contract_renewal_date: "2026-06-30T00:00:00Z"
+    expected_sla_hours: 12
+    cadence: "weekly during diligence"
+    timezone_offset: -7
+    sentiment_baseline: 0.55
+    history_summary: "Series A lead candidate focused on supply concentration and defensible launch metrics."
+    depends_on_components: ["PostgreSQL", "TimescaleDB", "S3", "Kafka"]
+    affected_by: ["pilot activation metrics", "reviewed safety incident count", "supplier risk evidence"]
+    symptom_language: "The data room needs a clean answer on sensor supply risk and which safety incident count is reviewed."
+
+  - name: "Owen Fields"
+    org: "Trailhead Capital"
+    first_name: "Owen"
+    last_name: "Fields"
+    email: "owen.fields@trailheadcap.example.com"
+    category: "customer"
+    internal_liaison: "Sales_Marketing"
+    contact_role: "Principal"
+    persona_archetype: "The Existing Investor"
+    persona:
+      typing_quirks: "Friendly but numbers-oriented, asks what changed since seed."
+      social_role: "The Follow-On Checker"
+      expertise: ["investor updates", "unit economics", "launch risk"]
+    trigger_on: ["always", "low_health"]
+    trigger_health_threshold: 84
+    tone: "formal"
+    topics: ["follow-on participation", "launch margin impact", "BAT-044 freight", "dealer pilot status"]
+    industry: "Venture capital"
+    tier: "Enterprise"
+    billing_region: "NA"
+    billing_city: "Palo Alto"
+    billing_state: "CA"
+    billing_country: "US"
+    arr: 2500000
+    is_lighthouse: false
+    expansion_potential: 8
+    contract_renewal_date: "2026-07-05T00:00:00Z"
+    expected_sla_hours: 24
+    cadence: "weekly"
+    timezone_offset: -7
+    sentiment_baseline: 0.62
+    history_summary: "Seed investor evaluating pro rata participation after the dealer pilot update."
+    depends_on_components: ["PostgreSQL", "S3", "TimescaleDB"]
+    affected_by: ["unit economics", "dealer launch status", "gross margin impact"]
+    symptom_language: "We need to understand whether replacement freight is a one-time launch cost or a structural margin issue."
+
+  - name: "Lauren Bell"
+    org: "East Bay Commuter Pilot"
+    first_name: "Lauren"
+    last_name: "Bell"
+    email: "lauren.bell@eastbaycommute.example.net"
+    category: "customer"
+    internal_liaison: "QA_Support"
+    contact_role: "Beta Rider VM-027"
+    persona_archetype: "The Shaken Rider"
+    persona:
+      typing_quirks: "Personal, specific about routes, and reluctant to ride again until the issue is explained."
+      social_role: "The Safety Signal"
+      expertise: ["commuter riding", "VM-027", "hill-start assist"]
+    trigger_on: ["incident", "low_health"]
+    trigger_health_threshold: 98
+    tone: "urgent"
+    topics: ["VM-027 near-miss", "delayed assist while merging uphill", "loaner decision", "rider confidence"]
+    industry: "Beta rider community"
+    tier: "SMB"
+    billing_region: "NA"
+    billing_city: "Oakland"
+    billing_state: "CA"
+    billing_country: "US"
+    arr: 0
+    is_lighthouse: true
+    expansion_potential: 4
+    contract_renewal_date: "2026-05-30T00:00:00Z"
+    expected_sla_hours: 4
+    cadence: "event-driven"
+    timezone_offset: -7
+    sentiment_baseline: 0.25
+    history_summary: "Reported delayed assist while merging uphill near Lake Merritt on VM-027."
+    depends_on_components: ["React Native", "TimescaleDB", "Kafka", "S3"]
+    affected_by: ["hill-start assist safety", "support retrieval process", "loaner availability"]
+    symptom_language: "The bike did not help when I started uphill into traffic, then the assist came in late. I am not comfortable riding it again until I understand what happened."
+
+  - name: "Talia Marks"
+    org: "Urban Glide Seattle"
+    first_name: "Talia"
+    last_name: "Marks"
+    email: "talia.marks@urbanglideseattle.example.com"
+    category: "customer"
+    internal_liaison: "Sales_Marketing"
+    contact_role: "General Manager"
+    persona_archetype: "The Expansion Watcher"
+    persona:
+      typing_quirks: "Upbeat, asks for launch proof points before committing staff."
+      social_role: "The Next Market"
+      expertise: ["dealer expansion", "staff training", "retail timing"]
+    trigger_on: ["always"]
+    trigger_health_threshold: 78
+    tone: "friendly"
+    topics: ["post-launch dealer expansion", "May pilot learnings", "demo timing", "training materials"]
+    industry: "Specialty bicycle retail"
+    tier: "Mid-Market"
+    billing_region: "NA"
+    billing_city: "Seattle"
+    billing_state: "WA"
+    billing_country: "US"
+    arr: 76000
+    is_lighthouse: false
+    expansion_potential: 8
+    contract_renewal_date: "2026-09-01T00:00:00Z"
+    expected_sla_hours: 48
+    cadence: "biweekly"
+    timezone_offset: -7
+    sentiment_baseline: 0.78
+    history_summary: "Interested in becoming a post-launch dealer if the May pilot is clean."
+    depends_on_components: ["React Native", "PostgreSQL", "S3"]
+    affected_by: ["dealer launch proof", "training readiness", "inventory reliability"]
+    symptom_language: "We are excited, but we want to see a clean pilot and training package before committing our Seattle staff."
+
+personas:
+  Maya:
+    role: "CEO / Co-founder"
+    style: "evidence-first launch leader"
+    social_role: "The Safety Backstop"
+    typing_quirks: "Maya writes crisp decision rules and repeats that safety evidence beats launch pressure."
+    pet_peeves: "optimistic commitments without evidence, metrics that hide definitions"
+    stress: 68
+    expertise: ["company narrative", "fundraising", "safety positioning", "launch decisions"]
+    tenure: "1yr"
+    is_lead: true
+  Lucas:
+    role: "COO / Supply Chain"
+    style: "operator with vendor receipts"
+    social_role: "The Constraint Mapper"
+    typing_quirks: "Lucas cites purchase orders, dates, lot counts, and exact inventory tradeoffs."
+    pet_peeves: "vendor ambiguity, hidden one-time costs"
+    stress: 64
+    expertise: ["supplier management", "inventory holds", "unit economics"]
+    tenure: "1yr"
+    is_lead: true
+  Amara:
+    role: "Head of Hardware"
+    style: "calm lab authority"
+    social_role: "The Hardware Judge"
+    typing_quirks: "Amara asks for chamber data, fixture coverage, and acceptance criteria before closing a risk."
+    pet_peeves: "bench runs that miss the cold-start window"
+    stress: 72
+    expertise: ["torque sensors", "hardware validation", "safety gates"]
+    tenure: "1yr"
+    is_lead: true
+  Tomas:
+    role: "Mechanical Engineer"
+    style: "hands-on fixture fixer"
+    social_role: "The Field Repair Translator"
+    typing_quirks: "Tomas talks in install minutes, tool names, and whether a dealer mechanic can actually perform the repair."
+    pet_peeves: "repair guides without photos"
+    stress: 52
+    expertise: ["frame hardware", "harness strain relief", "dealer repairs"]
+    tenure: "9mo"
+    is_lead: false
+  Lena:
+    role: "Battery Engineer"
+    style: "measured and data-backed"
+    social_role: "The Lot Skeptic"
+    typing_quirks: "Lena separates safety limits from rider-facing range promises and calls out battery lots by ID."
+    pet_peeves: "aggregate model metrics hiding bad slices"
+    stress: 66
+    expertise: ["BAT-042", "cold impedance", "battery validation"]
+    tenure: "10mo"
+    is_lead: false
+  Priya:
+    role: "Controls Safety Engineer"
+    style: "precise launch-gate owner"
+    social_role: "The Safety Clause"
+    typing_quirks: "Priya writes the exact condition, threshold, and diagnostic code before agreeing a gate is met."
+    pet_peeves: "stale cadence fixes being presented as stale torque fixes"
+    stress: 74
+    expertise: ["SmartAssist", "F_TORQUE_STALE", "assist safety caps"]
+    tenure: "11mo"
+    is_lead: false
+  Kenji:
+    role: "Firmware Engineer"
+    style: "pragmatic embedded engineer"
+    social_role: "The Firmware Bottleneck"
+    typing_quirks: "Kenji is terse, lists what is included and what is not, and asks for test rig support."
+    pet_peeves: "being asked to claim bench coverage without the fixture"
+    stress: 78
+    expertise: ["embedded C", "OTA rollback", "SmartAssist firmware"]
+    tenure: "1yr"
+    is_lead: true
+  Grant:
+    role: "Cloud API Engineer"
+    style: "schema-minded backend owner"
+    social_role: "The Missing Field Finder"
+    typing_quirks: "Grant names payload fields exactly and warns when joins depend on stale exports."
+    pet_peeves: "optional telemetry fields"
+    stress: 58
+    expertise: ["FastAPI", "incident upload schema", "dealer dashboard"]
+    tenure: "8mo"
+    is_lead: true
+  Noah:
+    role: "AI Lead"
+    style: "model owner under launch pressure"
+    social_role: "The Slice Analyst"
+    typing_quirks: "Noah cites model versions, features, and holdout slices before giving a recommendation."
+    pet_peeves: "aggregate MAE being used as launch proof"
+    stress: 70
+    expertise: ["range estimation", "SmartAssist models", "battery-lot features"]
+    tenure: "1yr"
+    is_lead: false
+  Eli:
+    role: "Data Scientist"
+    style: "metric definition purist"
+    social_role: "The Query Defender"
+    typing_quirks: "Eli explains which rows are excluded and why, especially service-mode and unreviewed classifier outputs."
+    pet_peeves: "investor metrics with hidden denominator changes"
+    stress: 55
+    expertise: ["activation metrics", "safety classifier evaluation", "data provenance"]
+    tenure: "7mo"
+    is_lead: false
+  Sofia:
+    role: "Mobile Lead"
+    style: "user-facing product engineer"
+    social_role: "The App Translator"
+    typing_quirks: "Sofia balances UX copy with implementation state and calls out app version numbers."
+    pet_peeves: "support scripts that tell riders to factory reset too early"
+    stress: 67
+    expertise: ["React Native", "OTA UX", "range card"]
+    tenure: "10mo"
+    is_lead: true
+  Claire:
+    role: "Product Designer"
+    style: "clear copy and policy thinker"
+    social_role: "The Wording Guardrail"
+    typing_quirks: "Claire flags phrases that imply autonomy or battery defects and proposes plainer alternatives."
+    pet_peeves: "marketing copy that outruns safety positioning"
+    stress: 50
+    expertise: ["rider copy", "consent flows", "launch positioning"]
+    tenure: "6mo"
+    is_lead: false
+  Aria:
+    role: "Head of Product"
+    style: "launch narrative owner"
+    social_role: "The Agency Advocate"
+    typing_quirks: "Aria frames choices around rider control, honest launch scope, and what not to promise."
+    pet_peeves: "autonomy claims"
+    stress: 62
+    expertise: ["product strategy", "launch narrative", "dealer messaging"]
+    tenure: "1yr"
+    is_lead: true
+  Ben:
+    role: "Sales Lead"
+    style: "relationship-driven but coachable"
+    social_role: "The Dealer Voice"
+    typing_quirks: "Ben relays partner pressure quickly and asks what he is allowed to say."
+    pet_peeves: "slow answers when a dealer is waiting"
+    stress: 69
+    expertise: ["dealer sales", "pilot commitments", "partner calls"]
+    tenure: "9mo"
+    is_lead: true
+  June:
+    role: "Finance and Investor Relations"
+    style: "numbers-first communicator"
+    social_role: "The Board Packet Owner"
+    typing_quirks: "June asks for one defensible number and one definition before she updates the deck."
+    pet_peeves: "activation metrics that include service rides"
+    stress: 71
+    expertise: ["fundraising", "gross margin", "investor metrics"]
+    tenure: "8mo"
+    is_lead: false
+  Zoe:
+    role: "Pilot Operations Lead"
+    style: "field ops coordinator"
+    social_role: "The Launch Traffic Controller"
+    typing_quirks: "Zoe summarizes decisions as who gets which bike, when, and under what hold condition."
+    pet_peeves: "silent serial swaps"
+    stress: 73
+    expertise: ["dealer pilots", "field inventory", "safety holds"]
+    tenure: "10mo"
+    is_lead: true
+  Rafael:
+    role: "Support Lead"
+    style: "rider-first escalation owner"
+    social_role: "The Safety Intake"
+    typing_quirks: "Rafael includes rider words, serial numbers, firmware versions, and recommended next action."
+    pet_peeves: "minimizing a near-miss because no one was injured"
+    stress: 76
+    expertise: ["support triage", "VM-027", "loaner process"]
+    tenure: "9mo"
+    is_lead: false
+  Hannah:
+    role: "Dealer Operations"
+    style: "inventory truth-teller"
+    social_role: "The Serial List"
+    typing_quirks: "Hannah writes serial-by-serial lists and warns when sales phrasing overpromises."
+    pet_peeves: "dashboards hiding held units"
+    stress: 61
+    expertise: ["dealer support", "inventory exports", "training logistics"]
+    tenure: "7mo"
+    is_lead: false
+
+default_persona:
+  role: "Team Member"
+  style: "competent launch teammate"
+  social_role: "The Reliable Contributor"
+  typing_quirks: "Writes clearly, stays on topic, and asks for the missing field or decision owner when blocked."
+  pet_peeves: "unclear launch criteria and stale spreadsheets"
+  stress: 45
+  expertise: "General competence in VeloMind's launch readiness work."
+  tenure: "6mo"
+  is_lead: false
+  usage_note: "Use this persona only when a named VeloMind persona is unavailable."
+
+crm:
+  salesforce:
+    enabled: true
+    seed_accounts: true
+  zendesk:
+    enabled: true
+    link_to_incidents: true
+
+insider_threat:
+  enabled: false
+  mode: "passive"
+  subjects: []
+  dlp_noise_ratio: 0.4
+  telemetry_dir: "security_telemetry"
+  log_format: "all"
+  idp_logs: true
+
+velomind_source_dir: "/Users/vedsirdeshmukh/Documents/Repos/ml-monorepo/services/agent/docker/worldsim-openclaw/base/worldsim_runtime/problems/gym/_world/scenarios/velomind"

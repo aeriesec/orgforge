@@ -34,6 +34,24 @@ import json
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from provider_config import (
+    openai_labelbox_litellm_model,
+    openai_labelbox_litellm_params,
+)
+
+# memory.py reads embedding settings at import time, so seed env from the active
+# preset before importing Memory below.
+os.environ.setdefault("EMBED_PROVIDER", _PRESET.get("embed_provider", "ollama"))
+os.environ.setdefault("EMBED_MODEL", _PRESET.get("embed_model", "mxbai-embed-large"))
+os.environ.setdefault("EMBED_DIMS", str(_PRESET.get("embed_dims", 1024)))
+os.environ.setdefault("ORGFORGE_MODEL_PROVIDER", _PROVIDER)
+os.environ.setdefault(
+    "ORGFORGE_REWRITE_MODEL", _PRESET.get("worker", _PRESET.get("planner", ""))
+)
+os.environ.setdefault("DB_NAME", CONFIG["simulation"].get("db_name", "orgforge"))
+if _PROVIDER == "bedrock":
+    os.environ.setdefault("AWS_DEFAULT_REGION", _PRESET.get("aws_region", "us-east-1"))
+
 from agent_factory import make_agent
 from crm_system import CRMSystem
 import genesis
@@ -80,7 +98,7 @@ from causal_chain_handler import (
 )
 from embed_worker import EmbedWorker
 
-os.makedirs("./export", exist_ok=True)
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -174,8 +192,9 @@ def build_llm(model_key: str):
     Return the correct LangChain LLM for the active quality_preset.
 
     preset provider values:
-      "ollama"  → langchain_community.llms.Ollama          (local_gpu)
-      "bedrock" → langchain_aws.ChatBedrock                (cloud — AWS Bedrock)
+      "ollama"          → langchain_community.llms.Ollama  (local_gpu)
+      "bedrock"         → CrewAI/LiteLLM Bedrock           (cloud — AWS Bedrock)
+      "openai_labelbox" → CrewAI/LiteLLM OpenAI-compatible Labelbox gateway
 
     model_key: "planner" or "worker"
     """
@@ -207,6 +226,33 @@ def build_llm(model_key: str):
                 "Run: pip install langchain-aws"
             )
 
+    if _PROVIDER == "openai_labelbox":
+        try:
+            from crewai import LLM
+
+            labelbox_args = openai_labelbox_litellm_params()
+            llm_args = {
+                "model": openai_labelbox_litellm_model(model),
+                "temperature": 0.7,
+                "max_tokens": 16384,
+                **labelbox_args,
+            }
+
+            llm = LLM(**llm_args)
+
+            logger.info(
+                "[config] %s → OpenAI/Labelbox/%s (%s)",
+                model_key,
+                model,
+                labelbox_args["base_url"],
+            )
+            return llm
+        except ImportError:
+            raise ImportError(
+                "crewai is required for the openai_labelbox preset. "
+                "Run: pip install crewai"
+            )
+
     env_base_url = os.environ.get("OLLAMA_BASE_URL")
     config_base_url = _PRESET.get("base_url", "http://localhost:11434")
 
@@ -218,13 +264,6 @@ def build_llm(model_key: str):
 
 PLANNER_MODEL = build_llm("planner")
 WORKER_MODEL = build_llm("worker")
-
-os.environ.setdefault("EMBED_PROVIDER", _PRESET.get("embed_provider", "ollama"))
-os.environ.setdefault("EMBED_MODEL", _PRESET.get("embed_model", "mxbai-embed-large"))
-os.environ.setdefault("EMBED_DIMS", str(_PRESET.get("embed_dims", 1024)))
-os.environ.setdefault("DB_NAME", CONFIG["simulation"].get("db_name", "orgforge"))
-if _PROVIDER == "bedrock":
-    os.environ.setdefault("AWS_DEFAULT_REGION", _PRESET.get("aws_region", "us-east-1"))
 
 
 def render_template(template: str) -> str:
@@ -817,7 +856,10 @@ class OrgForgeSimulation:
 
     def run(self):
         """Main entry point. Runs genesis then the daily simulation loop."""
-        self.genesis_phase()
+        if self._mem.load_latest_checkpoint():
+            logger.info("[flow] Existing checkpoint found — skipping genesis phase.")
+        else:
+            self.genesis_phase()
         self.daily_cycle()
 
     # ─── GENESIS ─────────────────────────────
@@ -951,10 +993,12 @@ class OrgForgeSimulation:
                     incident.causal_chain = handler
                 self.state.active_incidents.append(incident)
 
-            # Re-sync current_date string back to a datetime object
+            # Re-sync to the next calendar day after the checkpoint. Weekend
+            # skipping happens at the top of the daily loop without incrementing
+            # the business-day counter.
             self.state.current_date = datetime.strptime(
                 latest["state"]["date"], "%Y-%m-%d"
-            )
+            ) + timedelta(days=1)
 
             if "graph" in latest:
                 restored_graph = nx.node_link_graph(latest["graph"])
@@ -2701,9 +2745,25 @@ class OrgForgeSimulation:
             expected_output="A single Slack message under 100 words.",
             agent=agent,
         )
-        summary_text = str(
-            Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
-        ).strip()
+        try:
+            summary_text = str(
+                Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+            ).strip()
+        except Exception as exc:
+            logger.warning(
+                "[incident] external contact summary failed for %s/%s: %s. "
+                "Using deterministic fallback.",
+                inc.ticket_id,
+                display_name,
+                exc,
+            )
+            summary_text = (
+                f"I spoke with {display_name} from "
+                f"{contact.get('org', 'the external team')} about {inc.ticket_id}. "
+                f"They confirmed the current concern is tied to {inc.root_cause}. "
+                f"Next step: {liaison_name} will keep #incidents updated and coordinate "
+                "the follow-up owner before EOD."
+            )
 
         message = {
             "user": liaison_name,

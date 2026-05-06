@@ -68,6 +68,8 @@ DEFAULT_CHUNK_OVERLAP = 400
 JIRA_DEPT_PREFIX: dict[str, str] = {
     "Engineering_Backend": "ENG",
     "Engineering_Mobile": "ENG",
+    "Engineering_Hardware": "BIKE",
+    "Engineering_Firmware": "BIKE",
     "HR_Ops": "HR",
     "Sales_Marketing": "SALES",
     "Design": "DES",

@@ -155,6 +155,25 @@ class SimClock:
         """Return a specific actor's current time without advancing it."""
         return self._get_cursor(actor)
 
+    def ensure_not_before(
+        self,
+        actors: List[str],
+        minimum: datetime,
+        allow_after_hours: bool = False,
+    ) -> datetime:
+        """
+        Move each actor cursor forward to at least ``minimum``.
+
+        This is useful for external signals that arrive at a sampled timestamp:
+        the employee can only respond after the signal exists, even if their
+        actor-local cursor is still earlier in the day.
+        """
+        target = minimum if allow_after_hours else self._enforce_business_hours(minimum)
+        for actor in actors:
+            if self._get_cursor(actor) < target:
+                self._set_cursor(actor, target)
+        return target
+
     def sync_to_system(self, actors: List[str]) -> datetime:
         """
         INCIDENT RESPONSE: Forces specific actors to jump to the current system

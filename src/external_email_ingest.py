@@ -11,7 +11,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -297,6 +297,7 @@ class ExternalEmailIngestor:
     def _sales_pings_product(
         self, signal, sales_lead, product_lead, state, date_str
     ) -> Optional[str]:
+        self._ensure_after_email(signal.timestamp_iso, [sales_lead, product_lead])
         participants = [sales_lead, product_lead]
         ping_time, _ = self._clock.sync_and_advance(participants, hours=0.25)
 
@@ -376,6 +377,7 @@ class ExternalEmailIngestor:
     ) -> Optional[str]:
         ticket_id = self._registry.next_jira_id("PROD")
         self._registry.register_jira(ticket_id)
+        self._ensure_after_email(signal.timestamp_iso, [product_lead])
         jira_time, _ = self._clock.sync_and_advance([product_lead], hours=0.3)
 
         backstory = persona_utils.get_voice_card(
@@ -527,6 +529,7 @@ class ExternalEmailIngestor:
     def _engineer_opens_jira(self, signal, assignee, state, date_str) -> Optional[str]:
         ticket_id = self._registry.next_jira_id()
         self._registry.register_jira(ticket_id)
+        self._ensure_after_email(signal.timestamp_iso, [assignee])
         jira_time, _ = self._clock.sync_and_advance([assignee], hours=0.25)
 
         ticket = {
@@ -630,7 +633,7 @@ class ExternalEmailIngestor:
             timestamp_iso=hr_time.isoformat(),
             direction="outbound",
             embed_id=embed_id,
-            day=date_str,
+            day=state.day,
         )
 
         _exfil_path = self._threat.inject_email(
@@ -716,6 +719,7 @@ class ExternalEmailIngestor:
         High-priority emails get a more substantive response that references
         the internal escalation and promises a follow-up timeline.
         """
+        self._ensure_after_email(signal.timestamp_iso, [sales_lead])
         reply_time, _ = self._clock.sync_and_advance([sales_lead], hours=0.4)
 
         urgency_hint = (
@@ -794,6 +798,8 @@ class ExternalEmailIngestor:
             direction="outbound",
             embed_id=embed_id,
             day=state.day,
+            thread_id=signal.facts.get("thread_id", signal.embed_id),
+            reply_to_email_id=signal.embed_id,
         )
 
         if not is_high:
@@ -889,6 +895,7 @@ class ExternalEmailIngestor:
         Confirms receipt, states the issue is being investigated, and
         references any JIRA ticket already in the causal chain.
         """
+        self._ensure_after_email(signal.timestamp_iso, [recipient])
         ack_time, _ = self._clock.sync_and_advance([recipient], hours=0.3)
 
         jira_ref = next(
@@ -953,6 +960,8 @@ class ExternalEmailIngestor:
             direction="outbound",
             embed_id=embed_id,
             day=state.day,
+            thread_id=signal.facts.get("thread_id", signal.embed_id),
+            reply_to_email_id=signal.embed_id,
         )
 
         _exfil_path = self._threat.inject_email(
@@ -1213,6 +1222,9 @@ class ExternalEmailIngestor:
             subject=subject,
             body=body,
             timestamp_iso=email_ts.isoformat(),
+            embed_id=embed_id,
+            day=state.day,
+            thread_id=embed_id,
         )
 
         self._mem.embed_artifact(
@@ -1323,6 +1335,7 @@ class ExternalEmailIngestor:
                 "topic": topic,
                 "org": source_org,
                 "email_type": resolved_email_type,
+                "thread_id": embed_id,
             },
         )
 
@@ -1455,6 +1468,42 @@ class ExternalEmailIngestor:
             )
             return None
 
+    def _parse_timestamp(self, timestamp_iso: str) -> Optional[datetime]:
+        if not timestamp_iso:
+            return None
+        try:
+            return datetime.fromisoformat(str(timestamp_iso).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def _ensure_after_email(
+        self,
+        timestamp_iso: str,
+        actors: List[str],
+        min_minutes: int = 8,
+        max_minutes: int = 28,
+    ) -> Optional[datetime]:
+        parent_time = self._parse_timestamp(timestamp_iso)
+        if not parent_time:
+            return None
+        floor = parent_time + timedelta(
+            minutes=random.randint(min_minutes, max(min_minutes, max_minutes))
+        )
+        return self._clock.ensure_not_before(actors, floor)
+
+    def _reply_timestamp_after_touchpoint(
+        self, touchpoint_timestamp: str, contact_name: str, state
+    ) -> datetime:
+        parent_time = self._parse_timestamp(touchpoint_timestamp)
+        if not parent_time:
+            return state.current_date.replace(
+                hour=random.randint(9, 16),
+                minute=random.randint(0, 59),
+                second=random.randint(0, 59),
+            )
+        floor = parent_time + timedelta(minutes=random.randint(45, 150))
+        return self._clock.ensure_not_before([contact_name], floor)
+
     def generate_customer_replies(self, state) -> List[Any]:
         """
         For each open SF opportunity, probabilistically generate a customer reply
@@ -1493,14 +1542,18 @@ class ExternalEmailIngestor:
             last_touchpoint = touchpoints[-1]
             last_subject = last_touchpoint.get("subject", "")
             last_embed_id = last_touchpoint.get("embed_id", "")
+            last_touchpoint_ts = last_touchpoint.get("timestamp", "")
 
             prior_body = ""
+            parent_thread_id = last_embed_id
             if last_embed_id:
                 prior_doc = self._mem._db["emails"].find_one(
-                    {"embed_id": last_embed_id}, {"body": 1, "_id": 0}
+                    {"embed_id": last_embed_id},
+                    {"body": 1, "thread_id": 1, "_id": 0},
                 )
                 if prior_doc:
                     prior_body = prior_doc.get("body", "")
+                    parent_thread_id = prior_doc.get("thread_id") or last_embed_id
 
             acc = self._crm._sf_a.find_one(
                 {"name": account_name}, {"_id": 0, "_seq": 0}
@@ -1529,10 +1582,8 @@ class ExternalEmailIngestor:
 
             reply_body, email_type, suggested_stage = result
 
-            reply_ts = state.current_date.replace(
-                hour=random.randint(9, 16),
-                minute=random.randint(0, 59),
-                second=random.randint(0, 59),
+            reply_ts = self._reply_timestamp_after_touchpoint(
+                last_touchpoint_ts, contact_name, state
             )
 
             reply_subject = (
@@ -1559,6 +1610,8 @@ class ExternalEmailIngestor:
                 direction="inbound",
                 embed_id=embed_id,
                 day=state.day,
+                thread_id=parent_thread_id or embed_id,
+                reply_to_email_id=last_embed_id,
             )
 
             # Embed artifact for RAG.
@@ -1577,6 +1630,8 @@ class ExternalEmailIngestor:
                     "direction": "inbound",
                     "opportunity_id": opp_id,
                     "reply_to_subject": last_subject,
+                    "reply_to_email_id": last_embed_id,
+                    "thread_id": parent_thread_id or embed_id,
                     "email_type": email_type,
                 },
             )
@@ -1636,6 +1691,8 @@ class ExternalEmailIngestor:
                     "email_type": email_type,
                     "opportunity_id": opp_id,
                     "is_customer_reply": True,
+                    "reply_to_email_id": last_embed_id,
+                    "thread_id": parent_thread_id or embed_id,
                 },
             )
 
@@ -1798,6 +1855,7 @@ class ExternalEmailIngestor:
         product_dept = next((d for d in self._leads if "product" in d.lower()), None)
         product_lead = self._leads.get(product_dept, sales_lead)
 
+        self._ensure_after_email(signal.timestamp_iso, [sales_lead, product_lead])
         participants = [sales_lead, product_lead]
         fyi_time, _ = self._clock.sync_and_advance(participants, hours=0.1)
 
@@ -2246,27 +2304,37 @@ class ExternalEmailIngestor:
         direction: str = "inbound",
         embed_id: str = "",
         day: int = 0,
+        thread_id: str = "",
+        reply_to_email_id: str = "",
     ) -> Path:
         out_dir = self._export_dir / "emails" / direction / date_str
         out_dir.mkdir(parents=True, exist_ok=True)
         safe = from_name.lower().replace(" ", "_").replace("/", "_")
-        path = out_dir / f"{safe}.eml"
+        doc_id = embed_id or f"{from_name.lower().replace(' ', '_')}_{timestamp_iso}"
+        safe_doc_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", doc_id).strip("_")[:110]
+        path = out_dir / f"{safe}_{safe_doc_id}.eml"
         msg = MIMEMultipart("alternative")
         msg["From"] = f"{from_name} <{from_addr}>"
         msg["To"] = f"{to_name} <{to_addr}>"
         msg["Subject"] = subject
         msg["Date"] = timestamp_iso
+        msg["Message-ID"] = f"<{safe_doc_id}@orgforge.local>"
+        if reply_to_email_id:
+            safe_parent_id = re.sub(
+                r"[^A-Za-z0-9_.-]+", "_", reply_to_email_id
+            ).strip("_")[:110]
+            msg["In-Reply-To"] = f"<{safe_parent_id}@orgforge.local>"
+            msg["References"] = msg["In-Reply-To"]
         msg["X-OrgForge-Direction"] = direction
         msg.attach(MIMEText(body, "plain"))
         with open(path, "w") as fh:
             fh.write(msg.as_string())
 
-        doc_id = embed_id or f"{from_name.lower().replace(' ', '_')}_{timestamp_iso}"
         try:
             self._mem._db["emails"].update_one(
                 {"embed_id": doc_id},
                 {
-                    "$setOnInsert": {
+                    "$set": {
                         "embed_id": doc_id,
                         "direction": direction,
                         "from_name": from_name,
@@ -2279,6 +2347,8 @@ class ExternalEmailIngestor:
                         "day": day,
                         "date": date_str,
                         "eml_path": str(path),
+                        "thread_id": thread_id or doc_id,
+                        "reply_to_email_id": reply_to_email_id,
                     }
                 },
                 upsert=True,

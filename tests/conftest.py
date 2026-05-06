@@ -40,6 +40,7 @@ def mock_config_and_db():
     mock_cfg = {
         "simulation": {
             "company_name": "TestCorp",
+            "company_description": "builds test software",
             "domain": "test.com",
             "start_date": "2026-01-01",
             "max_days": 1,
