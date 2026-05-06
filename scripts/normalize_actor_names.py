@@ -80,7 +80,7 @@ def _update_snapshot(export_dir: Path, db) -> bool:
         snapshot = json.loads(snapshot_path.read_text())
     except json.JSONDecodeError:
         return False
-    snapshot["events"] = list(db.events.find({}, {"_id": 0, "embedding": 0}).sort("timestamp", 1))
+    snapshot["events"] = list(db.events.find({}, {"embedding": 0}).sort("timestamp", 1))
     snapshot_path.write_text(json.dumps(snapshot, indent=2, default=str))
     return True
 
