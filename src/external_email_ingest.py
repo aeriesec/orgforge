@@ -12,8 +12,6 @@ import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -2307,53 +2305,24 @@ class ExternalEmailIngestor:
         thread_id: str = "",
         reply_to_email_id: str = "",
     ) -> Path:
-        out_dir = self._export_dir / "emails" / direction / date_str
-        out_dir.mkdir(parents=True, exist_ok=True)
-        safe = from_name.lower().replace(" ", "_").replace("/", "_")
         doc_id = embed_id or f"{from_name.lower().replace(' ', '_')}_{timestamp_iso}"
-        safe_doc_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", doc_id).strip("_")[:110]
-        path = out_dir / f"{safe}_{safe_doc_id}.eml"
-        msg = MIMEMultipart("alternative")
-        msg["From"] = f"{from_name} <{from_addr}>"
-        msg["To"] = f"{to_name} <{to_addr}>"
-        msg["Subject"] = subject
-        msg["Date"] = timestamp_iso
-        msg["Message-ID"] = f"<{safe_doc_id}@orgforge.local>"
-        if reply_to_email_id:
-            safe_parent_id = re.sub(
-                r"[^A-Za-z0-9_.-]+", "_", reply_to_email_id
-            ).strip("_")[:110]
-            msg["In-Reply-To"] = f"<{safe_parent_id}@orgforge.local>"
-            msg["References"] = msg["In-Reply-To"]
-        msg["X-OrgForge-Direction"] = direction
-        msg.attach(MIMEText(body, "plain"))
-        with open(path, "w") as fh:
-            fh.write(msg.as_string())
-
         try:
-            self._mem._db["emails"].update_one(
-                {"embed_id": doc_id},
-                {
-                    "$set": {
-                        "embed_id": doc_id,
-                        "direction": direction,
-                        "from_name": from_name,
-                        "from_addr": from_addr,
-                        "to_name": to_name,
-                        "to_addr": to_addr,
-                        "subject": subject,
-                        "body": body,
-                        "timestamp": timestamp_iso,
-                        "day": day,
-                        "date": date_str,
-                        "eml_path": str(path),
-                        "thread_id": thread_id or doc_id,
-                        "reply_to_email_id": reply_to_email_id,
-                    }
-                },
-                upsert=True,
+            return self._mem.record_email(
+                export_dir=self._export_dir,
+                date_str=date_str,
+                from_name=from_name,
+                from_addr=from_addr,
+                to_name=to_name,
+                to_addr=to_addr,
+                subject=subject,
+                body=body,
+                timestamp=timestamp_iso,
+                direction=direction,
+                embed_id=doc_id,
+                day=day,
+                thread_id=thread_id,
+                reply_to_email_id=reply_to_email_id,
             )
         except Exception as exc:
-            logger.warning(f"[external_email] emails collection insert failed: {exc}")
-
-        return path
+            logger.warning(f"[external_email] email persistence failed: {exc}")
+            raise

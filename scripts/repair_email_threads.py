@@ -120,6 +120,93 @@ def write_eml(export_dir: Path, doc: dict[str, Any]) -> str:
     return str(path)
 
 
+def _email_addr_for_name(name: str, domain: str = "example.com") -> str:
+    return f"{safe_slug(name.lower().replace(' ', '.'))}@{domain}"
+
+
+def _doc_from_parent_artifact(db, parent_id: str, export_dir: Path) -> dict[str, Any] | None:
+    artifact = db.artifacts.find_one({"_id": parent_id}, {"embedding": 0})
+    if not artifact:
+        return None
+
+    metadata = artifact.get("metadata") or {}
+    event = db.events.find_one(
+        {
+            "$or": [
+                {"artifact_ids.email": parent_id},
+                {"artifact_ids.embed_id": parent_id},
+                {"artifact_ids.email_thread": parent_id},
+            ]
+        },
+        {"facts": 1, "actors": 1, "date": 1, "day": 1, "timestamp": 1, "_id": 0},
+    )
+    facts = (event or {}).get("facts") or {}
+    actors = (event or {}).get("actors") or []
+    direction = metadata.get("direction") or facts.get("direction") or "inbound"
+    from_name = (
+        facts.get("source")
+        or facts.get("from")
+        or metadata.get("source")
+        or (actors[0] if actors else "unknown")
+    )
+    to_name = (
+        facts.get("to")
+        or facts.get("liaison")
+        or metadata.get("liaison")
+        or (actors[1] if len(actors) > 1 else "unknown")
+    )
+    from_addr = facts.get("source_email") or _email_addr_for_name(from_name)
+    to_addr = facts.get("liaison_email") or _email_addr_for_name(to_name, "orgforge.local")
+    doc = {
+        "embed_id": parent_id,
+        "direction": direction,
+        "from_name": from_name,
+        "from_addr": from_addr,
+        "to_name": to_name,
+        "to_addr": to_addr,
+        "subject": facts.get("subject") or artifact.get("title") or parent_id,
+        "body": artifact.get("content", ""),
+        "timestamp": artifact.get("timestamp") or (event or {}).get("timestamp"),
+        "day": artifact.get("day") or (event or {}).get("day"),
+        "date": artifact.get("date") or (event or {}).get("date"),
+        "thread_id": parent_id,
+        "reply_to_email_id": "",
+        "thread_order": 0,
+        "metadata": {
+            "repaired_from_artifact": True,
+            "artifact_id": parent_id,
+        },
+    }
+    doc["eml_path"] = write_eml(export_dir, doc)
+    return doc
+
+
+def repair_missing_parent_emails(
+    db,
+    emails: dict[str, dict[str, Any]],
+    parents: dict[str, str],
+    export_dir: Path,
+) -> tuple[int, int]:
+    created = 0
+    dropped_edges = 0
+    for child_id, parent_id in list(parents.items()):
+        if parent_id in emails:
+            continue
+        parent_doc = _doc_from_parent_artifact(db, parent_id, export_dir)
+        if parent_doc:
+            db.emails.update_one(
+                {"embed_id": parent_id},
+                {"$set": parent_doc},
+                upsert=True,
+            )
+            emails[parent_id] = parent_doc
+            created += 1
+        else:
+            parents.pop(child_id, None)
+            dropped_edges += 1
+    return created, dropped_edges
+
+
 def load_date_to_day(db) -> dict[str, int]:
     mapping: dict[str, int] = {}
     for checkpoint in db.checkpoints.find({}, {"day": 1, "state.date": 1, "_id": 0}):
@@ -308,6 +395,12 @@ def update_snapshot(export_dir: Path, db) -> bool:
     except json.JSONDecodeError:
         return False
     snapshot["emails"] = list(db.emails.find({}, {"_id": 0}).sort("timestamp", 1))
+    snapshot["artifacts"] = list(
+        db.artifacts.find({}, {"_id": 0, "embedding": 0}).sort("timestamp", 1)
+    )
+    snapshot["events"] = list(
+        db.events.find({}, {"_id": 0, "embedding": 0}).sort("timestamp", 1)
+    )
     snapshot_path.write_text(json.dumps(snapshot, indent=2, default=str))
     return True
 
@@ -324,6 +417,11 @@ def main() -> None:
         for doc in db.emails.find({}, {"embedding": 0})
     }
     parents = build_parent_map(db, emails)
+    synthesized_parents, dropped_parent_edges = (
+        (0, 0)
+        if args.dry_run
+        else repair_missing_parent_emails(db, emails, parents, export_dir)
+    )
     roots, depths = resolve_thread_ids(emails, parents)
     date_to_day = load_date_to_day(db)
     ts_repairs = repair_timestamps(db, emails, parents, date_to_day)
@@ -352,7 +450,8 @@ def main() -> None:
                 "thread_order": doc.get("thread_order"),
                 "eml_path": doc.get("eml_path"),
             }
-            db.emails.update_one({"_id": doc["_id"]}, {"$set": update})
+            email_filter = {"_id": doc["_id"]} if "_id" in doc else {"embed_id": embed_id}
+            db.emails.update_one(email_filter, {"$set": update}, upsert=True)
 
             artifact_update = {
                 "timestamp": doc.get("timestamp"),
@@ -362,7 +461,25 @@ def main() -> None:
                 "metadata.reply_to_email_id": doc.get("reply_to_email_id"),
                 "metadata.file_path": doc.get("eml_path"),
             }
-            db.artifacts.update_one({"_id": embed_id}, {"$set": artifact_update})
+            db.artifacts.update_one(
+                {"_id": embed_id},
+                {
+                    "$set": artifact_update,
+                    "$setOnInsert": {
+                        "_id": embed_id,
+                        "type": "email",
+                        "title": doc.get("subject", embed_id),
+                        "content": (
+                            f"From: {doc.get('from_name', '')}\n"
+                            f"To: {doc.get('to_name', '')}\n"
+                            f"Subject: {doc.get('subject', '')}\n\n"
+                            f"{doc.get('body', '')}"
+                        ),
+                        "embedding": None,
+                    },
+                },
+                upsert=True,
+            )
 
             event_update = {
                 "timestamp": doc.get("timestamp"),
@@ -396,6 +513,8 @@ def main() -> None:
         snapshot_updated = False
 
     print(f"aligned_embed_ids={aligned}")
+    print(f"synthesized_parent_emails={synthesized_parents}")
+    print(f"dropped_missing_parent_edges={dropped_parent_edges}")
     print(f"parent_edges={len(parents)}")
     print(f"timestamp_repairs={ts_repairs}")
     print(f"updated_email_docs={updated_docs}")

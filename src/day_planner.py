@@ -529,10 +529,15 @@ class DepartmentPlanner:
             ep.agenda = unique_agenda
 
         proposed: List[ProposedEvent] = []
+        all_valid_names = {n for members in LIVE_ORG_CHART.values() for n in members}
+        all_valid_names.update(self.members)
+        live_members = [m for m in self.members if m in all_valid_names]
         for pe in data.get("proposed_events", []):
-            actors = [a for a in pe.get("actors", []) if a]
+            actors = [a for a in pe.get("actors", []) if a in all_valid_names]
             if not actors:
-                actors = self.members[:1]
+                actors = live_members[:1]
+            if not actors:
+                continue
             proposed.append(
                 ProposedEvent(
                     event_type=pe.get("event_type", "normal_day_slack"),
@@ -823,11 +828,15 @@ class OrgCoordinator:
         crm_context: str = "",
     ) -> OrgDayPlan:
 
+        all_names_str = "\n".join(
+            f"  {dept}: {', '.join(members)}"
+            for dept, members in LIVE_ORG_CHART.items()
+        )
         other_plans_str = ""
         for dept, plan in dept_plans.items():
             lead_name = self._config.get("leads", {}).get(dept)
             stress = state.persona_stress.get(lead_name, 50) if lead_name else 50
-            members = self._config.get("org_chart", {}).get(dept, [])
+            members = LIVE_ORG_CHART.get(dept, [])
             other_plans_str += (
                 f"- {dept}: Theme='{plan.theme}'. Lead={lead_name} (Stress: {stress}/100). "
                 f"Members: {members}. "
@@ -843,7 +852,7 @@ class OrgCoordinator:
             other_plans_with_stress=other_plans_str,
             health=state.system_health,
             morale_label=morale_label,
-            all_names=self._all_names_str,
+            all_names=all_names_str,
             crm_context=crm_context or "  (no active CRM pressure today)",
         )
         agent = make_agent(
@@ -1027,35 +1036,45 @@ class DayPlannerOrchestrator:
         dept_plans: Dict[str, DepartmentDayPlan] = {}
 
         if eng_key:
-            eng_plan = self._dept_planners[eng_key].plan(
-                org_theme=org_theme,
-                day=day,
-                date=date,
-                state=state,
-                mem=mem,
-                graph_dynamics=graph_dynamics,
-                cross_signals=cross_signals_by_dept.get(eng_key, []),
-                sprint_context=sprint_contexts.get(eng_key),
-                eng_plan=None,
-                email_signals=email_signals,
-                crm_summary=crm_summary,
-            )
-            self._patch_stress_levels(eng_plan, graph_dynamics)
-            dept_plans[eng_key] = eng_plan
-            logger.info(f"  [blue]📋 Eng plan:[/blue] {eng_plan.theme[:60]} ")
+            try:
+                eng_plan = self._dept_planners[eng_key].plan(
+                    org_theme=org_theme,
+                    day=day,
+                    date=date,
+                    state=state,
+                    mem=mem,
+                    graph_dynamics=graph_dynamics,
+                    cross_signals=cross_signals_by_dept.get(eng_key, []),
+                    sprint_context=sprint_contexts.get(eng_key),
+                    eng_plan=None,
+                    email_signals=email_signals,
+                    crm_summary=crm_summary,
+                )
+                self._patch_stress_levels(eng_plan, graph_dynamics)
+                dept_plans[eng_key] = eng_plan
+                logger.info(f"  [blue]📋 Eng plan:[/blue] {eng_plan.theme[:60]} ")
+            except Exception as e:
+                logger.error(
+                    f"  [red]✗ {eng_key} plan failed:[/red] {e} — using fallback"
+                )
+                eng_plan = self._dept_planners[eng_key]._fallback_plan(
+                    org_theme, day, date, []
+                )
+                self._patch_stress_levels(eng_plan, graph_dynamics)
+                dept_plans[eng_key] = eng_plan
 
         non_eng_depts = {
             dept: planner
             for dept, planner in self._dept_planners.items()
             if dept != eng_key
             and not (
-                len(self._config["org_chart"].get(dept, [])) == 1
+                len(LIVE_ORG_CHART.get(dept, [])) == 1
                 and dept.upper() == "CEO"
             )
         }
 
         if non_eng_depts:
-            with ThreadPoolExecutor(max_workers=min(1, len(non_eng_depts))) as ex:
+            with ThreadPoolExecutor(max_workers=max(1, min(4, len(non_eng_depts)))) as ex:
                 futures = {
                     ex.submit(
                         planner.plan,

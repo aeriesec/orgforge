@@ -20,8 +20,11 @@ import os
 import json
 import hashlib
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import time
 from typing import List, Dict, Optional, Any, Tuple, Union
 import boto3
@@ -56,6 +59,21 @@ def _current_embed_model() -> str:
 
 def _current_embed_dims() -> int:
     return int(os.environ.get("EMBED_DIMS", str(EMBED_DIMS)))
+
+
+def _safe_slug(value: str, limit: int = 110) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")[:limit] or "email"
+
+
+def _reply_depth(subject: str) -> int:
+    depth = 0
+    cleaned = (subject or "").strip()
+    while True:
+        updated = re.sub(r"^(re|fw|fwd):\s*", "", cleaned, flags=re.IGNORECASE).strip()
+        if updated == cleaned:
+            return depth
+        depth += 1
+        cleaned = updated
 
 
 _SKIP_EMBED_TYPES = {
@@ -144,6 +162,7 @@ class BaseEmbedder(ABC):
 
     def __init__(self, dims: int):
         self.dims = dims
+        self.fallback_count = 0
 
     @abstractmethod
     def embed(self, text: str, input_type: str = "search_document") -> List[float]:
@@ -152,6 +171,7 @@ class BaseEmbedder(ABC):
 
     def _fallback(self, text: str) -> List[float]:
         """Deterministic hash-based pseudo-embedding used when provider is unreachable."""
+        self.fallback_count += 1
         h = hashlib.sha256(text.encode()).digest()
         vec = [(b / 255.0) - 0.5 for b in h] * (self.dims // 32 + 1)
         return vec[: self.dims]
@@ -211,13 +231,13 @@ class OllamaEmbedder(BaseEmbedder):
             logger.warning(
                 f"[memory] Ollama embedding HTTP error: {e.response.status_code}.{error_details}"
             )
-            return []
+            return self._fallback(text)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
             logger.warning(f"[memory] Ollama connection/timeout error: {e}")
-            return []
+            return self._fallback(text)
         except (KeyError, IndexError) as e:
             logger.warning(f"[memory] Ollama embedding response malformed: {e}")
-            return []
+            return self._fallback(text)
 
 
 # ── CLOUD: OpenAI ──────────────────────────────
@@ -380,7 +400,7 @@ class InfinityEmbedder(BaseEmbedder):
             return r.json()["data"][0]["embedding"]
         except Exception as e:
             logger.warning(f"[memory] Infinity embedding failed: {e}")
-            return []
+            return self._fallback(text)
 
 
 # ── CLOUD: AWS Bedrock ─────────────────────────
@@ -511,23 +531,44 @@ class Memory:
         self._embed_worker = None
         self._client = mongo_client or MongoClient(mongo_uri)
         self._db = self._client[DB_NAME]
+        self._embedding_stats = {
+            "calls": 0,
+            "fallbacks": 0,
+            "empty_vectors": 0,
+            "wrong_dimensions": 0,
+            "errors": 0,
+        }
 
-        self._artifacts = self._db["artifacts"]
-        self._events = self._db["events"]
+        self._bind_collections()
+        self._ensure_indexes()
+
+        self._current_day: int = 0
+        self._event_log: List[SimEvent] = []
+
+        self._init_vector_indexes()
+
+    def _bind_collections(self) -> None:
         self._artifacts = self._db["artifacts"]
         self._events = self._db["events"]
         self._jira = self._db["jira_tickets"]
         self._prs = self._db["pull_requests"]
         self._checkpoints = self._db["checkpoints"]
         self._slack = self._db["slack_messages"]
+        self._emails = self._db["emails"]
         self._plans = self._db["dept_plans"]
         self._conversation_summaries = self._db["conversation_summaries"]
 
+    def _ensure_indexes(self) -> None:
         self._jira.create_index([("id", 1)], unique=True)
         self._jira.create_index([("assignee", 1), ("status", 1)])
         self._prs.create_index([("pr_id", 1)], unique=True)
         self._prs.create_index([("reviewers", 1), ("status", 1)])
         self._slack.create_index([("channel", 1), ("ts", 1)])
+        self._slack.create_index([("channel", 1), ("thread_id", 1), ("ts", 1)])
+        self._emails.create_index([("embed_id", 1)], unique=True)
+        self._emails.create_index([("thread_id", 1), ("timestamp", 1)])
+        self._emails.create_index([("reply_to_email_id", 1)])
+        self._emails.create_index([("timestamp", -1)])
         self._plans.create_index([("day", 1), ("dept", 1)])
         self._conversation_summaries.create_index(
             [("participants", 1), ("type", 1), ("day", -1)]
@@ -542,11 +583,6 @@ class Memory:
         self._events.create_index([("type", 1), ("facts.participants", 1)])
         self._checkpoints.create_index([("day", -1)])
         self._jira.create_index([("dept", 1), ("status", 1)])
-        self._current_day: int = 0
-
-        self._event_log: List[SimEvent] = []
-
-        self._init_vector_indexes()
 
     def _embed(
         self,
@@ -560,8 +596,44 @@ class Memory:
         Single internal embed call. All methods route through here so token
         logging is guaranteed regardless of which path triggers the embed.
         """
-        vector = self._embedder.embed(text, input_type=input_type)
+        self._embedding_stats["calls"] += 1
+        try:
+            vector = self._embedder.embed(text, input_type=input_type)
+        except Exception as exc:
+            self._embedding_stats["errors"] += 1
+            self._embedding_stats["fallbacks"] += 1
+            logger.error(
+                "[memory] embedding call failed for %s id=%s type=%s: %s",
+                caller,
+                doc_id,
+                doc_type,
+                exc,
+            )
+            return self._embedder._fallback(text)
 
+        if not vector:
+            self._embedding_stats["empty_vectors"] += 1
+            self._embedding_stats["fallbacks"] += 1
+            logger.warning(
+                "[memory] embedding provider returned an empty vector for %s id=%s type=%s; using deterministic fallback.",
+                caller,
+                doc_id,
+                doc_type,
+            )
+            return self._embedder._fallback(text)
+
+        if len(vector) != self._embedder.dims:
+            self._embedding_stats["wrong_dimensions"] += 1
+            self._embedding_stats["fallbacks"] += 1
+            logger.warning(
+                "[memory] embedding dimension mismatch for %s id=%s type=%s: got %s expected %s; using deterministic fallback.",
+                caller,
+                doc_id,
+                doc_type,
+                len(vector),
+                self._embedder.dims,
+            )
+            return self._embedder._fallback(text)
         return vector
 
     def _init_vector_indexes(self):
@@ -584,7 +656,15 @@ class Memory:
         for coll_name in ["artifacts", "events"]:
             coll = self._db[coll_name]
 
-            existing = list(coll.list_search_indexes())
+            try:
+                existing = list(coll.list_search_indexes())
+            except Exception as e:
+                logger.info(
+                    "[memory] Vector search index inspection unavailable on %s: %s",
+                    coll_name,
+                    e,
+                )
+                continue
             vector_idx = next(
                 (i for i in existing if i.get("name") == "vector_index"), None
             )
@@ -611,6 +691,104 @@ class Memory:
                     logger.error(f"[memory] Failed to create index on {coll_name}: {e}")
 
     # ─── WRITE ────────────────────────────────
+
+    def record_email(
+        self,
+        *,
+        export_dir: str | Path,
+        date_str: str,
+        from_name: str,
+        from_addr: str,
+        to_name: str,
+        to_addr: str,
+        subject: str,
+        body: str,
+        timestamp: str,
+        direction: str,
+        embed_id: str,
+        day: int,
+        thread_id: str = "",
+        reply_to_email_id: str = "",
+        metadata: Optional[Dict] = None,
+    ) -> Path:
+        """
+        Persist an email consistently across the export tree and MongoDB.
+
+        All generated email paths should use this helper so .eml headers,
+        thread metadata, and the emails collection stay in sync.
+        """
+        direction = direction or "inbound"
+        doc_id = embed_id or f"{from_name}_{timestamp}"
+        safe_from = _safe_slug(from_name.lower().replace(" ", "_"))
+        safe_doc_id = _safe_slug(doc_id)
+        out_dir = Path(export_dir) / "emails" / direction / date_str
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{safe_from}_{safe_doc_id}.eml"
+
+        parent_doc = None
+        if reply_to_email_id:
+            parent_doc = self._emails.find_one(
+                {"embed_id": reply_to_email_id},
+                {"thread_id": 1, "thread_order": 1, "_id": 0},
+            )
+            if not parent_doc:
+                logger.warning(
+                    "[memory] email %s replies to missing parent %s",
+                    doc_id,
+                    reply_to_email_id,
+                )
+
+        resolved_thread_id = (
+            thread_id
+            or (parent_doc or {}).get("thread_id")
+            or reply_to_email_id
+            or doc_id
+        )
+        if parent_doc and parent_doc.get("thread_id"):
+            resolved_thread_id = parent_doc["thread_id"]
+
+        parent_order = (parent_doc or {}).get("thread_order")
+        thread_order = (
+            int(parent_order) + 1
+            if isinstance(parent_order, int)
+            else _reply_depth(subject)
+        )
+
+        msg = MIMEMultipart("alternative")
+        msg["From"] = f"{from_name} <{from_addr}>"
+        msg["To"] = f"{to_name} <{to_addr}>"
+        msg["Subject"] = subject
+        msg["Date"] = timestamp
+        msg["Message-ID"] = f"<{safe_doc_id}@orgforge.local>"
+        if reply_to_email_id:
+            parent_msg_id = f"<{_safe_slug(reply_to_email_id)}@orgforge.local>"
+            msg["In-Reply-To"] = parent_msg_id
+            msg["References"] = parent_msg_id
+        msg["X-OrgForge-Direction"] = direction
+        msg.attach(MIMEText(body or "", "plain"))
+        with open(path, "w") as fh:
+            fh.write(msg.as_string())
+
+        doc = {
+            "embed_id": doc_id,
+            "direction": direction,
+            "from_name": from_name,
+            "from_addr": from_addr,
+            "to_name": to_name,
+            "to_addr": to_addr,
+            "subject": subject,
+            "body": body,
+            "timestamp": timestamp,
+            "day": day,
+            "date": date_str,
+            "eml_path": str(path),
+            "thread_id": resolved_thread_id,
+            "reply_to_email_id": reply_to_email_id or "",
+            "thread_order": thread_order,
+            "metadata": metadata or {},
+        }
+        self._emails.update_one({"embed_id": doc_id}, {"$set": doc}, upsert=True)
+        return path
 
     def embed_artifact(
         self,
@@ -1743,6 +1921,8 @@ class Memory:
             "embed_model": _current_embed_model(),
             "embed_dims": self._embedder.dims,
             "embedder_ok": embedder_ok,
+            "embedder_fallback_count": getattr(self._embedder, "fallback_count", 0),
+            "embedding_stats": dict(self._embedding_stats),
             "mongodb_ok": True,
         }
 
@@ -1755,15 +1935,8 @@ class Memory:
         self._db.create_collection("artifacts")
         self._db.create_collection("events")
 
-        # Re-bind all collection references to the fresh database
-        self._artifacts = self._db["artifacts"]
-        self._events = self._db["events"]
-        self._jira = self._db["jira_tickets"]
-        self._prs = self._db["pull_requests"]
-        self._checkpoints = self._db["checkpoints"]
-        self._slack = self._db["slack_messages"]
-        self._plans = self._db["dept_plans"]
-        self._conversation_summaries = self._db["conversation_summaries"]
+        self._bind_collections()
+        self._ensure_indexes()
 
         self._event_log = []
         self._init_vector_indexes()

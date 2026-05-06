@@ -445,15 +445,27 @@ def _seed_mailpit(
             "date": timestamp[:10],
             "source_system": "mailpit",
         }
-        mem._db["emails"].replace_one({"embed_id": embed_id}, doc, upsert=True)
-        eml_path = (
-            export_dir
-            / "emails"
-            / direction
-            / timestamp[:10]
-            / f"{embed_id}.eml"
+        eml_path = mem.record_email(
+            export_dir=export_dir,
+            date_str=timestamp[:10],
+            from_name=doc["from_name"],
+            from_addr=from_addr,
+            to_name=doc["to_name"],
+            to_addr=doc["to_addr"],
+            subject=doc["subject"],
+            body=body_text,
+            timestamp=timestamp,
+            direction=direction,
+            embed_id=embed_id,
+            day=0,
+            thread_id=embed_id,
+            metadata={"source_system": "mailpit", "to_addrs": to_addrs},
         )
-        _write_email(eml_path, doc)
+        mem._db["emails"].update_one(
+            {"embed_id": embed_id},
+            {"$set": {"body_html": body_html, "source_system": "mailpit"}},
+            upsert=True,
+        )
         mem.embed_artifact(
             id=embed_id,
             type="email",

@@ -642,10 +642,23 @@ def api_search(query: dict[str, list[str]]) -> dict[str, Any]:
 
 def api_inbox(query: dict[str, list[str]]) -> dict[str, Any]:
     raw_query = _query_value(query, "q", "").strip()
-    emails = _find_docs("emails", sort=[("timestamp", 1)], limit=5000)
+    thread_skip = _query_int(query, "skip", 0, 0, 100_000)
+    thread_limit = _query_int(query, "limit", 80, 1, 500)
+    filter_doc = _search_filter(raw_query)
+    if not _collection_exists("emails"):
+        return {
+            "threads": [],
+            "total_messages": 0,
+            "total_threads": 0,
+            "skip": thread_skip,
+            "limit": thread_limit,
+        }
+    cursor = _db()["emails"].find(filter_doc, {"embedding": 0}).sort("timestamp", 1)
     threads_by_id: dict[str, dict[str, Any]] = {}
+    total_messages = _db()["emails"].count_documents(filter_doc)
 
-    for email in emails:
+    for raw_email in cursor:
+        email = _sanitize(raw_email)
         subject = email.get("subject", "No subject")
         tid = email.get("thread_id") or _thread_id(subject) or "no-subject"
         base_subject = _normalize_subject(subject) or subject
@@ -657,12 +670,13 @@ def api_inbox(query: dict[str, list[str]]) -> dict[str, Any]:
                 "participants": [],
                 "participant_emails": [],
                 "directions": set(),
-                "messages": [],
+                "count": 0,
                 "first": email.get("timestamp") or email.get("date"),
                 "last": email.get("timestamp") or email.get("date"),
+                "preview": "",
             },
         )
-        thread["messages"].append(email)
+        thread["count"] += 1
         thread["directions"].add(email.get("direction", "unknown"))
         for name_key, email_key in (("from_name", "from_addr"), ("to_name", "to_addr")):
             label = email.get(name_key) or email.get(email_key)
@@ -675,37 +689,73 @@ def api_inbox(query: dict[str, list[str]]) -> dict[str, Any]:
         if ts:
             thread["first"] = min(thread["first"], ts) if thread["first"] else ts
             thread["last"] = max(thread["last"], ts) if thread["last"] else ts
+            thread["preview"] = _truncate(email.get("body", ""), 220)
 
     threads = []
     for thread in threads_by_id.values():
-        thread["messages"] = sorted(
-            thread["messages"],
-            key=lambda msg: (
-                msg.get("timestamp", ""),
-                int(msg.get("thread_order", 0) or 0),
-                _reply_depth(msg.get("subject", "")),
-            ),
-        )
-        thread["count"] = len(thread["messages"])
         thread["directions"] = sorted(thread["directions"])
-        thread["preview"] = _truncate(thread["messages"][-1].get("body", ""), 220)
-        if _contains_query(thread, raw_query):
-            threads.append(thread)
+        threads.append(thread)
 
     threads.sort(key=lambda item: item.get("last", ""), reverse=True)
+    total_threads = len(threads)
+    threads = threads[thread_skip : thread_skip + thread_limit]
     return {
         "threads": threads,
-        "total_messages": len(emails),
-        "total_threads": len(threads),
+        "total_messages": total_messages,
+        "total_threads": total_threads,
+        "skip": thread_skip,
+        "limit": thread_limit,
+    }
+
+
+def api_inbox_thread(query: dict[str, list[str]]) -> dict[str, Any]:
+    thread_id = _query_value(query, "id", "").strip()
+    limit = _query_int(query, "limit", 500, 1, 2000)
+    if not thread_id:
+        raise KeyError("id is required")
+    if not _collection_exists("emails"):
+        return {"id": thread_id, "messages": [], "total_messages": 0}
+    messages = [
+        _sanitize(doc)
+        for doc in _db()["emails"]
+        .find({"thread_id": thread_id}, {"embedding": 0})
+        .sort([("timestamp", 1), ("thread_order", 1)])
+        .limit(limit)
+    ]
+    messages.sort(
+        key=lambda msg: (
+            msg.get("timestamp", ""),
+            int(msg.get("thread_order", 0) or 0),
+            _reply_depth(msg.get("subject", "")),
+        )
+    )
+    return {
+        "id": thread_id,
+        "messages": messages,
+        "total_messages": _db()["emails"].count_documents({"thread_id": thread_id}),
     }
 
 
 def api_slack_app(query: dict[str, list[str]]) -> dict[str, Any]:
     raw_query = _query_value(query, "q", "").strip()
-    messages = _find_docs("slack_messages", sort=[("ts", 1)], limit=20000)
+    channel_skip = _query_int(query, "skip", 0, 0, 100_000)
+    channel_limit = _query_int(query, "limit", 120, 1, 500)
+    if not _collection_exists("slack_messages"):
+        return {
+            "channels": [],
+            "total_messages": 0,
+            "total_threads": 0,
+            "skip": channel_skip,
+            "limit": channel_limit,
+        }
+    filter_doc = _search_filter(raw_query)
+    messages = _db()["slack_messages"].find(filter_doc, {"embedding": 0}).sort("ts", 1)
     channels_by_name: dict[str, dict[str, Any]] = {}
 
-    for message in messages:
+    total_messages = _db()["slack_messages"].count_documents(filter_doc)
+    seen_threads: set[tuple[str, str]] = set()
+    for raw_message in messages:
+        message = _sanitize(raw_message)
         channel_name = message.get("channel", "unknown")
         thread_id = message.get("thread_id") or f"{channel_name}:{message.get('ts', '')}"
         channel = channels_by_name.setdefault(
@@ -716,55 +766,104 @@ def api_slack_app(query: dict[str, list[str]]) -> dict[str, Any]:
                 "message_count": 0,
                 "thread_count": 0,
                 "participants": [],
-                "threads_by_id": {},
                 "last": "",
             },
         )
         channel["message_count"] += 1
+        thread_key = (channel_name, thread_id)
+        if thread_key not in seen_threads:
+            seen_threads.add(thread_key)
+            channel["thread_count"] += 1
         if message.get("user") and message["user"] not in channel["participants"]:
             channel["participants"].append(message["user"])
         if message.get("ts"):
             channel["last"] = max(channel["last"], message["ts"])
 
-        thread = channel["threads_by_id"].setdefault(
+    channels = list(channels_by_name.values())
+    channels.sort(key=lambda item: (item["kind"] != "channel", item["name"]))
+    total_threads = sum(channel["thread_count"] for channel in channels)
+    channels = channels[channel_skip : channel_skip + channel_limit]
+    return {
+        "channels": channels,
+        "total_messages": total_messages,
+        "total_threads": total_threads,
+        "skip": channel_skip,
+        "limit": channel_limit,
+    }
+
+
+def api_slack_channel(query: dict[str, list[str]]) -> dict[str, Any]:
+    channel_name = _query_value(query, "channel", "").strip()
+    raw_query = _query_value(query, "q", "").strip()
+    thread_skip = _query_int(query, "skip", 0, 0, 100_000)
+    thread_limit = _query_int(query, "limit", 100, 1, 500)
+    if not channel_name:
+        raise KeyError("channel is required")
+    if not _collection_exists("slack_messages"):
+        return {"channel": channel_name, "threads": [], "total_threads": 0}
+    filter_doc = {"channel": channel_name}
+    if raw_query:
+        filter_doc = {"$and": [filter_doc, _search_filter(raw_query)]}
+    cursor = _db()["slack_messages"].find(filter_doc, {"embedding": 0}).sort("ts", 1)
+    threads_by_id: dict[str, dict[str, Any]] = {}
+    for raw_message in cursor:
+        message = _sanitize(raw_message)
+        thread_id = message.get("thread_id") or f"{channel_name}:{message.get('ts', '')}"
+        thread = threads_by_id.setdefault(
             thread_id,
             {
                 "id": thread_id,
                 "channel": channel_name,
-                "messages": [],
                 "participants": [],
                 "first": message.get("ts", ""),
                 "last": message.get("ts", ""),
                 "preview": "",
+                "count": 0,
             },
         )
-        thread["messages"].append(message)
+        thread["count"] += 1
         if message.get("user") and message["user"] not in thread["participants"]:
             thread["participants"].append(message["user"])
         if message.get("ts"):
             thread["first"] = min(thread["first"], message["ts"]) if thread["first"] else message["ts"]
             thread["last"] = max(thread["last"], message["ts"]) if thread["last"] else message["ts"]
-
-    channels = []
-    for channel in channels_by_name.values():
-        threads = []
-        for thread in channel.pop("threads_by_id").values():
-            thread["messages"] = sorted(thread["messages"], key=lambda msg: msg.get("ts", ""))
-            thread["count"] = len(thread["messages"])
-            thread["preview"] = _truncate(thread["messages"][0].get("text", ""), 180)
-            if _contains_query(thread, raw_query):
-                threads.append(thread)
-        threads.sort(key=lambda item: item.get("last", ""), reverse=True)
-        channel["threads"] = threads
-        channel["thread_count"] = len(threads)
-        if threads:
-            channels.append(channel)
-
-    channels.sort(key=lambda item: (item["kind"] != "channel", item["name"]))
+        if not thread["preview"]:
+            thread["preview"] = _truncate(message.get("text", ""), 180)
+    threads = list(threads_by_id.values())
+    threads.sort(key=lambda item: item.get("last", ""), reverse=True)
+    total_threads = len(threads)
+    threads = threads[thread_skip : thread_skip + thread_limit]
     return {
-        "channels": channels,
-        "total_messages": len(messages),
-        "total_threads": sum(channel["thread_count"] for channel in channels),
+        "channel": channel_name,
+        "threads": threads,
+        "total_threads": total_threads,
+        "skip": thread_skip,
+        "limit": thread_limit,
+    }
+
+
+def api_slack_thread(query: dict[str, list[str]]) -> dict[str, Any]:
+    channel_name = _query_value(query, "channel", "").strip()
+    thread_id = _query_value(query, "id", "").strip()
+    limit = _query_int(query, "limit", 1000, 1, 5000)
+    if not channel_name or not thread_id:
+        raise KeyError("channel and id are required")
+    if not _collection_exists("slack_messages"):
+        return {"channel": channel_name, "id": thread_id, "messages": []}
+    messages = [
+        _sanitize(doc)
+        for doc in _db()["slack_messages"]
+        .find({"channel": channel_name, "thread_id": thread_id}, {"embedding": 0})
+        .sort("ts", 1)
+        .limit(limit)
+    ]
+    return {
+        "channel": channel_name,
+        "id": thread_id,
+        "messages": messages,
+        "total_messages": _db()["slack_messages"].count_documents(
+            {"channel": channel_name, "thread_id": thread_id}
+        ),
     }
 
 
@@ -957,7 +1056,10 @@ API_ROUTES = {
     "/api/file": api_file,
     "/api/search": api_search,
     "/api/app/inbox": api_inbox,
+    "/api/app/inbox-thread": api_inbox_thread,
     "/api/app/slack": api_slack_app,
+    "/api/app/slack-channel": api_slack_channel,
+    "/api/app/slack-thread": api_slack_thread,
     "/api/app/jira": api_jira_app,
     "/api/app/docs": api_docs_app,
     "/api/app/crm": api_crm_app,

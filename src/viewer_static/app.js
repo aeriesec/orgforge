@@ -244,20 +244,24 @@ async function loadInbox() {
       )
       .join("") || `<div class="empty-state">No matching email threads.</div>`;
   $$("#inboxThreadList .record").forEach((button) => {
-    button.addEventListener("click", () => selectInboxThread(Number(button.dataset.index)));
+    button.addEventListener("click", () =>
+      selectInboxThread(Number(button.dataset.index)).catch((error) => showError(error.message))
+    );
   });
-  if (data.threads[0]) selectInboxThread(0);
+  if (data.threads[0]) selectInboxThread(0).catch((error) => showError(error.message));
 }
 
-function selectInboxThread(index) {
+async function selectInboxThread(index) {
   const thread = state.caches.inbox.threads[index];
   $$("#inboxThreadList .record").forEach((item) => item.classList.remove("active"));
   $$("#inboxThreadList .record")[index]?.classList.add("active");
   $("#inboxThreadTitle").textContent = thread.subject;
   $("#inboxThreadMeta").textContent = thread.participants.join(", ");
-  $("#inboxMessages").innerHTML = thread.messages
+  $("#inboxMessages").innerHTML = `<div class="empty-state">Loading thread...</div>`;
+  const detail = await api("/api/app/inbox-thread", { id: thread.id });
+  $("#inboxMessages").innerHTML = detail.messages
     .map((message) => {
-      const direction = message.direction === "outbound" ? "outbound" : "inbound";
+      const direction = message.direction === "outbound" ? "outbound" : message.direction === "internal" ? "bot" : "inbound";
       return `
         <article class="message ${direction}">
           <div class="message-header">
@@ -269,7 +273,7 @@ function selectInboxThread(index) {
         </article>
       `;
     })
-    .join("");
+    .join("") || `<div class="empty-state">No messages in this thread.</div>`;
 }
 
 async function loadSlack() {
@@ -292,12 +296,14 @@ async function loadSlack() {
       )
       .join("") || `<div class="empty-state">No Slack channels found.</div>`;
   $$("#slackChannelList .record").forEach((button) => {
-    button.addEventListener("click", () => selectSlackChannel(Number(button.dataset.index)));
+    button.addEventListener("click", () =>
+      selectSlackChannel(Number(button.dataset.index)).catch((error) => showError(error.message))
+    );
   });
-  if (data.channels[0]) selectSlackChannel(0);
+  if (data.channels[0]) selectSlackChannel(0).catch((error) => showError(error.message));
 }
 
-function selectSlackChannel(index) {
+async function selectSlackChannel(index) {
   const channel = state.caches.slack.channels[index];
   state.caches.activeSlackChannel = channel;
   $$("#slackChannelList .record").forEach((item) => item.classList.remove("active"));
@@ -305,6 +311,13 @@ function selectSlackChannel(index) {
   $("#slackThreadPanelTitle").textContent =
     channel.kind === "dm" ? channel.name.replace(/^dm_/, "DM ") : `#${channel.name}`;
   $("#slackThreadMeta").textContent = `${formatCount(channel.thread_count)} threads`;
+  $("#slackThreadList").innerHTML = `<div class="empty-state">Loading threads...</div>`;
+  $("#slackMessages").innerHTML = "";
+  const detail = await api("/api/app/slack-channel", {
+    channel: channel.name,
+    q: $("#slackQuery").value.trim(),
+  });
+  channel.threads = detail.threads;
   $("#slackThreadList").innerHTML =
     channel.threads
       .map((thread, threadIndex) =>
@@ -320,18 +333,25 @@ function selectSlackChannel(index) {
       )
       .join("") || `<div class="empty-state">No threads in this channel.</div>`;
   $$("#slackThreadList .record").forEach((button) => {
-    button.addEventListener("click", () => selectSlackThread(Number(button.dataset.index)));
+    button.addEventListener("click", () =>
+      selectSlackThread(Number(button.dataset.index)).catch((error) => showError(error.message))
+    );
   });
-  if (channel.threads[0]) selectSlackThread(0);
+  if (channel.threads[0]) selectSlackThread(0).catch((error) => showError(error.message));
 }
 
-function selectSlackThread(index) {
+async function selectSlackThread(index) {
   const thread = state.caches.activeSlackChannel.threads[index];
   $$("#slackThreadList .record").forEach((item) => item.classList.remove("active"));
   $$("#slackThreadList .record")[index]?.classList.add("active");
   $("#slackMessageTitle").textContent = truncate(thread.preview || thread.id, 72);
   $("#slackMessageMeta").textContent = `${thread.participants.join(", ")} · ${formatDateTime(thread.first)}`;
-  $("#slackMessages").innerHTML = thread.messages
+  $("#slackMessages").innerHTML = `<div class="empty-state">Loading messages...</div>`;
+  const detail = await api("/api/app/slack-thread", {
+    channel: thread.channel,
+    id: thread.id,
+  });
+  $("#slackMessages").innerHTML = detail.messages
     .map((message) => `
       <article class="message ${message.is_bot ? "bot" : ""}">
         <div class="message-header">
@@ -341,7 +361,7 @@ function selectSlackThread(index) {
         <p class="message-body">${escapeHtml(message.text || "")}</p>
       </article>
     `)
-    .join("");
+    .join("") || `<div class="empty-state">No messages in this thread.</div>`;
 }
 
 async function loadJira() {

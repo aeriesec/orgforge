@@ -55,6 +55,7 @@ class NormalDayHandler:
         embed_worker=None,
         lifecycle=None,
         crm=None,
+        org_chart=None,
     ):
         self._config = config
         self._mem = mem
@@ -67,8 +68,8 @@ class NormalDayHandler:
         self._base = config["simulation"].get("output_dir", "./export")
         self._domain = config["simulation"]["domain"]
         self._company = config["simulation"]["company_name"]
-        self._all_names = [n for dept in config["org_chart"].values() for n in dept]
-        self._org_chart = config["org_chart"]
+        self._org_chart = org_chart or config["org_chart"]
+        self._all_names = [n for dept in self._org_chart.values() for n in dept]
         self._clock = clock
         self._persona_helper = persona_helper
         self._confluence = confluence_writer
@@ -78,6 +79,11 @@ class NormalDayHandler:
         self._embed_worker = embed_worker
         self._lifecycle = lifecycle
         self._crm = crm or NullCRMSystem()
+
+    def _is_live_actor(self, name: str) -> bool:
+        if self._lifecycle and name in set(self._lifecycle.departed_names()):
+            return False
+        return True
 
     def handle(self, org_plan: OrgDayPlan) -> None:
         """Processes both planned agenda items and unplanned org collisions."""
@@ -110,6 +116,12 @@ class NormalDayHandler:
             dept_plan = org_plan.dept_plans[dept]
 
             for eng_plan in dept_plan.engineer_plans:
+                if not self._is_live_actor(eng_plan.name):
+                    logger.warning(
+                        "[normal_day] Skipping agenda for non-live actor %s",
+                        eng_plan.name,
+                    )
+                    continue
                 watercooler_prob = self._config["simulation"].get(
                     "watercooler_prob", 0.15
                 )
@@ -2455,6 +2467,24 @@ class NormalDayHandler:
             body = clean
 
         thread_id = f"email_{ticket_id}_{self._state.day}"
+        sender_addr = f"{assignee.lower().replace(' ', '.')}@{self._domain}"
+        lead_addr = f"{lead.lower().replace(' ', '.')}@{self._domain}"
+        eml_path = self._mem.record_email(
+            export_dir=self._base,
+            date_str=date_str,
+            from_name=assignee,
+            from_addr=sender_addr,
+            to_name=lead,
+            to_addr=lead_addr,
+            subject=subject,
+            body=body,
+            timestamp=timestamp,
+            direction="internal",
+            embed_id=thread_id,
+            day=self._state.day,
+            thread_id=thread_id,
+            metadata={"ticket_id": ticket_id, "dept": dept},
+        )
 
         self._mem.log_event(
             SimEvent(
@@ -2463,7 +2493,12 @@ class NormalDayHandler:
                 day=self._state.day,
                 date=date_str,
                 actors=[assignee, lead],
-                artifact_ids={"jira": ticket_id, "email_thread": thread_id},
+                artifact_ids={
+                    "jira": ticket_id,
+                    "email_thread": thread_id,
+                    "email": thread_id,
+                    "eml_path": str(eml_path),
+                },
                 facts={
                     "ticket_id": ticket_id,
                     "subject": subject,
@@ -2490,6 +2525,8 @@ class NormalDayHandler:
                 "from": assignee,
                 "to": lead,
                 "dept": dept,
+                "thread_id": thread_id,
+                "file_path": str(eml_path),
             },
         )
 
@@ -2601,26 +2638,27 @@ class NormalDayHandler:
             new_stage = stage_label
 
         sender_addr = f"{assignee.lower().replace(' ', '.')}@{self._domain}"
-        out_dir = Path(self._base) / "emails" / "outbound" / date_str
-        out_dir.mkdir(parents=True, exist_ok=True)
-        safe_sender = assignee.lower().replace(" ", "_")
-        safe_org = account_name.lower().replace(" ", "_")
-        eml_path = out_dir / f"{safe_sender}_to_{safe_org}_{ticket_id}.eml"
-
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-
-        msg = MIMEMultipart("alternative")
-        msg["From"] = f"{assignee} <{sender_addr}>"
-        msg["To"] = f"{contact_name} <{contact_email}>"
-        msg["Subject"] = subject
-        msg["Date"] = timestamp
-        msg["X-OrgForge-Direction"] = "outbound"
-        msg.attach(MIMEText(body, "plain"))
-        with open(eml_path, "w") as fh:
-            fh.write(msg.as_string())
-
         thread_id = f"sales_email_{ticket_id}_{self._state.day}"
+        eml_path = self._mem.record_email(
+            export_dir=self._base,
+            date_str=date_str,
+            from_name=assignee,
+            from_addr=sender_addr,
+            to_name=contact_name,
+            to_addr=contact_email,
+            subject=subject,
+            body=body,
+            timestamp=timestamp,
+            direction="outbound",
+            embed_id=thread_id,
+            day=self._state.day,
+            thread_id=thread_id,
+            metadata={
+                "ticket_id": ticket_id,
+                "account": account_name,
+                "opportunity_id": opportunity_id,
+            },
+        )
 
         self._crm.process_outbound_email(
             email_data={
@@ -2635,27 +2673,6 @@ class NormalDayHandler:
             timestamp=timestamp,
             date_str=date_str,
             day=self._state.day,
-        )
-
-        self._mem._db["emails"].update_one(
-            {"embed_id": thread_id},
-            {
-                "$setOnInsert": {
-                    "embed_id": thread_id,
-                    "direction": "outbound",
-                    "from_name": assignee,
-                    "from_addr": sender_addr,
-                    "to_name": contact_name,
-                    "to_addr": contact_email,
-                    "subject": subject,
-                    "body": body,
-                    "timestamp": timestamp,
-                    "day": self._state.day,
-                    "date": date_str,
-                    "eml_path": str(eml_path),
-                }
-            },
-            upsert=True,
         )
 
         chain.append(thread_id)
@@ -2675,6 +2692,8 @@ class NormalDayHandler:
                 "account": account_name,
                 "opportunity_id": opportunity_id,
                 "direction": "outbound",
+                "thread_id": thread_id,
+                "file_path": str(eml_path),
             },
         )
 
@@ -2688,6 +2707,7 @@ class NormalDayHandler:
                 artifact_ids={
                     "jira": ticket_id,
                     "email_thread": thread_id,
+                    "email": thread_id,
                     "eml_path": str(eml_path),
                     "sf_opp": opportunity_id or "",
                 },
@@ -2700,6 +2720,8 @@ class NormalDayHandler:
                     "opportunity_id": opportunity_id,
                     "stage": stage_label,
                     "direction": "outbound",
+                    "thread_id": thread_id,
+                    "file_path": str(eml_path),
                     "causal_chain": chain.snapshot(),
                 },
                 summary=f'{assignee} sent outbound email to {contact_name} ({account_name}): "{subject[:80]}"',

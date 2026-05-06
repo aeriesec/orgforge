@@ -22,6 +22,18 @@ def test_embedder_fallback_mechanism():
     assert vec1 != vec3
 
 
+def test_memory_embed_uses_fallback_for_empty_vectors(make_test_memory):
+    mem = make_test_memory
+    mem._embedder.embed.return_value = []
+    mem._embedder._fallback = lambda text: [0.0] * mem._embedder.dims
+
+    vector = mem._embed("searchable text", caller="test", doc_id="DOC-1")
+
+    assert len(vector) == mem._embedder.dims
+    assert mem.stats()["embedding_stats"]["empty_vectors"] == 1
+    assert mem.stats()["embedding_stats"]["fallbacks"] == 1
+
+
 def test_rewrite_query_uses_openai_labelbox_provider(monkeypatch, make_test_memory):
     """HyDE query rewriting must use the configured Labelbox OpenAI gateway."""
     import sys

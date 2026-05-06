@@ -4,6 +4,7 @@ OrgForge simulation engine.
 
 from pathlib import Path
 
+import config_loader as _config_loader
 from config_loader import (
     COMPANY_DESCRIPTION,
     EXPORT_DIR,
@@ -282,10 +283,43 @@ vader = SentimentIntensityAnalyzer()
 
 
 def dept_of(name: str) -> str:
-    for dept, members in ORG_CHART.items():
+    for dept, members in LIVE_ORG_CHART.items():
         if name in members:
             return dept
+    if ORG_CHART is not _config_loader.ORG_CHART:
+        for dept, members in ORG_CHART.items():
+            if name in members:
+                return dept
     return "Unknown"
+
+
+def live_all_names() -> List[str]:
+    return list(
+        dict.fromkeys(name for members in LIVE_ORG_CHART.values() for name in members)
+    )
+
+
+def live_members_for_dept(dept: str) -> List[str]:
+    return list(LIVE_ORG_CHART.get(dept, []))
+
+
+def live_dept_of(name: str) -> str:
+    return dept_of(name)
+
+
+def live_role_holder(role_key: str) -> str:
+    dept = CONFIG.get("roles", {}).get(role_key)
+    if dept and dept in LIVE_ORG_CHART:
+        lead = LEADS.get(dept)
+        if lead in LIVE_ORG_CHART[dept]:
+            return lead
+        if LIVE_ORG_CHART[dept]:
+            return LIVE_ORG_CHART[dept][0]
+    resolved = resolve_role(role_key)
+    if resolved in live_all_names():
+        return resolved
+    names = live_all_names()
+    return names[0] if names else resolved
 
 
 def email_of(name: str) -> str:
@@ -488,13 +522,17 @@ class GitSimulator:
         pr_id = f"PR-{self._mem._prs.count_documents({}) + 100}"
 
         if not reviewers:
-            edges = self._graph[author]
+            edges = self._graph[author] if author in self._graph else {}
+            active_reviewer_names = set(live_all_names())
+            if author not in active_reviewer_names:
+                active_reviewer_names = set(self._graph.nodes)
 
             eng_colleagues = {
                 n: edges[n].get("weight", 1.0)
                 for n in edges
                 if "engineer" in self._graph.nodes[n].get("dept", "").lower()
                 and n != author
+                and n in active_reviewer_names
             }
 
             if eng_colleagues:
@@ -506,12 +544,17 @@ class GitSimulator:
                     reviewers.append(sorted_eng[1][0])
             else:
                 eng_dept = next(
-                    (d for d in ORG_CHART if "engineer" in d.lower()),
-                    list(ORG_CHART.keys())[0],
+                    (d for d in LIVE_ORG_CHART if "engineer" in d.lower()),
+                    list(LIVE_ORG_CHART.keys())[0],
                 )
+                live_engineers = [n for n in LIVE_ORG_CHART[eng_dept] if n != author]
+                if not live_engineers:
+                    live_engineers = [n for n in live_all_names() if n != author]
+                if not live_engineers:
+                    raise RuntimeError("Cannot create PR without a live reviewer")
                 fallback = next(
-                    (n for n in ORG_CHART[eng_dept] if n != author),
-                    ORG_CHART[eng_dept][0],
+                    (n for n in live_engineers if n in self._graph),
+                    live_engineers[0],
                 )
                 reviewers = [fallback]
 
@@ -799,6 +842,7 @@ class OrgForgeSimulation:
             embed_worker=self._embed_worker,
             lifecycle=self._lifecycle,
             crm=self._crm,
+            org_chart=LIVE_ORG_CHART,
         )
         self._recurrence_detector = RecurrenceDetector(self._mem)
         self._ticket_assigner = TicketAssigner(
@@ -1019,7 +1063,7 @@ class OrgForgeSimulation:
 
             self.state.ticket_actors_today = {}  # cleared here; orchestrator re-seeds from SprintContext
             self._threat.begin_day(self.state.day, self.state)
-            self._clock.reset_to_business_start(ALL_NAMES)
+            self._clock.reset_to_business_start(live_all_names())
             date_str = str(self.state.current_date.date())
             departures = self._lifecycle.process_departures(
                 self.state.day,
@@ -1143,7 +1187,7 @@ class OrgForgeSimulation:
             se_results = self._threat.inject_social_engineering(
                 day=self.state.day,
                 current_date=self.state.current_date,
-                active_names=self.state.daily_active_actors or ALL_NAMES,
+                active_names=self.state.daily_active_actors or live_all_names(),
             )
             for r in se_results:
                 if r.get("pattern") == "trust_building":
@@ -1210,8 +1254,9 @@ class OrgForgeSimulation:
                 dict.fromkeys(leads + random.sample(active, min(3, len(active))))
             )
         else:
+            live_names = live_all_names()
             attendees = list(
-                dict.fromkeys(leads + random.sample(ALL_NAMES, min(3, len(ALL_NAMES))))
+                dict.fromkeys(leads + random.sample(live_names, min(3, len(live_names))))
             )
         meeting_time = self._clock.schedule_meeting(attendees, min_hour=9, max_hour=11)
         timestamp_str = meeting_time.isoformat()
@@ -1515,7 +1560,7 @@ class OrgForgeSimulation:
     def _handle_standup(self):
         logger.info("  [bold blue]☕ Multi-Agent Standup[/bold blue]")
 
-        all_names = [n for dept in CONFIG["org_chart"].values() for n in dept]
+        all_names = live_all_names()
         attendees = random.sample(all_names, min(8, len(all_names)))
 
         meeting_time = self._clock.schedule_meeting(
@@ -1536,7 +1581,7 @@ class OrgForgeSimulation:
                 n=3,
             )
 
-            dept = dept_of_name(name, CONFIG["org_chart"])
+            dept = dept_of_name(name, LIVE_ORG_CHART)
             sprint_ctx = self.state.org_day_plan.sprint_contexts.get(dept)
             owned = (
                 [
@@ -1652,7 +1697,7 @@ class OrgForgeSimulation:
         # ── Attendees: engineering + product only ────────────────────────────────
         sprint_depts = {"engineering", "product"}
         attendees = [
-            n for n in ALL_NAMES if dept_of_name(n, ORG_CHART).lower() in sprint_depts
+            n for n in live_all_names() if dept_of_name(n, LIVE_ORG_CHART).lower() in sprint_depts
         ]
 
         meeting_time = self._clock.schedule_meeting(
@@ -2182,11 +2227,12 @@ class OrgForgeSimulation:
 
     def _advance_incidents(self):
         still_active = []
-        on_call = resolve_role("on_call_engineer")
+        on_call = live_role_holder("on_call_engineer")
+        on_call_dept = CONFIG["roles"].get("on_call_engineer", "")
         eng_peer = next(
             (
                 n
-                for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), [])
+                for n in LIVE_ORG_CHART.get(on_call_dept, [])
                 if n != on_call
             ),
             on_call,
@@ -2331,11 +2377,12 @@ class OrgForgeSimulation:
         self.state.active_incidents = still_active
 
     def _write_postmortem(self, inc: ActiveIncident):
-        on_call = resolve_role("postmortem_writer")
+        on_call = live_role_holder("postmortem_writer")
+        postmortem_dept = CONFIG["roles"].get("postmortem_writer", "")
         eng_peer = next(
             (
                 n
-                for n in ORG_CHART.get(CONFIG["roles"].get("postmortem_writer", ""), [])
+                for n in LIVE_ORG_CHART.get(postmortem_dept, [])
                 if n != on_call
             ),
             on_call,
@@ -2407,8 +2454,13 @@ class OrgForgeSimulation:
         return thread_id
 
     def _get_next_on_call(self, day: int):
-        eng_dept_key = next((k for k in ORG_CHART if "eng" in k.lower()), "Engineering")
-        engineers = ORG_CHART.get(eng_dept_key, [])
+        eng_dept_key = next(
+            (k for k in LIVE_ORG_CHART if "eng" in k.lower()),
+            next(iter(LIVE_ORG_CHART), "Engineering"),
+        )
+        engineers = LIVE_ORG_CHART.get(eng_dept_key, [])
+        if not engineers:
+            engineers = live_all_names()
 
         index = day % len(engineers)
         return engineers[index]
@@ -2433,7 +2485,7 @@ class OrgForgeSimulation:
 
         self.state.morale_history.append(self.state.team_morale)
 
-        all_cursors = [self._clock.now(a) for a in ALL_NAMES]
+        all_cursors = [self._clock.now(a) for a in live_all_names()]
         latest_time_worked = (
             max(all_cursors) if all_cursors else self.state.current_date
         )
