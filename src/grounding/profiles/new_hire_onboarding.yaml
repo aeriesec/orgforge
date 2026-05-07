@@ -1,0 +1,83 @@
+genre: new_hire_onboarding
+schema_version: 1
+seeds_used:
+- ros_discourse/273
+- ros_discourse/42926
+- ros_discourse/51466
+deterministic:
+  sample_count: 3
+  sources:
+  - ros_discourse
+  body_length_chars:
+    mean: 5342
+    median: 6957
+    p95: 7272
+    max: 7272
+    min: 1798
+  body_length_words:
+    mean: 819
+    median: 1030
+    p95: 1186
+  title_length_chars:
+    mean: 47
+    median: 51
+  actor_count:
+    mean: 4.33
+    max: 10
+    distribution_bins:
+      '1': 1
+      2-3: 1
+      4-6: 0
+      7+: 1
+llm_patterns:
+  tone_register: mixed
+  tone_examples:
+  - Hi, this will be a long post!
+  - I would appreciate some feedback on the general idea
+  - We get this question a lot.
+  - Feel free to join us for the PMC, Working Group, and Community Group meetings.
+  - Any suggestions or guidance will be greatly appreciated.
+  vagueness_rate: moderate
+  vagueness_markers:
+  - I think
+  - could be improved
+  - possibly your help
+  - could also be interesting
+  - might bias it
+  - mostly okay
+  - roughly similar
+  - off the top of my head
+  - without knowing much about you
+  - it is really hard
+  dialog_act_sequence:
+  - announce_context_or_self_introduction
+  - describe_prior_experience_or_learning_path
+  - identify_onboarding_gap_or_pain_point
+  - state_motivation_to_contribute_or_improve
+  - link_external_resources_or_documents
+  - request_feedback_guidance_or_suitable_tasks
+  - community_acknowledges_and_validates
+  - responders_add_personal_experience_or_constraints
+  - experienced_member_redirects_to self-directed_resources
+  - offer_specific_next_steps_meetings_repos_prs_guidelines
+  - invite_further_comments_or participation
+  resolution_shape: resolved_partial
+  drift_rate: low
+  threading_style: branching
+  rendering_hints:
+  - Open with a substantial background paragraph before asking for help.
+  - Use polite community-facing language and explicit appreciation for existing maintainers.
+  - Include concrete links to docs, GitHub issues, meetings, tutorials, calendars,
+    or shared documents.
+  - Let replies add personal learning experiences rather than only answering the original
+    request.
+  - Frame next steps as invitations and suggestions, not assignments.
+  - Use ROS-style technical nouns and version names naturally, such as Humble, Jazzy,
+    Gazebo, RViz, Docker, PRs, issues, and launch files.
+  - End with open invitations for feedback or participation rather than a final decision.
+  avoid:
+  - Do not produce a clean executive summary or formal onboarding checklist as the
+    whole artifact.
+  - Do not make the thread resolve with a single authoritative answer.
+  - Do not omit community uncertainty, hedging, or self-directed guidance.
+  - Do not add unrelated social small talk beyond brief greetings or thanks.

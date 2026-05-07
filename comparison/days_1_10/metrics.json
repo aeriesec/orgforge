@@ -1,0 +1,114 @@
+{
+  "baseline": {
+    "label": "baseline",
+    "root": "export/velomind_30d_baseline_days_1_10",
+    "exists": true,
+    "slack": {
+      "count": 379,
+      "channel_count": 34,
+      "date_range": [
+        "2026-04-27",
+        "2026-05-08"
+      ],
+      "length": {
+        "n": 379,
+        "char_mean": 125,
+        "char_median": 120,
+        "char_p95": 249,
+        "char_max": 381,
+        "word_mean": 20,
+        "word_median": 21,
+        "word_p95": 39
+      },
+      "vagueness_pct": 10.82,
+      "drift_pct": 0.0,
+      "markup": {
+        "mention_rate_pct": 0.0,
+        "quote_rate_pct": 0.0,
+        "code_block_rate_pct": 0.0,
+        "emoji_rate_pct": 0.0
+      }
+    },
+    "email": {
+      "count": 295,
+      "kinds": {
+        "inbound": 154,
+        "outbound": 141
+      },
+      "length": {
+        "n": 295,
+        "char_mean": 363,
+        "char_median": 361,
+        "char_p95": 653,
+        "char_max": 721,
+        "word_mean": 57,
+        "word_median": 58,
+        "word_p95": 99
+      },
+      "vagueness_pct": 0.34,
+      "drift_pct": 0.0,
+      "markup": {
+        "mention_rate_pct": 0.0,
+        "quote_rate_pct": 0.0,
+        "code_block_rate_pct": 0.0,
+        "emoji_rate_pct": 0.0
+      }
+    }
+  },
+  "grounded": {
+    "label": "grounded",
+    "root": "export/velomind_grounded_days_1_10",
+    "exists": true,
+    "slack": {
+      "count": 1029,
+      "channel_count": 35,
+      "date_range": [
+        "2026-04-27",
+        "2026-05-08"
+      ],
+      "length": {
+        "n": 1029,
+        "char_mean": 273,
+        "char_median": 258,
+        "char_p95": 399,
+        "char_max": 4518,
+        "word_mean": 43,
+        "word_median": 41,
+        "word_p95": 60
+      },
+      "vagueness_pct": 21.67,
+      "drift_pct": 0.39,
+      "markup": {
+        "mention_rate_pct": 0.0,
+        "quote_rate_pct": 0.0,
+        "code_block_rate_pct": 0.0,
+        "emoji_rate_pct": 0.49
+      }
+    },
+    "email": {
+      "count": 172,
+      "kinds": {
+        "inbound": 84,
+        "outbound": 88
+      },
+      "length": {
+        "n": 172,
+        "char_mean": 429,
+        "char_median": 427,
+        "char_p95": 636,
+        "char_max": 799,
+        "word_mean": 67,
+        "word_median": 69,
+        "word_p95": 97
+      },
+      "vagueness_pct": 4.65,
+      "drift_pct": 0.0,
+      "markup": {
+        "mention_rate_pct": 0.0,
+        "quote_rate_pct": 0.0,
+        "code_block_rate_pct": 0.0,
+        "emoji_rate_pct": 0.0
+      }
+    }
+  }
+}

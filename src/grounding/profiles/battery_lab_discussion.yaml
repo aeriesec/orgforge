@@ -1,0 +1,84 @@
+genre: battery_lab_discussion
+schema_version: 1
+seeds_used:
+- irc/2006-02-20/1251
+- irc/2011-03-18/1367
+- irc/2005-10-12/1444
+- irc/2007-06-01/1020
+- irc/2010-03-08/1329
+- irc/2017-05-09/1183
+- irc/2013-08-29/1353
+- irc/2011-02-23/1333
+- irc/2010-01-04/1165
+- irc/2015-12-28/1001
+- irc/2011-12-07/1455
+- irc/2007-02-06/1303
+deterministic:
+  sample_count: 12
+  sources:
+  - irc_disentanglement
+  body_length_chars:
+    mean: 799
+    median: 567
+    p95: 1799
+    max: 2388
+    min: 312
+  body_length_words:
+    mean: 123
+    median: 84
+    p95: 298
+  title_length_chars:
+    mean: 62
+    median: 71
+  actor_count:
+    mean: 3.83
+    max: 7
+    distribution_bins:
+      '1': 0
+      2-3: 5
+      4-6: 6
+      7+: 1
+llm_patterns:
+  tone_register: casual
+  tone_examples:
+  - anybody know of any good guides
+  - im noob---
+  - ah k
+  - pretty sure
+  - thanks...trying in a second
+  vagueness_rate: moderate
+  vagueness_markers:
+  - What do you mean?
+  - if its that what u mean
+  - you may want to look into
+  - maybe
+  - pretty sure
+  - guessing here
+  - I suppose
+  - sounds like
+  - Any idea how to fix this?
+  dialog_act_sequence:
+  - open_broadcast_question
+  - helper_requests_clarification_or_scope
+  - asker_adds_context_and_self-assesses_expertise
+  - helper_gives_short_command_link_or_pointer
+  - asker_confirms_or_tests
+  - bot_or_side_user_interjects
+  - asker_reports_result_or_blocker
+  - thread_either_gets_partial_answer_or_trails_off
+  resolution_shape: resolved_partial
+  drift_rate: medium
+  threading_style: mention_heavy
+  rendering_hints:
+  - Use timestamped one-line chat turns with angle-bracket nicknames.
+  - Address users directly by nick at the start of replies.
+  - 'Keep most technical advice terse: commands, paths, links, or short checks.'
+  - Let users reveal missing context gradually after clarification questions.
+  - Include occasional bot notices, wrong bot triggers, or paste warnings.
+  - Allow side chatter and interleaved unrelated troubleshooting to interrupt.
+  - End some threads with thanks, partial confirmation, or no final outcome.
+  avoid:
+  - Do not produce a polished summary or formal ticket-style resolution.
+  - Do not make every helper certain or fully correct.
+  - Do not keep the conversation perfectly on one topic.
+  - Do not over-explain every command in tutorial prose.

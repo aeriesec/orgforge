@@ -1,0 +1,86 @@
+genre: knowledge_gap_escalation
+schema_version: 1
+seeds_used:
+- irc/2007-01-21/1343
+- irc/2007-12-17/1009
+- irc/2008-04-30/1528
+- irc/2007-02-06/1159
+- irc/2011-04-14/1014
+- irc/2008-04-30/1361
+- irc/2008-01-02/1046
+- irc/2008-02-07/1208
+- irc/2017-07-15/1300
+- irc/2014-09-29/1385
+deterministic:
+  sample_count: 10
+  sources:
+  - irc_disentanglement
+  body_length_chars:
+    mean: 632
+    median: 577
+    p95: 1152
+    max: 1152
+    min: 256
+  body_length_words:
+    mean: 97
+    median: 92
+    p95: 174
+  title_length_chars:
+    mean: 56
+    median: 55
+  actor_count:
+    mean: 2.8
+    max: 4
+    distribution_bins:
+      '1': 0
+      2-3: 8
+      4-6: 2
+      7+: 0
+llm_patterns:
+  tone_register: casual
+  tone_examples:
+  - hey guys, i got a problem....
+  - any ideas???
+  - huh?
+  - ok / cool thanks guys
+  - wtf / nvm / brb
+  vagueness_rate: moderate
+  vagueness_markers:
+  - any ideas
+  - for whatever reason
+  - that's quite tricky
+  - settings like what, from where?
+  - I don't know
+  - I imagine
+  - ought to be
+  - I'm unsure
+  - maybe
+  - I thought
+  dialog_act_sequence:
+  - broadcast_question_or_problem
+  - helper_requests_clarification_or_confirms_context
+  - asker_provides_partial_context
+  - helper_offers_short_diagnostic_or_pointer
+  - asker_signals_confusion_or_followup_gap
+  - helper_expands_with_steps_or_alternative
+  - asker_acknowledges_or_thanks
+  - thread_either_trails_off_or_defers_future_attempt
+  resolution_shape: resolved_partial
+  drift_rate: low
+  threading_style: mention_heavy
+  rendering_hints:
+  - Use timestamped, nick-prefixed short chat lines.
+  - Let the initial question be under-specified and mildly urgent or confused.
+  - Have helpers answer with terse commands, package names, menu paths, or links.
+  - Include clarification turns like 'what version?', 'from where?', or 'are you set
+    up for X?'.
+  - Allow partial resolution with thanks, deferral, or a final follow-up question
+    rather than a polished close.
+  - Use casual IRC spelling, abbreviations, typos, and punctuation bursts.
+  - Address people by nick frequently instead of quoting prior messages.
+  avoid:
+  - Do not produce a clean executive summary at the end.
+  - Do not make every thread fully resolved.
+  - Do not use formal ticketing language or structured troubleshooting templates.
+  - Do not remove uncertainty; helpers often hedge or give approximate directions.
+  - Do not make the conversation single-speaker or monologic.

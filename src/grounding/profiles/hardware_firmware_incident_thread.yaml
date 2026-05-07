@@ -1,0 +1,94 @@
+genre: hardware_firmware_incident_thread
+schema_version: 1
+seeds_used:
+- irc/2008-06-03/1016
+- irc/2006-09-24/1243
+- irc/2005-09-26/1207
+- irc/2010-10-27/1448
+- irc/2013-05-05/1067
+- irc/2010-10-17/1311
+- irc/2006-05-15/1132
+- irc/2009-03-25/1080
+- irc/2007-09-07/1575
+- irc/2006-11-01/1053
+- irc/2007-02-15/1473
+- irc/2006-06-01/1882
+- irc/2011-04-28/1079
+- irc/2014-12-27/1013
+- irc/2007-12-17/1486
+- irc/2006-01-02/1038
+- irc/2006-02-24/1010
+- irc/2005-05-14/1023
+- irc/2012-03-24/1460
+- irc/2011-08-17/1015
+deterministic:
+  sample_count: 20
+  sources:
+  - irc_disentanglement
+  body_length_chars:
+    mean: 988
+    median: 709
+    p95: 2701
+    max: 2908
+    min: 195
+  body_length_words:
+    mean: 153
+    median: 99
+    p95: 425
+  title_length_chars:
+    mean: 52
+    median: 53
+  actor_count:
+    mean: 3.25
+    max: 6
+    distribution_bins:
+      '1': 0
+      2-3: 14
+      4-6: 6
+      7+: 0
+llm_patterns:
+  tone_register: casual
+  tone_examples:
+  - can someone help me with a simple xterm problem?
+  - not sure what it is, you can figure it out
+  - Thanks, I'll give that a try right now
+  - sorry, I didn't even see your question
+  - what do you mean urlin2u?
+  vagueness_rate: moderate
+  vagueness_markers:
+  - not sure
+  - probably
+  - i think
+  - afaik
+  - let me see if I can find it
+  - you could probably
+  - try
+  - might be
+  - or whatever it is
+  - any ideas?
+  dialog_act_sequence:
+  - initial_question_or_problem_statement
+  - optional_repeat_or_clarification
+  - helper_requests_context_or_redirects_to_ask_properly
+  - user_provides_environment_or_constraint
+  - helper_gives_short_command_or_menu_path
+  - user_asks_followup_or_reports_attempt
+  - helper_corrects_typo_or_refines_instruction
+  - user_thanks_or_thread_trails_off
+  resolution_shape: resolved_partial
+  drift_rate: medium
+  threading_style: mention_heavy
+  rendering_hints:
+  - Use timestamped short chat lines with nicknames in angle brackets.
+  - Have helpers address users by nick frequently before giving advice.
+  - Let commands and paths appear inline, often without much explanation.
+  - Include typos, abbreviations, lowercase phrasing, and quick corrections.
+  - Allow repeated questions, follow-up constraints, and partial diagnostics.
+  - End many threads after thanks, a command to try, or no confirmation.
+  - Permit occasional bot interjections, redirects, or mild off-topic chatter.
+  avoid:
+  - Do not produce a clean executive summary at the end.
+  - Do not make every incident fully diagnosed and closed.
+  - Do not use polished corporate incident-management language.
+  - Do not remove typos, fragmentary messages, or command-line shorthand.
+  - Do not make turn-taking perfectly orderly.

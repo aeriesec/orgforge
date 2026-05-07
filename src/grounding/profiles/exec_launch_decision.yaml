@@ -1,0 +1,77 @@
+genre: exec_launch_decision
+schema_version: 1
+seeds_used:
+- sec_edgar/0001193125-12-089204
+- sec_edgar/0001193125-12-089204
+- sec_edgar/0001193125-12-089204
+- sec_edgar/0001193125-12-089204
+- sec_edgar/0000950133-09-000547
+deterministic:
+  sample_count: 5
+  sources:
+  - sec_edgar
+  body_length_chars:
+    mean: 0
+    median: 0
+    p95: 0
+    max: 0
+    min: 0
+  body_length_words:
+    mean: 0
+    median: 0
+    p95: 0
+  title_length_chars:
+    mean: 47
+    median: 46
+  actor_count:
+    mean: 1
+    max: 1
+    distribution_bins:
+      '1': 5
+      2-3: 0
+      4-6: 0
+      7+: 0
+llm_patterns:
+  tone_register: formal
+  tone_examples:
+  - This Amendment is entered into as of the Effective Date
+  - The parties agree as follows
+  - Subject to the terms and conditions set forth herein
+  - Company shall pay Contractor in accordance with the milestone schedule
+  - Except as expressly modified herein, all other provisions remain in full force
+    and effect
+  vagueness_rate: rare
+  vagueness_markers:
+  - subject to
+  - as applicable
+  - to the extent
+  - commercially reasonable efforts
+  - unless otherwise agreed
+  - if any
+  - approximately
+  - from time to time
+  dialog_act_sequence:
+  - identify_contracting_parties
+  - state_effective_date
+  - recite_background_or_prior_agreement
+  - define_launch_or_program_terms
+  - record_decision_or_amendment
+  - allocate_obligations_and_deliverables
+  - specify_payment_or_milestone_terms
+  - state_exceptions_and_continuing_terms
+  - execute_by_authorized_signatures
+  resolution_shape: resolved_clean
+  drift_rate: none
+  threading_style: linear
+  rendering_hints:
+  - Use legal-agreement structure rather than conversational dialogue
+  - Open with parties, dates, agreement references, and recitals
+  - Express decisions as binding obligations using shall, will, and agrees
+  - Use numbered sections, subsections, defined terms, and cross-references
+  - Keep tone impersonal and institutional
+  - End with execution language and signature blocks
+  avoid:
+  - Do not include off-topic chatter or informal executive banter
+  - Do not add a clean narrative summary at the end
+  - Do not overuse uncertainty phrases like I think or maybe
+  - Do not format it as a chat thread

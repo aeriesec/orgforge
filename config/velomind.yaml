@@ -23,8 +23,23 @@ model_presets:
 
   openai_labelbox:
     provider: "openai_labelbox"
-    planner: "openai/gpt-4o"
-    worker: "openai/gpt-4o"
+    # gpt-5.5 with role-specific reasoning_effort:
+    #   - worker (renders Slack/email): high      ← quality matters most here
+    #   - planner (daily activity plan): medium   ← cheaper, still capable
+    #   - grounding-internal:           medium   ← short structural summarisation
+    # The `openai/` prefix routes through OpenAI on Labelbox (the `nova/`
+    # variants list in /models but route through AWS Nova which 404s on these).
+    planner: "openai/gpt-5.5"
+    worker: "openai/gpt-5.5"
+    grounding_worker: "openai/gpt-5.5"
+    # Per-role reasoning_effort (read by flow.py and llm_client.py).
+    # Switched worker high→medium after Day 1 took ~22min at high.
+    # Medium should be ~3-4× faster + cheaper, with only modest quality loss.
+    worker_reasoning_effort: "medium"
+    planner_reasoning_effort: "medium"
+    grounding_reasoning_effort: "medium"
+    # Fallback for callers that don't pass a role-specific override.
+    reasoning_effort: "medium"
     embed_provider: "openai_labelbox"
     embed_model: "openai/text-embedding-3-large"
     embed_dims: 1024
@@ -34,9 +49,11 @@ simulation:
   industry: "micromobility and AI hardware"
   company_description: "builds Atlas One, an AI-powered electric bicycle with adaptive pedal assist, range prediction, safety telemetry, dealer dashboards, and over-the-air firmware updates."
   domain: "velomind.co"
-  output_dir: "./export/velomind_30d"
-  db_name: "orgforge_velomind_30d"
-  max_days: 30
+  # Grounded run targets a fresh location so --reset doesn't touch the
+  # existing 30-day pure-synthetic baseline at ./export/velomind_30d/.
+  output_dir: "./export/velomind_grounded_days_1_10"
+  db_name: "orgforge_velomind_grounded_days_1_10"
+  max_days: 10
   start_date: "2026-04-25"
 
   adhoc_confluence_prob: 0.28

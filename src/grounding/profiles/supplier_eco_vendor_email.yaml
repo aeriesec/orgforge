@@ -1,0 +1,99 @@
+genre: supplier_eco_vendor_email
+schema_version: 1
+seeds_used:
+- sec_edgar/0000950123-11-020657
+- sec_edgar/0001193125-25-265796
+- sec_edgar/0001032210-03-000324
+- sec_edgar/0000950170-25-104000
+- sec_edgar/0001396814-24-000030
+- sec_edgar/0001193125-16-438372
+- sec_edgar/0000950123-10-102733
+- sec_edgar/0001564590-19-029323
+- sec_edgar/0001193125-15-371493
+- sec_edgar/0000950123-11-023815
+- sec_edgar/0001002637-05-000038
+- sec_edgar/0001628280-26-012297
+- sec_edgar/0001564590-19-029323
+- sec_edgar/0000950170-21-004377
+- sec_edgar/0001396814-25-000041
+- sec_edgar/0001047469-04-007758
+- sec_edgar/0001104659-14-034303
+- sec_edgar/0001396814-22-000021
+- sec_edgar/0000950135-03-006012
+- sec_edgar/0001193125-20-211886
+- sec_edgar/0001113481-12-000025
+- sec_edgar/0001104506-18-000002
+- sec_edgar/0001396814-22-000021
+- sec_edgar/0001193125-06-044016
+- sec_edgar/0001193125-13-035891
+deterministic:
+  sample_count: 25
+  sources:
+  - sec_edgar
+  body_length_chars:
+    mean: 0
+    median: 0
+    p95: 0
+    max: 0
+    min: 0
+  body_length_words:
+    mean: 0
+    median: 0
+    p95: 0
+  title_length_chars:
+    mean: 53
+    median: 53
+  actor_count:
+    mean: 1
+    max: 1
+    distribution_bins:
+      '1': 25
+      2-3: 0
+      4-6: 0
+      7+: 0
+llm_patterns:
+  tone_register: semi-formal
+  tone_examples:
+  - Please review the attached ECO and advise on impact.
+  - Can you confirm timing and any cost implications?
+  - We will proceed once supplier approval is received.
+  - Let us know if additional documentation is required.
+  vagueness_rate: moderate
+  vagueness_markers:
+  - please advise
+  - as soon as possible
+  - pending review
+  - if applicable
+  - at your earliest convenience
+  - we believe
+  - may impact
+  - to be confirmed
+  - subject to approval
+  dialog_act_sequence:
+  - announce_or_forward_eco
+  - identify_affected_part_numbers_or_revisions
+  - request_supplier_review
+  - ask_for_cost_lead_time_or_inventory_impact
+  - vendor_acknowledges_receipt
+  - vendor_requests_clarification_or_documents
+  - buyer_provides_attachment_or_context
+  - vendor_commits_to_review_timeline
+  - defer_until_internal_or_customer_approval
+  resolution_shape: deferred
+  drift_rate: low
+  threading_style: quote_heavy
+  rendering_hints:
+  - Use concise business-email phrasing with polite requests.
+  - Include ECO, part number, revision, drawing, attachment, lead time, and approval
+    references.
+  - Let the thread move through acknowledgments and requests for clarification rather
+    than a single complete answer.
+  - Use quoted prior-email fragments or forwarded context to show threading.
+  - End many exchanges with pending review, approval, quote, or confirmation.
+  - Keep off-topic chatter minimal and operational.
+  avoid:
+  - Do not produce a clean executive summary at the end.
+  - Do not make every issue fully resolved in one message.
+  - Do not use casual chat slang or emotional language.
+  - Do not omit practical identifiers such as ECO number, revision, supplier, attachment,
+    or affected item.

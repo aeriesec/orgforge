@@ -234,10 +234,36 @@ def build_llm(model_key: str):
             labelbox_args = openai_labelbox_litellm_params()
             llm_args = {
                 "model": openai_labelbox_litellm_model(model),
-                "temperature": 0.7,
                 "max_tokens": 16384,
                 **labelbox_args,
             }
+
+            # OpenAI reasoning models (gpt-5+, o-series) reject `temperature`
+            # and want `reasoning_effort` instead. Detect by model name.
+            model_lc = model.lower()
+            is_reasoning = (
+                "gpt-5" in model_lc
+                or model_lc.startswith("o1")
+                or model_lc.startswith("o3")
+                or "/o1" in model_lc
+                or "/o3" in model_lc
+            )
+            if is_reasoning:
+                # Per-role reasoning_effort: planner_reasoning_effort,
+                # worker_reasoning_effort, with reasoning_effort as fallback.
+                role_specific = _PRESET.get(f"{model_key}_reasoning_effort")
+                effort = role_specific or _PRESET.get("reasoning_effort", "high")
+                llm_args["reasoning_effort"] = effort
+                # LiteLLM's static OpenAI schema lags behind the API for gpt-5
+                # reasoning params; whitelist explicitly so the param flows.
+                llm_args["allowed_openai_params"] = ["reasoning_effort"]
+                logger.info(
+                    "[config] %s → reasoning model detected, "
+                    "using reasoning_effort=%s (no temperature)",
+                    model_key, effort,
+                )
+            else:
+                llm_args["temperature"] = 0.7
 
             llm = LLM(**llm_args)
 

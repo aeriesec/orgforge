@@ -1,0 +1,83 @@
+genre: outbound_sales_email
+schema_version: 1
+seeds_used:
+- apache_lists/dev-kafka.apache.org/pony-6daf4fcc-81e3-4ff2-8de1-2ec
+- apache_lists/dev-kafka.apache.org/pony-871ec221-d73b-422c-a71b-084
+- apache_lists/dev-kafka.apache.org/CAFc58G9YnLOwbYeA71yzY39qUBfVsRb
+- apache_lists/dev-spark.apache.org/CANpmDOdfFck9d0rdKcH=PsTsny1b5c=
+- apache_lists/dev-spark.apache.org/CAJiQeYJnU_jxxad0cmUQwR_oC=YzNqz
+- apache_lists/dev-spark.apache.org/CAFX8L23zic2KpRr-9wjDj4GWNgXhYZT
+- apache_lists/announce-apache.org/a7dbf9b7-2617-4f96-b1d4-6133d338
+- apache_lists/dev-cassandra.apache.org/CABQvOJxo1Zp7u+dhNY2_G6TV2puj8yz
+deterministic:
+  sample_count: 8
+  sources:
+  - apache_lists
+  body_length_chars:
+    mean: 10408
+    median: 9924
+    p95: 17545
+    max: 17545
+    min: 4027
+  body_length_words:
+    mean: 1690
+    median: 1581
+    p95: 3006
+  title_length_chars:
+    mean: 73
+    median: 67
+  actor_count:
+    mean: 4.12
+    max: 16
+    distribution_bins:
+      '1': 1
+      2-3: 4
+      4-6: 2
+      7+: 1
+llm_patterns:
+  tone_register: semi-formal
+  tone_examples:
+  - Hi, Sorry for the delay in responding.
+  - Thanks for the thorough review.
+  - 'I think there are two broad ways to achieve this:'
+  - +1 (non-binding)
+  - Cheers -Andreas
+  vagueness_rate: moderate
+  vagueness_markers:
+  - I think
+  - probably
+  - somehow
+  - I’m not sure
+  - does it make sense?
+  - would suggest
+  - might look like
+  - I would prefer
+  - I don’t expect
+  - along the right lines
+  dialog_act_sequence:
+  - email_header_metadata
+  - brief_greeting
+  - acknowledge_previous_message_or_delay
+  - state_position_or_vote
+  - provide_technical_rationale
+  - ask_clarifying_question_or_request_update
+  - propose_alternative_or_next_step
+  - brief_signoff
+  - quote_prior_thread
+  resolution_shape: trailing_off
+  drift_rate: low
+  threading_style: quote_heavy
+  rendering_hints:
+  - Start with mailing-list metadata such as From, Date, and Subject.
+  - Use short greetings and concise acknowledgements before the substantive reply.
+  - Preserve quoted prior messages with nested angle brackets.
+  - Use compact technical labels or numbered points such as AS1, jr1, or option a/b.
+  - Let threads continue without a polished final conclusion.
+  - Include terse votes like '+1' with optional binding status.
+  - Keep side comments minimal and tied to process or implementation details.
+  avoid:
+  - Do not write a polished sales pitch or marketing-style call to action.
+  - Do not produce a clean executive summary at the end.
+  - Do not remove quoted thread history.
+  - Do not make every issue fully resolved in the same message.
+  - Do not overuse casual banter or unrelated chatter.

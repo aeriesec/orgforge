@@ -26,6 +26,15 @@ from causal_chain_handler import CausalChainHandler
 from insider_threat import _NullInjector
 from utils.persona_utils import persona_utils
 
+# Real-world structural grounding (opt-in via ORGFORGE_GROUNDING_ENABLED).
+# When disabled, _ground_augment is a strict no-op and OrgForge produces
+# its baseline pure-synthetic output unchanged.
+try:
+    from grounding.integration import augment as _ground_augment
+except Exception:  # pragma: no cover — never fail the import
+    def _ground_augment(backstory, **_kwargs):  # type: ignore
+        return backstory
+
 logger = logging.getLogger("orgforge.normalday")
 
 _ASYNC_DOC_PROB: Dict[str, float] = {
@@ -357,6 +366,17 @@ class NormalDayHandler:
                         )
                     break
 
+        backstory = _ground_augment(
+            backstory,
+            activity_type="ticket_progress",
+            assignee=assignee,
+            ticket=ticket,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+            completion_artifact=completion_artifact,
+            knowledge_gap_hint=orphaned_domain_hint,
+        )
         agent = make_agent(
             role=f"{assignee} — {agent_role}",
             backstory=backstory,
@@ -943,6 +963,16 @@ class NormalDayHandler:
                         f"partial knowledge: {known_by or 'nobody'}."
                     )
 
+        backstory = _ground_augment(
+            backstory,
+            activity_type="pr_review",
+            assignee=reviewer,
+            actors=[author] if author else [],
+            pr_title=pr_title,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+        )
         agent = make_agent(
             role=f"{reviewer} — {p.get('social_role', 'Code Reviewer')}",
             goal=f"Write a PR review comment as {reviewer} would, reflecting your current stress and style.",
@@ -1291,6 +1321,16 @@ class NormalDayHandler:
         backstory = persona_utils.get_voice_card(reviewer, "async", self._gd, self._mem)
         p = self._config.get("personas", {}).get(reviewer, {})
 
+        backstory = _ground_augment(
+            backstory,
+            activity_type="pr_review",
+            assignee=reviewer,
+            actors=[author] if author else [],
+            pr_title=pr_title,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+        )
         agent = make_agent(
             role=f"{reviewer} — {p.get('social_role', 'Code Reviewer')}",
             goal=f"Write a PR review comment as {reviewer} would, reflecting your current stress and style.",
@@ -1449,6 +1489,17 @@ class NormalDayHandler:
         agents, tasks, speakers, prev_task = [], [], [], None
         turn_speakers = [name, collaborator] * (1 + 1)
 
+        # Grounding augmentation applied once before the loop (no-op when disabled).
+        backstory_for_loop = _ground_augment(
+            backstory,
+            activity_type="one_on_one",
+            assignee=name,
+            actors=[collaborator] if collaborator else [],
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+        )
+
         for i, speaker in enumerate(turn_speakers):
             is_last = i == len(turn_speakers) - 1
             other = collaborator if speaker == name else name
@@ -1457,7 +1508,7 @@ class NormalDayHandler:
             agent = make_agent(
                 role=f"{speaker} — {p.get('role', 'Engineer')}",
                 goal=f"Have a natural 1:1 DM conversation as {speaker}.",
-                backstory=backstory,
+                backstory=backstory_for_loop,
                 llm=self._worker,
             )
 
@@ -1646,6 +1697,16 @@ class NormalDayHandler:
 
         backstory = persona_utils.get_voice_card(
             all_actors, "async", self._gd, self._mem
+        )
+        backstory = _ground_augment(
+            backstory,
+            activity_type="async_question",
+            assignee=asker,
+            actors=[a for a in all_actors if a != asker],
+            ticket={"title": ticket_title, "description": ticket_title},
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
         )
 
         responders = [a for a in all_actors if a != asker]
@@ -2002,6 +2063,16 @@ class NormalDayHandler:
         backstory = persona_utils.get_voice_card(
             [mentor, mentee], "mentoring", self._gd, self._mem
         )
+        backstory = _ground_augment(
+            backstory,
+            activity_type="mentoring",
+            assignee=mentor,
+            actors=[mentee],
+            item_description=item.description,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+        )
 
         agents, tasks, prev_task = [], [], None
         n_turns = self._turn_count([mentor, mentee], (3, 6))
@@ -2201,10 +2272,19 @@ class NormalDayHandler:
             ),
         }.get(tension, "")
 
+        backstory = _ground_augment(
+            "You write authentic workplace Slack conversations that reflect each person's distinct voice and the emotional arc of the situation.",
+            activity_type="collision_event",
+            actors=participants,
+            item_description=event.rationale,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+        )
         agent = make_agent(
             role="Slack Conversation Simulator",
             goal="Write a realistic multi-turn Slack exchange between coworkers. Treat the provided backstory as character reference sheets.",
-            backstory="You write authentic workplace Slack conversations that reflect each person's distinct voice and the emotional arc of the situation.",
+            backstory=backstory,
             llm=self._planner,
         )
         task = Task(
@@ -2286,6 +2366,16 @@ class NormalDayHandler:
 
         backstory = persona_utils.get_voice_card(
             participants, "dm", self._gd, self._mem
+        )
+        backstory = _ground_augment(
+            backstory,
+            activity_type="blocker_thread",
+            assignee=asker,
+            actors=[collaborator],
+            ticket={"title": ticket_title, "description": blocker_text},
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
         )
 
         asker_role = (
@@ -2421,6 +2511,17 @@ class NormalDayHandler:
         lead = self._find_lead_for(assignee) or assignee
 
         backstory = persona_utils.get_voice_card(assignee, "async", self._gd, self._mem)
+        backstory = _ground_augment(
+            backstory,
+            activity_type="ticket_completion_email",
+            assignee=assignee,
+            actors=[lead],
+            ticket=ticket,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+            channel_kind="email_internal",
+        )
 
         p = self._config.get("personas", {}).get(assignee, {})
 
@@ -2587,6 +2688,17 @@ class NormalDayHandler:
 
         p = self._config.get("personas", {}).get(assignee, {})
         backstory = persona_utils.get_voice_card(assignee, "async", self._gd, self._mem)
+        backstory = _ground_augment(
+            backstory,
+            activity_type="sales_outreach",
+            assignee=assignee,
+            actors=[contact_name] if contact_name else [],
+            ticket=ticket,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+            channel_kind="email_external",
+        )
         stage = opportunity_id and self._crm._sf_o.find_one(
             {"opportunity_id": opportunity_id}, {"stage": 1, "_id": 0}
         )
@@ -2865,6 +2977,17 @@ class NormalDayHandler:
         """Author replies to a review question in #engineering."""
 
         backstory = persona_utils.get_voice_card(author, "async", self._gd, self._mem)
+        backstory = _ground_augment(
+            backstory,
+            activity_type="review_reply",
+            assignee=author,
+            actors=[reviewer],
+            pr_title=f"PR {pr_id}",
+            item_description=review_text[:200],
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+        )
         p = self._config.get("personas", {}).get(author, {})
 
         agent = make_agent(
@@ -3400,6 +3523,16 @@ class NormalDayHandler:
         backstory = persona_utils.get_voice_card(
             participants, "async", self._gd, self._mem
         )
+        backstory = _ground_augment(
+            backstory,
+            activity_type="design_discussion",
+            assignee=initiator,
+            actors=[p for p in participants if p != initiator],
+            item_description=topic,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
+        )
 
         turn_speakers = [initiator] + [
             participants[i % len(participants)] for i in range(1, random.randint(5, 8))
@@ -3483,6 +3616,16 @@ class NormalDayHandler:
 
         backstory = persona_utils.get_voice_card(
             participants, "sync", self._gd, self._mem
+        )
+        backstory = _ground_augment(
+            backstory,
+            activity_type="design_discussion_zoom",
+            assignee=initiator,
+            actors=[p for p in participants if p != initiator],
+            item_description=topic,
+            date_str=date_str,
+            sim_day=getattr(self._state, "day", 0),
+            company_industry=self._config["simulation"].get("industry"),
         )
 
         agent = make_agent(

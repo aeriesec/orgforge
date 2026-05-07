@@ -1,0 +1,85 @@
+genre: pilot_line_manufacturing_bulletin
+schema_version: 1
+seeds_used:
+- nhtsa_recall/24V284000
+- nhtsa_recall/24V554000
+- nhtsa_recall/24V935000
+- nhtsa_recall/25V002000
+- nhtsa_recall/24V051000
+- nhtsa_recall/24V554000
+deterministic:
+  sample_count: 6
+  sources:
+  - nhtsa_tsb
+  body_length_chars:
+    mean: 690
+    median: 662
+    p95: 896
+    max: 896
+    min: 512
+  body_length_words:
+    mean: 105
+    median: 98
+    p95: 139
+  title_length_chars:
+    mean: 53
+    median: 51
+  actor_count:
+    mean: 1
+    max: 1
+    distribution_bins:
+      '1': 6
+      2-3: 0
+      4-6: 0
+      7+: 0
+llm_patterns:
+  tone_register: formal
+  tone_examples:
+  - is recalling certain 2021-2024 vehicles
+  - fail to comply with the requirements of Federal Motor Vehicle Safety Standard
+  - increasing the risk of a crash
+  - free of charge
+  - Owners may contact customer service
+  vagueness_rate: moderate
+  vagueness_markers:
+  - certain vehicles
+  - may fail
+  - may not remain illuminated
+  - can fully open
+  - may deploy improperly
+  - affected vehicle
+  - any vehicles that experienced
+  - stress that may lead
+  - increasing the risk of
+  - resulting in
+  dialog_act_sequence:
+  - identify_issuer_and_recall_scope
+  - state_affected_models_and_years
+  - describe_defect_or_noncompliance
+  - cite_regulatory_standard_if_applicable
+  - label_consequence
+  - state_safety_risk
+  - label_remedy
+  - describe_corrective_action
+  - state_cost_or_free_of_charge
+  - provide_notification_status
+  - provide_owner_contact_and_internal_recall_number
+  resolution_shape: resolved_clean
+  drift_rate: none
+  threading_style: broadcast
+  rendering_hints:
+  - Use compact regulatory prose with no conversational framing.
+  - Start with the company name, parenthetical short name, and recall scope.
+  - Describe the defect in one or two factual sentences before the labeled consequence.
+  - Use explicit labels such as "Consequence:" and "Remedy:".
+  - Include model years, affected models, standards, dates, phone numbers, and bulletin
+    numbers where appropriate.
+  - Frame remedies as completed, released, mailed, or to be performed free of charge.
+  - Use safety-risk phrasing such as "increasing the risk of a crash" or "increasing
+    the risk of injury."
+  avoid:
+  - Do not add dialogue, personal opinions, or internal discussion.
+  - Do not include off-topic operational chatter.
+  - Do not over-explain root cause beyond a concise defect statement.
+  - Do not end with an executive summary or narrative conclusion.
+  - Do not use casual language or speculative troubleshooting language.

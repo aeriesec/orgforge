@@ -1,0 +1,80 @@
+genre: investor_diligence_qa
+schema_version: 1
+seeds_used:
+- sec_edgar/0001493152-22-011207
+- sec_edgar/0001493152-23-043391
+- sec_edgar/0001493152-22-024845
+- sec_edgar/0001493152-22-028119
+- sec_edgar/0001493152-22-034890
+deterministic:
+  sample_count: 5
+  sources:
+  - sec_edgar
+  body_length_chars:
+    mean: 0
+    median: 0
+    p95: 0
+    max: 0
+    min: 0
+  body_length_words:
+    mean: 0
+    median: 0
+    p95: 0
+  title_length_chars:
+    mean: 64
+    median: 64
+  actor_count:
+    mean: 1
+    max: 1
+    distribution_bins:
+      '1': 5
+      2-3: 0
+      4-6: 0
+      7+: 0
+llm_patterns:
+  tone_register: formal
+  tone_examples:
+  - The Company believes that its disclosures are responsive to the comment.
+  - We may not be able to successfully implement our business plan.
+  - Management expects to use the proceeds for working capital and general corporate
+    purposes.
+  - There can be no assurance that we will generate sufficient revenue.
+  - The following response is qualified in its entirety by the risk factors described
+    herein.
+  vagueness_rate: frequent
+  vagueness_markers:
+  - may
+  - could
+  - believes
+  - expects
+  - anticipates
+  - intends
+  - plans to
+  - no assurance
+  - subject to
+  - from time to time
+  dialog_act_sequence:
+  - pose_diligence_question
+  - provide_formal_answer
+  - reference_disclosure_or_filing
+  - qualify_with_forward_looking_language
+  - identify_risk_or_limitation
+  - defer_to_future_results_or_regulatory_process
+  resolution_shape: deferred
+  drift_rate: none
+  threading_style: linear
+  rendering_hints:
+  - Use formal securities-disclosure language rather than conversational wording.
+  - Answer questions with caveated, risk-aware statements.
+  - Include forward-looking qualifiers such as may, expects, intends, and no assurance.
+  - Refer back to disclosures, risk factors, management discussion, or the registration
+    statement.
+  - Keep exchanges linear and topic-bound with little or no off-topic material.
+  - Resolve issues by clarifying disclosure or deferring to future operations, financing,
+    or regulatory review.
+  avoid:
+  - Do not add casual investor-chat banter or jokes.
+  - Do not give uncaveated guarantees about performance, revenue, approvals, or financing.
+  - Do not produce a clean executive summary unless the artifact format calls for
+    one.
+  - Do not make the exchange highly emotional or argumentative.

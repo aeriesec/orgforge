@@ -1,0 +1,228 @@
+# Event → genre mapping for OrgForge real-world grounding.
+#
+# Each genre defines:
+#   - tier:        A/B/C/D — drives Stage 1 sample budget
+#   - sample_n:    how many real artifacts to fetch for the one-time profile
+#   - sources:     ordered list of {tier, name} — first reachable wins
+#   - apps:        which OrgForge apps render this genre (used to scope hook)
+#   - description: human-readable
+#
+# Industry override: top-level `industries:` block lets a different company
+# config (fintech, healthcare, etc.) route the same genre to different sources.
+
+version: 1
+
+# Default routing assumes hardware/micromobility (matches velomind.yaml).
+genres:
+
+  hardware_firmware_incident_thread:
+    tier: C
+    sample_n: 20
+    apps: [slack, email_internal]
+    description: "Multi-actor incident debugging — TS-17B cold-start, OTA storm, F_TORQUE_STALE."
+    sources:
+      # IRC-Disentanglement is the canonical match for chat-shaped multi-actor
+      # technical debugging. NHTSA secondary for hardware-domain anchors.
+      - {tier: 2, name: irc_disentanglement}
+      - {tier: 1, name: nhtsa_tsb}
+      - {tier: 1, name: nhtsa_investigations}
+      - {tier: 2, name: ros_discourse}
+      - {tier: 3, name: endless_sphere}
+
+  battery_lab_discussion:
+    tier: B
+    sample_n: 12
+    apps: [slack, email_internal]
+    description: "BAT-042 cold impedance, BAT-044 swap timing, lab/QA discussion."
+    sources:
+      # IRC primary for chat shape; NHTSA for battery-domain language.
+      - {tier: 2, name: irc_disentanglement}
+      - {tier: 1, name: nhtsa_voq}
+      - {tier: 1, name: nhtsa_tsb}
+      - {tier: 2, name: ros_discourse}
+      - {tier: 3, name: endless_sphere}
+
+  supplier_eco_vendor_email:
+    tier: C
+    sample_n: 25
+    apps: [email_external]
+    description: "Borealis TS-17B ECO, VoltEdge BAT swap, supplier coordination email."
+    sources:
+      - {tier: 1, name: sec_edgar_ex10}
+      - {tier: 1, name: nhtsa_tsb}
+
+  pilot_line_manufacturing_bulletin:
+    tier: A
+    sample_n: 6
+    apps: [email_external]
+    description: "Fremont pilot fixture protocol, dealer repair bulletins."
+    sources:
+      - {tier: 1, name: nhtsa_tsb}
+
+  dealer_escalation:
+    tier: C
+    sample_n: 25
+    apps: [email_external, slack]
+    description: "Golden Gate held-units, dealer demo readiness, training count."
+    sources:
+      - {tier: 1, name: nhtsa_complaints}
+      - {tier: 3, name: bikeforums_industry}
+
+  beta_rider_safety_report:
+    tier: C
+    sample_n: 30
+    apps: [email_external, slack]
+    description: "VM-027 hill-start near-miss, rider safety reports."
+    sources:
+      - {tier: 1, name: nhtsa_voq}
+      - {tier: 1, name: cpsc_saferproducts}
+      - {tier: 2, name: convokit_reddit_ebikes}
+
+  investor_diligence_qa:
+    tier: D
+    sample_n: 5
+    apps: [email_external]
+    description: "Northstar Series A — supply concentration, reviewed safety count."
+    sources:
+      - {tier: 1, name: sec_edgar_s1}
+
+  internal_sprint_planning:
+    tier: A
+    sample_n: 5
+    apps: [slack, email_internal]
+    description: "10-day sprint planning, standup, retro. Also internal status emails."
+    sources:
+      # Apache mailing list dev@ threads are the canonical match for internal
+      # eng status emails + release planning discussion.
+      - {tier: 1, name: apache_lists}
+      - {tier: 2, name: ros_discourse}
+      - {tier: 2, name: irc_disentanglement}
+
+  insurance_regulatory_framing:
+    tier: D
+    sample_n: 5
+    apps: [email_external]
+    description: "Greenway Insurance reviewed-incident definitions."
+    sources:
+      - {tier: 1, name: nhtsa_foia}
+
+  knowledge_gap_escalation:
+    tier: B
+    sample_n: 10
+    apps: [slack]
+    description: "Post-departure knowledge surfacing — Nikhil/Priya domains. Also covers 1:1 DMs."
+    sources:
+      # IRC-Disentanglement annotated 2-actor threads are the closest match
+      # for one-on-one DM and "who knows about X" gap surfacing.
+      - {tier: 2, name: irc_disentanglement}
+      - {tier: 2, name: ros_discourse}
+      - {tier: 3, name: adafruit_forum}
+
+  new_hire_onboarding:
+    tier: B
+    sample_n: 10
+    apps: [slack, email_internal]
+    description: "Omar / Imani onboarding; mentoring 1:1s."
+    sources:
+      # ROS Discourse has rich newcomer/onboarding texture in #help / community
+      # support threads (questions from new contributors, mentor-style answers).
+      - {tier: 2, name: ros_discourse}
+      - {tier: 2, name: convokit_reddit_managers}
+
+  marketing_launch_copy_review:
+    tier: B
+    sample_n: 10
+    apps: [slack, email_internal]
+    description: "Rider-agency language, autonomy claims review."
+    sources:
+      - {tier: 2, name: convokit_reddit_ebikes}
+
+  exec_launch_decision:
+    tier: D
+    sample_n: 5
+    apps: [email_internal, slack]
+    description: "Maya safety backstop, June board packet, launch go/no-go."
+    sources:
+      - {tier: 1, name: sec_edgar_s1_risk_factors}
+      - {tier: 3, name: university_board_minutes}
+
+  outbound_sales_email:
+    tier: B
+    sample_n: 8
+    apps: [email_external]
+    description: "Outbound professional sales / customer-facing email — Acme→customer."
+    sources:
+      # SEC EDGAR EX-10 contracts give the formal corporate-to-customer language;
+      # Apache announce@ lists give release-announcement / external-update tone.
+      - {tier: 1, name: sec_edgar_ex10}
+      - {tier: 1, name: apache_lists}
+
+  automated_alert:
+    tier: A
+    sample_n: 5
+    apps: [slack]
+    description: "Atlas App Alerts, Datadog/AWS automated paging."
+    sources:
+      - {tier: 3, name: status_page_archives}
+
+# OrgForge activity_type → genre lookup.
+# Covers every renderer call site in normal_day.py that emits Slack/email
+# content (see grounding integration audit). event_context.py resolves the
+# final genre using component-aware routing where applicable.
+activity_routing:
+  # ── Engineering agenda items ────────────────────────────────────────────
+  ticket_progress:
+    default: hardware_firmware_incident_thread
+    by_component:
+      battery: battery_lab_discussion
+      torque_sensor: hardware_firmware_incident_thread
+      ota: hardware_firmware_incident_thread
+  pr_review: hardware_firmware_incident_thread
+  pr_review_for_incident: hardware_firmware_incident_thread
+  async_question:
+    default: hardware_firmware_incident_thread
+    by_component:
+      battery: battery_lab_discussion
+  design_discussion:
+    default: hardware_firmware_incident_thread
+    by_component:
+      battery: battery_lab_discussion
+  design_discussion_zoom: internal_sprint_planning   # Zoom transcript shape ≠ Slack
+  one_on_one: knowledge_gap_escalation
+  mentoring: new_hire_onboarding
+
+  # ── Side artifacts emitted from inside handlers ─────────────────────────
+  blocker_thread:
+    default: hardware_firmware_incident_thread
+    by_component:
+      battery: battery_lab_discussion
+  collision_event: hardware_firmware_incident_thread   # cross-team technical friction
+  review_reply: hardware_firmware_incident_thread      # PR review reply in #engineering
+
+  # ── Email-shaped activities ─────────────────────────────────────────────
+  ticket_completion_email: internal_sprint_planning    # internal status update email
+  sales_outreach: outbound_sales_email                 # outbound customer-facing email (NEW genre with EX-10 + Apache announce@)
+
+  # ── Off-topic / noise (intentionally skip — would dilute the comparison) ──
+  watercooler: null
+  generic_activity: hardware_firmware_incident_thread  # fallback for unknown types
+
+# Channel → genre overrides
+channel_routing:
+  beta-pilot: beta_rider_safety_report
+  ops-supply: supplier_eco_vendor_email
+  app-cloud: hardware_firmware_incident_thread
+  digital-hq: exec_launch_decision
+
+# Per-industry source-tier overrides. Reused for other fictional companies.
+industries:
+  fintech:
+    hardware_firmware_incident_thread:
+      sources:
+        - {tier: 1, name: cfpb_complaints}
+        - {tier: 1, name: sec_edgar_enforcement}
+  healthcare:
+    hardware_firmware_incident_thread:
+      sources:
+        - {tier: 1, name: fda_maude}
+        - {tier: 1, name: cms_open_payments}

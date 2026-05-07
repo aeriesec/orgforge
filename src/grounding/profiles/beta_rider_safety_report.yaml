@@ -1,0 +1,109 @@
+genre: beta_rider_safety_report
+schema_version: 1
+seeds_used:
+- nhtsa_voq/11733743
+- nhtsa_voq/11733637
+- nhtsa_voq/11732498
+- nhtsa_voq/11732592
+- nhtsa_voq/11726987
+- nhtsa_voq/11720733
+- nhtsa_voq/11720438
+- nhtsa_voq/11712810
+- nhtsa_voq/11712202
+- nhtsa_voq/11710315
+- nhtsa_voq/11709516
+- nhtsa_voq/11705295
+- nhtsa_voq/11704891
+- nhtsa_voq/11704744
+- nhtsa_voq/11704483
+- nhtsa_voq/11704105
+- nhtsa_voq/11702355
+- nhtsa_voq/11702043
+- nhtsa_voq/11701831
+- nhtsa_voq/11701498
+- nhtsa_voq/11700777
+- nhtsa_voq/11699992
+- nhtsa_voq/11699081
+- nhtsa_voq/11698467
+- nhtsa_voq/11697482
+- nhtsa_voq/11697082
+- nhtsa_voq/11697172
+- nhtsa_voq/11696818
+- nhtsa_voq/11695584
+- nhtsa_voq/11695350
+deterministic:
+  sample_count: 30
+  sources:
+  - nhtsa_voq
+  body_length_chars:
+    mean: 948
+    median: 728
+    p95: 1998
+    max: 2075
+    min: 58
+  body_length_words:
+    mean: 151
+    median: 129
+    p95: 318
+  title_length_chars:
+    mean: 39
+    median: 40
+  actor_count:
+    mean: 1
+    max: 1
+    distribution_bins:
+      '1': 30
+      2-3: 0
+      4-6: 0
+      7+: 0
+llm_patterns:
+  tone_register: mixed
+  tone_examples:
+  - I am submitting a formal safety complaint regarding a potentially dangerous defect
+  - This is a serious safety concern
+  - known issue, no known hardware cause. In other words live with it.
+  - Luckily no other vehicles were hit.
+  - I guess they're waiting for somebody to have an accident
+  vagueness_rate: moderate
+  vagueness_markers:
+  - potentially
+  - I believe
+  - appears to be
+  - unsure of actual issue
+  - presumed
+  - may be unable
+  - has not yet been formally confirmed
+  - could not replicate
+  - known issue
+  - no known hardware cause
+  dialog_act_sequence:
+  - identify_vehicle_or_component
+  - describe_incident_or_recurring_defect
+  - give_operating_conditions
+  - state_safety_consequence
+  - mention_prior_warnings_or_frequency
+  - report_service_or_manufacturer_response
+  - note_evidence_or_inspection_status
+  - assert_unresolved_safety_concern
+  resolution_shape: unresolved
+  drift_rate: low
+  threading_style: linear
+  rendering_hints:
+  - Use first-person complaint narration with vehicle model, date, mileage, location,
+    or software version when available.
+  - Frame the defect as a safety risk rather than a general product dissatisfaction
+    issue.
+  - Include manufacturer or service-center responses that do not fully resolve the
+    problem.
+  - Allow typos, uneven capitalization, legal references, invoice numbers, VIN redactions,
+    and bracketed privacy placeholders.
+  - Often end with the issue still active, awaiting parts, inspection, or official
+    confirmation.
+  - Mention recurrence, warning messages, dashcam footage, diagnostics, or repair
+    attempts as supporting detail.
+  avoid:
+  - Do not write a clean executive summary with a neat conclusion.
+  - Do not make the complaint sound like a polished legal brief throughout; preserve
+    some ordinary-driver phrasing.
+  - Do not resolve the defect unless the artifact explicitly says it was fixed.
+  - Do not add off-topic conversation or multi-speaker dialogue.

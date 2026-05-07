@@ -1,0 +1,85 @@
+genre: internal_sprint_planning
+schema_version: 1
+seeds_used:
+- apache_lists/dev-kafka.apache.org/pony-6daf4fcc-81e3-4ff2-8de1-2ec
+- apache_lists/dev-kafka.apache.org/pony-871ec221-d73b-422c-a71b-084
+- apache_lists/dev-kafka.apache.org/CAFc58G9YnLOwbYeA71yzY39qUBfVsRb
+- apache_lists/dev-spark.apache.org/CANpmDOdfFck9d0rdKcH=PsTsny1b5c=
+- apache_lists/dev-spark.apache.org/CAJiQeYJnU_jxxad0cmUQwR_oC=YzNqz
+deterministic:
+  sample_count: 5
+  sources:
+  - apache_lists
+  body_length_chars:
+    mean: 11549
+    median: 13294
+    p95: 17545
+    max: 17545
+    min: 4276
+  body_length_words:
+    mean: 1854
+    median: 2230
+    p95: 2839
+  title_length_chars:
+    mean: 86
+    median: 80
+  actor_count:
+    mean: 5.2
+    max: 16
+    distribution_bins:
+      '1': 0
+      2-3: 3
+      4-6: 1
+      7+: 1
+llm_patterns:
+  tone_register: semi-formal
+  tone_examples:
+  - Hi, Sorry for the delay in responding.
+  - Thanks for the thorough review.
+  - I think there are two broad ways to achieve this
+  - I have updated the KIP based on your feedback.
+  - Best Regards,
+  vagueness_rate: moderate
+  vagueness_markers:
+  - I think
+  - probably
+  - could
+  - somehow
+  - along the right lines
+  - I would suggest
+  - I would be really worried otherwise
+  - subject of this earlier
+  - will keep improving/rephrasing it
+  - starting to explore
+  dialog_act_sequence:
+  - greet_recipient
+  - apologize_or_thank_for_review
+  - acknowledge_prior_point
+  - respond_to_numbered_or_named_items
+  - state_agreement_or_disagreement
+  - provide_technical_rationale
+  - propose_option_or_alternative
+  - request_clarification_or_update
+  - commit_to_update_documentation
+  - sign_off
+  - include_trimmed_quote_of_prior_messages
+  resolution_shape: unresolved
+  drift_rate: low
+  threading_style: quote_heavy
+  rendering_hints:
+  - Use top-posted replies followed by large quoted prior messages.
+  - Keep the exchange technical and narrowly focused on design tradeoffs.
+  - Use numbered reviewer tags such as AS4, jr1, chia_01 to anchor responses.
+  - Include polite acknowledgements before disagreement or correction.
+  - Let conclusions remain provisional, often ending with a document update or further
+    exploration.
+  - Use concise greetings and signoffs, but allow dense technical paragraphs in the
+    body.
+  - Mention implementation artifacts, protocol versions, APIs, config names, links,
+    and exception names inline.
+  avoid:
+  - Do not end with a clean executive summary or final decision unless explicitly
+    present.
+  - Do not remove quoted email history; quoting is a major structural feature.
+  - Do not make the tone chatty or social beyond brief greetings and thanks.
+  - Do not over-resolve technical disagreements; leave room for continued discussion.

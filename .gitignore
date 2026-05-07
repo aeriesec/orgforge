@@ -32,3 +32,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.patch
+
+# ── Grounding raw artifact cache (added on realworld-grounding-poc branch) ──
+src/grounding/_cache/

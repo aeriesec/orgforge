@@ -1,0 +1,104 @@
+genre: dealer_escalation
+schema_version: 1
+seeds_used:
+- nhtsa_voq/11733743
+- nhtsa_voq/11733637
+- nhtsa_voq/11732498
+- nhtsa_voq/11732592
+- nhtsa_voq/11726987
+- nhtsa_voq/11720733
+- nhtsa_voq/11720438
+- nhtsa_voq/11712810
+- nhtsa_voq/11712202
+- nhtsa_voq/11710315
+- nhtsa_voq/11709516
+- nhtsa_voq/11705295
+- nhtsa_voq/11704891
+- nhtsa_voq/11704744
+- nhtsa_voq/11704483
+- nhtsa_voq/11704105
+- nhtsa_voq/11702355
+- nhtsa_voq/11702043
+- nhtsa_voq/11701831
+- nhtsa_voq/11701498
+- nhtsa_voq/11700777
+- nhtsa_voq/11699992
+- nhtsa_voq/11699081
+- nhtsa_voq/11698467
+- nhtsa_voq/11697482
+deterministic:
+  sample_count: 25
+  sources:
+  - nhtsa_voq
+  body_length_chars:
+    mean: 988
+    median: 806
+    p95: 1810
+    max: 2075
+    min: 58
+  body_length_words:
+    mean: 156
+    median: 135
+    p95: 278
+  title_length_chars:
+    mean: 38
+    median: 33
+  actor_count:
+    mean: 1
+    max: 1
+    distribution_bins:
+      '1': 25
+      2-3: 0
+      4-6: 0
+      7+: 0
+llm_patterns:
+  tone_register: mixed
+  tone_examples:
+  - This is a serious safety concern
+  - known issue, no known hardware cause. In other words live with it.
+  - I believe this vehicle is unsafe to operate
+  - To Whom It May Concern, I am submitting a formal safety complaint
+  - Very scary.
+  vagueness_rate: moderate
+  vagueness_markers:
+  - intermittently
+  - potentially
+  - appears to be
+  - I believe
+  - unsure of actual issue
+  - could not replicate
+  - known issue
+  - no known hardware cause
+  - not yet been formally confirmed
+  - raises concerns
+  dialog_act_sequence:
+  - identify_vehicle_or_component
+  - state_defect_or_failure
+  - describe_incident_conditions
+  - provide_timeline_or_mileage
+  - state_safety_risk
+  - mention_prior_service_or_dealer_response
+  - assert_inadequate_resolution
+  - request_regulatory_attention_or_imply_required_action
+  resolution_shape: unresolved
+  drift_rate: low
+  threading_style: linear
+  rendering_hints:
+  - Use first-person complaint narration with specific dates, mileage, locations,
+    invoices, warnings, or software versions when available.
+  - Frame the problem as a safety defect rather than a customer-service inconvenience.
+  - Include manufacturer or dealer responses such as unable to replicate, working
+    as designed, known issue, or no timeframe.
+  - Let the complaint end with the defect still active, monitored, deferred, or inadequately
+    repaired.
+  - Mix polished formal language with occasional frustrated plain speech.
+  - Use component names, warning codes, acronyms, and legal or regulatory references
+    sparingly but concretely.
+  - Mention inspection availability, dashcam/video evidence, service records, or prior
+    complaints when escalating.
+  avoid:
+  - Do not provide a clean resolution or warranty success story.
+  - Do not turn the artifact into a balanced executive summary.
+  - Do not add casual small talk or unrelated personal chatter.
+  - Do not omit the safety-risk framing.
+  - Do not make the dealer or manufacturer fully transparent and cooperative.
