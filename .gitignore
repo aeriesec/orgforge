@@ -5,6 +5,8 @@ simulation_snapshot.json
 results/
 leaderboard.csv
 leaderboard.json
+leaderboard/
+eval_results.json
 
 # ── Environments & Secrets ──
 .env

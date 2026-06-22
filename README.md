@@ -10,11 +10,10 @@
 
 ![OrgForge corpus overview](orgforge_hero.png)
 
-OrgForge simulates weeks of realistic enterprise activity — Confluence pages, JIRA tickets, Slack threads, Git PRs, Zoom transcripts, Zendesk tickets, Salesforce records, emails, and server telemetry — grounded in an event-driven state machine so LLMs can't hallucinate facts out of sequence.
+OrgForge simulates weeks of realistic enterprise activity: Confluence pages, JIRA tickets, Slack threads, Git PRs, Zoom transcripts, Zendesk tickets, Salesforce records, emails, and server telemetry. It is grounded in an event-driven state machine so LLMs cannot hallucinate facts out of sequence.
 
 The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, forcing deterministic incident handoffs, ticket reassignments, and CRM ownership lapses. Knowledge gaps surface when under-documented systems break. New hires build their internal network through simulated collaboration. Stress propagates through a live, weighted social graph. Every artifact reflects the exact state of the org at the moment it was written.
 
----
 
 ## Table of Contents
 
@@ -31,7 +30,7 @@ The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, f
   - [Option 3 — Cloud Preset](#option-3--cloud-preset-aws-bedrock--openai)
   - [Running on AWS EC2](#running-on-aws-ec2)
 - [Configuration](#configuration)
-  - [Quality Presets](#quality-presets)
+  - [Quality Presets & Multi-Provider Support](#quality-presets--multi-provider-support)
   - [Key Config Fields](#key-config-fields)
   - [Dynamic Org Lifecycle](#dynamic-org-lifecycle)
 - [How the Event Bus Works](#how-the-event-bus-works)
@@ -43,17 +42,15 @@ The dataset is the exhaust of a living simulation. Engineers leave mid-sprint, f
 - [Citation](#citation)
 - [License](#license)
 
----
 
 ## Why Does This Exist?
 
-When building AI agents that reason over institutional knowledge, you need a realistic corpus to test against. The only widely-used corporate dataset is the Enron email corpus — 25 years old, legally sensitive, and covering one company in crisis.
+When building AI agents that reason over institutional knowledge, you need a realistic corpus to test against. The only widely-used corporate dataset is the Enron email corpus: 25 years old, legally sensitive, and covering one company in crisis.
 
-OrgForge generates that corpus from scratch, parameterized to any company, industry, or org structure. LLMs write the prose, but the facts — who was on-call, which ticket was open, when the incident resolved, who just left the team, and which customer SLA was breached — are strictly controlled by the state machine.
+OrgForge generates that corpus from scratch, parameterized to any company, industry, or org structure. LLMs write the prose, but the facts (who was on-call, which ticket was open, when the incident resolved, who just left the team, and which customer SLA was breached) are strictly controlled by the state machine.
 
-**The central design bet:** grounding LLM output in a deterministic event log makes the dataset actually useful for evaluating retrieval systems. You have ground truth about what happened, when, who was involved, and what the org's state was — so you can measure whether an agent surfaces the right context, not just plausible-sounding context.
+**The central design bet:** grounding LLM output in a deterministic event log makes the dataset actually useful for evaluating retrieval systems. You have ground truth about what happened, when, who was involved, and what the org's state was, so you can measure whether an agent surfaces the right context, not just plausible-sounding context.
 
----
 
 ## What the Output Looks Like
 
@@ -86,13 +83,9 @@ Here's what a slice of a real simulation produces. An incident fires on Day 8:
 
 **`confluence/postmortems/IT-108.md`** — written the next day, linking the same root cause and PR:
 
-> _This incident was triggered by connection pool exhaustion under sustained load, first surfaced in IT-108. The fix landed in PR \#47 (merged by Sarah). A prior knowledge gap in TitanDB connection management — stemming from Jordan's departure on Day 12 — contributed to the delayed diagnosis._
+> *This incident was triggered by connection pool exhaustion under sustained load, first surfaced in IT-108. The fix landed in PR #47 (merged by Sarah). A prior knowledge gap in TitanDB connection management — stemming from Jordan's departure on Day 12 — contributed to the delayed diagnosis.*
 
 Meanwhile, the `datadog/metrics.jsonl` time-series data reflects the exact latency spike, Zendesk support tickets from affected customers are automatically escalated to 'Urgent', Salesforce opportunities are flagged as 'at-risk', and end-of-month customer invoices (`invoices/`) automatically apply SLA credits based on the incident's duration.
-
-None of this is coincidence — it all traces back to one SimEvent that every downstream artifact reads from.
-
----
 
 ## What Gets Generated
 
@@ -107,14 +100,13 @@ A default 22-day simulation produces:
 | `zoom/`                    | Verbatim meeting transcripts from sync design discussions, capturing undocumented verbal decisions                          |
 | `salesforce/`              | CRM accounts and active sales opportunities, including risk flags propagated from active incidents                          |
 | `zendesk/`                 | Customer support tickets and comments, automatically escalated during system outages                                        |
-| `emails/`                  | External inbound/outbound emails — customer complaints, vendor messages, HR communications, sales updates                   |
+| `emails/`                  | External inbound/outbound emails: customer complaints, vendor messages, HR communications, sales updates                    |
 | `datadog/`                 | Time-series system metrics (`metrics.jsonl`) and alert payloads (`alerts.jsonl`) reflecting incident degradation & recovery |
 | `nps/`                     | Post-simulation customer satisfaction surveys, scored deterministically based on SLA breaches and support ticket resolution |
 | `invoices/`                | End-of-month customer invoices featuring SLA credit line items calculated directly from incident duration                   |
 | `simulation_snapshot.json` | Full state: incidents, morale curve, system health, relationship graph, departed employees, new hires, knowledge gap events |
 | `simulation.log`           | Complete chronological system and debug logs for the entire run                                                             |
 
----
 
 ## Architecture & Mechanics
 
@@ -122,11 +114,10 @@ OrgForge is not an LLM wrapper. Four interlocking systems enforce correctness.
 
 👉 **[Read the full Architecture Deep-Dive here.](ARCHITECTURE.md)**
 
----
 
 ## The Departure Cascade
 
-The most complex behaviour in the simulation. When an engineer departs mid-sprint, the following fires in order before that day's planning runs:
+The most complex behavior in the simulation. When an engineer departs mid-sprint, the following fires in order before that day's planning runs:
 
 1.  **Incident handoff** — active incidents assigned to the departing engineer are rerouted via Dijkstra escalation routing (while the node is still in the graph) to the next available person in the chain.
 2.  **Ticket & CRM reassignment** — orphaned JIRA tickets go to the dept lead. Salesforce accounts and open opportunities owned by the departed employee are flagged for reassignment, maintaining cross-domain ground truth.
@@ -134,13 +125,12 @@ The most complex behaviour in the simulation. When an engineer departs mid-sprin
 4.  **Knowledge gap propagation** — if the departed engineer owned undocumented domains (configured via `documented_pct`), those gaps are registered in the SimEvent log and surface in subsequent incidents as contributing factors.
 5.  **`employee_departed` SimEvent** — emitted with edge snapshot, centrality at departure, reassigned tickets, and incident handoffs. Full ground truth for retrieval evaluation.
 
-So when Jordan leaves on Day 12, the postmortem on Day 9's incident doesn't mention her. But the postmortem on Day 15 might: _"A prior knowledge gap in auth-service, stemming from a recent departure, contributed to the delayed diagnosis."_ That sentence is grounded in a real SimEvent, not LLM inference.
+So when Jordan leaves on Day 12, the postmortem on Day 9's incident doesn't mention her. But the postmortem on Day 15 might: *"A prior knowledge gap in auth-service, stemming from a recent departure, contributed to the delayed diagnosis."* That sentence is grounded in a real SimEvent, not LLM inference.
 
----
 
 ## Insider Threat Simulation
 
-OrgForge includes an optional insider threat module that layers adversarial behavior on top of the normal simulation — without touching any of the clean simulation paths. When disabled (the default), it is completely inert: no overhead, no additional output, no altered code paths.
+OrgForge includes an optional insider threat module that layers adversarial behavior on top of the normal simulation, without touching any of the clean simulation paths. When disabled (the default), it is completely inert: no overhead, no additional output, no altered code paths.
 
 When enabled, designated employees exhibit configurable threat behaviors across multiple surfaces: anomalous git activity, off-hours access, sentiment drift in Slack, data staging on their workstation, and IDP authentication anomalies. All threat telemetry is written to a separate `security_telemetry/` directory in industry-standard log formats (JSONL, CEF, ECS, LEEF), keeping it cleanly isolated from the normal simulation output so detection agents must work to find it.
 
@@ -148,7 +138,6 @@ The module is designed for building and evaluating insider threat detection syst
 
 👉 **[Read the full Insider Threat reference here.](INSIDER_THREAT.md)**
 
----
 
 ## Quickstart
 
@@ -160,7 +149,7 @@ The module is designed for building and evaluating insider threat detection syst
 | ---------------------------------- | ------------------------------------ | -------------------------------------- |
 | Everything in Docker               | `docker compose up`                  | Recommended for first run              |
 | Local Ollama + Docker for the rest | `docker compose up mongodb orgforge` | Set `OLLAMA_BASE_URL` in `.env`        |
-| Cloud preset (AWS Bedrock)         | `docker compose up mongodb orgforge` | Set credentials in `.env`, skip Ollama |
+| Cloud preset (any provider)        | `docker compose up mongodb orgforge` | Set credentials in `.env`, skip Ollama |
 
 ### Option 1 — Everything in Docker (Recommended)
 
@@ -170,12 +159,9 @@ cd orgforge
 docker compose up
 ```
 
-First run pulls models automatically (\~5–8 min depending on your connection). Subsequent runs start in seconds — models are cached in a named volume.
-
 When the simulation finishes, run the post-processing artifact generators:
 
 ```bash
-python email_gen.py
 python post_sim_artifacts.py
 ```
 
@@ -197,35 +183,60 @@ docker compose up mongodb orgforge
 
 > **Linux note:** `host.docker.internal` requires Docker Desktop, or the `extra_hosts: host-gateway` entry in `docker-compose.yaml` (already included).
 
-### Option 3 — Cloud Preset (AWS Bedrock + OpenAI)
+### Option 3 — Cloud Preset (Any Provider)
 
-Best output quality. Uses Claude Sonnet for document generation, Llama 3.1 8B on Bedrock for high-volume worker calls, and OpenAI `text-embedding-3-large` for embeddings.
+Best output quality. Uses CrewAI's multi-provider `LLM` class, which auto-detects the provider from the model string. Supported providers include OpenAI, Anthropic, AWS Bedrock, Google Gemini, Groq, and Azure.
 
 Set `quality_preset: "cloud"` in `config.yaml`, then:
 
 ```bash
-# .env
-AWS_ACCESS_KEY_ID=...
+# .env — set the env vars for whichever provider(s) you configure
+AWS_ACCESS_KEY_ID=...          # for Bedrock
 AWS_SECRET_ACCESS_KEY=...
 AWS_DEFAULT_REGION=us-east-1
-OPENAI_API_KEY=...
+OPENAI_API_KEY=...             # for OpenAI
+ANTHROPIC_API_KEY=...          # for Anthropic
 ```
 
 ```bash
-pip install boto3 langchain-aws openai
+pip install crewai boto3 openai
 docker compose up mongodb orgforge
 ```
 
+**Using OpenAI directly** — add an `openai` preset to `config/config.yaml`:
+
+```yaml
+quality_presets:
+  cloud:
+    provider: openai
+    planner: gpt-4o
+    worker: gpt-4o-mini
+```
+
+Then set `quality_preset: "openai"` and ensure `OPENAI_API_KEY` is in `.env`. No code changes needed.
+
+**Using Anthropic directly** — same pattern:
+
+```yaml
+quality_presets:
+  cloud:
+    provider: anthropic
+    planner: claude-sonnet-4-20250514
+    worker: claude-haiku-3-5-20241022
+```
+
+Set `ANTHROPIC_API_KEY` in `.env` and you're done.
+
 ### Running on AWS EC2
 
-**Cheap EC2 + Bedrock/OpenAI (no GPU required)**
+**Cheap EC2 + Cloud API (no GPU required)**
 
-A `t3.small` works fine — the cloud APIs do all the heavy lifting.
+A `t3.small` works fine: the cloud APIs do all the heavy lifting.
 
 1.  Launch an EC2 instance (Ubuntu or Amazon Linux) and install Docker
 2.  `git clone https://github.com/aeriesec/orgforge.git && cd orgforge`
 3.  `cp .env.example .env` and fill in your credentials
-4.  Set `quality_preset: "cloud"` in `config/config.yaml`
+4.  Set `quality_preset: "cloud"` (or `openai`, `anthropic`, `gemini`) in `config/config.yaml`
 5.  `docker compose up --build -d mongodb orgforge`
 
 **GPU Instance + 70B Local Models**
@@ -238,16 +249,44 @@ For `Llama 3.3 70B` entirely locally, use a `g5.2xlarge` or `g5.12xlarge` with t
 
 `config/config.yaml` is the single source of truth. No Python changes are needed for most customizations.
 
-### Quality Presets
+### Quality Presets & Multi-Provider Support
+
+OrgForge uses CrewAI's `LLM` class, which auto-detects the provider from the model string. This means you can use any supported provider by simply adding a preset to your config and setting the corresponding API key environment variable.
+
+| Provider   | Model Example                       | Env Var Required      |
+| ---------- | ----------------------------------- | --------------------- |
+| Ollama     | `llama3.3:70b-instruct-q4_KM`       | `OLLAMA_BASE_URL`     |
+| AWS Bedrock | `us.anthropic.claude-sonnet-4-20250514-v1:0` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
+| OpenAI     | `gpt-4o`                            | `OPENAI_API_KEY`      |
+| Anthropic  | `claude-sonnet-4-20250514`          | `ANTHROPIC_API_KEY`   |
+| Gemini     | `gemini-2.5-pro`                    | `GEMINI_API_KEY`      |
+| Groq       | `groq/llama-3.1-70b-versatile`      | `GROQ_API_KEY`        |
+| Azure      | `azure/gpt-4o`                      | Azure credentials     |
+
+**Built-in presets:**
 
 ```yaml
-quality_preset: "local_gpu" # local_gpu | cloud
+quality_preset: "local_gpu" # local_gpu | cloud | openai | anthropic
 ```
 
-| Preset      | Planner                     | Worker                | Embeddings             | Best For                 |
-| ----------- | --------------------------- | --------------------- | ---------------------- | ------------------------ |
-| `local_gpu` | llama3.3:70b-instruct-q4_KM | llama3.1:8b-instruct  | mxbai-embed-large      | High-fidelity local runs |
-| `cloud`     | Claude Sonnet (Bedrock)     | llama3.1:8b (Bedrock) | text-embedding-3-large | Best output quality      |
+| Preset      | Planner                     | Worker                | Best For                 |
+| ----------- | --------------------------- | --------------------- | ------------------------ |
+| `local_gpu` | llama3.3:70b-instruct-q4_KM | llama3.1:8b-instruct  | High-fidelity local runs |
+| `cloud`     | Claude Sonnet (Bedrock)     | llama3.1:8b (Bedrock) | Best output quality      |
+| `openai`    | gpt-4o                      | gpt-4o-mini           | Fastest cloud setup      |
+| `anthropic` | claude-sonnet-4-20250514    | claude-haiku-3-5-20241022 | Anthropic-native access |
+
+**Adding your own preset**: just add a block under `quality_presets` in `config/config.yaml`:
+
+```yaml
+quality_presets:
+  gemini:
+    provider: gemini
+    planner: gemini-2.5-pro
+    worker: gemini-2.0-flash
+```
+
+Then set the corresponding API key in `.env` and switch `quality_preset: "gemini"`. That's it — CrewAI handles the routing.
 
 ### Key Config Fields
 
@@ -281,7 +320,7 @@ org_lifecycle:
       knowledge_domains:
         - "auth-service"
         - "redis-cache"
-      documented_pct: 0.25 # fraction written down — drives gap severity
+      documented_pct: 0.25 # fraction written down: drives gap severity
 
   scheduled_hires:
     - name: "Taylor"
@@ -338,58 +377,26 @@ facts={
 }
 ```
 
-This is what makes the dataset useful for RAG evaluation: you have ground truth about what happened, when, who was involved, and what the org's state was — so you can measure whether a retrieval system actually surfaces the right context.
 
----
 
 ## Memory Requirements
 
 | Preset      | RAM Required | Notes                                    |
 | ----------- | ------------ | ---------------------------------------- |
-| `local_gpu` | \~48 GB VRAM | Llama 3.3 70B — requires A100 or 2× A10G |
-| `cloud`     | \~500 MB     | Only MongoDB + Python run locally        |
+| `local_gpu` | ~48 GB VRAM | Llama 3.3 70B: requires A100 or 2x A10G  |
+| Cloud presets (openai, anthropic, cloud, gemini) | ~500 MB | Only MongoDB + Python run locally |
 
-For `local_gpu` on AWS, a `g5.2xlarge` (A10G 24GB) runs 70B at q4 quantization. At \~$0.50/hour spot pricing a full 22-day simulation costs roughly $3–5.
-
----
-
-## Project Structure
-
-```
-orgforge/
-├── .github/workflows/    # CI/CD pipelines
-├── src/
-│   ├── flow.py           # State machine and simulation engine
-│   ├── day_planner.py    # LLM-driven per-department daily planning
-│   ├── normal_day.py     # Agenda dispatcher — produces typed artifacts per activity
-│   ├── crm_system.py     # Salesforce & Zendesk integration and propagation rules
-│   ├── planner_models.py # Dataclasses for plans, events, and validation results
-│   ├── plan_validator.py # Integrity boundary between LLM proposals and execution
-│   ├── org_lifecycle.py  # Dynamic hiring, firing, and knowledge gap propagation
-│   ├── graph_dynamics.py # Social graph: stress propagation, edge decay, escalation
-│   ├── memory.py         # Vector DB and SimEvent bus
-│   ├── email_gen.py      # Reflective post-processing email artifacts
-│   └── post_sim_artifacts.py # Deterministic post-processing (NPS, invoices, Datadog)
-├── config/               # YAML configurations
-├── tests/                # Pytest suite
-├── scripts/              # Entrypoint and helper scripts
-├── export/               # Output directory for generated dataset
-├── README.md
-├── ARCHITECTURE.md
-└── CONTRIBUTING.md
-```
-
----
+For `local_gpu` on AWS, a `g5.2xlarge` (A10G 24GB) runs 70B at q4 quantization. At ~$0.50/hour spot pricing a full 22-day simulation costs roughly $3–5.
 
 ## Roadmap
 
 - [x] Native integrations for Zoom, Zendesk, and Salesforce CRM
+- [x] Multi-provider LLM support via CrewAI (OpenAI, Anthropic, Bedrock, Gemini, Groq, Azure)
 - [ ] Plugin architecture for additional integrations (PagerDuty, Workday, etc.)
-- [ ] Domain packs — pre-configured `config.yaml` templates for healthcare, fintech, legal
+- [ ] Domain packs: pre-configured `config.yaml` templates for healthcare, fintech, legal
 - [x] Export to HuggingFace dataset format
-- [x] Evaluation harness — benchmark RAG retrieval against SimEvent ground truth
+- [x] Evaluation harness: benchmark RAG retrieval against SimEvent ground truth
 
----
 
 ## Adding a New Artifact Type
 
@@ -398,13 +405,11 @@ orgforge/
 
 A formal plugin architecture is on the roadmap. Open an issue before starting so we can align on the interface.
 
----
 
 ## Contributing
 
 Contributions are welcome. Please read **[CONTRIBUTING.md](CONTRIBUTING.md)** before opening a PR. For new domain configs or artifact types, open an Issue first.
 
----
 
 ## Citation
 
@@ -419,8 +424,7 @@ If you use this work, please cite:
 }
 ```
 
----
 
 ## License
 
-MIT — see **[LICENSE](https://www.google.com/search?q=LICENSE)**.
+MIT — see **[LICENSE](LICENSE)**.

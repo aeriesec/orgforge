@@ -21,23 +21,16 @@ quality_preset: "cloud"
 model_presets:
   local_gpu:
     provider: "ollama"
-    planner: "ollama/llama3.3:70b"
-    worker: "ollama/llama3.1:8b-instruct"
+    planner: "ollama/gemma4:e4b"
+    worker: "ollama/gemma4:e4b"
     base_url: "http://localhost:11434"
-    embed_provider: "ollama"
-    embed_model: "mxbai-embed-large"
-    embed_dims: 1024
 
   cloud:
-    provider: "bedrock"
-    # Claude 4.6 Sonnet on Bedrock — best for long-form corporate doc generation
-    planner: "bedrock/openai.gpt-oss-120b-1:0"
-    # Llama 3.1 8B on Bedrock — fast, cheap for high-volume worker calls
-    worker: "bedrock/openai.gpt-oss-120b-1:0"
-    aws_region: "us-east-2"
-    embed_provider: "ollama"
-    embed_model: "mxbai-embed-large"
-    embed_dims: 1024
+    provider: "openai"
+    planner: "DeepSeek-V4-Pro"
+    worker: "DeepSeek-V4-Pro"
+    aws_region: "us-east-2" # ← only needed for bedrock
+    base_url: "https://tenure-foundry.services.ai.azure.com/openai/v1" 
 
 # ── SIMULATION ────────────────────────────────────────────────
 simulation:
@@ -47,26 +40,26 @@ simulation:
   domain: "apexathletics.io"
   output_dir: "./export"
   db_name: "orgforge"
-  max_days: 30
-  start_date: "2026-03-02"
+  max_days: 60
+  start_date: "2026-01-01"
 
   adhoc_confluence_prob: 0.2
   aws_alert_prob: 0.4
   snyk_alert_prob: 0.2
   sprint_tickets_per_planning: 4
-  max_incident_email_threads: 3
+  max_incident_email_threads: 4
   new_hire: "Elena"
   new_hire_dept: "Product"
   sprint_length_days: 10
-  incident_base_prob: 0.15
-  incident_cooldown_days: 3
+  incident_base_prob: 0.22
+  incident_cooldown_days: 2
 
 # ── MORALE ────────────────────────────────────────────────────
 morale:
-  initial: 0.75
-  daily_decay: 0.97
-  good_day_recovery: 0.02
-  intervention_threshold: 0.55
+  initial: 0.70
+  daily_decay: 0.96
+  good_day_recovery: 0.015
+  intervention_threshold: 0.60
 
 # ── LEGACY SYSTEMS ────────────────────────────────────────────
 legacy_system:
@@ -122,6 +115,16 @@ knowledge_gaps:
       - "AWS cost structure"
       - "Project Titan"
     documented_pct: 0.20
+  - name: "Sharon"
+    left: "2025-03"
+    dept: "Engineering_Mobile"
+    role: "iOS Engineer"
+    knew_about:
+      - "mobile analytics"
+      - "legacy auth service"
+      - "AWS cost structure"
+      - "Project Titan"
+    documented_pct: 0.32
 
 # ── ORG CHART ─────────────────────────────────────────────────
 org_chart:
@@ -160,9 +163,8 @@ org_lifecycle:
         - "redis-cache"
         - "oauth2-flow"
       documented_pct: 0.25 # only 25% written down — high gap risk
-
     - name: "Morgan"
-      day: 24
+      day: 34
       reason: "layoff"
       role: "DevOps Engineer"
       dept: "Engineering_Backend"
@@ -190,7 +192,7 @@ org_lifecycle:
       tenure: "new"
 
     - name: "Reese"
-      day: 20
+      day: 26
       dept: "Engineering_Backend"
       role: "DevOps Engineer"
       expertise: ["Kubernetes", "Terraform", "AWS", "Infrastructure"]
@@ -396,7 +398,7 @@ personas:
       she says 'no, that's wrong for iOS' and drops a link. She's not hostile, she's just
       precise and tired of relitigating platform basics.
     pet_peeves: "web-first design thinking, Android-parity delays"
-    stress: 65
+    stress: 72
     expertise:
       [
         "iOS mobile development",

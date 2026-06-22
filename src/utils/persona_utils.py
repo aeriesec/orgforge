@@ -37,6 +37,7 @@ class PersonaUtils:
         graph_dynamics=None,
         mem=None,
         internal=True,
+        include_expertise: bool = True,
     ) -> str:
         """
         Unified persona generator for all OrgForge LLM prompts.
@@ -60,6 +61,7 @@ class PersonaUtils:
             tenure = p.get("tenure", "mid")
             dept = dept_of_name(name)
 
+            
             expertise = ", ".join(
                 str(e) for e in p.get("expertise", [])[:3]
             ) or ", ".join(
@@ -67,12 +69,13 @@ class PersonaUtils:
                     dept, ["cross-functional communication"]
                 )
             )
+            if mem and include_expertise:
+                live_tokens = mem.get_author_domain_tokens(name)
+                expertise = ", ".join(sorted(live_tokens)[:5]) if live_tokens else expertise
             social_role = p.get("social_role", "Contributor")
 
             interests = (
-                ", ".join(
-                    str(i) for i in (p.get("interests") or p.get("expertise", []))[:3]
-                )
+                ", ".join(str(i) for i in p.get("interests", [])[:3])
                 or "general topics"
             )
             style = p.get("style", "")
@@ -155,7 +158,8 @@ class PersonaUtils:
 
             lines = [header, f"  Typing style: {quirks}", f"  Current mood: {mood}"]
 
-            lines.insert(2, f"  Expertise: {expertise}")
+            if include_expertise:
+                lines.insert(2, f"  Expertise: {expertise}")
 
             if context == "watercooler":
                 lines.insert(2, f"  Personal interests: {interests}")

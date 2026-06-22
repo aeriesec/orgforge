@@ -51,20 +51,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("orgforge.registry")
 
-# ── Patterns ──────────────────────────────────────────────────────────────────
 _CONF_REF_RE = re.compile(r"\bCONF-[A-Z]+-\d+\b")
 
-# ── Chunking defaults ─────────────────────────────────────────────────────────
-# Cohere Embed v4 supports 128K tokens, but focused pages improve retrieval
-# precision. ~9 000 chars ≈ ~750 tokens — well inside any embedder's window.
+
 DEFAULT_CHUNK_CHARS = 12_000
 DEFAULT_CHUNK_OVERLAP = 400
 
-# ── JIRA project key mapping ──────────────────────────────────────────────────
-# Maps org_chart department names to their JIRA project prefix.
-# Engineering_Backend and Engineering_Mobile share ENG — engineers work across
-# both and PRs reference the same ticket space.
-# Add new departments here; any unmapped dept falls back to "ORG".
+
 JIRA_DEPT_PREFIX: dict[str, str] = {
     "Engineering_Backend": "ENG",
     "Engineering_Mobile": "ENG",
@@ -75,13 +68,8 @@ JIRA_DEPT_PREFIX: dict[str, str] = {
     "Product": "PROD",
 }
 
-# Starting sequence number for every JIRA project (mirrors original ORG-100 convention)
+
 _JIRA_START = 99
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA CLASSES
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -152,18 +140,8 @@ class TicketSummary:
         return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXCEPTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class DuplicateArtifactError(Exception):
     """Raised when an artifact ID is registered more than once."""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# REGISTRY
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class ArtifactRegistry:
@@ -190,33 +168,21 @@ class ArtifactRegistry:
         self._mem = mem
         self._base = base_export_dir
 
-        self._confluence: Dict[str, str] = {}  # CONF-ENG-001 → title
-        self._jira: Dict[str, int] = {}  # ENG-100, HR-100, … → seq num
+        self._confluence: Dict[str, str] = {}
+        self._jira: Dict[str, int] = {}
 
-        # Single lock for all allocation and registration operations.
-        # Acquired by next_id(), next_jira_id(), register_confluence(),
-        # and register_jira() so parallel genesis batches and sprint
-        # ticket generation can't race on the same counter.
         self._lock = threading.Lock()
 
         self._seed_from_mongo()
 
-    # ─────────────────────────────────────────────
-    # SEEDING
-    # ─────────────────────────────────────────────
-
     def _seed_from_mongo(self) -> None:
         """Populate both caches from MongoDB on startup."""
         try:
-            # Seed Confluence (from artifacts collection)
             for doc in self._mem._artifacts.find(
                 {"type": "confluence"}, {"_id": 1, "title": 1}
             ):
                 self._confluence[doc["_id"]] = doc.get("title", "")
 
-            # Seed JIRA (from new dedicated tickets collection)
-            # IDs may now be ENG-100, HR-101, SALES-102, etc.
-            # Parse by splitting on the last '-' so any prefix works.
             for doc in self._mem._jira.find({}, {"_id": 0, "id": 1}):
                 jid = doc.get("id", "")
                 if not jid:
@@ -231,15 +197,11 @@ class ArtifactRegistry:
         except Exception as e:
             logger.warning(f"[registry] Seeding failed: {e}")
 
-    # ─────────────────────────────────────────────
-    # SHARED ALLOCATOR CORE
-    # ─────────────────────────────────────────────
-
     @staticmethod
     def _allocate(
         store: Dict,
-        existing_nums_fn,  # callable(store) → List[int]
-        make_id_fn,  # callable(n: int) → str
+        existing_nums_fn,
+        make_id_fn,
         reserve_value: Any,
     ) -> str:
         """
@@ -253,10 +215,6 @@ class ArtifactRegistry:
         new_id = make_id_fn(next_n)
         store[new_id] = reserve_value
         return new_id
-
-    # ─────────────────────────────────────────────
-    # CONFLUENCE  —  allocation & registration
-    # ─────────────────────────────────────────────
 
     def next_id(self, prefix: str) -> str:
         """
@@ -308,10 +266,6 @@ class ArtifactRegistry:
 
     def all_confluence_ids(self) -> List[str]:
         return [k for k, v in self._confluence.items() if v != "__reserved__"]
-
-    # ─────────────────────────────────────────────
-    # JIRA  —  allocation & registration
-    # ─────────────────────────────────────────────
 
     def next_jira_id(self, prefix: str = "ORG") -> str:
         """
@@ -372,10 +326,6 @@ class ArtifactRegistry:
     def all_jira_ids(self) -> List[str]:
         return [k for k, v in self._jira.items() if v != 0]
 
-    # ─────────────────────────────────────────────
-    # TICKET SUMMARY
-    # ─────────────────────────────────────────────
-
     def ticket_summary(self, ticket: Dict, current_day: int) -> TicketSummary:
         """
         Build a TicketSummary from a raw JIRA ticket dict.
@@ -405,8 +355,6 @@ class ArtifactRegistry:
             for c in comments
         )
 
-        # Normalise comment dicts — strip internal engine fields before
-        # passing to the LLM, and remove quote-wrapping on stored text.
         clean_comments = [
             {
                 "author": c.get("author", "?"),
@@ -430,10 +378,6 @@ class ArtifactRegistry:
             sprint=ticket.get("sprint"),
         )
 
-    # ─────────────────────────────────────────────
-    # CONTEXT FOR PROMPTS
-    # ─────────────────────────────────────────────
-
     def related_context(self, topic: str, n: int = 5) -> str:
         """
         Return a bullet list of existing Confluence page IDs + titles.
@@ -450,10 +394,6 @@ class ArtifactRegistry:
             return "None yet."
 
         return "\n".join(f"- {id_}: {title}" for id_, title in candidates[-n:])
-
-    # ─────────────────────────────────────────────
-    # REFERENCE VALIDATION
-    # ─────────────────────────────────────────────
 
     def validate_references(self, content: str) -> List[str]:
         """
@@ -482,10 +422,6 @@ class ArtifactRegistry:
             f"[registry] Replaced {len(broken)} unresolved ref(s): {sorted(broken)}"
         )
         return result
-
-    # ─────────────────────────────────────────────
-    # PAGE CHUNKING
-    # ─────────────────────────────────────────────
 
     def chunk_into_pages(
         self,
@@ -525,7 +461,6 @@ class ArtifactRegistry:
             self.register_confluence(parent_id, parent_title)
             return [page]
 
-        # Build child pages
         child_pages: List[ConfluencePage] = []
         for i, section_text in enumerate(sections):
             child_id = f"{parent_id}-{str(i + 1).zfill(2)}"
@@ -544,7 +479,6 @@ class ArtifactRegistry:
                 )
             )
 
-        # Build parent index
         child_links = "\n".join(f"- [{p.title}]({p.id})" for p in child_pages)
         index_page = self._make_page(
             conf_id=parent_id,
@@ -559,7 +493,6 @@ class ArtifactRegistry:
             child_ids=[p.id for p in child_pages],
         )
 
-        # Register parent first, then children
         self.register_confluence(parent_id, parent_title)
         for cp in child_pages:
             self.register_confluence(cp.id, cp.title)
@@ -569,10 +502,6 @@ class ArtifactRegistry:
             f"{len(child_pages)} child page(s) under {parent_id}."
         )
         return [index_page] + child_pages
-
-    # ─────────────────────────────────────────────
-    # PRIVATE HELPERS
-    # ─────────────────────────────────────────────
 
     def _make_page(
         self,

@@ -62,7 +62,6 @@ from utils.persona_utils import persona_utils
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from crewai import Process, Task, Crew
-from langchain_ollama import OllamaLLM
 
 from memory import Memory, SimEvent
 from graph_dynamics import GraphDynamics
@@ -78,7 +77,7 @@ from causal_chain_handler import (
     ARTIFACT_KEY_SLACK_THREAD,
     RecurrenceDetector,
 )
-from embed_worker import EmbedWorker
+
 
 os.makedirs("./export", exist_ok=True)
 
@@ -151,7 +150,6 @@ def _patch_crewai_bedrock():
                 func_name = sanitize_tool_name(
                     func_info.get("name", "") or tool_call.get("name", "")
                 )
-                # FIX: use None default so falsy check correctly falls through to input
                 func_args = func_info.get("arguments") or tool_call.get("input") or {}
                 return call_id, func_name, func_args
             return None
@@ -169,59 +167,51 @@ def _bare_model(model_str: str) -> str:
     return model_str.strip()
 
 
-def build_llm(model_key: str):
+def build_llm(model_key: str, temperature: float = 0.3):
     """
-    Return the correct LangChain LLM for the active quality_preset.
+    Return a CrewAI or Ollama LLM for the active quality_preset.
 
-    preset provider values:
-      "ollama"  → langchain_community.llms.Ollama          (local_gpu)
-      "bedrock" → langchain_aws.ChatBedrock                (cloud — AWS Bedrock)
+    local_gpu → OllamaLLM (local models)
+    cloud     → CrewAI LLM (auto-detects provider from model string)
 
     model_key: "planner" or "worker"
     """
-    model_str = _PRESET[model_key]
-    model = _bare_model(model_str)
+    model = _bare_model(_PRESET[model_key])
 
-    if _PROVIDER == "bedrock":
-        try:
-            from crewai import LLM
+    if _PROVIDER == "ollama":
+        from crewai import LLM
+        base_url = os.environ.get("OLLAMA_BASE_URL") or _PRESET.get(
+            "base_url", "http://localhost:11434"
+        )
+        logger.info(f"[config] {model_key} → Ollama/{model} ({base_url})")
+        return LLM(model=model, base_url=base_url, temperature=temperature, max_tokens=16384)
 
-            region = _PRESET.get(
-                "aws_region", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-            )
+    from crewai import LLM
 
-            llm_args = {
-                "model": model,
-                "region_name": region,
-                "temperature": 0.7,
-                "max_tokens": 16384,
-            }
+    kwargs = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": 16384,
+    }
 
-            llm = LLM(**llm_args)
+    provider = _PRESET.get("provider", "openai")
 
-            logger.info(f"[config] {model_key} → Bedrock/{model} (region={region})")
-            return llm
-        except ImportError:
-            raise ImportError(
-                "langchain-aws is required for the cloud preset. "
-                "Run: pip install langchain-aws"
-            )
+    if provider == "bedrock":
+        kwargs["region_name"] = _PRESET.get(
+            "aws_region", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+        )
+    elif provider == "openai":
+        custom_url = _PRESET.get("base_url") or os.environ.get("OPENAI_BASE_URL")
+        if custom_url:
+            kwargs["base_url"] = custom_url
 
-    env_base_url = os.environ.get("OLLAMA_BASE_URL")
-    config_base_url = _PRESET.get("base_url", "http://localhost:11434")
-
-    base_url = env_base_url if env_base_url else config_base_url
-
-    logger.info(f"[config] {model_key} → Ollama/{model} ({base_url})")
-    return OllamaLLM(model=model, base_url=base_url)
+    logger.info(f"[config] {model_key} → {provider}/{model}")
+    return LLM(**kwargs)
 
 
-PLANNER_MODEL = build_llm("planner")
-WORKER_MODEL = build_llm("worker")
+PLANNER_MODEL = build_llm("planner", temperature=0.3)
+WORKER_MODEL = build_llm("worker", temperature=0.3)
 
-os.environ.setdefault("EMBED_PROVIDER", _PRESET.get("embed_provider", "ollama"))
-os.environ.setdefault("EMBED_MODEL", _PRESET.get("embed_model", "mxbai-embed-large"))
-os.environ.setdefault("EMBED_DIMS", str(_PRESET.get("embed_dims", 1024)))
 os.environ.setdefault("DB_NAME", CONFIG["simulation"].get("db_name", "orgforge"))
 if _PROVIDER == "bedrock":
     os.environ.setdefault("AWS_DEFAULT_REGION", _PRESET.get("aws_region", "us-east-1"))
@@ -314,6 +304,7 @@ class ActiveIncident(BaseModel):
     on_call: str = ""
     actors: List[str] = []
     contacted_customers: List[str] = []
+    stage_advance_probs: Dict[str, float] = Field(default_factory=dict)
 
 
 class SprintState(BaseModel):
@@ -367,7 +358,7 @@ class State(BaseModel):
     daily_active_actors: List[str] = []
     daily_event_type_counts: Dict[str, int] = {}
     departed_employees: Dict[str, Dict] = {}
-    new_hires: Dict[str, Dict] = {}  # name → {joined, role, dept, expertise}
+    new_hires: Dict[str, Dict] = {}
     ticket_actors_today: Dict[str, List[str]] = Field(default_factory=dict)
 
 
@@ -642,6 +633,13 @@ _NON_ENG_DEPTS = {
 }
 
 
+_STALL_REASONS: Dict[str, str] = {
+    "detected": "alert noise under review — triage not yet confirmed",
+    "investigating": "root cause unclear; investigation still in progress",
+    "fix_in_progress": "fix branch blocked — awaiting test results or dependency",
+    "review_pending": "reviewers unavailable or requesting changes",
+}
+
 _DEPT_COMPLETION_ARTIFACT: dict[str, str] = {
     "HR_Ops": "confluence",
     "Sales_Marketing": "email",
@@ -665,10 +663,6 @@ class OrgForgeSimulation:
     def __init__(self, mem: Optional[Memory] = None):
         self.state = State()
         self._mem = mem if mem is not None else Memory()
-
-        self._embed_worker = EmbedWorker(self._mem)
-        self._embed_worker.start()
-        self._mem.set_embed_worker(self._embed_worker)
 
         self.graph_dynamics = GraphDynamics(
             build_social_graph(self._mem), CONFIG, self._mem
@@ -757,7 +751,6 @@ class OrgForgeSimulation:
             confluence_writer=self._confluence,
             vader=vader,
             threat_injector=self._threat,
-            embed_worker=self._embed_worker,
             lifecycle=self._lifecycle,
             crm=self._crm,
         )
@@ -771,7 +764,7 @@ class OrgForgeSimulation:
 
         stats = self._mem.stats()
         logger.info(
-            f"[dim]Memory: provider={stats['embed_provider']} model={stats['embed_model']} dims={stats['embed_dims']} MongoDB={'✓' if stats['mongodb_ok'] else '⚠'}[/dim]"
+            f"[dim]Memory: artifacts={stats['artifact_count']} events={stats['event_count']} MongoDB={'✓' if stats['mongodb_ok'] else '⚠'}[/dim]"
         )
 
     def _is_sprint_planning_day(self) -> bool:
@@ -783,13 +776,12 @@ class OrgForgeSimulation:
         return self.state.day % sprint_length == (sprint_length - 1)
 
     def _is_standup_day(self) -> bool:
-        # Skip standup if the team is already doing sprint planning today
         if self._is_sprint_planning_day():
             return False
         return self.state.current_date.weekday() in (0, 2, 4)
 
-    def _embed_and_count(self, **kwargs):
-        self._embed_worker.enqueue(**kwargs)
+    def _store_and_count(self, **kwargs):
+        self._mem.embed_artifact(**kwargs)
         self.state.daily_artifacts_created += 1
 
     def _record_daily_actor(self, *names: str):
@@ -820,7 +812,6 @@ class OrgForgeSimulation:
         self.genesis_phase()
         self.daily_cycle()
 
-    # ─── GENESIS ─────────────────────────────
     def genesis_phase(self):
         logger.info(
             Panel.fit(
@@ -914,7 +905,6 @@ class OrgForgeSimulation:
             f"Memory: {self._mem.stats()['artifact_count']} artifacts embedded.\n"
         )
 
-    # ─── DAILY LOOP ───────────────────────────
     def daily_cycle(self):
         latest = self._mem.load_latest_checkpoint()
         if latest:
@@ -925,7 +915,6 @@ class OrgForgeSimulation:
             self.state.team_morale = latest["state"]["morale"]
             self.state.system_health = latest["state"]["health"]
 
-            # Restore the 'Live' state of the secondary systems
             self.graph_dynamics._stress = latest["stress"]
             self.state.actor_cursors = latest["cursors"]
 
@@ -951,7 +940,6 @@ class OrgForgeSimulation:
                     incident.causal_chain = handler
                 self.state.active_incidents.append(incident)
 
-            # Re-sync current_date string back to a datetime object
             self.state.current_date = datetime.strptime(
                 latest["state"]["date"], "%Y-%m-%d"
             )
@@ -961,7 +949,6 @@ class OrgForgeSimulation:
                 self.social_graph.clear()
                 self.social_graph.add_nodes_from(restored_graph.nodes(data=True))
                 self.social_graph.add_edges_from(restored_graph.edges(data=True))
-                # Force graph_dynamics to recalculate betweenness centrality
                 self.graph_dynamics._centrality_dirty = True
 
         while self.state.day <= self.state.max_days:
@@ -973,7 +960,7 @@ class OrgForgeSimulation:
                 self.state.current_date += timedelta(days=1)
                 continue
 
-            self.state.ticket_actors_today = {}  # cleared here; orchestrator re-seeds from SprintContext
+            self.state.ticket_actors_today = {}
             self._threat.begin_day(self.state.day, self.state)
             self._clock.reset_to_business_start(ALL_NAMES)
             date_str = str(self.state.current_date.date())
@@ -996,16 +983,11 @@ class OrgForgeSimulation:
                 inc.days_active += 1
 
             if departures or hires:
-                # Patch the day planner's validator to reflect the new roster
                 patch_validator_for_lifecycle(
                     self._day_planner._validator, self._lifecycle
                 )
 
             vendor_signals = self._email_ingestor.generate_pre_standup(state=self.state)
-
-            if self.state.day > 1:
-                logger.info("[dim] Draining embedding queue[/dim]")
-                self._embed_worker.drain()
 
             crm_signals = self._crm.planner_context()
 
@@ -1078,9 +1060,6 @@ class OrgForgeSimulation:
             self._email_ingestor.generate_customer_replies(state=self.state)
             self._email_ingestor.generate_hr_outbound(state=self.state)
 
-            if random.random() < CONFIG["simulation"].get("adhoc_confluence_prob", 0.3):
-                self._generate_adhoc_confluence_page()
-
             for subject_name in self._threat.active_subject_names():
                 result = self._threat.inject_host_hoarding(
                     actor=subject_name,
@@ -1106,9 +1085,6 @@ class OrgForgeSimulation:
                     self._se_followup_days[r["followup_due_day"]] = r["target"]
 
             self._advance_incidents()
-
-            logger.info("[dim] Draining embedding queue[/dim]")
-            self._embed_worker.drain()
 
             serialized_incidents = []
             for inc in self.state.active_incidents:
@@ -1148,7 +1124,6 @@ class OrgForgeSimulation:
             self.state.day += 1
             self.state.current_date += timedelta(days=1)
 
-        self._embed_worker.stop()
         self._print_final_report()
         run_post_sim(export_dir=Path(BASE), use_llm=True)
 
@@ -1173,9 +1148,6 @@ class OrgForgeSimulation:
         timestamp_str = meeting_time.isoformat()
         date_str = str(self.state.current_date.date())
 
-        # ── Step 1: LLM generates sprint theme (one call, cheap) ──────────────
-        # Tier 1: structured MongoDB query — no embedding needed here.
-        # sprint_theme omitted intentionally; it hasn't been decided yet.
         ctx = self._mem.context_for_sprint_planning(
             sprint_num=sprint_num,
             dept="",
@@ -1381,7 +1353,7 @@ class OrgForgeSimulation:
                     save_json(f"{BASE}/jira/{tid}.json", ticket)
                     self.state.sprint.tickets_in_sprint.append(tid)
                     dept_tickets.append(ticket)
-                    self._embed_and_count(
+                    self._store_and_count(
                         id=tid,
                         type="jira",
                         title=ticket["title"],
@@ -1562,7 +1534,7 @@ class OrgForgeSimulation:
 
         if thread_id and messages:
             full_transcript = "\n".join(f"{m['user']}: {m['text']}" for m in messages)
-            self._embed_and_count(
+            self._store_and_count(
                 id=thread_id,
                 type="slack_thread",
                 title=f"Standup Day {self.state.day}",
@@ -1594,7 +1566,6 @@ class OrgForgeSimulation:
         self._record_daily_actor(*attendees)
         self._record_daily_event("standup")
 
-    # ─── RETROSPECTIVE ────────────────────────
     def _handle_retrospective(self):
         logger.info(
             f"  [bold blue]🔄 Retro — Sprint #{self.state.sprint.sprint_number}[/bold blue]"
@@ -1605,7 +1576,6 @@ class OrgForgeSimulation:
         conf_id = self._registry.next_id("RETRO")
         self._registry.register_confluence(conf_id, f"Retro Sprint #{sprint_num}")
 
-        # ── Attendees: engineering + product only ────────────────────────────────
         sprint_depts = {"engineering", "product"}
         attendees = [
             n for n in ALL_NAMES if dept_of_name(n, ORG_CHART).lower() in sprint_depts
@@ -1616,21 +1586,18 @@ class OrgForgeSimulation:
         )
         meeting_time_iso = meeting_time.isoformat()
 
-        # ── Sprint-bounded context only ──────────────────────────────────────────
         sprint_length = CONFIG["simulation"].get("sprint_length_days", 10)
         sprint_start_iso = self.state.sprint.start_date(
             self.state.current_date
             - timedelta(days=self.state.day - self.state.sprint.start_day),
             sprint_length,
         ).isoformat()
-        # Tier 1: structured sprint-window query — no embedding.
         ctx = self._mem.context_for_retrospective(
             sprint_num=sprint_num,
             since_iso=sprint_start_iso,
             as_of_iso=meeting_time_iso,
         )
 
-        # ── Participants ─────────────────────────────────────────────────────────
         scrum_master = resolve_role("scrum_master")
         eng_dept = next((d for d in LEADS if "engineering" in d.lower()), None)
         eng_lead = LEADS.get(eng_dept)
@@ -1639,7 +1606,6 @@ class OrgForgeSimulation:
 
         sprint_leads = [p for p in [scrum_master, eng_lead, product_lead] if p]
 
-        # ── Per-voice agents ─────────────────────────────────────────────────────
         agents = []
         tasks = []
         prev_task = None
@@ -1706,11 +1672,10 @@ class OrgForgeSimulation:
             ).kickoff()
         )
 
-        # ── Persist ──────────────────────────────────────────────────────────────
         path = f"{BASE}/confluence/retros/{conf_id}.md"
         save_md(path, content)
 
-        self._embed_and_count(
+        self._store_and_count(
             id=conf_id,
             type="confluence",
             title=f"Retro Sprint #{sprint_num}",
@@ -1739,7 +1704,6 @@ class OrgForgeSimulation:
             )
         )
 
-        # ── Close sprint ─────────────────────────────────────────────────────────
         self._close_sprint()
         self._record_daily_actor(*attendees)
         self._record_daily_event("retrospective")
@@ -1749,6 +1713,58 @@ class OrgForgeSimulation:
         """Advance sprint counter and reset per-sprint state."""
         self.state.sprint.sprint_number += 1
         self.state.sprint.tickets_in_sprint = []
+
+    def _compute_stage_probs(
+        self,
+        involves_gap: bool,
+        recurrence_of: Optional[str],
+        system_health: int,
+    ) -> Dict[str, float]:
+        """
+        Compute per-stage advance probabilities for a new incident.
+
+        Base probabilities give an *expected* duration of ~4-5 days for a
+        clean incident.  Severity signals lower them, extending the tail:
+
+          - Knowledge gap   → harder to investigate and fix (lower probs on
+                              investigating + fix_in_progress)
+          - Recurrence      → review cycle is more scrutinised (lower prob
+                              on review_pending)
+          - Low system health → everything is slower (global penalty)
+
+        Stage order: detected → investigating → fix_in_progress →
+                     review_pending → resolved
+
+        A probability of 1.0 means "always advance today".
+        A probability of 0.6 means "40% chance of stalling for one more day".
+        """
+        cfg = CONFIG.get("simulation", {})
+
+        base = {
+            "detected": cfg.get("incident_prob_detected", 1.00),
+            "investigating": cfg.get("incident_prob_investigating", 0.70),
+            "fix_in_progress": cfg.get("incident_prob_fix_in_progress", 0.65),
+            "review_pending": cfg.get("incident_prob_review_pending", 0.75),
+        }
+
+        if involves_gap:
+            base["investigating"] = round(base["investigating"] * 0.65, 3)
+            base["fix_in_progress"] = round(base["fix_in_progress"] * 0.65, 3)
+
+        if recurrence_of:
+            base["review_pending"] = round(base["review_pending"] * 0.70, 3)
+
+        if system_health < 40:
+            factor = 0.70
+        elif system_health < 65:
+            factor = 0.85
+        else:
+            factor = 1.00
+
+        if factor < 1.00:
+            base = {k: round(v * factor, 3) for k, v in base.items()}
+
+        return {k: max(0.20, v) for k, v in base.items()}
 
     def _handle_incident(self):
         ticket_id = next_jira_id(self.state, self._registry, dept="Engineering_Backend")
@@ -1841,6 +1857,7 @@ class OrgForgeSimulation:
             date_str=date_str,
             state=self.state,
             timestamp=incident_start_iso,
+            author=on_call,
         )
 
         involves_gap = len(detected_gaps) > 0
@@ -1921,6 +1938,11 @@ class OrgForgeSimulation:
             ),
             llm=WORKER_MODEL,
         )
+        gap_note = (
+            "  - Note the knowledge gap and documentation risk explicitly\n"
+            if gap_areas
+            else ""
+        )
         desc_task = Task(
             description=(
                 f"Write a Jira ticket description for this incident.\n\n"
@@ -1937,7 +1959,7 @@ class OrgForgeSimulation:
                 f"  - What is broken and how it manifests (1-2 sentences)\n"
                 f"  - Which system or component is affected\n"
                 f"  - User or business impact\n"
-                f"{'  - Note the knowledge gap and documentation risk explicitly\n' if gap_areas else ''}"
+                f"{gap_note}"
                 f"  - One acceptance criterion for resolution\n\n"
                 f"Keep it under 100 words. Write as {on_call} would in Jira."
             ),
@@ -2012,7 +2034,7 @@ class OrgForgeSimulation:
             )
         )
 
-        self._embed_and_count(
+        self._store_and_count(
             id=ticket_id,
             type="jira",
             title=title,
@@ -2030,6 +2052,11 @@ class OrgForgeSimulation:
             },
         )
 
+        stage_probs = self._compute_stage_probs(
+            involves_gap=involves_gap,
+            recurrence_of=recurrence_of,
+            system_health=self.state.system_health,
+        )
         inc = ActiveIncident(
             ticket_id=ticket_id,
             title=title,
@@ -2038,7 +2065,9 @@ class OrgForgeSimulation:
             root_cause=root_cause,
             causal_chain=chain_handler,
             recurrence_of=recurrence_of,
+            on_call=on_call,
             actors=responders,
+            stage_advance_probs=stage_probs,
         )
         self.state.active_incidents.append(inc)
         self.state.daily_incidents_opened += 1
@@ -2137,20 +2166,59 @@ class OrgForgeSimulation:
         logger.info(f"    [red]🚨 {ticket_id}:[/red] {root_cause[:80]}")
 
     def _advance_incidents(self):
-        still_active = []
-        on_call = resolve_role("on_call_engineer")
-        eng_peer = next(
-            (
-                n
-                for n in ORG_CHART.get(CONFIG["roles"].get("on_call_engineer", ""), [])
-                if n != on_call
-            ),
-            on_call,
-        )
+        """
+        Advance each active incident by one stage — or stall it for the day.
 
+        Each stage has a configured advance probability stored on the incident
+        at creation time (stage_advance_probs).  On a failed roll the incident
+        stays in its current stage, a stall SimEvent is logged, and the day's
+        planner context will continue to show the incident as open.  This
+        produces realistic variation in resolution time:
+
+          - Clean incident (no gap, healthy system):  ~4–6 days
+          - Gap-knowledge incident:                   ~6–10 days
+          - Recurrence + degraded system:             can stretch to ~12+ days
+        """
+        still_active = []
         cron_time_iso = self._clock.now("system").isoformat()
+        date_str = str(self.state.current_date.date())
 
         for inc in self.state.active_incidents:
+            on_call = inc.on_call or resolve_role("on_call_engineer")
+            eng_peer = next((a for a in inc.actors if a != on_call), on_call)
+
+            advance_prob = inc.stage_advance_probs.get(inc.stage, 1.0)
+            if random.random() > advance_prob:
+                stall_reason = _STALL_REASONS.get(inc.stage, "blocked on current stage")
+                logger.info(
+                    f"    [yellow]⏸ {inc.ticket_id} stalled in '{inc.stage}' "
+                    f"(p={advance_prob:.2f}) — {stall_reason}[/yellow]"
+                )
+                self._mem.log_event(
+                    SimEvent(
+                        type="incident_stalled",
+                        timestamp=cron_time_iso,
+                        day=self.state.day,
+                        date=date_str,
+                        actors=[on_call],
+                        artifact_ids={"jira": inc.ticket_id},
+                        facts={
+                            "stage": inc.stage,
+                            "days_active": inc.days_active,
+                            "stall_reason": stall_reason,
+                            "advance_prob": advance_prob,
+                            "root_cause": inc.root_cause,
+                        },
+                        summary=(
+                            f"{inc.ticket_id} stalled in {inc.stage} "
+                            f"(day {inc.days_active}): {stall_reason}."
+                        ),
+                        tags=["incident_stalled", inc.stage],
+                    )
+                )
+                still_active.append(inc)
+                continue
+
             if inc.stage == "detected":
                 inc.stage = "investigating"
                 still_active.append(inc)
@@ -2215,7 +2283,7 @@ class OrgForgeSimulation:
                                 self._normal_day._handle_pr_review_for_incident(
                                     reviewer=reviewer,
                                     pr=pr_doc,
-                                    date_str=str(self.state.current_date.date()),
+                                    date_str=date_str,
                                     timestamp=cron_time_iso,
                                 )
                             except Exception as exc:
@@ -2254,7 +2322,7 @@ class OrgForgeSimulation:
                     incident_id=inc.ticket_id,
                     postmortem_link=postmortem_link,
                     timestamp=cron_time_iso,
-                    date_str=str(self.state.current_date.date()),
+                    date_str=date_str,
                     day=self.state.day,
                 )
 
@@ -2265,7 +2333,7 @@ class OrgForgeSimulation:
                         type="incident_resolved",
                         timestamp=cron_time_iso,
                         day=self.state.day,
-                        date=str(self.state.current_date.date()),
+                        date=date_str,
                         actors=[on_call, eng_peer],
                         artifact_ids={"jira": inc.ticket_id, "pr": inc.pr_id or ""},
                         facts={
@@ -2287,21 +2355,15 @@ class OrgForgeSimulation:
         self.state.active_incidents = still_active
 
     def _write_postmortem(self, inc: ActiveIncident):
-        on_call = resolve_role("postmortem_writer")
-        eng_peer = next(
-            (
-                n
-                for n in ORG_CHART.get(CONFIG["roles"].get("postmortem_writer", ""), [])
-                if n != on_call
-            ),
-            on_call,
-        )
+        actors = inc.actors or [inc.on_call]
+        writer = actors[1] if len(actors) > 1 else actors[0]
+        eng_peer = next((a for a in actors if a != writer), writer)
         conf_id, timestamp = self._confluence.write_postmortem(
             incident_id=inc.ticket_id,
             incident_title=inc.title,
             root_cause=inc.root_cause,
             days_active=inc.days_active,
-            on_call=on_call,
+            on_call=writer,
             eng_peer=eng_peer,
         )
 
@@ -2349,7 +2411,7 @@ class OrgForgeSimulation:
         )
 
         if thread_id:
-            self._embed_and_count(
+            self._store_and_count(
                 id=thread_id,
                 type="slack_thread",
                 title=f"Bot message in #{channel}",
@@ -2368,13 +2430,6 @@ class OrgForgeSimulation:
 
         index = day % len(engineers)
         return engineers[index]
-
-    def _generate_adhoc_confluence_page(
-        self,
-        author: Optional[str] = None,
-        backstory: Optional[str] = None,
-    ):
-        self._confluence.write_adhoc_page(author=author, backstory=backstory)
 
     def _end_of_day(self):
         date_str = str(self.state.current_date.date())
@@ -2419,7 +2474,9 @@ class OrgForgeSimulation:
 
         event_counts = self.state.daily_event_type_counts
         dominant_event = (
-            max(event_counts, key=event_counts.get) if event_counts else "normal_day"
+            max(event_counts, key=lambda k: event_counts[k])
+            if event_counts
+            else "normal_day"
         )
 
         departments_involved = list(
@@ -2561,14 +2618,14 @@ class OrgForgeSimulation:
         for row in [
             (
                 "Confluence Pages",
-                str(self._mem._artifacts.count_documents({"type": "confluence"})),
+                str(self._mem._confluence_pages.count_documents({})),
             ),
             ("JIRA Tickets", str(self._mem._jira.count_documents({}))),
             ("Slack Threads", str(self._mem._slack.count_documents({}))),
             ("Git PRs", str(self._mem._prs.count_documents({}))),
             ("Emails", str(self._mem._db["emails"].count_documents({}))),
             ("Incidents Resolved", str(len(self.state.resolved_incidents))),
-            ("Embedded Artifacts", str(s["artifact_count"])),
+            ("Stored Artifacts", str(s["artifact_count"])),
             ("Employees Departed", str(len(self._lifecycle._departed))),
             ("Employees Hired", str(len(self._lifecycle._hired))),
             ("Knowledge Gaps Surfaced", str(len(self._lifecycle._gap_events))),
@@ -2581,7 +2638,7 @@ class OrgForgeSimulation:
         _proj = {"_id": 0, "embedding": 0}
         snapshot = {
             "confluence_pages": list(
-                self._mem._artifacts.find({"type": "confluence"}, _proj)
+                self._mem._confluence_pages.find({}, _proj)
             ),
             "jira_tickets": list(self._mem._jira.find({}, {"_id": 0})),
             "emails": list(self._mem._db["emails"].find({}, {"_id": 0})),
@@ -2760,7 +2817,7 @@ class OrgForgeSimulation:
         )
         self.state.daily_external_contacts += 1
 
-        self._embed_and_count(
+        self._store_and_count(
             id=f"ext_{external_node}_{inc.ticket_id}",
             type="slack",
             title=f"External contact summary: {display_name} re {inc.ticket_id}",

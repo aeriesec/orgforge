@@ -33,10 +33,10 @@ _PROB_ALWAYS = 0.40
 _PROB_INCIDENT = 0.70
 _PROB_INCIDENT_QUIET = 0.10
 _HEALTH_THRESHOLD = 60
-_PROB_EMAIL_DROPPED = 0.15  # customer emails dropped with no action
-_PROB_CUSTOMER_JIRA = 0.55  # high-priority customer complaint → JIRA
-_PROB_VENDOR_JIRA = 0.45  # vendor alert → JIRA task
-_HR_EMAIL_WINDOW = (1, 3)  # days before hire arrival to send email
+_PROB_EMAIL_DROPPED = 0.15
+_PROB_CUSTOMER_JIRA = 0.55
+_PROB_VENDOR_JIRA = 0.45
+_HR_EMAIL_WINDOW = (1, 3)
 _VALID_EMAIL_TYPES = frozenset(
     ["complaint", "question", "feature_request", "positive_feedback", "general_inquiry"]
 )
@@ -78,16 +78,10 @@ _PROB_CUSTOMER_REPLY = 0.30
 
 _PROB_NON_COMPLAINT_SALES_FYI = 0.35
 
-# Email types that trigger a ZD ticket via handle_inbound_customer_email.
-# feature_request → Slack FYI to Product only (no ticket).
-# positive_feedback → no ticket.
 _ZD_TICKET_TYPES = frozenset(["complaint", "question", "general_inquiry"])
 
-# Kept for any import sites not yet updated; mirrors _ZD_TICKET_TYPES.
 _COMPLAINT_EMAIL_TYPES = frozenset(["complaint"])
 
-# Probability gate per email type — complaints always get a ticket,
-# others are sampled so not every question floods the ZD queue.
 _ZD_TICKET_PROB: dict = {
     "complaint": 1.0,
     "question": 0.70,
@@ -1101,9 +1095,6 @@ class ExternalEmailIngestor:
         )
 
         if category == "customer":
-            # Customers never see our tech stack. They experience symptoms.
-            # symptom_context is the customer-facing description of their problem;
-            # trigger_context tells the LLM why this email is being sent today.
             symptom_hint = f"\nSITUATION: {symptom}" if symptom else ""
             email_type_hint = {
                 "complaint": "You are writing to report a problem you are experiencing. Describe the business impact on your organisation. Do NOT name or guess at internal systems.",
@@ -1160,7 +1151,6 @@ class ExternalEmailIngestor:
                 return None
 
         else:
-            # Vendors: plain text, tech_ctx injected, first-person framing
             tech_stack = self._mem.tech_stack_for_prompt()
             tech_ctx = (
                 (
@@ -1561,7 +1551,6 @@ class ExternalEmailIngestor:
                 day=state.day,
             )
 
-            # Embed artifact for RAG.
             self._mem.embed_artifact(
                 id=embed_id,
                 type="email",
@@ -1736,7 +1725,6 @@ class ExternalEmailIngestor:
             signal.internal_liaison, next(iter(self._leads.values()))
         )
 
-        # Append pre-created ZD ticket to causal chain if present
         zd_ticket_id = signal.facts.get("zd_ticket_id")
         if zd_ticket_id:
             signal.causal_chain.append(zd_ticket_id)
@@ -1999,9 +1987,7 @@ class ExternalEmailIngestor:
             sentiment = source.get("sentiment_baseline", 0.8)
             tone = source.get("tone", "formal")
 
-            # ── Signal 1: Active incident affecting this customer ────────────
             for incident in state.active_incidents:
-                # Skip if already contacted proactively via _handle_external_contact
                 if org_name in getattr(incident, "contacted_customers", []):
                     continue
                 if not self._gd._incident_affects_customer(incident, source):
@@ -2024,7 +2010,6 @@ class ExternalEmailIngestor:
                 break
 
             else:
-                # ── Signal 2: Stale deal at Negotiation/Review ───────────────
                 opp = None
                 if hasattr(self._crm, "_sf_o"):
                     opp = self._crm._sf_o.find_one(
@@ -2067,7 +2052,6 @@ class ExternalEmailIngestor:
                         )
                         continue
 
-                # ── Signal 3: Contract renewal within 60 days ────────────────
                 renewal_str = source.get("contract_renewal_date", "")
                 if renewal_str:
                     try:
@@ -2092,7 +2076,6 @@ class ExternalEmailIngestor:
                     except ValueError:
                         pass
 
-                # ── Signal 4: Opp has risk notes + low sentiment ─────────────
                 if hasattr(self._crm, "_sf_o"):
                     risky_opp = self._crm._sf_o.find_one(
                         {
@@ -2117,11 +2100,10 @@ class ExternalEmailIngestor:
                         )
                         continue
 
-                # ── Signal 5: High expansion potential + healthy system ───────
                 if (
                     source.get("expansion_potential", 0) >= 8
                     and state.system_health >= 80
-                    and random.random() < 0.25  # not every day — keep it sparse
+                    and random.random() < 0.25
                 ):
                     topic = "Exploring additional use cases and features for our team"
                     signals.append(
@@ -2134,9 +2116,6 @@ class ExternalEmailIngestor:
                         }
                     )
 
-                # ── Signal 6: Chronically low sentiment — unprompted complaint ─
-                # Unhappy customers complain regardless of active incidents.
-                # Fires independently of all other signals as a baseline floor.
                 elif sentiment < 0.45 and random.random() < 0.15:
                     topic = source.get("topics", ["platform reliability concerns"])[0]
                     signals.append(

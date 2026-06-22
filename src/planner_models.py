@@ -140,8 +140,6 @@ class SprintContext:
     in_review: List[str]
     sprint_theme: str = ""
     ticket_domain_tags: Dict[str, List[str]] = field(default_factory=dict)
-    # e.g. {"TICKET-42": ["billing-legacy"], "TICKET-43": ["kafka", "infra"]}
-    # Populated by TicketAssigner via domain registry cross-reference.
 
 
 @dataclass
@@ -176,6 +174,7 @@ class DepartmentDayPlan:
     day: int
     date: str
     sprint_context: Optional["SprintContext"] = None
+    avg_stress: int = 0
 
 
 @dataclass

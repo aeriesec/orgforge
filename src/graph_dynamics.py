@@ -17,16 +17,16 @@ import networkx as nx
 
 
 DEFAULT_CFG = {
-    "stress_bleed_rate": 0.25,  # fraction of key-player excess that bleeds
-    "burnout_threshold": 72,  # stress score that triggers propagation
-    "incident_stress_hit": 20,  # raw stress added per P1 involvement
-    "stress_daily_recovery": 3,  # flat recovery applied to everyone EOD
-    "key_player_multiplier": 2.0,  # top-N% by betweenness = key players
-    "edge_decay_rate": 0.97,  # multiplicative daily decay
-    "slack_boost": 1.5,  # weight added per shared Slack thread
-    "pr_review_boost": 3.0,  # weight added per PR review pair
-    "incident_boost": 4.0,  # weight added per shared incident
-    "edge_weight_floor": 0.5,  # decay never goes below this
+    "stress_bleed_rate": 0.25,
+    "burnout_threshold": 72,
+    "incident_stress_hit": 20,
+    "stress_daily_recovery": 3,
+    "key_player_multiplier": 2.0,
+    "edge_decay_rate": 0.97,
+    "slack_boost": 1.5,
+    "pr_review_boost": 3.0,
+    "incident_boost": 4.0,
+    "edge_weight_floor": 0.5,
     "escalation_max_hops": 6,
 }
 
@@ -543,7 +543,7 @@ class GraphDynamics:
                 if open_opp.get("risk_notes"):
                     risk_penalty += 2.5
             elif not open_tickets:
-                silence_penalty = 0.5  # going quiet
+                silence_penalty = 0.5
 
             if account and account.get("risk_flag"):
                 risk_penalty += 1.0
@@ -595,7 +595,6 @@ class GraphDynamics:
 
         deltas: Dict[str, int] = {}
 
-        # Build a map: internal_node -> [org_names they're liaison for]
         liaison_orgs: Dict[str, List[str]] = {}
         for node, data in self.G.nodes(data=True):
             if not data.get("external", False):
@@ -630,7 +629,7 @@ class GraphDynamics:
                 if at_risk_opp:
                     delta += 6
                     if at_risk_opp.get("stage") == "Negotiation/Review":
-                        delta += 2  # so close, yet so at-risk
+                        delta += 2
 
             self._stress[employee] = max(0, min(100, self._stress[employee] + delta))
             if delta != 0:

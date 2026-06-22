@@ -1,39 +1,24 @@
 """
 confluence_writer.py
-=====================
 Single source of truth for all Confluence page generation in OrgForge.
 
-Every path that produces a Confluence artifact — genesis, postmortems,
-design doc stubs, ad-hoc pages — runs through this module.
+Every path that produces a Confluence artifact (genesis, postmortems,
+design doc stubs, ad-hoc pages) runs through this module.
 
-Responsibilities:
-  - ID allocation (Python owns the namespace, never the LLM)
-  - Single-page LLM generation (one task per page, no PAGE BREAK parsing)
-  - Reference injection (LLM is told which pages already exist)
-  - Reference validation + broken-ref stripping (via ArtifactRegistry)
-  - Chunking of long content into focused child pages
-  - Embedding and SimEvent logging
+Knowledge gap detection is fully deterministic and engine-controlled:
+  - _compute_domain_fit() checks the author's expertise against orphaned
+    domains in the registry using system_tags and documentation_coverage
+    thresholds. No LLM involvement.
+  - scan_for_knowledge_gaps() (on org_lifecycle.py) uses BM25 text search
+    over persona_skill artifacts cross-referenced with the DomainRegistry.
+    No LLM involvement.
 
-Callers (flow.py, normal_day.py) import ConfluenceWriter and call the
-appropriate method. They no longer manage conf_id allocation or embedding
-directly for Confluence artifacts.
+The LLM's only job is to produce prose and alias vocabulary. It never
+assesses its own knowledge gaps, domain fit, or confidence.
 
-Usage:
-    from confluence_writer import ConfluenceWriter
-
-    writer = ConfluenceWriter(
-        mem=self._mem,
-        registry=self._registry,
-        state=self.state,
-        config=CONFIG,
-        worker_llm=WORKER_MODEL,
-        planner_llm=PLANNER_MODEL,
-        clock=self._clock,
-        lifecycle=self._lifecycle,
-        persona_helper=persona_backstory,
-        graph_dynamics=self.graph_dynamics,
-        base_export_dir=BASE,
-    )
+Alias vocabulary is emitted by the LLM and stored as a List[str] of domain
+terms. Each term is indexed by Atlas Search for BM25 retrieval so vocabulary
+captured at write time grows with each artifact.
 """
 
 from __future__ import annotations
@@ -69,6 +54,27 @@ _CONF_PREFIX_MAP = {
     "HR_Ops": "HR",
     "QA_Support": "QA",
 }
+
+_ALIAS_INSTRUCTION = (
+    "\n\n### ALIAS VOCABULARY\n"
+    "List 4-10 short lowercase domain terms that someone searching for this \n"
+    "page's topic would use (system names, component names, protocol names,\n"
+    "abbreviated names. NOT generic words like 'overview' or 'documentation').\n"
+)
+
+_ALIAS_JSON_FIELDS = '  "aliases": ["string"]\n'
+
+
+def _extract_aliases(parsed: dict) -> Optional[List[str]]:
+    """
+    Pull the aliases array from a parsed LLM JSON response.
+    Returns a list of lowercase terms, or None if absent/malformed.
+    """
+    raw = parsed.get("aliases")
+    if not isinstance(raw, list):
+        return None
+    clean_terms = [t.lower().strip() for t in raw if isinstance(t, str) and t.strip()]
+    return clean_terms if clean_terms else None
 
 
 class ConfluenceWriter:
@@ -117,26 +123,9 @@ class ConfluenceWriter:
     ) -> List[str]:
         """
         Generate *count* independent genesis Confluence pages for a given prefix.
-
-        Python allocates all IDs upfront. Each page is generated in a separate
-        LLM call so max_tokens truncation only ever affects one page, not the
-        whole batch. Later pages in the batch receive the IDs of earlier ones as
-        allowed references so cross-links are always resolvable.
-
-        Args:
-            prefix:      ID namespace, e.g. "ENG" or "MKT".
-            count:       Number of pages to generate.
-            prompt_tpl:  Single-page prompt template. Available placeholders:
-                           {id}, {company}, {industry}, {legacy_system},
-                           {project_name}, {author}, {related_pages}
-            author:      Author of the page.
-            extra_vars:  Any additional {placeholder} → value substitutions.
-            subdir:      Export subdirectory under confluence/.
-
-        Returns:
-            List of registered conf_ids in generation order.
+        Each page is generated in a separate LLM call. The alias vocabulary is
+        extracted from the same JSON output as the page content.
         """
-
         genesis_time = self._clock.now("system").isoformat()
         queue = [self._registry.next_id(prefix) for _ in range(count)]
         registered_ids: List[str] = []
@@ -172,41 +161,57 @@ class ConfluenceWriter:
 
             historian = make_agent(
                 role=f"{author}, {prefix} Department",
-                goal="Write one authentic internal Confluence page as yourself. Write with real insider detail.",
+                goal="Write one authentic internal Confluence page as yourself.",
                 backstory=self._persona(author, mem=self._mem, graph_dynamics=self._gd),
                 llm=self._planner,
             )
             task = Task(
-                description=prompt,
-                expected_output=(
-                    f"A single Markdown Confluence page with ID {conf_id}. "
-                    f"No separators. No preamble. "
-                    f"Do not include a main # title or a metadata block at the top. "
-                    f"Start directly with the first paragraph or ## section."
+                description=(
+                    f"{prompt}\n\n"
+                    f"{_ALIAS_INSTRUCTION}"
+                    f"\nRespond ONLY with valid JSON:\n"
+                    f"{{\n"
+                    f'  "markdown_doc": "full Markdown page content, no # title",\n'
+                    f"{_ALIAS_JSON_FIELDS}"
+                    f"}}"
                 ),
+                expected_output=(f"Valid JSON with markdown_doc and aliases keys."),
                 agent=historian,
             )
-            raw = str(
+
+            raw_output = str(
                 Crew(agents=[historian], tasks=[task], verbose=False).kickoff()
             ).strip()
+
+            clean = raw_output.replace("```json", "").replace("```", "").strip()
+            content = raw_output
+            aliases: Optional[List[str]] = None
+
+            try:
+                parsed = json.loads(clean)
+                content = parsed.get("markdown_doc", raw_output)
+                aliases = _extract_aliases(parsed)
+            except (json.JSONDecodeError, ValueError):
+                content = raw_output
 
             resolved_tags = tags or ["genesis", "confluence"]
 
             conf_ids = self._finalize_page(
-                raw_content=raw,
+                raw_content=content,
                 conf_id=conf_id,
-                title=self._extract_title(raw, conf_id),
+                title=self._extract_title(content, conf_id),
                 author=author,
                 date_str=str(self._state.current_date.date()),
                 timestamp=genesis_time,
                 subdir=subdir,
                 tags=resolved_tags,
                 facts={"phase": "genesis"},
+                aliases=aliases,
             )
             registered_ids.extend(conf_ids)
 
         logger.info(
-            f"[confluence] ✓ Genesis batch complete ({prefix}): "
+            f"[confluence] Genesis batch complete ({prefix}): "
             f"{len(registered_ids)} page(s) registered."
         )
         return registered_ids
@@ -217,36 +222,12 @@ class ConfluenceWriter:
     ) -> Dict[str, List[str]]:
         """
         Run multiple independent genesis batches concurrently.
-
-        Each batch is a dict with the same kwargs as write_genesis_batch():
-            prefix, count, prompt_tpl, author, extra_vars, subdir, tags
-
-        Pages WITHIN a batch remain sequential (each page references prior
-        pages in the same batch via related_pages — that dependency is
-        load-bearing and cannot be parallelised).
-
-        Pages ACROSS batches (e.g. ENG vs MKT) are completely independent
-        and safe to run in parallel.
-
-        Args:
-            batches: list of kwarg dicts, one per independent batch.
-
-        Returns:
-            Dict mapping prefix → list of registered conf_ids.
-
-        Example:
-            results = writer.write_genesis_batches_parallel([
-                {"prefix": "ENG", "count": 3, "prompt_tpl": ..., "author": eng_member,
-                 "subdir": "archives", "extra_vars": {"tech_stack": tech_context}},
-                {"prefix": "MKT", "count": 2, "prompt_tpl": ..., "author": sale_member,
-                 "subdir": "archives", "tags": ["genesis"]},
-            ])
+        Pages within a batch remain sequential; batches across prefixes are parallel.
         """
         prefixes = [b["prefix"] for b in batches]
         if len(prefixes) != len(set(prefixes)):
             raise ValueError(
-                f"[confluence] Duplicate prefixes in parallel genesis batches: {prefixes}. "
-                f"Each batch must have a unique prefix."
+                f"[confluence] Duplicate prefixes in parallel genesis batches: {prefixes}."
             )
         results: Dict[str, List[str]] = {}
         lock = threading.Lock()
@@ -263,12 +244,12 @@ class ConfluenceWriter:
                     with lock:
                         results[prefix] = ids
                     logger.info(
-                        f"[confluence] ✓ Parallel genesis batch done ({prefix}): "
+                        f"[confluence] Parallel genesis batch done ({prefix}): "
                         f"{len(ids)} page(s)"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[confluence] ✗ Parallel genesis batch failed ({prefix}): {e}"
+                        f"[confluence] Parallel genesis batch failed ({prefix}): {e}"
                     )
                     with lock:
                         results[prefix] = []
@@ -286,8 +267,7 @@ class ConfluenceWriter:
     ) -> tuple:
         """
         Generate a postmortem Confluence page for a resolved incident.
-
-        Returns the registered conf_id.
+        The LLM emits alias vocabulary alongside Markdown in a single JSON response.
         """
         conf_id = self._registry.next_id("ENG")
         date_str = str(self._state.current_date.date())
@@ -314,7 +294,7 @@ class ConfluenceWriter:
             f"  - Code review / PR: {eng_peer}\n"
             f"  - Test coverage / QA: {_qa_lead}\n"
             f"  - Infra / alerting: {_infra_lead}\n"
-            f"Do NOT use role labels like 'backend lead' or 'qa lead' — use the names above."
+            f"Do NOT use role labels. Use the names above."
         )
 
         writer = make_agent(
@@ -325,33 +305,52 @@ class ConfluenceWriter:
         )
         task = Task(
             description=(
-                f"Write a Confluence postmortem page with ID {conf_id} "
-                f"for incident {incident_id}.\n"
+                f"Write a postmortem for incident {incident_id}.\n"
                 f"Title: Postmortem: {incident_title}\n"
                 f"Root Cause: {root_cause}\n"
                 f"Duration: {days_active} days.\n"
                 f"You may reference these existing pages if relevant:\n{related}\n"
-                f"{_action_owners}\n"
-                f"Format as Markdown. Do NOT write a main # title — start directly with ## Executive Summary. "
+                f"{_action_owners}\n\n"
+                f"Format as Markdown. Do NOT write a main # title. "
+                f"Start directly with ## Executive Summary. "
                 f"Include: Executive Summary, Timeline, Root Cause, Impact, "
-                f"What Went Wrong, What Went Right, Action Items."
+                f"What Went Wrong, What Went Right, Action Items.\n\n"
+                f"{_ALIAS_INSTRUCTION}"
+                f"\nRespond ONLY with valid JSON:\n"
+                f"{{\n"
+                f'  "markdown_doc": "full postmortem Markdown, no # title",\n'
+                f"{_ALIAS_JSON_FIELDS}"
+                f"}}"
             ),
-            expected_output=f"A single Markdown postmortem page with ID {conf_id}.",
+            expected_output="Valid JSON with markdown_doc and aliases keys.",
             agent=writer,
         )
-        raw = str(Crew(agents=[writer], tasks=[task], verbose=False).kickoff()).strip()
+        raw_output = str(
+            Crew(agents=[writer], tasks=[task], verbose=False).kickoff()
+        ).strip()
+
+        clean = raw_output.replace("```json", "").replace("```", "").strip()
+        content = raw_output
+        aliases: Optional[List[str]] = None
+        try:
+            parsed = json.loads(clean)
+            content = parsed.get("markdown_doc", raw_output)
+            aliases = _extract_aliases(parsed)
+        except (json.JSONDecodeError, ValueError):
+            content = raw_output
 
         self._lifecycle.scan_for_knowledge_gaps(
-            text=raw,
+            text=content,
             triggered_by=conf_id,
             day=self._state.day,
             date_str=date_str,
             state=self._state,
             timestamp=timestamp,
+            author=on_call,
         )
 
         conf_ids = self._finalize_page(
-            raw_content=raw,
+            raw_content=content,
             conf_id=conf_id,
             title=f"Postmortem: {incident_title}",
             author=on_call,
@@ -361,16 +360,13 @@ class ConfluenceWriter:
             tags=["postmortem", "confluence"],
             facts={"root_cause": root_cause, "incident_id": incident_id},
             extra_artifact_ids={"jira": incident_id},
+            aliases=aliases,
         )
-        logger.info(f"    [green]📄 Postmortem:[/green] {conf_ids[0]}")
+        logger.info(f"    [green]Postmortem:[/green] {conf_ids[0]}")
 
         for inc in self._state.active_incidents:
             if inc.ticket_id == incident_id and getattr(inc, "causal_chain", None):
                 inc.causal_chain.append(conf_ids[0])
-                logger.info(
-                    f"    [dim]🔗 Postmortem {conf_ids[0]} appended to "
-                    f"{incident_id} causal chain[/dim]"
-                )
                 break
 
         return conf_ids[0], timestamp
@@ -385,47 +381,36 @@ class ConfluenceWriter:
     ) -> Optional[str]:
         """
         Generate a design doc Confluence page from a Slack discussion.
-        Also spawns 1 JIRA ticket from the action items in the chat.
 
-        Returns the registered conf_id, or None on failure.
+        The LLM produces prose and a self_audit block containing raw
+        observations only. All gap classification and domain_fit scoring
+        is computed deterministically by the engine from those observations,
+        consistent with the physics-cognition boundary.
         """
-
         conf_id = self._registry.next_id("ENG")
         write_delay_hours = random.uniform(0.5, 1.5)
         artifact_time, _ = self._clock.advance_actor(author, hours=write_delay_hours)
         timestamp = artifact_time.isoformat()
 
         chat_log = "\n".join(f"{m['user']}: {m['text']}" for m in slack_transcript)
-        ctx = self._mem.recall_with_rewrite(raw_query=topic, n=3, as_of_time=timestamp)
-        related = self._registry.related_context(topic=topic, n=3)
+
         backstory = persona_utils.get_voice_card(
-            author, "design", mem=self._mem, graph_dynamics=self._gd
+            author, "design", mem=self._mem, graph_dynamics=self._gd, include_expertise=False
         )
 
-        persona = self._config.get("personas", {}).get(author, {})
-        expertise_list = persona.get("expertise", ["general tasks"])
-        expertise_str = ", ".join(str(e) for e in expertise_list[:5])
-        author_dept = next(
-            (d for d, members in self._org_chart.items() if author in members),
-            "Unknown",
+        related_pages = self._mem.search_artifacts_text(
+            query=topic,
+            n=5,
+            type_filter="confluence",
+            as_of_time=timestamp,
         )
+        related = "\n".join(
+            f"- {r['id']}: {r['title']}"
+            for r in related_pages
+        ) or "None yet."
 
-        orphaned_domain_context = ""
-        all_domains = list(
-            self._mem._db["domain_registry"].find({"primary_owner": None})
-        )
-        for rec in all_domains:
-            tags = rec.get("system_tags", [])
-            topic_lower = topic.lower()
-            if any(tag in topic_lower for tag in tags):
-                pct = int(rec.get("documentation_coverage", 0) * 100)
-                known_by = rec.get("known_by", [])
-                orphaned_domain_context += (
-                    f"\n⚠ '{rec['domain']}' is an orphaned domain: "
-                    f"former owner={rec.get('former_owner', 'unknown')}, "
-                    f"documentation={pct}%, "
-                    f"partial knowledge held by: {known_by or 'nobody'}."
-                )
+        expertise_tokens = self._mem.get_author_domain_tokens(author)
+        expertise_str = ", ".join(sorted(expertise_tokens))
 
         agent = make_agent(
             role="Technical Lead",
@@ -436,48 +421,31 @@ class ConfluenceWriter:
         task = Task(
             description=(
                 f"You just had this Slack discussion about '{topic}':\n\n{chat_log}\n\n"
-                f"Background context: {ctx}\n"
                 f"Existing pages you may reference:\n{related}\n\n"
                 f"Write a design doc Confluence page with ID {conf_id}.\n"
                 f"Also extract 1 concrete next step as a JIRA ticket.\n\n"
-                + (
-                    f"DOMAIN CONTEXT:{orphaned_domain_context}\n\n"
-                    if orphaned_domain_context
-                    else ""
-                )
-                + "### SELF-AUDIT (fill metadata objectively, not in character)\n"
+                f"\n\n### SELF-AUDIT\n"
                 f"Your expertise on record: [{expertise_str}]\n"
-                f"Your department: {author_dept}\n"
-                "Compare every topic in your doc against that expertise list.\n"
-                "If the doc discusses areas NOT in that list, name them in "
-                "'topics_beyond_author_expertise'.\n"
-                "If you had to guess, hedge, or hand-wave on any claim, list it "
-                "in 'hedged_claims'.\n"
-                "If you deferred or left incomplete any section you know should "
-                "exist, list it in 'deferred_or_incomplete'.\n\n"
-                "Use these criteria:\n"
-                "  author_domain_fit:\n"
-                "    'high'   — doc demonstrates fluency: correct abstractions, aware of edge cases\n"
-                "    'medium' — doc is functional but shows shallow understanding or minor missteps\n"
-                "    'low'    — doc shows clear unfamiliarity: wrong patterns, missing fundamentals\n\n"
-                "  gap_classification:\n"
-                f"    'none'     — {author}'s expertise aligns with all domains in this doc\n"
-                f"    'possible' — doc touches 1-2 domains outside {author}'s expertise but content looks adequate\n"
-                f"    'likely'   — doc touches domains outside {author}'s expertise AND the content shows it\n\n"
+                f"After writing the doc, fill the self_audit block objectively, not in character.\n"
+                f"  topics_in_doc: every distinct technical domain, system, or component this doc discusses.\n"
+                f"  topics_outside_my_expertise: copy terms from topics_in_doc only — "
+                f"do not add new terms — where the topic is NOT in your expertise list above.\n"
+                f"  claims_i_approximated: specific sentences or values where you inferred, "
+                f"generalized, or were uncertain rather than stating a known fact.\n"
+                f"  sections_i_left_thin: section headers (## only) where you wrote less "
+                f"than the section warrants because you lacked detail.\n\n"
                 f"Respond ONLY with valid JSON:\n"
                 f"{{\n"
-                f'  "markdown_doc": "full Markdown, no # title, start with '
-                f'## Problem Statement",\n'
+                f'  "markdown_doc": "full Markdown, no # title, start with ## Problem Statement",\n'
                 f'  "new_tickets": [\n'
-                f'    {{"title": "string", "assignee": "{author}", '
-                f'"story_points": 1|2|3|5|8}}\n'
+                f'    {{"title": "string", "assignee": "{author}", "story_points": 1}}\n'
                 f"  ],\n"
-                f'  "metadata": {{\n'
-                f'    "author_domain_fit": "low | medium | high",\n'
-                f'    "gap_classification": "none | possible | likely",\n'
-                f'    "topics_beyond_author_expertise": ["string"],\n'
-                f'    "hedged_claims": ["string"],\n'
-                f'    "deferred_or_incomplete": ["string"]\n'
+                f"{_ALIAS_JSON_FIELDS}"
+                f'  "self_audit": {{\n'
+                f'    "topics_in_doc": ["string"],\n'
+                f'    "topics_outside_my_expertise": ["subset of topics_in_doc only"],\n'
+                f'    "claims_i_approximated": ["string"],\n'
+                f'    "sections_i_left_thin": ["string"]\n'
                 f"  }}\n"
                 f"}}"
             ),
@@ -492,30 +460,35 @@ class ConfluenceWriter:
             brace_end = clean.rindex("}") + 1
             clean = clean[brace_start:brace_end]
         except ValueError:
-            logger.warning(
-                f"[confluence] No JSON object found in design doc response — "
-                f"raw output: {clean[:200]!r}"
-            )
             clean = "{}"
 
         try:
             parsed = json.loads(clean)
             content = parsed.get("markdown_doc", "Draft pending.")
             new_tickets = parsed.get("new_tickets", [])
-            metadata = parsed.get("metadata", {})
+            aliases = _extract_aliases(parsed)
+            audit = parsed.get("self_audit", {})
         except json.JSONDecodeError as e:
-            logger.warning(
-                f"[confluence] JSON parse failed for design doc: {e} — "
-                f"raw JSON attempt: {clean[:200]!r}"
-            )
+            logger.warning(f"[confluence] JSON parse failed for design doc: {e}")
             content = raw
             new_tickets = []
-            metadata = {}
+            aliases = None
+            audit = {}
+
+        topics_in_doc = set(audit.get("topics_in_doc", []))
+        topics_outside = [
+            t for t in audit.get("topics_outside_my_expertise", [])
+            if t in topics_in_doc and t not in expertise_tokens
+        ]
+        claims_approximated = audit.get("claims_i_approximated", [])
+        sections_thin = audit.get("sections_i_left_thin", [])
+
+
 
         conf_ids = self._finalize_page(
             raw_content=content,
             conf_id=conf_id,
-            title=f"Design: {topic[:70]}",
+            title=f"Design: {topic[:80]}",
             author=author,
             date_str=date_str,
             timestamp=timestamp,
@@ -523,6 +496,7 @@ class ConfluenceWriter:
             tags=["confluence", "design_doc"],
             facts={"title": f"Design: {topic[:80]}", "type": "design_doc"},
             skip_event=True,
+            aliases=aliases,
         )
 
         _updated_domains = [
@@ -532,59 +506,17 @@ class ConfluenceWriter:
             )
         ]
 
-        domain_fit = metadata.get("author_domain_fit", "high")
-        gap_class = metadata.get("gap_classification", "none")
-        beyond_expertise = metadata.get("topics_beyond_author_expertise", [])
-        hedged = metadata.get("hedged_claims", [])
-        deferred = metadata.get("deferred_or_incomplete", [])
-
-        gap_detected = (
-            domain_fit == "low"
-            or gap_class == "likely"
-            or (gap_class == "possible" and len(beyond_expertise) > 0)
+        self._lifecycle.scan_for_knowledge_gaps(
+            text=content,
+            triggered_by=conf_id,
+            day=self._state.day,
+            date_str=date_str,
+            state=self._state,
+            timestamp=timestamp,
+            author=author,
+            topics_outside_expertise=topics_outside,
+            claims_approximated=claims_approximated,
         )
-
-        if gap_detected:
-            self._mem.log_event(
-                SimEvent(
-                    type="knowledge_gap_detected",
-                    timestamp=timestamp,
-                    day=self._state.day,
-                    date=date_str,
-                    actors=[author],
-                    artifact_ids={"confluence": conf_id},
-                    facts={
-                        "detection_method": "author_self_audit",
-                        "topic": topic,
-                        "author_domain_fit": domain_fit,
-                        "author_expertise": expertise_list,
-                        "gap_classification": gap_class,
-                        "topics_beyond_expertise": beyond_expertise,
-                        "hedged_claims": hedged,
-                        "deferred_sections": deferred,
-                    },
-                    summary=(
-                        f"Knowledge gap detected in {conf_id}: "
-                        f"{author} (expertise: {expertise_str}) wrote about '{topic}' "
-                        f"with fit={domain_fit}, gap={gap_class}"
-                    ),
-                    tags=["knowledge_gap", "confluence", "design_doc"],
-                )
-            )
-
-        if beyond_expertise:
-            targeted_text = ". ".join(beyond_expertise)
-            if hedged:
-                targeted_text += ". " + ". ".join(hedged)
-
-            self._lifecycle.scan_for_knowledge_gaps(
-                text=targeted_text,
-                triggered_by=conf_id,
-                day=self._state.day,
-                date_str=date_str,
-                state=self._state,
-                timestamp=timestamp,
-            )
 
         created_ticket_ids = self._spawn_tickets(
             new_tickets, author, participants, date_str, timestamp
@@ -610,26 +542,25 @@ class ConfluenceWriter:
                     "type": "design_doc",
                     "spawned_tickets": created_ticket_ids,
                     "causal_chain": chain.snapshot(),
-                    "author_domain_fit": metadata.get("author_domain_fit", "high"),
-                    "gap_classification": metadata.get("gap_classification", "none"),
+                    "author_domain_fit": domain_fit,
+                    "gap_classification": gap_classification,
+                    "topics_outside_author_expertise": topics_outside,
+                    "claims_approximated": claims_approximated,
+                    "sections_left_thin": sections_thin,
                     "domains_updated": _updated_domains,
                 },
                 summary=(
                     f"{author} created {conf_ids[0]} and spawned "
                     f"{len(created_ticket_ids)} ticket(s): {', '.join(created_ticket_ids)}"
                 ),
-                tags=[
-                    "confluence",
-                    "design_doc",
-                    "jira",
-                    "causal_chain",
-                ],
+                tags=["confluence", "design_doc", "jira", "causal_chain"],
             )
         )
 
         logger.info(
-            f"    [dim]📄 Design doc: {conf_ids[0]} "
-            f"(spawned {len(created_ticket_ids)} ticket(s))[/dim]"
+            f"    [dim]Design doc: {conf_ids[0]} "
+            f"(spawned {len(created_ticket_ids)} ticket(s), "
+            f"domain_fit={domain_fit}, gap={gap_classification})[/dim]"
         )
         return conf_ids[0]
 
@@ -637,16 +568,10 @@ class ConfluenceWriter:
         self,
         author: Optional[str] = None,
         backstory: Optional[str] = None,
-    ) -> None:
+    ) -> Optional[tuple]:
         """
         Generate a character-accurate ad-hoc Confluence page.
-
-        Topic and ID prefix are derived from the author's persona expertise via
-        a fast LLM call — no hardcoded topic lists required. The author is drawn
-        from state.daily_active_actors so every page is organically tied to
-        someone who was actually working today.
-
-        Falls back to a random org member only if no active actors exist yet.
+        The writer task emits alias vocabulary alongside the page content.
         """
         active_today: List[str] = list(
             dict.fromkeys(getattr(self._state, "daily_active_actors", []))
@@ -703,9 +628,9 @@ class ConfluenceWriter:
         expertise_str = ", ".join(expertise_list)
 
         seed_query = f"{resolved_author} {expertise_str} {daily_theme}"
-        topic_ctx = self._mem.recall_with_rewrite(
-            raw_query=seed_query,
-            n=3,
+        topic_ctx = self._mem.context_for_prompt(
+            seed_query,
+            n=5,
             as_of_time=self._clock.now(resolved_author).isoformat(),
         )
         backstory = persona_utils.get_voice_card(
@@ -726,12 +651,12 @@ class ConfluenceWriter:
                 f"EXISTING DOCUMENTATION (Do NOT duplicate or overlap significantly):\n"
                 f"{history_str}\n\n"
                 f"TASK:\n"
-                f"Based on your expertise ({expertise_str}), propose ONE specific Confluence page title "
-                f"you would plausibly write TODAY. \n\n"
+                f"Based on your expertise ({expertise_str}), propose ONE specific "
+                f"Confluence page title you would plausibly write TODAY.\n\n"
                 f"Rules:\n"
-                f"- The topic MUST fall within your area of expertise ({expertise_str}). "
-                f"Do NOT propose engineering, infrastructure, or backend topics unless that is your expertise.\n"
-                f"- Find a specific 'gap'. If a topic is already documented, look for a sub-topic or angle not yet covered.\n"
+                f"- The topic MUST fall within your area of expertise ({expertise_str}).\n"
+                f"- Find a specific gap. If a topic is already documented, "
+                f"look for a sub-topic or angle not yet covered.\n"
                 f"- Be specific and realistic based on the current Org Theme.\n"
                 f"- Return ONLY the page title string. No explanation. No quotes."
             ),
@@ -745,8 +670,6 @@ class ConfluenceWriter:
             .strip('"')
             .strip("'")
         )
-
-        # Sanity-trim in case the LLM adds extra prose
         title = title.splitlines()[0][:120]
 
         conf_id = self._registry.next_id(prefix)
@@ -777,31 +700,47 @@ class ConfluenceWriter:
                 f"Existing pages you may reference (and ONLY these):\n{related}\n\n"
                 f"Rules:\n"
                 f"- Use your specific technical expertise and typing style.\n"
-                f"- If stressed, the doc may be shorter or more blunt.\n"
                 f"- Do not invent any CONF-* IDs not listed above.\n"
-                f"- Format as Markdown. Do not write a main # title or metadata block (like Author/Date) at the top.\n"
-                f"- Start directly with the first paragraph or ## section."
+                f"- Format as Markdown. Do not write a main # title or metadata block.\n"
+                f"- Start directly with the first paragraph or ## section.\n\n"
+                f"{_ALIAS_INSTRUCTION}"
+                f"\nRespond ONLY with valid JSON:\n"
+                f"{{\n"
+                f'  "markdown_doc": "full Markdown page content",\n'
+                f"{_ALIAS_JSON_FIELDS}"
+                f"}}"
             ),
-            expected_output=f"A single Markdown Confluence page with ID {conf_id}.",
+            expected_output="Valid JSON with markdown_doc and aliases keys.",
             agent=writer_agent,
         )
         raw = str(
             Crew(agents=[writer_agent], tasks=[task], verbose=False).kickoff()
         ).strip()
-        raw += self._knowledge_gap_warning(title)
 
-        # Lifecycle scan before chunking
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        content = raw
+        aliases: Optional[List[str]] = None
+        try:
+            parsed = json.loads(clean)
+            content = parsed.get("markdown_doc", raw)
+            aliases = _extract_aliases(parsed)
+        except (json.JSONDecodeError, ValueError):
+            content = raw
+
         self._lifecycle.scan_for_knowledge_gaps(
-            text=raw,
+            text=content,
             triggered_by=conf_id,
             day=self._state.day,
             date_str=date_str,
             state=self._state,
             timestamp=timestamp,
+            author=resolved_author,
         )
 
+        content += self._knowledge_gap_warning(title)
+
         self._finalize_page(
-            raw_content=raw,
+            raw_content=content,
             conf_id=conf_id,
             title=title,
             author=resolved_author,
@@ -810,7 +749,10 @@ class ConfluenceWriter:
             subdir="general",
             tags=["confluence", "adhoc"],
             facts={"title": title, "adhoc": True},
+            aliases=aliases,
         )
+
+        return (conf_id, resolved_author, title)
 
     def _finalize_page(
         self,
@@ -825,17 +767,12 @@ class ConfluenceWriter:
         facts: Dict,
         extra_artifact_ids: Optional[Dict[str, str]] = None,
         skip_event: bool = False,
+        aliases: Optional[List[str]] = None,
     ) -> List[str]:
         """
-        Common finalization pipeline for every Confluence page:
-          1. Strip broken cross-references
-          2. Register ID (raises DuplicateArtifactError — caller handles)
-          3. Chunk into child pages if content is long
-          4. Save .md files, embed, log SimEvents
-
-        Returns list of all conf_ids created (parent + children).
+        Common finalization pipeline for every Confluence page.
+        Writes aliases as a list so Atlas Search can index them for BM25 retrieval.
         """
-
         clean_content = self._registry.strip_broken_references(raw_content)
 
         pages: List[ConfluencePage] = self._registry.chunk_into_pages(
@@ -850,13 +787,10 @@ class ConfluenceWriter:
 
         created_ids: List[str] = []
         for page in pages:
-            logger.info(
-                f"[finalize] embedding page.id={page.id} parent={page.parent_id or 'ROOT'} content_len={len(page.content)}"
-            )
             try:
                 final_content = self._registry.strip_broken_references(page.content)
             except Exception as e:
-                logger.info(f"[finalize] Caught exception {e}")
+                logger.warning(f"[finalize] strip_broken_references failed: {e}")
                 final_content = page.content
 
             self._save_md(page.path, final_content)
@@ -870,6 +804,8 @@ class ConfluenceWriter:
             if tags and "genesis" in tags:
                 meta["phase"] = "genesis"
 
+            page_aliases = aliases if page.parent_id is None else None
+
             self._mem.embed_artifact(
                 id=page.id,
                 type="confluence",
@@ -879,6 +815,7 @@ class ConfluenceWriter:
                 date=date_str,
                 timestamp=timestamp,
                 metadata=meta,
+                aliases=page_aliases,
             )
 
             if page.parent_id is None and author and "genesis" not in (tags or []):
@@ -891,18 +828,9 @@ class ConfluenceWriter:
                 if domains_updated:
                     meta["domains_updated"] = domains_updated
 
-            if page.parent_id is None and author:
-                self._mem._db["author_expertise"].update_one(
-                    {"author": author},
-                    {"$addToSet": {"topics": page.title.lower().strip()}},
-                    upsert=True,
-                )
-
             self._state.daily_artifacts_created += 1
 
-            logger.debug(f"[finalize] pre-facts page.id={page.id}")
             page_facts = dict(facts)
-
             page_facts.update(
                 {
                     "parent_id": page.parent_id or "",
@@ -912,25 +840,9 @@ class ConfluenceWriter:
                 }
             )
 
-            logger.info(f"[finalize] page facts {page_facts}")
-            logger.debug(f"[finalize] pre-artifact-ids page.id={page.id}")
             artifact_ids = {"confluence": page.id}
             if extra_artifact_ids:
                 artifact_ids.update(extra_artifact_ids)
-
-            logger.debug(f"[finalize] pre-log-event page.id={page.id}")
-            logger.debug(
-                f"[finalize] SimEvent fields — "
-                f"type=confluence_created "
-                f"timestamp={timestamp} "
-                f"day={self._state.day} "
-                f"date={date_str} "
-                f"actors={[author]} "
-                f"artifact_ids={artifact_ids} "
-                f"facts={page_facts} "
-                f"summary={'Child' if page.parent_id else 'Page'} {page.id} created: {page.title} "
-                f"tags={tags}"
-            )
 
             if not skip_event:
                 self._mem.log_event(
@@ -943,18 +855,70 @@ class ConfluenceWriter:
                         artifact_ids=artifact_ids,
                         facts=page_facts,
                         summary=(
-                            f"{'Child' if page.parent_id else 'Page'} {page.id} created: {page.title}"
+                            f"{'Child' if page.parent_id else 'Page'} "
+                            f"{page.id} created: {page.title}"
                         ),
                         tags=tags,
                     )
                 )
-            logger.debug(f"[finalize] post-log-event page.id={page.id}")
-
-            logger.info(f"[confluence] _finalize_page complete: {page.id}")
 
             created_ids.append(page.id)
 
         return created_ids
+
+    def generate_tech_stack(self) -> dict:
+        """
+        Ask the LLM to invent a plausible tech stack for this company and industry.
+        Persists to MongoDB immediately so every subsequent LLM call can reference it.
+        """
+        existing = self._mem.get_tech_stack()
+        if existing:
+            logger.info("[confluence] Tech stack already exists. Skipping generation.")
+            return existing
+
+        agent = make_agent(
+            role="Principal Engineer",
+            goal="Define the canonical technology stack for this company.",
+            backstory=(
+                f"You are a principal engineer at {self._company}, "
+                f"a {self._industry} company. You are documenting the actual "
+                f"technologies in use. Not aspirational, not greenfield."
+            ),
+            llm=self._planner,
+        )
+        task = Task(
+            description=(
+                f"Define the canonical tech stack for {self._company} "
+                f"which {COMPANY_DESCRIPTION}\n\n"
+                f"The legacy system is called '{self._legacy.get('name', '')}' "
+                f"({self._legacy.get('description', '')}).\n\n"
+                f"Respond ONLY with a JSON object with these keys:\n"
+                f"  database, backend_language, frontend_language, mobile, "
+                f"  infra, message_queue, source_control, ci_cd, "
+                f"  monitoring, notable_quirks\n\n"
+                f"Each value is a short string (1-2 sentences max). "
+                f"Include at least one legacy wart or technical debt item. "
+                f"No preamble, no markdown fences."
+            ),
+            expected_output="A single JSON object. No preamble.",
+            agent=agent,
+        )
+
+        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
+
+        try:
+            stack = json.loads(raw.replace("```json", "").replace("```", "").strip())
+        except json.JSONDecodeError:
+            logger.warning(
+                "[confluence] Tech stack JSON parse failed. Using minimal fallback."
+            )
+            stack = {
+                "notable_quirks": "Stack unknown. Legacy system predates documentation."
+            }
+
+        self._mem.save_tech_stack(stack)
+        logger.info(f"[confluence] Tech stack established: {list(stack.keys())}")
+        return stack
 
     def _spawn_tickets(
         self,
@@ -1027,129 +991,142 @@ class ConfluenceWriter:
         content: str,
         day: int,
         coverage_delta: float = 0.10,
+        known_by_tag_threshold: int = 2,
     ) -> List[str]:
         """
-        After any Confluence page is finalised, check whether the page title or
-        content touches any registered domain in the DomainRegistry. If it does,
-        increment documentation_coverage by coverage_delta (default +10%) and
-        add the author to known_by.
+        After any Confluence page is finalised, increment documentation_coverage
+        for any domain whose system_tags appear in the page content.
 
-        This is the recovery arc: every page written against an orphaned domain
-        nudges coverage upward. The planner prompt and gap detection both read
-        live coverage, so this produces visible narrative improvement over time.
-
-        Matching is done against system_tags so variant spellings still resolve
-        (e.g. "titan" matches "TitanDB", "auth" matches "legacy auth service").
-
-        Returns:
-            List of domain names that were updated.
+        known_by is only updated when the domain is clearly a primary topic:
+        either the domain name itself appears in the content, or at least
+        known_by_tag_threshold distinct system_tags match. A single incidental
+        tag mention (e.g. 'auth' in a page about something else) does not
+        qualify.
         """
         updated: List[str] = []
-
         all_domains = list(self._mem._db["domain_registry"].find({}))
         if not all_domains:
             return updated
 
-        search_text = f"{title} {content[:500]}".lower()
+        search_text = f"{title} {content}".lower()
+        title_lower = title.lower()
 
         for rec in all_domains:
             tags = rec.get("system_tags", [])
-            if not any(tag in search_text for tag in tags):
+            matched_tags = [tag for tag in tags if tag in search_text]
+            if not matched_tags:
                 continue
 
             old_coverage = rec.get("documentation_coverage", 0.0)
             new_coverage = min(1.0, old_coverage + coverage_delta)
 
+
+            is_primary_topic = (
+                rec["domain"].lower() in title_lower
+                or len(matched_tags) >= known_by_tag_threshold
+            )
+
+            update: dict = {
+                "$set": {
+                    "documentation_coverage": round(new_coverage, 3),
+                    "last_updated_day": day,
+                }
+            }
+            if is_primary_topic:
+                update["$addToSet"] = {"known_by": author}
+
             self._mem._db["domain_registry"].update_one(
                 {"_id": rec["_id"]},
-                {
-                    "$set": {
-                        "documentation_coverage": round(new_coverage, 3),
-                        "last_updated_day": day,
-                    },
-                    "$addToSet": {"known_by": author},
-                },
+                update,
             )
             updated.append(rec["domain"])
             logger.info(
-                f"    [dim]→ Domain registry: '{rec['domain']}' coverage "
-                f"{int(old_coverage * 100)}% → {int(new_coverage * 100)}% "
-                f"(author: {author})[/dim]"
+                f"    [dim]Domain registry: '{rec['domain']}' coverage "
+                f"{int(old_coverage * 100)}% to {int(new_coverage * 100)}%"
+                f"{' (known_by: ' + author + ')' if is_primary_topic else ''}"
+                f" (author: {author})[/dim]"
             )
 
         return updated
 
     def _pick_dept_author(self, prefix: str) -> str:
-        """Return a random member of the department matching prefix, fallback to any employee."""
         for dept, members in self._org_chart.items():
             if prefix.upper() in dept.upper() and members:
                 return random.choice(members)
-
         return random.choice(self._all_names)
 
     def _conf_prefix_for(self, author: str) -> str:
         dept = next(
             (d for d, members in self._org_chart.items() if author in members),
-            None,
+            "",
         )
         return _CONF_PREFIX_MAP.get(dept, "ENG")
 
-    def generate_tech_stack(self) -> dict:
+    def _compute_domain_fit(self, author: str, topic: str) -> str:
         """
-        Ask the LLM to invent a plausible tech stack for this company and industry.
-        Persists to MongoDB immediately so every subsequent LLM call can reference it.
-        Returns the stack as a dict.
+        Deterministically compute how well the author's expertise covers the
+        topic, using the domain_registry's orphan status and system_tags.
+
+        Returns "high", "medium", or "low" based on documentation_coverage
+        thresholds (same thresholds used in scan_for_knowledge_gaps):
+          - No orphaned domains touched by topic -> "high"
+          - Author is in known_by for all touched orphans -> "high"
+          - avg coverage < 0.3 -> "low"
+          - avg coverage < 0.6 -> "medium"
+          - else -> "high"
+
         """
+        orphaned = list(self._mem._db["domain_registry"].find({"primary_owner": None}))
+        topic_lower = topic.lower()
+        touched_orphans = [
+            rec
+            for rec in orphaned
+            if any(tag in topic_lower for tag in rec.get("system_tags", []))
+        ]
+        if not touched_orphans:
+            return "high"
+        covered = all(author in rec.get("known_by", []) for rec in touched_orphans)
+        if covered:
+            return "high"
+        avg_coverage = sum(
+            r.get("documentation_coverage", 0) for r in touched_orphans
+        ) / len(touched_orphans)
+        if avg_coverage < 0.3:
+            return "low"
+        if avg_coverage < 0.6:
+            return "medium"
+        return "high"
 
-        existing = self._mem.get_tech_stack()
-        if existing:
-            logger.info("[confluence] Tech stack already exists — skipping generation.")
-            return existing
+    def _compute_gap_classification(self, author: str, topic: str) -> str:
+        """
+        Deterministically classify whether this topic/author combination
+        represents a knowledge gap, using the same thresholds as
+        scan_for_knowledge_gaps in org_lifecycle.py:
+          - live_coverage < 0.3 -> "likely"
+          - live_coverage < 0.6 -> "possible"
+          - else -> "none"
 
-        agent = make_agent(
-            role="Principal Engineer",
-            goal="Define the canonical technology stack for this company.",
-            backstory=(
-                f"You are a principal engineer at {self._company}, "
-                f"a {self._industry} company. You are documenting the actual "
-                f"technologies in use — not aspirational, not greenfield. "
-                f"This is a company with years of history and legacy decisions."
-            ),
-            llm=self._planner,
-        )
-        task = Task(
-            description=(
-                f"Define the canonical tech stack for {self._company} "
-                f"which {COMPANY_DESCRIPTION}\n\n"
-                f"The legacy system is called '{self._legacy.get('name', '')}' "
-                f"({self._legacy.get('description', '')}).\n\n"
-                f"Respond ONLY with a JSON object with these keys:\n"
-                f"  database, backend_language, frontend_language, mobile, "
-                f"  infra, message_queue, source_control, ci_cd, "
-                f"  monitoring, notable_quirks\n\n"
-                f"Each value is a short string (1-2 sentences max). "
-                f"Include at least one legacy wart or technical debt item. "
-                f"No preamble, no markdown fences."
-            ),
-            expected_output="A single JSON object. No preamble.",
-            agent=agent,
-        )
-
-        raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
-
-        try:
-            stack = json.loads(raw.replace("```json", "").replace("```", "").strip())
-        except json.JSONDecodeError:
-            logger.warning(
-                "[confluence] Tech stack JSON parse failed — using minimal fallback."
-            )
-            stack = {
-                "notable_quirks": "Stack unknown — legacy system predates documentation."
-            }
-
-        self._mem.save_tech_stack(stack)
-        logger.info(f"[confluence] ✓ Tech stack established: {list(stack.keys())}")
-        return stack
+        This runs BEFORE the LLM writes anything, so the engine knows at
+        planning time whether this document enters a gap zone.
+        """
+        orphaned = list(self._mem._db["domain_registry"].find({"primary_owner": None}))
+        topic_lower = topic.lower()
+        touched_orphans = [
+            rec
+            for rec in orphaned
+            if any(tag in topic_lower for tag in rec.get("system_tags", []))
+        ]
+        if not touched_orphans:
+            return "none"
+        covered = all(author in rec.get("known_by", []) for rec in touched_orphans)
+        if covered:
+            return "none"
+        min_coverage = min(r.get("documentation_coverage", 0) for r in touched_orphans)
+        if min_coverage < 0.3:
+            return "likely"
+        if min_coverage < 0.6:
+            return "possible"
+        return "none"
 
     @staticmethod
     def _render(template: str, vars_: Dict[str, str]) -> str:
@@ -1158,7 +1135,6 @@ class ConfluenceWriter:
         return template
 
     def _render_template(self, template: str) -> str:
-        """Apply simulation-level placeholder substitutions."""
         return (
             template.replace("{legacy_system}", self._legacy.get("name", ""))
             .replace("{project_name}", self._legacy.get("project_name", ""))
@@ -1168,9 +1144,7 @@ class ConfluenceWriter:
 
     @staticmethod
     def _extract_title(content: str, fallback: str) -> str:
-
         clean = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
-
         m = re.search(r"^#\s+(.+)", clean, re.MULTILINE)
         if m:
             return m.group(1).strip()
@@ -1181,18 +1155,11 @@ class ConfluenceWriter:
 
     @staticmethod
     def _id_prefix_from_id(conf_id: str) -> str:
-        """Extract prefix from a conf_id like CONF-ENG-003 → ENG."""
         parts = conf_id.split("-")
         return parts[1] if len(parts) >= 3 else "GEN"
 
     def _knowledge_gap_warning(self, topic: str) -> str:
-        """
-        Append a knowledge-gap warning if the topic touches a registered orphaned domain.
-        Uses live documentation_coverage from DomainRegistry rather than the static
-        config value so the warning reflects any recovery that has happened since genesis.
-        """
         topic_lower = topic.lower()
-
         all_domains = list(
             self._mem._db["domain_registry"].find({"primary_owner": None})
         )
@@ -1208,7 +1175,7 @@ class ConfluenceWriter:
                     else " No current owner."
                 )
                 return (
-                    f"\n\n> ⚠️ **Knowledge Gap**: This area ({rec['domain']}) was owned by "
+                    f"\n\n> **Knowledge Gap**: This area ({rec['domain']}) was owned by "
                     f"{former}. Only ~{pct}% documented.{known_str}"
                 )
 
@@ -1217,7 +1184,7 @@ class ConfluenceWriter:
             hits = [k for k in emp.get("knew_about", []) if k.lower() in topic_lower]
             if hits:
                 return (
-                    f"\n\n> ⚠️ **Knowledge Gap**: This area ({', '.join(hits)}) was owned by "
+                    f"\n\n> **Knowledge Gap**: This area ({', '.join(hits)}) was owned by "
                     f"{emp['name']} (ex-{emp['role']}, left {emp['left']}). "
                     f"Only ~{int(emp.get('documented_pct', 0.2) * 100)}% documented."
                 )
@@ -1241,14 +1208,6 @@ class ConfluenceWriter:
     def _tenure_at_date(
         tenure_str: str, sim_start: datetime, page_date: datetime
     ) -> str:
-        """
-        Back-calculate what an employee's tenure label should read
-        on a historical page_date, given their tenure string at sim_start.
-
-        "5yr" at 2026-03-02, page dated 2024-03-02  →  "3yr"
-        "2yr" at 2026-03-02, page dated 2025-09-02  →  "6mo"
-        "new" / unparseable                          →  returned unchanged
-        """
         import re
         from dateutil.relativedelta import relativedelta
 

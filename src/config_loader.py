@@ -7,6 +7,8 @@ Single source of truth for all constants.
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
 from pathlib import Path
 from typing import Any, Dict
 
@@ -15,6 +17,8 @@ import yaml
 
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 EXPORT_DIR = PROJECT_ROOT / "export"

@@ -3,13 +3,40 @@ requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flow"
+name = "orgforge"
 dynamic = ["version"]
 readme = "README.md"
 description = "Synthetic corporate dataset generator for AI agent evaluation."
+requires-python = ">=3.13"
+dependencies = [
+    "crewai>=1.14.5",
+    "crewai-tools>=1.14.5",
+    "pymongo>=4.6.0",
+    "requests>=2.31.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0.0",
+    "networkx>=3.0",
+    "vaderSentiment>=3.3.2",
+    "rich>=13.0.0",
+    "boto3==1.42.63",
+    "scipy>=1.17.1",
+    "json-repair>=0.58.6",
+    
+]
+
+[dependency-groups]
+dev = [
+    "mongomock>=4.3.0",
+    "pytest>=9.1.1",
+    "ruff>=0.4.0",
+]
 
 [tool.setuptools_scm]
 
+[tool.uv]
+override-dependencies = [
+    "json-repair>=0.58.6",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -20,3 +47,9 @@ pythonpath = ["src"]
 filterwarnings = [
     "ignore:deprecated:DeprecationWarning:crewai.crew",
 ]
+
+[tool.ruff]
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]

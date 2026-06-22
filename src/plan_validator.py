@@ -100,7 +100,6 @@ class PlanValidator:
         Called daily by the DayPlannerOrchestrator.
         """
         self._external_names = set(names)
-        # Recalculate the union set used by _validate_one
         self._valid_actors = self._internal_names | self._external_names
 
     def validate_plan(

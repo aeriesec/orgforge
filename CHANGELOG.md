@@ -6,6 +6,56 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v2.0.0] — 2026-06-22
+
+### Added
+
+- **Multi-provider LLM support via CrewAI**: The project now uses CrewAI's `LLM` class with auto-detection for provider from model string. Supports OpenAI, Anthropic, AWS Bedrock, Google Gemini, Groq, and Azure out of the box. New presets added: `openai`, `anthropic`, `gemini`.
+- **Alias vocabulary extraction**: All Confluence page generation now emits domain-level alias terms alongside Markdown content, indexed via Atlas Search for BM25 retrieval.
+- **Stage-based incident advancement with realistic stall probabilities**: Incidents now advance through stages (detected → investigating → fix_in_progress → review_pending → resolved) with configurable per-stage probabilities influenced by knowledge gaps, recurrence, and system health. Incidents can stall for days, creating realistic resolution timelines.
+- **Domain ownership claiming**: Engineers who repeatedly work in orphaned knowledge domains (via PR authorship, Confluence writing, or incident resolution) are automatically promoted to `primary_owner` in the domain registry, driving a knowledge recovery arc.
+- **Post-simulation evaluation questions**: The HF dataset export now includes `questions/eval_questions.jsonl` for benchmark evaluation.
+- **Department-level average stress tracking**: `DepartmentDayPlan` now carries `avg_stress` for visibility into team-wide morale.
+- **Deterministic gap detection**: Knowledge gap detection in Confluence writing and PR reviews is now fully deterministic, driven by domain registry lookups and BM25 text search over persona skill records — no LLM involvement.
+- **Ad-hoc Confluence page authorship tracking**: Ad-hoc page generation now returns `(conf_id, author, title)` for downstream lifecycle credit.
+
+### Changed
+
+- **Migration from `requirements.txt` to `uv`/`pyproject.toml`**: The project now uses `uv` for dependency management with a `pyproject.toml` declaring all dependencies. Removed `requirements.txt`, `requirements-cloud.txt`, and `requirements-test.txt`.
+- **Embedding pipeline replaced with structured text retrieval**: Vector embeddings removed entirely. Memory now uses Atlas Search with alias-weighted BM25 for artifact retrieval and MongoDB `$text` search for event retrieval. Removed `embed_worker.py`, all embedder classes (Ollama, OpenAI, Bedrock, Infinity), and fallback hash embeddings.
+- **Dockerfile overhaul**: Now uses multi-stage `uv` copy, `pyproject.toml`-based install, and `uv run` execution. Removed separate `requirements-cloud.txt` install step.
+- **Recurrence detection simplified to text-only**: Recurrence detector now uses MongoDB `$text` index exclusively (text-only), removing the vector/hybrid fusion pipeline, RRF scoring, and all vector-specific thresholds.
+- **Confluence pages moved to dedicated `confluence_pages` collection**: No longer stored in the generic `artifacts` collection. Zoom transcripts similarly moved to `zoom_transcripts`. `embed_artifact()` is now a routing function dispatching to type-specific stores.
+- **Ticket assignment uses BM25 term overlap instead of cosine similarity**: `TicketAssigner` now computes skill scores via normalized term overlap between ticket title tokens and engineer domain-registry expertise tokens.
+- **Config overhaul**: Expanded provider presets, added `base_url` for non-standard OpenAI endpoints, removed `embed_provider`/`embed_model`/`embed_dims` fields from presets. Simulation defaults updated (60-day runs, higher incident probability, adjusted morale decay).
+- **Persona config updates**: New departed employee "Sharon" added to knowledge gaps. Morgan's departure moved to day 34, Reese's hire to day 26. Mobile engineer stress increased to 72.
+- **LLM task outputs now structured JSON**: All Confluence writing tasks now require JSON responses with `markdown_doc` and `aliases` keys, replacing freeform Markdown output.
+- **Knowledge gap detection moved from LLM self-audit to engine computation**: The LLM emits raw observations (`topics_in_doc`, `topics_outside_my_expertise`, `claims_i_approximated`, `sections_i_left_thin`) and the engine classifies gaps deterministically using domain registry coverage thresholds.
+- **`context_for_prompt()` replaced with tiered context builder**: Three tiers — pinned tech stack + active gaps, alias-weighted BM25 search, and open knowledge gap questions. Noise-stripping applied before BM25 search.
+- **PR review knowledge audit removed**: Reviewer audit metadata (author_domain_fit, gap_classification) removed from PR review task. Gap detection now runs via `scan_for_knowledge_gaps` on the PR text.
+- **Dataset export rebranded**: HuggingFace dataset card now uses "OrgForge EpistemicBench" naming, includes questions config, and updated citation format.
+- **`dotenv` auto-loaded**: `.env` is now loaded automatically in `config_loader.py` on import.
+- **Postmortem writer selection**: Now uses incident actors rather than a static `postmortem_writer` role.
+
+### Removed
+
+- **All vector/embedding infrastructure**: `embed_worker.py` (242 lines), all embedder classes (`OllamaEmbedder`, `OpenAIEmbedder`, `BedrockEmbedder`, `InfinityEmbedder`), `build_embedder()` factory, `_embed()` method, `_init_vector_indexes()`, and all vector search aggregation pipelines.
+- **HyDE query rewriting**: `_rewrite_query()` removed. Noise-stripping in `_strip_query_noise()` replaces the HyDE pattern.
+- **LLM-authored knowledge gap self-assessments**: The `author_domain_fit`, `gap_classification`, `topics_beyond_author_expertise`, `hedged_claims`, and `deferred_or_incomplete` fields removed from PR review and design doc JSON output schemas.
+- **`_SKIP_EMBED_TYPES`**: Removed the event type embedding skip list since no events are embedded.
+- **`find_confluence_experts()`**: Replaced by `search_persona_skills_text()` and `domain_context_for_topic()`.
+- **`recall()` and `recall_events()` vector search methods**: Replaced by `search_artifacts_text()` and structured MongoDB queries.
+- **Postmortem causal chain log line**: Removed the verbose causal chain append log message.
+
+### Fixed
+
+- **Postmortem artifact timestamp**: `_write_postmortem` now correctly uses incident actors to determine the writer, fixing timestamp attribution.
+- **Ad-hoc Confluence return type**: `write_adhoc_page()` now returns `(conf_id, author, title)` tuple instead of `None`, enabling callers in `NormalDayHandler` to credit domain knowledge.
+- **Test suite updated**: Removed embedding-dependent tests, patched mongomock for Atlas Search index methods, and fixed incident advancement tests to account for stochastic stage progression.
+- **`docker-compose.yaml` version field**: Removed deprecated `version: "3.9"` top-level key.
+
+---
+
 ## [v1.3.3] — 2026-04-05
 
 ### Added

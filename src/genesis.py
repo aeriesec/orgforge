@@ -49,14 +49,12 @@ def initialize(config, planner_llm, reset=False):
     return mem
 
 
-# genesis.py — replace seed_external_sources entirely
-
-
 def seed_external_sources(mem: Memory, planner_llm):
     if mem.get_inbound_email_sources():
         return
 
     logger.info("[cyan]🌐 Generating inbound email sources...[/cyan]")
+
     tech_stack = mem.tech_stack_for_prompt()
 
     vendors = _generate_vendor_sources(mem, planner_llm, tech_stack)
@@ -83,12 +81,13 @@ def _generate_vendor_sources(mem: Memory, planner_llm, tech_stack: str) -> List[
 
     agent = make_agent(
         role="Enterprise IT Architect",
-        goal=f"Design the vendor email ecosystem for {COMPANY_NAME}.",
+        goal=f"Design the vendor email ecosystem for {COMPANY_NAME} which {COMPANY_DESCRIPTION}.",
         backstory=(
             f"You map communication patterns between a {INDUSTRY} company "
             f"and its technology vendors."
         ),
         llm=planner_llm,
+        max_execution_time=60,
     )
     task = Task(
         description=(
@@ -215,16 +214,39 @@ def _generate_customer_sources(mem: Memory, planner_llm, tech_stack: str) -> Lis
 
 def seed_tech_stack(mem: Memory, planner_llm):
     """Generates the tech stack ground truth."""
-    if mem._artifacts.find_one({"type": "tech_stack"}):
+    if mem.get_tech_stack():
         return
 
     logger.info("[genesis] Generating tech stack...")
+
+    gap_domains = []
+    for gap in CONFIG.get("knowledge_gaps", []):
+        gap_domains.extend(gap.get("knew_about", []))
+
+    for dep in CONFIG.get("org_lifecycle", {}).get("scheduled_departures", []):
+        gap_domains.extend(dep.get("knowledge_domains", []))
+
+    gap_domains_str = ""
+    if gap_domains:
+        unique = sorted(set(gap_domains))
+        gap_domains_str = (
+            "\n\nCRITICAL — REQUIRED TECHNOLOGY DOMAINS:\n"
+            "The following systems and domains MUST appear explicitly in your "
+            "tech stack output. They represent real systems this company runs "
+            "that have since lost their primary knowledge owner. Do not omit "
+            "or rename them:\n"
+            + "\n".join(f"  - {d}" for d in unique)
+            + "\n\nFit them into the appropriate stack categories "
+            "(e.g. a 'redis-cache' entry belongs under infra or database, "
+            "'HL7 message routing' belongs under notable_quirks or a "
+            "dedicated integration_middleware key)."
+        )
 
     agent = make_agent(
         role="Principal Engineer",
         goal="Define the canonical technology stack for this company.",
         backstory=(
-            f"You are a principal engineer at {COMPANY_NAME}, "
+            f"You are a principal engineer at {COMPANY_NAME} which {COMPANY_DESCRIPTION}, "
             f"a {INDUSTRY} company. You are documenting the actual "
             f"technologies in use — not aspirational, not greenfield. "
             f"This is a company with years of history and legacy decisions."
@@ -236,11 +258,13 @@ def seed_tech_stack(mem: Memory, planner_llm):
             f"Define the canonical tech stack for {COMPANY_NAME} "
             f"which {COMPANY_DESCRIPTION}\n\n"
             f"The legacy system is called '{LEGACY['name']}' "
-            f"({LEGACY['description']}).\n\n"
+            f"({LEGACY['description']}).{gap_domains_str}\n\n"
             f"Respond ONLY with a JSON object with these keys:\n"
             f"  database, backend_language, frontend_language, mobile, "
             f"  infra, message_queue, source_control, ci_cd, "
             f"  monitoring, notable_quirks\n\n"
+            f"You may add additional keys (e.g. 'integration_middleware', "
+            f"'auth_layer') if needed to accommodate required domains above. "
             f"Each value is a short string (1-2 sentences max). "
             f"Include at least one legacy wart or technical debt item. "
             f"No preamble, no markdown fences."
@@ -264,9 +288,9 @@ def seed_tech_stack(mem: Memory, planner_llm):
     mem.save_tech_stack(stack)
     logger.info(f"[confluence] ✓ Tech stack established: {list(stack.keys())}")
 
-    mem._db["artifacts"].create_index(
+    mem._db["confluence_pages"].create_index(
         [("title", "text"), ("content", "text")],
-        name="artifacts_text_search",
+        name="confluence_text_search",
         weights={"title": 3, "content": 1},
     )
 
@@ -439,13 +463,13 @@ def seed_knowledge_gaps(mem: Memory):
     equal to the normalised domain key.  Each document schema:
 
         {
-            "_id":                  "titandb",          # normalised key
-            "domain":               "TitanDB",          # display name
-            "primary_owner":        None,               # None = orphaned
+            "_id":                  "titandb",
+            "domain":               "TitanDB",
+            "primary_owner":        None,
             "former_owner":         "Bill",
             "documentation_coverage": 0.20,
-            "last_updated_day":     -180,               # day relative to sim start
-            "known_by":             [],                 # engineers with partial knowledge
+            "last_updated_day":     -180,
+            "known_by":             [],
             "system_tags":          ["titandb", "titan", "db"],
             "dept":                 "Engineering_Backend",
             "is_genesis_gap":       True,
@@ -457,6 +481,12 @@ def seed_knowledge_gaps(mem: Memory):
     """
     if not CONFIG.get("knowledge_gaps"):
         return
+
+    if not mem.get_tech_stack():
+        raise RuntimeError(
+            "[genesis] seed_knowledge_gaps called before tech stack exists. "
+            "Call seed_tech_stack first."
+        )
 
     logger.info("[genesis] Seeding pre-simulation knowledge gaps...")
 
@@ -512,9 +542,6 @@ def seed_knowledge_gaps(mem: Memory):
 
             existing = mem._db["domain_registry"].find_one({"_id": key})
             if existing:
-                # Domain already registered (e.g. two departures knew the
-                # same system).  Just ensure former_owners is a list and
-                # append — don't overwrite coverage.
                 mem._db["domain_registry"].update_one(
                     {"_id": key},
                     {
@@ -533,12 +560,12 @@ def seed_knowledge_gaps(mem: Memory):
             record = {
                 "_id": key,
                 "domain": domain,
-                "primary_owner": None,  # orphaned from day 0
+                "primary_owner": None,
                 "former_owner": name,
                 "former_owners": [name],
                 "documentation_coverage": doc_pct,
                 "last_updated_day": departure_day,
-                "known_by": [],  # no current engineers
+                "known_by": [],
                 "system_tags": system_tags,
                 "dept": dept,
                 "is_genesis_gap": True,
@@ -606,7 +633,6 @@ def _parse_sources(raw: str) -> List[dict]:
         for s in parsed:
             if not required.issubset(s.keys()):
                 continue
-            # Force-correct customer liaison at parse time
             if s.get("category", "").lower() == "customer":
                 s["internal_liaison"] = "Sales_Marketing"
             valid.append(s)

@@ -274,8 +274,6 @@ class NormalDayHandler:
 
         backstory = persona_utils.get_voice_card(assignee, "async", self._gd, self._mem)
 
-        # Surface any orphaned domains this ticket touches so the engineer's
-        # comment naturally reflects uncertainty about legacy systems
         orphaned_domain_hint = ""
         if self._lifecycle:
             all_domains = list(
@@ -612,6 +610,14 @@ class NormalDayHandler:
         if completion_id:
             generated_artifacts.append(completion_id)
 
+        if self._lifecycle:
+            self._credit_domain_knowledge(
+                actor=assignee,
+                text=f"{ticket.get('title', '')} {ticket.get('description', '')} {comment_text}",
+                day=self._state.day,
+                pathway="pr_authorship",
+            )
+
         return generated_artifacts
 
     def _try_force_merge_stale_pr(
@@ -738,6 +744,13 @@ class NormalDayHandler:
                 )
                 if completion_id:
                     chain.append(completion_id)
+                    if self._lifecycle:
+                        self._credit_domain_knowledge(
+                            actor=assignee,
+                            text=ticket.get("title", ""),
+                            day=self._state.day,
+                            pathway="confluence_authorship",
+                        )
                     logger.info(
                         f"    [dim]📄 {assignee} completed [{ticket.get('id')}] → {completion_id}[/dim]"
                     )
@@ -869,7 +882,6 @@ class NormalDayHandler:
         )
         current_actor_time = artifact_time.isoformat()
 
-        ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
         backstory = persona_utils.get_voice_card(reviewer, "async", self._gd, self._mem)
         p = self._config.get("personas", {}).get(reviewer, {})
 
@@ -894,7 +906,7 @@ class NormalDayHandler:
         if prior_reviews:
             rounds = "\n".join(
                 f"  - {c['author']} ({c['date']}): [{c.get('verdict', '?')}] {c['text'][:120]}"
-                for c in prior_reviews[-6:]  # last 6 comments max
+                for c in prior_reviews[-6:]  
             )
             review_history = f"\n--- PRIOR REVIEW ROUNDS ---\n{rounds}\n\n"
 
@@ -959,6 +971,7 @@ class NormalDayHandler:
             description=(
                 f"You are {reviewer}. You are reviewing this PR by {author}: {pr_title}\n\n"
                 f"{review_history}"
+                + (f"RECURRENCE NOTE: {recurrence_hint}\n\n" if recurrence_hint else "")
                 + (
                     f"DOMAIN CONTEXT:{orphaned_domain_context}\n\n"
                     if orphaned_domain_context
@@ -971,41 +984,11 @@ class NormalDayHandler:
                 f"Write 1-3 sentences consistent with your verdict. If approved, acknowledge "
                 f"what looks good. If changes_requested, name the specific issue only.\n"
                 f"Your tone must reflect your current stress level (see your backstory).\n\n"
-                f"STEP 3 — AUTHOR KNOWLEDGE AUDIT (answer objectively, NOT in character):\n"
-                f"Your expertise as reviewer: [{reviewer_expertise_str}]\n"
-                f"Your department: {reviewer_dept}\n"
-                f"{author}'s expertise on record: [{expertise_str}]\n"
-                f"{author}'s department: {author_dept}\n"
-                f"Based on the PR content and your expertise, assess whether {author} "
-                f"demonstrates a knowledge gap in the domains this PR touches.\n"
-                f"- In 'topics_beyond_author_expertise', list any technical areas where "
-                f"{author}'s implementation, approach, or omissions suggest unfamiliarity.\n"
-                f"- In 'hedged_claims', list specific decisions or statements in the PR "
-                f"that appear incorrect, naive, or underconfident given the problem domain.\n"
-                f"- If {author} deferred or left incomplete any section you know should "
-                f"exist, list it in 'deferred_or_incomplete'.\n\n"
-                f"Use these criteria:\n"
-                f"  author_domain_fit:\n"
-                f"    'high'   — PR demonstrates fluency: correct abstractions, aware of edge cases, idiomatic\n"
-                f"    'medium' — PR is functional but shows shallow understanding or minor missteps\n"
-                f"    'low'    — PR shows clear unfamiliarity: wrong patterns, missing fundamentals, or over-reliance on guesswork\n\n"
-                f"  gap_classification:\n"
-                f"    'none'     — {author}'s expertise aligns with all domains touched by this PR\n"
-                f"    'possible' — PR touches 1-2 domains outside {author}'s expertise but implementation looks adequate\n"
-                f"    'likely'   — PR touches domains outside {author}'s expertise AND the implementation shows it\n\n"
                 f"Respond ONLY with valid JSON. No preamble, no markdown fences.\n"
                 f"{{\n"
                 f'  "comment": "your review comment here",\n'
-                f'  "verdict": "approved" or "changes_requested",\n'
-                f'  "metadata": {{\n'
-                f'    "author_domain_fit": "low | medium | high",\n'
-                f'    "confidence": "low | medium | high",\n'
-                f'    "gap_classification": "none | possible | likely",\n'
-                f'    "topics_beyond_author_expertise": ["string"],\n'
-                f'    "hedged_claims": ["string"],\n'
-                f'    "deferred_or_incomplete": ["string"]\n'
-                f"  }}\n"
-                f"}}"
+                f'  "verdict": "approved" or "changes_requested"\n'
+                f"}}\n"
             ),
             expected_output="Valid JSON only. No preamble, no markdown fences.",
             agent=agent,
@@ -1022,11 +1005,9 @@ class NormalDayHandler:
             verdict = parsed_review.get("verdict", "approved")
             if verdict not in ("approved", "changes_requested"):
                 verdict = "approved"
-            review_metadata = parsed_review.get("metadata", {})
         except (json.JSONDecodeError, AttributeError):
             review_text = raw_review
             verdict = "approved"
-            review_metadata = {}
 
         pr_comment = {
             "author": reviewer,
@@ -1059,6 +1040,13 @@ class NormalDayHandler:
                 f"    [green]✅ {pr.get('pr_id', pr_id)} merged — "
                 f"{linked_ticket_id} → Done[/green]"
             )
+            if self._lifecycle:
+                self._credit_domain_knowledge(
+                    actor=author,
+                    text=f"{pr_title} {review_text}",
+                    day=self._state.day,
+                    pathway="pr_authorship",
+                )
         else:
             pr["changes_requested"] = True
             if linked_ticket and linked_ticket.get("status") == "In Review":
@@ -1173,54 +1161,20 @@ class NormalDayHandler:
                 date_str=date_str,
                 state=self._state,
                 timestamp=current_actor_time,
+                author=reviewer,
             )
 
-        # Fire a structured gap event from reviewer audit metadata — distinct
-        # from the embedding scan above so the two signal sources are traceable
-        if review_metadata:
-            domain_fit = review_metadata.get("author_domain_fit", "high")
-            gap_class = review_metadata.get("gap_classification", "none")
-            beyond = review_metadata.get("topics_beyond_author_expertise", [])
-            hedged = review_metadata.get("hedged_claims", [])
-            deferred = review_metadata.get("deferred_or_incomplete", [])
-
-            gap_detected = (
-                domain_fit == "low"
-                or gap_class == "likely"
-                or (gap_class == "possible" and len(beyond) > 0)
+        if self._lifecycle:
+            pr_text = f"{pr_title} {review_text}"
+            self._lifecycle.scan_for_knowledge_gaps(
+                text=pr_text,
+                triggered_by=pr.get("pr_id", pr_id or ""),
+                day=self._state.day,
+                date_str=date_str,
+                state=self._state,
+                timestamp=current_actor_time,
+                author=author,  # Note: author of the PR, not the reviewer
             )
-
-            if gap_detected:
-                self._mem.log_event(
-                    SimEvent(
-                        type="knowledge_gap_detected",
-                        timestamp=current_actor_time,
-                        day=self._state.day,
-                        date=date_str,
-                        actors=[author],
-                        artifact_ids={"pr": pr.get("pr_id", pr_id or "")},
-                        facts={
-                            "detection_method": "reviewer_audit",
-                            "reviewer": reviewer,
-                            "author": author,
-                            "pr_title": pr_title,
-                            "author_domain_fit": domain_fit,
-                            "author_expertise": expertise_list,
-                            "reviewer_expertise": reviewer_expertise_list,
-                            "gap_classification": gap_class,
-                            "topics_beyond_author_expertise": beyond,
-                            "hedged_claims": hedged,
-                            "deferred_or_incomplete": deferred,
-                        },
-                        summary=(
-                            f"Knowledge gap detected via reviewer audit: "
-                            f"{author} (expertise: {expertise_str}) submitted PR '{pr_title}' "
-                            f"with fit={domain_fit}, gap={gap_class}. "
-                            f"Reviewed by {reviewer}."
-                        ),
-                        tags=["knowledge_gap", "pr_review", "reviewer_audit"],
-                    )
-                )
 
         logger.info(
             f"    [dim]🔍 {reviewer} reviewed {pr.get('pr_id', 'PR')} [{verdict}][/dim]"
@@ -1275,7 +1229,12 @@ class NormalDayHandler:
                     f"Prior root cause: {ancestor_root_cause[:120]}"
                 )
 
-        ctx = self._mem.context_for_prompt(pr_title, n=2, as_of_time=current_actor_time)
+        ctx = self._mem.context_for_pr_review(
+            pr_id=pr_id,
+            ticket_id=linked_ticket_id or "",
+            as_of_time=current_actor_time,
+            n=2,
+        )
         backstory = persona_utils.get_voice_card(reviewer, "async", self._gd, self._mem)
         p = self._config.get("personas", {}).get(reviewer, {})
 
@@ -1610,19 +1569,7 @@ class NormalDayHandler:
             ticket_id=ticket_id, as_of_time=meeting_time_iso
         )
 
-        relevant_experts = self._mem.find_confluence_experts(
-            topic=ticket_title,
-            score_threshold=0.75,
-            n=3,
-            as_of_time=meeting_time_iso,
-        )
-        doc_hint = (
-            "Note: the following internal documentation exists and may be "
-            "referenced naturally in this conversation:\n"
-            + "\n".join(f"  - '{e['title']}' day {e['day']})" for e in relevant_experts)
-            if relevant_experts
-            else ""
-        )
+        _, doc_hint = self._mem.domain_context_for_topic(ticket_title, as_hint=True)
 
         discussions = self._mem.design_discussions_for_ticket(
             ticket_id=ticket_id or "",
@@ -2147,7 +2094,6 @@ class NormalDayHandler:
         participants = event.actors
         tension = event.facts_hint.get("tension_level", "medium")
 
-        # Sync all participants to a shared start time
         chat_duration_mins = random.randint(5, 30)
         thread_start, _ = self._clock.sync_and_advance(
             participants, hours=chat_duration_mins / 60.0
@@ -2201,11 +2147,11 @@ class NormalDayHandler:
                 f"Situation: {event.rationale}\n"
                 f"Tension level: {tension}\n\n"
                 f"{tension_guidance}\n\n"
-                f"Participants (voice cards — each person's style, mood, and pet peeves):\n{voice_cards}\n\n"
+                f"Participants (voice cards: each person's style, mood, and pet peeves):\n{voice_cards}\n\n"
                 f"Context: {ctx}\n\n"
                 f"Turn order: {speaker_sequence}\n\n"
                 f"Rules:\n"
-                f"- Each message must sound distinctly like that person — use their typing quirks\n"
+                f"- Each message must sound distinctly like that person. Use their typing quirks\n"
                 f"- The conversation must have a natural arc: opening → escalation or negotiation → some resolution or stalemate\n"
                 f"- Each message 1-2 sentences\n"
                 f"- Do not add narration or stage directions\n\n"
@@ -2973,7 +2919,19 @@ class NormalDayHandler:
         # using daily_active_actors and persona expertise — do not pick randomly here.
         # daily_theme is passed so the topic agent can skew toward operational docs
         # on incident days and strategic docs on calm ones.
-        self._confluence.write_adhoc_page()
+        result = self._confluence.write_adhoc_page()
+
+        if isinstance(result, tuple) and len(result) >= 3:
+            conf_id, adhoc_author, adhoc_topic = result[0], result[1], result[2]
+        else:
+            return
+        if conf_id and adhoc_author and self._lifecycle:
+            self._credit_domain_knowledge(
+                actor=adhoc_author,
+                text=adhoc_topic,
+                day=self._state.day,
+                pathway="confluence_authorship",
+            )
 
     def _trigger_watercooler_chat(
         self, target_actor: str, date_str: str, penalty_hours: float
@@ -3214,6 +3172,7 @@ class NormalDayHandler:
                 date_str=date_str,
                 state=self._state,
                 timestamp=timestamp,
+                author=asker,
             )
 
             self._mem.log_event(
@@ -3893,42 +3852,24 @@ class NormalDayHandler:
         """
         Given a topic string and a seed participant list, return an augmented
         list that pulls in people whose persona expertise overlaps the topic.
-
-        Priority order:
-          1. Anyone in seed_participants stays.
-          2. Authors of semantically similar Confluence pages already in MongoDB
-             are injected as subject-matter experts.  This uses vector similarity
-             via Memory.find_confluence_experts() -- no new embed calls are made
-             for stored pages, only one embed call for the topic query string.
-             Causal ordering is enforced by the as_of_time cutoff so a page
-             being written right now cannot be referenced before it is saved.
-          3. Up to max_extras additional people whose persona expertise tags
-             appear in the topic string, weighted by social-graph proximity to
-             the seed so the conversation stays socially plausible.
-
-        People with zero expertise overlap are never added -- primary eval guard
-        against off-domain participants joining technical threads.
         """
         topic_lower = topic.lower()
         participants: List[str] = list(seed_participants)
 
-        # 1. Semantic expert injection via MongoDB vector search.
-        #    find_confluence_experts() reuses already-stored embeddings, so the
-        #    only new embed call is for the topic query string itself.
-        #    as_of_time enforces causal ordering at sub-day precision.
-        experts = self._mem.find_confluence_experts(
-            topic=topic,
-            score_threshold=0.75,
-            n=5,
-            as_of_time=as_of_time,
-        )
-        for e in experts:
-            author = e.get("author")
-            if author and author in self._all_names and author not in participants:
-                participants.append(author)
+        domain_docs, _ = self._mem.domain_context_for_topic(topic)
+        for rec in domain_docs:
+            primary = rec.get("primary_owner")
+            if primary and primary in self._all_names and primary not in participants:
+                participants.append(primary)
+            for name in rec.get("known_by", []):
+                if (
+                    name in self._all_names
+                    and name not in participants
+                    and len(participants) < len(seed_participants) + max_extras
+                ):
+                    participants.append(name)
 
-        # 2. Expertise-tag fallback for engineers with no Confluence history yet
-        #    (new hires, or topics that haven't been documented before).
+
         if len(participants) >= len(seed_participants) + max_extras:
             return participants
 
@@ -3984,6 +3925,146 @@ class NormalDayHandler:
             return random.randint(*default_range[:2])  # low end of range
         else:
             return random.randint(*default_range)  # full range
+
+    def _credit_domain_knowledge(
+        self,
+        actor: str,
+        text: str,
+        day: int,
+        pathway: str,  # "incident_resolution" | "pr_authorship" | "confluence_authorship"
+        ownership_coverage_threshold: float = 0.70,
+        pr_ownership_hit_threshold: int = 3,
+    ) -> None:
+        """
+        Award domain knowledge to `actor` based on demonstrated work in `text`.
+
+        For every domain_registry entry whose system_tags appear in `text`:
+
+          1. Add `actor` to `known_by` (always, all pathways).
+
+          2. Promote `actor` to `primary_owner` when:
+               - pathway == "confluence_authorship" and
+                 documentation_coverage >= ownership_coverage_threshold  (default 70%)
+               - pathway == "pr_authorship" and the actor has now touched this
+                 domain in >= pr_ownership_hit_threshold PRs  (default 3)
+               - pathway == "incident_resolution" and the domain is orphaned
+                 (primary_owner is None) — incident responders who step up for
+                 an orphaned system are the most natural owners.
+
+        """
+        if not self._lifecycle or not self._mem:
+            return
+
+        text_lower = text.lower()
+        all_domains = list(self._mem._db["domain_registry"].find({}))
+
+        for rec in all_domains:
+            tags = rec.get("system_tags", [])
+            if not any(tag in text_lower for tag in tags):
+                continue
+
+            domain_id = rec["_id"]
+            domain_name = rec["domain"]
+            current_owner = rec.get("primary_owner")
+            current_coverage = rec.get("documentation_coverage", 0.0)
+            known_by = rec.get("known_by", [])
+
+            # ── Always: add to known_by ───────────────────────────────────────
+            if actor not in known_by:
+                self._mem._db["domain_registry"].update_one(
+                    {"_id": domain_id},
+                    {"$addToSet": {"known_by": actor}},
+                )
+                logger.info(
+                    f"    [dim]→ Domain '{domain_name}': {actor} added to known_by "
+                    f"via {pathway}.[/dim]"
+                )
+
+            if current_owner is not None and current_owner != actor:
+                if pathway != "confluence_authorship":
+                    continue
+                continue
+
+            promote = False
+            promotion_reason = ""
+
+            if pathway == "incident_resolution":
+                if current_owner is None:
+                    promote = True
+                    promotion_reason = (
+                        f"resolved incident touching orphaned domain "
+                        f"(coverage={int(current_coverage * 100)}%)"
+                    )
+
+            elif pathway == "pr_authorship":
+                pr_touches = rec.get("pr_touches", {})
+                actor_touches = pr_touches.get(actor, 0) + 1
+
+                self._mem._db["domain_registry"].update_one(
+                    {"_id": domain_id},
+                    {"$set": {f"pr_touches.{actor}": actor_touches}},
+                )
+
+                if (
+                    current_owner is None
+                    and actor_touches >= pr_ownership_hit_threshold
+                ):
+                    promote = True
+                    promotion_reason = (
+                        f"authored {actor_touches} PRs touching this domain "
+                        f"(threshold={pr_ownership_hit_threshold})"
+                    )
+
+            elif pathway == "confluence_authorship":
+                if (
+                    current_owner is None
+                    and current_coverage >= ownership_coverage_threshold
+                ):
+                    promote = True
+                    promotion_reason = (
+                        f"documentation coverage reached "
+                        f"{int(current_coverage * 100)}% "
+                        f"(threshold={int(ownership_coverage_threshold * 100)}%)"
+                    )
+
+            if promote:
+                self._mem._db["domain_registry"].update_one(
+                    {"_id": domain_id},
+                    {
+                        "$set": {
+                            "primary_owner": actor,
+                            "last_updated_day": day,
+                        },
+                        "$addToSet": {"known_by": actor},
+                    },
+                )
+                logger.info(
+                    f"    [cyan]🏷 Domain '{domain_name}':[/cyan] "
+                    f"{actor} promoted to primary_owner — {promotion_reason}."
+                )
+
+                self._mem.log_event(
+                    SimEvent(
+                        type="domain_ownership_claimed",
+                        timestamp=self._clock.now(actor).isoformat(),
+                        day=day,
+                        date=str(self._state.current_date.date()),
+                        actors=[actor],
+                        artifact_ids={},
+                        facts={
+                            "domain": domain_name,
+                            "new_owner": actor,
+                            "pathway": pathway,
+                            "documentation_coverage": round(current_coverage, 3),
+                            "promotion_reason": promotion_reason,
+                        },
+                        summary=(
+                            f"{actor} became primary owner of '{domain_name}' "
+                            f"via {pathway.replace('_', ' ')}. {promotion_reason}."
+                        ),
+                        tags=["domain_registry", "knowledge_recovery", pathway],
+                    )
+                )
 
 
 def dept_of_name(name: str, org_chart: Dict[str, List[str]]) -> str:

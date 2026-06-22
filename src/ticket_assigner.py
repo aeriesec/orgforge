@@ -5,10 +5,11 @@ Deterministic ticket assignment for OrgForge.
 
   Graph-weighted assignment
       Scores every (engineer, ticket) pair using:
-        • skill match via embedding cosine similarity (ticket title ↔ engineer expertise)
-        • inverse stress  (burnt-out engineers get lighter loads)
-        • betweenness centrality penalty (key players shouldn't hoard tickets)
-        • recency bonus   (engineer already touched this ticket in a prior sprint)
+        - skill match via BM25 term overlap (ticket title tokens vs engineer
+          expertise tags from domain_registry)
+        - inverse stress  (burnt-out engineers get lighter loads)
+        - betweenness centrality penalty (key players shouldn't hoard tickets)
+        - recency bonus   (engineer already touched this ticket in a prior sprint)
       Uses scipy linear_sum_assignment (Hungarian algorithm) for globally
       optimal matching. Falls back to greedy round-robin if scipy is absent.
 
@@ -16,39 +17,30 @@ Deterministic ticket assignment for OrgForge.
       Pass 1 (this module): builds a fully valid SprintContext with locked
       assignments before any LLM call.
       Pass 2 (DepartmentPlanner): receives SprintContext and only writes
-      narrative — it cannot affect who owns what.
-
-The result is a SprintContext injected into every DepartmentPlanner prompt.
-The LLM sees only its legal menu; ownership conflicts become structurally
-impossible rather than validated-away after the fact.
+      narrative -- it cannot affect who owns what.
 
 Skill scoring
 -------------
-  Engineer expertise strings (joined from persona["expertise"]) and ticket
-  titles are both embedded at runtime using the same embedder already wired
-  into Memory.  Cosine similarity replaces the old hardcoded _SKILL_KEYWORDS
-  dict, so the scorer generalises to any domain or industry defined in
-  config.yaml without code changes.
-
-  Engineer vectors are computed once in __init__ and cached in memory.
-  Ticket title vectors are cached in a dedicated MongoDB collection
-  ("ticket_skill_embeddings") keyed by ticket_id, so each title is only
-  embedded once across the full simulation.
+  Engineer expertise tags (from domain_registry) are matched against
+  ticket title tokens via a normalized term overlap score. The overlap is
+  rescaled to [0.5, 1.5] -- the same range used by the old cosine path --
+  so the Hungarian matrix is numerically identical.
 
 Public API
 ----------
     assigner = TicketAssigner(config, graph_dynamics, mem)
     sprint_ctx = assigner.build(state, dept_members)
-    # → SprintContext with owned_tickets, available_tickets, capacity_by_member
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, List
-import json as _json
+import os
+import re
+from typing import Dict, List, Set
 
 import numpy as np
+import json as _json
 
 from graph_dynamics import GraphDynamics
 from memory import Memory
@@ -57,13 +49,57 @@ from planner_models import SprintContext
 logger = logging.getLogger("orgforge.ticket_assigner")
 
 
-def _cosine(a: List[float], b: List[float]) -> float:
-    """Safe cosine similarity — returns 0.0 if either vector is empty/zero."""
-    if not a or not b:
-        return 0.0
-    va, vb = np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)
-    denom = np.linalg.norm(va) * np.linalg.norm(vb)
-    return float(np.dot(va, vb) / denom) if denom > 1e-9 else 0.0
+_STOP_WORDS: Set[str] = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "in",
+    "of",
+    "to",
+    "for",
+    "with",
+    "on",
+    "at",
+    "by",
+    "up",
+    "is",
+    "are",
+    "was",
+    "be",
+    "as",
+    "from",
+    "into",
+    "that",
+    "this",
+    "it",
+    "its",
+    "our",
+    "we",
+    "i",
+    "my",
+    "their",
+    "not",
+    "no",
+    "new",
+    "add",
+    "fix",
+    "update",
+    "improve",
+    "support",
+    "using",
+    "via",
+}
+
+
+def _tokenize(text: str) -> Set[str]:
+    """
+    Lowercase, split on non-alphanumeric boundaries, strip stop words.
+    Returns a set of meaningful tokens.
+    """
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return {t for t in tokens if len(t) > 1 and t not in _STOP_WORDS}
 
 
 class TicketAssigner:
@@ -74,7 +110,7 @@ class TicketAssigner:
     ----------
     config         : the full OrgForge config dict
     graph_dynamics : live GraphDynamics instance (owns stress + betweenness)
-    mem            : shared Memory instance (embedder + MongoDB collections)
+    mem            : shared Memory instance (MongoDB collections)
     """
 
     def __init__(self, config: dict, graph_dynamics: GraphDynamics, mem: Memory):
@@ -83,23 +119,17 @@ class TicketAssigner:
         self._mem = mem
         self._base = config["simulation"].get("output_dir", "./export")
 
-        self._skill_embed_cache = mem._db["ticket_skill_embeddings"]
-        self._skill_embed_cache.create_index([("ticket_id", 1)], unique=True)
-
-        self._engineer_vectors: Dict[str, List[float]] = {}
-        self._precompute_engineer_vectors()
-
     def build(
         self, state, dept_members: List[str], dept_name: str = "", on_call: str = ""
     ) -> SprintContext:
         """
-        Main entry point.  Call once per department, before DepartmentPlanner.plan().
+        Main entry point. Call once per department, before DepartmentPlanner.plan().
 
         Returns a SprintContext with:
-          • owned_tickets      — final {ticket_id: engineer} mapping
-          • available_tickets  — unowned ticket IDs (for the LLM to reference)
-          • in_progress_ids    — tickets already "In Progress"
-          • capacity_by_member — {name: available_hrs} for every dept member
+          - owned_tickets      -- final {ticket_id: engineer} mapping
+          - available_tickets  -- unowned ticket IDs (for the LLM to reference)
+          - in_progress_ids    -- tickets already "In Progress"
+          - capacity_by_member -- {name: available_hrs} for every dept member
         """
         capacity = self._compute_capacity(dept_members, state, on_call=on_call)
 
@@ -129,6 +159,7 @@ class TicketAssigner:
                     ticket["assignee"] = owner
                     if self._base:
                         path = f"{self._base}/jira/{ticket['id']}.json"
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
                         with open(path, "w") as f:
                             _json.dump(ticket, f, indent=2)
                     self._mem.upsert_ticket(ticket)
@@ -205,8 +236,8 @@ class TicketAssigner:
         """
         Globally optimal assignment via scipy's Hungarian algorithm.
 
-        Cost matrix  [engineers × tickets]
-        Each cell = -(skill_score × stress_score × centrality_factor)
+        Cost matrix  [engineers x tickets]
+        Each cell = -(skill_score x stress_score x centrality_factor x recency)
         Negative because linear_sum_assignment minimises cost.
         """
         from scipy.optimize import linear_sum_assignment
@@ -217,6 +248,7 @@ class TicketAssigner:
         n_eng = len(members)
         n_tkt = len(tickets)
         cost = np.zeros((n_eng, n_tkt))
+
         assignment_scores = []
         for i, eng in enumerate(members):
             stress = self._gd._stress.get(eng, 30)
@@ -234,12 +266,12 @@ class TicketAssigner:
                     {
                         "day": state.day,
                         "engineer": eng,
-                        "ticket_id": tickets[j]["id"],
-                        "skill_score": self._skill_score(eng, tickets[j]),
-                        "stress_score": 1.0 - (self._gd._stress.get(eng, 30) / 100),
-                        "centrality_factor": 1.0 - (centrality.get(eng, 0.0) * 0.3),
-                        "composite_score": -cost[i][j],
-                        "was_assigned": False,  # update after linear_sum_assignment
+                        "ticket_id": ticket["id"],
+                        "skill_score": skill,
+                        "stress_score": stress_score,
+                        "centrality_factor": cent_factor,
+                        "composite_score": score,
+                        "was_assigned": False,
                     }
                 )
 
@@ -260,7 +292,10 @@ class TicketAssigner:
             else:
                 logger.debug(f"[assigner] {eng} over capacity, skipping {tkt['id']}")
 
-        self._mem._db["assignment_scores"].insert_many(assignment_scores)
+        try:
+            self._mem._db["assignment_scores"].insert_many(assignment_scores)
+        except Exception as exc:
+            logger.warning(f"[assigner] assignment_scores insert failed: {exc}")
 
         return result
 
@@ -290,184 +325,39 @@ class TicketAssigner:
         return result
 
     def _skill_score(self, engineer: str, ticket: dict) -> float:
-        """
-        Returns a [0.5, 1.5] score representing how well the engineer's
-        expertise matches the ticket title.
-
-        Method
-        ------
-        1. Engineer expertise is embedded once at init (or lazily on first use
-           for mid-sim hires) and stored in self._engineer_vectors.
-        2. Ticket title is embedded on first encounter and cached in MongoDB
-           ("ticket_skill_embeddings"), so re-scoring the same ticket in a
-           later sprint costs zero embed calls.
-        3. Cosine similarity ∈ [-1, 1] is linearly rescaled to [0.5, 1.5]
-           so it's a drop-in replacement for the old keyword ratio.
-
-        Neutral / empty-expertise engineers default to 1.0 (no preference).
-        """
-        eng_vec = self._expertise_vector(engineer)
-        if not eng_vec:
+        title_tokens = _tokenize(f"{ticket.get('title', '')} {ticket.get('description', '')}")
+        if not title_tokens:
             return 1.0
 
-        tkt_vec = self._ticket_title_vector(ticket)
-        if not tkt_vec:
+        engineer_tokens = self._mem.get_author_domain_tokens(engineer)
+        if not engineer_tokens:
             return 1.0
 
-        similarity = _cosine(eng_vec, tkt_vec)
-
-        return 0.5 + (similarity + 1.0) / 2.0
-
-    def _precompute_engineer_vectors(self) -> None:
-        """
-        Embed every known persona's expertise at startup.
-        Called once in __init__; new-hire personas picked up lazily via
-        _expertise_vector() during the sim.
-        """
-        from config_loader import PERSONAS
-
-        for name in PERSONAS:
-            doc = self._mem._artifacts.find_one(
-                {"_id": name, "type": "persona_skills"}, {"_id": 0, "embedding": 1}
-            )
-            if doc and doc.get("embedding"):
-                self._engineer_vectors[name] = doc["embedding"]
-
-    def _expertise_vector(self, engineer: str) -> List[float]:
-        """
-        Return (and lazily cache) the expertise embedding for an engineer.
-        Handles mid-sim hires whose persona wasn't present at __init__ time.
-        """
-        if engineer not in self._engineer_vectors:
-            from config_loader import PERSONAS, DEFAULT_PERSONA
-
-            persona = PERSONAS.get(engineer, DEFAULT_PERSONA)
-            self._engineer_vectors[engineer] = self._build_expertise_vector(
-                engineer, persona
-            )
-        return self._engineer_vectors[engineer]
-
-    def _build_expertise_vector(self, name: str, persona: dict) -> List[float]:
-        """
-        Produce a single embedding for an engineer by joining their expertise
-        list and style into a short descriptive string.
-
-        Example input  → "backend infra distributed-systems | methodical architect"
-        This gives the embedder enough semantic context to differentiate
-        a backend specialist from a mobile or design engineer.
-        """
-        expertise: List[str] = [e.lower() for e in persona.get("expertise", [])]
-        style: str = persona.get("style", "").lower()
-
-        if not expertise and not style:
-            return []
-
-        text_parts = []
-        if expertise:
-            text_parts.append(" ".join(expertise))
-        if style:
-            text_parts.append(style)
-
-        text = " | ".join(text_parts)
-        try:
-            return self._mem._embed(
-                text,
-                input_type="search_document",
-                caller="ticket_assigner.expertise",
-                doc_id=name,
-                doc_type="engineer_expertise",
-            )
-        except Exception as exc:
-            logger.warning(f"[assigner] expertise embed failed for {name}: {exc}")
-            return []
-
-    def _ticket_title_vector(self, ticket: dict) -> List[float]:
-        """
-        Return the embedding for a ticket title, using MongoDB as a
-        write-through cache to avoid re-embedding across sprints.
-
-        Cache document schema:
-          { ticket_id: str, title: str, embedding: List[float] }
-        """
-        ticket_id: str = ticket.get("id", "")
-        title: str = ticket.get("title", "").strip()
-
-        if not title:
-            return []
-
-        cached = self._skill_embed_cache.find_one(
-            {"ticket_id": ticket_id}, {"embedding": 1, "_id": 0}
-        )
-        if cached and cached.get("embedding"):
-            return cached["embedding"]
-
-        try:
-            vector = self._mem._embed(
-                title,
-                input_type="search_query",
-                caller="ticket_assigner.ticket_title",
-                doc_id=ticket_id,
-                doc_type="ticket_title",
-            )
-        except Exception as exc:
-            logger.warning(
-                f"[assigner] ticket title embed failed for {ticket_id!r}: {exc}"
-            )
-            return []
-
-        if vector:
-            try:
-                self._skill_embed_cache.update_one(
-                    {"ticket_id": ticket_id},
-                    {
-                        "$set": {
-                            "ticket_id": ticket_id,
-                            "title": title,
-                            "embedding": vector,
-                        }
-                    },
-                    upsert=True,
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"[assigner] ticket embed cache write failed for {ticket_id!r}: {exc}"
-                )
-
-        return vector
+        overlap_count = len(engineer_tokens & title_tokens)
+        raw_overlap = min(1.0, overlap_count / len(title_tokens))
+        return 0.5 + raw_overlap
 
     def evict_engineer(self, name: str) -> None:
         """
-        Remove a departed engineer's vector from the cache so they no longer
-        influence cost matrix scoring in _hungarian_assign.
         Called by OrgLifecycleManager after _execute_departure completes.
+        No-op in the BM25 pipeline since there are no cached vectors to evict.
+        Retained for interface compatibility with OrgLifecycleManager.
         """
-        self._engineer_vectors.pop(name, None)
-        logger.debug(f"[assigner] Evicted vector for departed engineer: {name}")
+        logger.debug(f"[assigner] Eviction noted for departed engineer: {name}")
 
     def register_hire(self, name: str) -> None:
         """
-        Pre-warm the expertise vector for a new hire so their first sprint
-        assignment scores correctly rather than defaulting to the neutral 1.0.
         Called by OrgLifecycleManager after _execute_hire completes.
-        The persona must already be written to PERSONAS before this is called.
+        No pre-warming needed -- expertise comes from the live persona config
+        which is already populated before this is called.
+        Retained for interface compatibility with OrgLifecycleManager.
         """
-        vec = self._expertise_vector(name)
-        if vec:
-            logger.debug(
-                f"[assigner] Pre-warmed expertise vector for new hire: {name} "
-                f"({len(vec)}-dim)"
-            )
-        else:
-            logger.debug(
-                f"[assigner] No expertise vector for new hire {name} "
-                f"(empty expertise — will score neutral)"
-            )
+        logger.debug(f"[assigner] New hire registered: {name} (no pre-warm needed)")
 
     def _ticket_history(self, state) -> Dict[str, set]:
         """
         Returns {engineer: {ticket_ids they've touched in prior days}}.
-        Derived from ticket_actors_today which flow.py accumulates over the sim.
-        Also checks jira_tickets assignee history for continuity.
+        Derived from jira_tickets assignee history for continuity across sprints.
         """
         history: Dict[str, set] = {}
         for ticket in self._mem._jira.find(

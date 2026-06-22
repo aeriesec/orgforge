@@ -744,7 +744,6 @@ class DatadogWriter:
             resolve_ts = inc.get("resolve_ts")
 
             alert = {
-                # Datadog Events API schema fields
                 "id": iid,
                 "title": f"[P1] {monitor_name}",
                 "text": (

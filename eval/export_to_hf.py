@@ -11,8 +11,8 @@ Output layout
 -------------
 export/hf_dataset/
   corpus/
-    corpus-00000.parquet    — flat document corpus (one row per artifact)
-  README.md                 — HuggingFace dataset card
+    corpus-00000.parquet    - flat document corpus (one row per artifact)
+  README.md                 - HuggingFace dataset card
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import textwrap
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 import email as email_lib
 from email.header import decode_header
 import shutil
@@ -85,7 +85,7 @@ try:
 except ImportError:
     _PARQUET_AVAILABLE = False
     logger.warning(
-        "pandas/pyarrow not installed — Parquet output disabled. "
+        "pandas/pyarrow not installed - Parquet output disabled. "
         "pip install pandas pyarrow"
     )
 
@@ -109,10 +109,6 @@ def _dept_from_artifact_id(artifact_id: str) -> str:
         "HR": "HR_Ops",
         "RETRO": "",
     }.get(code, "")
-
-
-import email as email_lib
-from email.header import decode_header
 
 
 def _parse_eml(eml_path: Path) -> dict:
@@ -165,7 +161,6 @@ def _load_confluence_from_disk() -> List[dict]:
             text = p.read_text(encoding="utf-8", errors="replace")
             lines = text.splitlines()
 
-            # Parse header fields
             doc_id = p.stem
             title = ""
             author = ""
@@ -201,7 +196,7 @@ def _load_confluence_from_disk() -> List[dict]:
                 }
             )
         except Exception as exc:
-            logger.warning(f"  confluence disk read failed: {p} — {exc}")
+            logger.warning(f"  confluence disk read failed: {p} - {exc}")
 
     logger.info(f"  confluence disk fallback: {len(rows)} pages loaded")
     return rows
@@ -235,7 +230,7 @@ def _load_slack_from_disk() -> List[dict]:
                 if text:
                     bucket["texts"].append(f"{user}: {text}" if user else text)
         except Exception as exc:
-            logger.warning(f"  slack disk read failed: {p} — {exc}")
+            logger.warning(f"  slack disk read failed: {p} - {exc}")
 
     rows = []
     for tid, bucket in buckets.items():
@@ -343,7 +338,7 @@ class CorpusBuilder:
 
         # Deduplication strategy:
         #   - For artifact doc_ids (jira, confluence, slack, etc.): keep the row
-        #     with the longest body — the MongoDB-enriched version wins over the
+        #     with the longest body - the MongoDB-enriched version wins over the
         #     thin SimEvent version.
         #   - Internal event rows (EVT-* doc_ids) are unique by construction and
         #     never conflict with artifact rows, so they pass through intact.
@@ -626,7 +621,7 @@ class CorpusBuilder:
                     "category": "artifact",
                     "title": str(
                         facts.get("account_name", opp_id)
-                        + " — "
+                        + " - "
                         + facts.get("stage", "")
                     )[:512],
                     "body": self._sf_opp_body(facts),
@@ -649,7 +644,7 @@ class CorpusBuilder:
                 }
             )
 
-        # ── Internal event row — ALWAYS emitted, even when artifact rows exist ─
+        # ── Internal event row - ALWAYS emitted, even when artifact rows exist ─
         # Preserves the full ground-truth facts (stress snapshots, similarity
         # scores, coverage percentages, departure edge snapshots, etc.) as a
         # separately retrievable document. Filter by category == "sim_event"
@@ -776,7 +771,7 @@ class CorpusBuilder:
         accounts_lapsed = facts.get("accounts_lapsed", [])
         if acc_id in accounts_lapsed:
             parts.append(f"account_id: {acc_id}")
-            parts.append("status: ownership lapsed — pending reassignment")
+            parts.append("status: ownership lapsed - pending reassignment")
         opps_lapsed = facts.get("opportunities_lapsed", [])
         if opps_lapsed:
             parts.append(
@@ -812,7 +807,7 @@ class CorpusBuilder:
                     {
                         "doc_id": plan_id,
                         "doc_type": "dept_plan",
-                        "title": f"{dept} plan — Day {day}",
+                        "title": f"{dept} plan - Day {day}",
                         "body": body,
                         "day": day,
                         "date": plan["date"],
@@ -835,7 +830,7 @@ class CorpusBuilder:
                 {
                     "doc_id": f"{plan_id}-reasoning",
                     "doc_type": "dept_plan_reasoning",
-                    "title": f"{dept} planner reasoning — Day {day}",
+                    "title": f"{dept} planner reasoning - Day {day}",
                     "body": reasoning,
                     "day": day,
                     "date": plan["date"],
@@ -1133,7 +1128,7 @@ class CorpusBuilder:
                     f"primary_contact: {doc.get('primary_contact', '')}",
                 ]
                 if doc.get("risk_flag"):
-                    parts.append("risk_flag: true — ownership lapsed or at-risk")
+                    parts.append("risk_flag: true - ownership lapsed or at-risk")
                 return "\n".join(p for p in parts if p)
 
             jira_rich, jira_meta = self._build_rich_and_meta(
@@ -1383,7 +1378,7 @@ class CorpusBuilder:
                 )
                 existing_ids.add(aid)
 
-            # slack_messages — bucket by thread_id
+            # slack_messages - bucket by thread_id
             thread_buckets: Dict[str, dict] = {}
             for msg in self._mem._db["slack_messages"].find({}, {"embedding": 0}):
                 tid = msg.get("thread_id", "")
@@ -1441,7 +1436,7 @@ def _compute_corpus_stats(corpus: List[dict], cfg: dict, mem=None) -> dict:
     """
     Derives everything the dataset card needs from the corpus + config.
 
-    mem is optional — if provided, the raw SimEvent count is read from MongoDB
+    mem is optional - if provided, the raw SimEvent count is read from MongoDB
     so the card shows total events alongside deduplicated corpus documents.
     """
     sim_cfg = cfg.get("simulation", {})
@@ -1478,7 +1473,7 @@ def _compute_corpus_stats(corpus: List[dict], cfg: dict, mem=None) -> dict:
     # Most SimEvents are internal state-machine events (day_summary,
     # knowledge_gap_detected, proposed_event_rejected, etc.) that do not
     # map 1:1 to a corpus artifact. The corpus is the deduplicated set of
-    # *artifacts* those events produced — which is why corpus doc count
+    # *artifacts* those events produced - which is why corpus doc count
     # will always be much smaller than the raw event count.
     sim_events_total = None
     sim_days_actual = None
@@ -1580,7 +1575,7 @@ class DatasetCardWriter:
     """
     Produces the HuggingFace README.md dataset card.
 
-    Tells the story of the corpus first — what it is, why the ground truth
+    Tells the story of the corpus first - what it is, why the ground truth
     is trustworthy, and what makes this dataset structurally different from
     other synthetic benchmarks. Artifact counts and schema follow.
     """
@@ -1662,6 +1657,10 @@ class DatasetCardWriter:
             "  data_files:\n"
             "  - split: train\n"
             '    path: "corpus/*.parquet"\n'
+            "- config_name: questions\n"
+            "  data_files:\n"
+            "  - split: test\n"
+            '    path: "questions/*.jsonl"\n'
             "task_categories:\n"
             "- question-answering\n"
             "- text-retrieval\n"
@@ -1688,7 +1687,8 @@ class DatasetCardWriter:
             "- temporal-reasoning\n"
             "- knowledge-graphs\n"
             "- agentic-eval\n"
-            f'pretty_name: "OrgForge — {company} Enterprise Corpus"\n'
+            "- benchmark\n"
+            'pretty_name: "OrgForge EpistemicBench"\n'
             "size_categories:\n"
             "- 1K<n<10K\n"
             "---"
@@ -1697,15 +1697,15 @@ class DatasetCardWriter:
         sections = []
 
         # ── Title + pitch ──────────────────────────────────────────────────────
-        sections.append(f"# OrgForge — {company} Enterprise Corpus")
+        sections.append("# OrgForge EpistemicBench")
         sections.append("")
         sections.append("![OrgForge corpus overview](orgforge_dataset_hero.png)")
         sections.append("")
         sections.append(
             "OrgForge generates synthetic but causally grounded enterprise corpora from a\n"
-            "deterministic simulation engine. Every artifact in this dataset — Jira tickets,\n"
+            "deterministic simulation engine. Every artifact in this dataset, Jira tickets,\n"
             "Slack threads, Confluence pages, customer emails, Zendesk tickets, invoices, Zoom\n"
-            "transcripts, Datadog alerts — traces back to a single event log. No LLM invented\n"
+            "transcripts, Datadog alerts, traces back to a single event log. No LLM invented\n"
             "any facts. The state machine controls what happened; LLMs only wrote the prose."
         )
         sections.append("")
@@ -1726,7 +1726,7 @@ class DatasetCardWriter:
         sections.append(
             f"This dataset is the output of a **{num_days}-day simulation** of **{company}**, a\n"
             f"{industry} company which {company_description} with ~{org_size} employees. It is not a random walk through\n"
-            "enterprise activity — it was seeded with specific organizational crises and simulated\n"
+            "enterprise activity - it was seeded with specific organizational crises and simulated\n"
             "through to their resolution."
         )
         sections.append("")
@@ -1738,7 +1738,7 @@ class DatasetCardWriter:
             "**Causal grounding.** Every artifact is downstream of a SimEvent. A Jira ticket,\n"
             "the Slack thread that opened alongside it, the Confluence postmortem written the\n"
             "next day, and the Zendesk tickets that escalated from the same incident all share\n"
-            "a causal ancestor. Cross-referencing between artifact types is not coincidental —\n"
+            "a causal ancestor. Cross-referencing between artifact types is not coincidental -\n"
             "it reflects the actual information flow the simulation produced."
         )
         sections.append("")
@@ -1754,9 +1754,9 @@ class DatasetCardWriter:
         sections.append(
             "**Verifiable ground truth.** The simulation snapshot and domain registry ship\n"
             "alongside the corpus as structured reference files (see Supplemental Files). For\n"
-            "any question the corpus can raise — who owned this domain when this incident fired,\n"
+            "any question the corpus can raise, who owned this domain when this incident fired,\n"
             "which customer was affected, what was the system health on the day this postmortem\n"
-            "was written — the answer exists as a queryable record independent of the text. You\n"
+            "was written, the answer exists as a queryable record independent of the text. You\n"
             "do not need to parse the corpus to build your eval set."
         )
         sections.append("")
@@ -1773,7 +1773,7 @@ class DatasetCardWriter:
             "**State-driven external communication.** Customer emails, vendor alerts, and\n"
             "Zendesk tickets are generated from actual simulation conditions, not randomly\n"
             "sampled. Each external contact has a `depends_on_components` list mapped to the\n"
-            "tech stack — an outage to a component a customer depends on is what triggers their\n"
+            "tech stack, an outage to a component a customer depends on is what triggers their\n"
             "email. Approximately 15% of customer emails are deliberately dropped with no action,\n"
             "leaving ground-truth absences in the event log that an agent must detect through\n"
             "negative evidence rather than positive retrieval."
@@ -1792,17 +1792,17 @@ class DatasetCardWriter:
         sections.append("## Use cases")
         sections.append("")
         sections.append(
-            "- **Agentic reasoning** — tasks that require traversing causal chains across\n"
+            "- **Agentic reasoning** - tasks that require traversing causal chains across\n"
             "  artifact types, time, and org boundaries rather than finding a single relevant\n"
             "  document\n"
-            "- **Multi-hop question answering** — questions whose correct answer requires\n"
+            "- **Multi-hop question answering** - questions whose correct answer requires\n"
             "  joining facts from Jira, Confluence, Slack, CRM, and the simulation ground truth\n"
-            "- **Temporal reasoning** — questions where the correct answer depends on what day\n"
+            "- **Temporal reasoning** - questions where the correct answer depends on what day\n"
             "  they are asked relative to the simulation timeline\n"
-            "- **RAG pipeline evaluation** — a corpus with known causal structure allows\n"
+            "- **RAG pipeline evaluation** - a corpus with known causal structure allows\n"
             "  precise measurement of what a retrieval system found versus what it needed to\n"
             "  find to answer correctly\n"
-            "- **Org dynamics and knowledge loss research** — the simulation snapshot exposes\n"
+            "- **Org dynamics and knowledge loss research** - the simulation snapshot exposes\n"
             "  how knowledge concentration, engineer departure, and incident causation interact\n"
             "  over time in a controlled, reproducible setting"
         )
@@ -1814,8 +1814,8 @@ class DatasetCardWriter:
         sections.append(
             "This is not a dataset of real corporate communications. The company, employees,\n"
             "customers, and vendors are entirely fictional. The simulation models organizational\n"
-            "behavior at the structural level — stress, knowledge concentration, incident\n"
-            "causation, relationship graph dynamics — but does not model everything. Affect,\n"
+            "behavior at the structural level - stress, knowledge concentration, incident\n"
+            "causation, relationship graph dynamics - but does not model everything. Affect,\n"
             "politics, ambiguity, and the texture of real human communication are present only\n"
             "to the extent that the persona and mood system introduces them through LLM-generated\n"
             "prose. Researchers should treat this as a controlled benchmark environment, not a\n"
@@ -1831,7 +1831,7 @@ class DatasetCardWriter:
         sections.append(
             "These gaps pre-date the simulation. They are the structural cause of the\n"
             "organizational narrative in this corpus. Each departed employee's domains entered\n"
-            "Day 1 as orphaned — undocumented, unowned, and detectable only through semantic\n"
+            "Day 1 as orphaned - undocumented, unowned, and detectable only through semantic\n"
             "similarity when new incidents touch the same systems."
         )
         sections.append("")
@@ -1909,7 +1909,7 @@ class DatasetCardWriter:
         )
         sections.append("")
         sections.append(
-            "**`simulation_snapshot.json`** — Full org state at simulation end: incidents with\n"
+            "**`simulation_snapshot.json`** - Full org state at simulation end: incidents with\n"
             "open/resolve timestamps, morale curve, daily system health scores, relationship\n"
             "graph edge weights, departed employees, new hires, and knowledge gap events. This\n"
             "is the oracle for eval construction. Use it to build questions with verifiable\n"
@@ -1917,7 +1917,7 @@ class DatasetCardWriter:
         )
         sections.append("")
         sections.append(
-            "**`assignment_scores.parquet`** — Per-sprint ticket assignment decisions with full\n"
+            "**`assignment_scores.parquet`** - Per-sprint ticket assignment decisions with full\n"
             "scoring breakdown: skill match (embedding cosine similarity), inverse stress, \n"
             "betweenness centrality penalty, recency bonus, and composite score. One row per\n"
             "(engineer, ticket, day) triple. Useful for eval questions about whether assignments\n"
@@ -1925,21 +1925,21 @@ class DatasetCardWriter:
         )
         sections.append("")
         sections.append(
-            "**`domain_registry.json`** — Snapshot of all knowledge domains: owner history,\n"
+            "**`domain_registry.json`** - Snapshot of all knowledge domains: owner history,\n"
             "documentation coverage scores at each sim day, orphan status, and which incidents\n"
             "triggered semantic similarity matches against each domain. Joinable to corpus rows\n"
             "via the Confluence `doc_id` values that cover each domain."
         )
         sections.append("")
         sections.append(
-            "**`sim_config.json`** — Reference record for the org configuration: full customer\n"
+            "**`sim_config.json`** - Reference record for the org configuration: full customer\n"
             "and vendor profiles (including `depends_on_components`, `sentiment_baseline`,\n"
             "`trigger_on` conditions, and `persona_archetype`), tech stack, and org structure.\n"
             "Useful for understanding why specific external communications were generated."
         )
         sections.append("")
         sections.append(
-            "**`datadog_metrics.parquet`** — Time-series telemetry at 15-minute intervals\n"
+            "**`datadog_metrics.parquet`** - Time-series telemetry at 15-minute intervals\n"
             "across the simulation. Schema: `timestamp`, `metric_name`, `value`, `day`,\n"
             "`alert_firing` (bool). Kept separate from the corpus because individual metric\n"
             "ticks are not retrievable text documents. Datadog *alerts* are in the main corpus\n"
@@ -2016,11 +2016,15 @@ class DatasetCardWriter:
         # ── Citation + license ─────────────────────────────────────────────────
         sections.append("## Citation")
         sections.append("")
-        sections.append("If you use the OrgForge methodology or simulator, cite the paper:")
+        sections.append(
+            "If you use the OrgForge methodology or simulator, cite the paper:"
+        )
         sections.append("")
         sections.append("```bibtex")
         sections.append("@misc{flynt2026orgforge,")
-        sections.append("  title     = {OrgForge: A Multi-Agent Simulation Framework for Verifiable Synthetic Corporate Corpora},")
+        sections.append(
+            "  title     = {OrgForge: A Multi-Agent Simulation Framework for Verifiable Synthetic Corporate Corpora},"
+        )
         sections.append("  author    = {Jeffrey Flynt},")
         sections.append("  year      = {2026},")
         sections.append("  url       = {https://arxiv.org/abs/2603.14997},")
@@ -2032,10 +2036,12 @@ class DatasetCardWriter:
         sections.append("")
         sections.append("```bibtex")
         sections.append("@misc{flynt2026orgforgedata,")
-        sections.append(f"  title     = {{OrgForge — {company} Enterprise Corpus}},")
+        sections.append("  title     = {OrgForge EpistemicBench},")
         sections.append("  author    = {Jeffrey Flynt},")
         sections.append("  year      = {2026},")
-        sections.append("  url       = {https://huggingface.co/datasets/aeriesec/orgforge},")
+        sections.append(
+            "  url       = {https://huggingface.co/datasets/aeriesec/orgforge},"
+        )
         sections.append("  note      = {Dataset generated by the OrgForge simulator}")
         sections.append("}")
         sections.append("```")
@@ -2096,7 +2102,7 @@ class DatasetCardWriter:
         | Column | Type | Description |
         |---|---|---|
         | `doc_id` | str | Unique artifact ID (e.g. `IT-042`, `CONF-ENG-007`, `PR-031`) |
-        | `doc_type` | str | Artifact: {artifact_types} — SimEvent: {sim_event_types} |
+        | `doc_type` | str | Artifact: {artifact_types} - SimEvent: {sim_event_types} |
         | `category` | str | `artifact` \\| `sim_event` \\| `sim_config` |
         | `title` | str | Human-readable title or subject line |
         | `body` | str | Full text content |
@@ -2123,7 +2129,7 @@ def _write_parquet(rows: List[dict], out_dir: Path, stem: str = "corpus-00000") 
         with open(out_path, "w") as f:
             json.dump(rows, f, indent=2, default=str)
         logger.info(
-            f"  → {out_path} (JSON fallback — install pandas+pyarrow for Parquet)"
+            f"  → {out_path} (JSON fallback - install pandas+pyarrow for Parquet)"
         )
         return
 
@@ -2160,8 +2166,19 @@ class HFExporter:
             logger.info("  → orgforge_dataset_hero.png")
         else:
             logger.warning(
-                "  orgforge_dataset_hero.png not found next to script — skipping"
+                "  orgforge_dataset_hero.png not found next to script - skipping"
             )
+
+    def _write_questions(self, out_dir: Path) -> None:
+        questions_dir = out_dir / "questions"
+        questions_dir.mkdir(parents=True, exist_ok=True)
+
+        src = BASE / "eval" / "eval_questions.jsonl"
+        if src.exists():
+            shutil.copy2(src, questions_dir / "eval_questions.jsonl")
+            logger.info("  → questions/eval_questions.jsonl")
+        else:
+            logger.warning("  eval_questions.jsonl not found next to script - skipping")
 
     def _write_supplemental(self, mem, out_dir: Path) -> None:
         supp_dir = out_dir / "supplemental"
@@ -2170,9 +2187,9 @@ class HFExporter:
         snap_src = BASE / "simulation_snapshot.json"
         if snap_src.exists():
             shutil.copy2(snap_src, supp_dir / "simulation_snapshot.json")
-            logger.info(f"  → supplemental/simulation_snapshot.json")
+            logger.info("  → supplemental/simulation_snapshot.json")
         else:
-            logger.warning("  simulation_snapshot.json not found — skipping")
+            logger.warning("  simulation_snapshot.json not found - skipping")
 
         if mem is not None:
             try:
@@ -2199,7 +2216,7 @@ class HFExporter:
                 )
         elif dd_metrics.exists():
             shutil.copy2(dd_metrics, supp_dir / "datadog_metrics.jsonl")
-            logger.info(f"  → supplemental/datadog_metrics.jsonl (parquet unavailable)")
+            logger.info("  → supplemental/datadog_metrics.jsonl (parquet unavailable)")
 
         try:
             scores = list(
@@ -2223,7 +2240,7 @@ class HFExporter:
                 (supp_dir / "sim_config.json").write_text(
                     json.dumps(sim_config_out, indent=2, default=str)
                 )
-                logger.info(f"  → supplemental/sim_config.json")
+                logger.info("  → supplemental/sim_config.json")
         except Exception as exc:
             logger.warning(f"  sim_config export failed: {exc}")
 
@@ -2247,7 +2264,7 @@ class HFExporter:
         )
         corpus = corpus_builder.build()
         if not corpus:
-            logger.warning("  Empty corpus — check that flow.py has run first.")
+            logger.warning("  Empty corpus - check that flow.py has run first.")
             return
 
         counts = corpus_builder.artifact_counts(corpus)
@@ -2260,6 +2277,8 @@ class HFExporter:
         self._write_supplemental(mem, HF_DIR)
 
         self._write_hero_image(HF_DIR)
+
+        self._write_questions(HF_DIR)
 
         DatasetCardWriter().write(
             out_path=HF_DIR / "README.md",

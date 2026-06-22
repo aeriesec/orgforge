@@ -40,9 +40,11 @@ from plan_validator import PlanValidator
 from ticket_assigner import TicketAssigner
 from external_email_ingest import ExternalEmailSignal
 from config_loader import (
+    DEFAULT_PERSONA,
     LEADS,
     LIVE_ORG_CHART,
     COMPANY_DESCRIPTION,
+    PERSONAS,
     resolve_role,
 )
 from utils.persona_utils import persona_utils
@@ -367,7 +369,7 @@ class DepartmentPlanner:
 
         raw = str(Crew(agents=[agent], tasks=[task], verbose=False).kickoff()).strip()
         result, raw_data = self._parse_plan(
-            raw, org_theme, day, date, cross_signals, sprint_context
+            raw, org_theme, day, date, cross_signals, sprint_context, graph_dynamics
         )
 
         mem.log_dept_plan(
@@ -412,6 +414,7 @@ class DepartmentPlanner:
         date: str,
         cross_signals: List[CrossDeptSignal],
         sprint_context: Optional[SprintContext] = None,
+        graph_dynamics: Optional[GraphDynamics] = None,
     ) -> Tuple[DepartmentDayPlan, dict]:
         """
         Parse the LLM JSON response into a DepartmentDayPlan.
@@ -492,12 +495,19 @@ class DepartmentPlanner:
                     )
                 ]
 
+            p = PERSONAS.get(name, DEFAULT_PERSONA)
+            current_stress = (
+                graph_dynamics._stress.get(name, p.get("stress", 50))
+                if graph_dynamics
+                else p.get("stress", 50)
+            )
+
             eng_plans.append(
                 EngineerDayPlan(
                     name=name,
                     dept=self.dept,
                     agenda=agenda,
-                    stress_level=0,
+                    stress_level=current_stress,
                     focus_note=ep.get("focus_note", ""),
                 )
             )
@@ -825,10 +835,12 @@ class OrgCoordinator:
         other_plans_str = ""
         for dept, plan in dept_plans.items():
             lead_name = self._config.get("leads", {}).get(dept)
-            stress = state.persona_stress.get(lead_name, 50) if lead_name else 50
+            lead_stress = state.persona_stress.get(lead_name, 50) if lead_name else 50
             members = self._config.get("org_chart", {}).get(dept, [])
             other_plans_str += (
-                f"- {dept}: Theme='{plan.theme}'. Lead={lead_name} (Stress: {stress}/100). "
+                f"- {dept}: Theme='{plan.theme}'. "
+                f"Lead={lead_name} (Stress: {lead_stress}/100). "
+                f"Team avg stress: {plan.avg_stress}/100. "
                 f"Members: {members}. "
                 f"Events planned: {[e.event_type for e in plan.proposed_events[:2]]}\n"
             )
@@ -912,7 +924,6 @@ class OrgCoordinator:
             if dept == eng_key:
                 continue
             events_str = ", ".join(e.event_type for e in plan.proposed_events[:2])
-            # Extract the names of the people in this department
             names = ", ".join(ep.name for ep in plan.engineer_plans)
 
             lines.append(
@@ -927,10 +938,8 @@ class DayPlannerOrchestrator:
     Called once per day from flow.py's daily_cycle(), replacing _generate_theme().
 
     Usage in flow.py:
-        # In __init__:
         self._day_planner = DayPlannerOrchestrator(CONFIG, WORKER_MODEL, PLANNER_MODEL)
 
-        # In daily_cycle(), replacing _generate_theme():
         org_plan = self._day_planner.plan(
             state=self.state,
             mem=self._mem,
@@ -1288,6 +1297,12 @@ class DayPlannerOrchestrator:
         """Fills in stress_level on each EngineerDayPlan after parsing."""
         for ep in plan.engineer_plans:
             ep.stress_level = graph_dynamics._stress.get(ep.name, 30)
+
+        if plan.engineer_plans:
+            plan.avg_stress = round(
+                sum(ep.stress_level for ep in plan.engineer_plans)
+                / len(plan.engineer_plans)
+            )
 
     def _recent_day_summaries(self, mem: Memory, day: int) -> List[dict]:
         """Last 7 day_summary facts dicts for the validator. Queries MongoDB."""

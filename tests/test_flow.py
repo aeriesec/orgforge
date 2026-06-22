@@ -32,21 +32,6 @@ def mock_flow():
         return sim
 
 
-def test_embed_and_count_recursion_fix(mock_flow):
-    """
-    Verifies that _embed_and_count enqueues to the embed worker
-    rather than calling embed_artifact synchronously (which would
-    previously cause recursion if wired incorrectly).
-    """
-    mock_flow._embed_worker.enqueue = MagicMock()
-
-    mock_flow._embed_and_count(
-        id="test", type="doc", title="T", content="C", day=1, date="2026-01-01"
-    )
-
-    assert mock_flow._embed_worker.enqueue.called
-    assert mock_flow.state.daily_artifacts_created == 1
-
 
 @patch("flow.Crew")
 @patch("flow.Task")
@@ -81,7 +66,6 @@ def test_social_graph_burnout_propagation(mock_flow):
     """Tests if stress correctly propagates through the network."""
     person = list(mock_flow.social_graph.nodes)[0]
 
-    # Dynamically grab the configured threshold and push them over it
     burnout_threshold = mock_flow.graph_dynamics.cfg["burnout_threshold"]
     mock_flow.graph_dynamics._stress[person] = burnout_threshold + 10
 
@@ -91,34 +75,6 @@ def test_social_graph_burnout_propagation(mock_flow):
     assert len(result.stress_snapshot) > 0
 
 
-def test_memory_context_retrieval(mock_flow):
-    """Tests semantic context window construction."""
-    from memory import Memory
-
-    mem = Memory()  # Safe: MongoClient, build_embedder, and _init_vector_indexes are all mocked by autouse fixture
-
-    # Wire up the instance so context_for_prompt has something to work with
-    mem._embedder.embed = MagicMock(return_value=[0.1] * 1024)
-    mem._artifacts.count_documents = MagicMock(return_value=10)
-    mem._artifacts.aggregate = MagicMock(return_value=[])
-    mem.recall_events = MagicMock(
-        return_value=[
-            SimEvent(
-                type="test",
-                day=1,
-                date="2026-01-01",
-                actors=[],
-                artifact_ids={},
-                facts={},
-                summary="Test Event",
-                timestamp="2026-03-05T13:33:51.027Z",
-            )
-        ]
-    )
-
-    context = mem.context_for_prompt("server crash")
-    assert "RELEVANT EVENTS" in context
-
 
 def test_edge_weight_decay(mock_flow):
     """Verifies that social edges decay over time without interaction."""
@@ -127,7 +83,6 @@ def test_edge_weight_decay(mock_flow):
     floor = mock_flow.graph_dynamics.cfg["edge_weight_floor"]
     decay_rate = mock_flow.graph_dynamics.cfg["edge_decay_rate"]
 
-    # Manually boost the weight safely above the floor
     initial_weight = floor + 5.0
     mock_flow.social_graph[u][v]["weight"] = initial_weight
 
@@ -135,7 +90,6 @@ def test_edge_weight_decay(mock_flow):
 
     new_weight = mock_flow.social_graph[u][v]["weight"]
 
-    # Dynamically calculate the exact expected result
     expected_weight = round(max(floor, initial_weight * decay_rate), 4)
 
     assert new_weight == expected_weight
@@ -147,12 +101,10 @@ def test_escalation_path_logic(mock_flow):
     bestie = "Bob"
     lead = "Charlie"
 
-    # Register the nodes
     mock_flow.social_graph.add_node(responder)
     mock_flow.social_graph.add_node(bestie)
     mock_flow.social_graph.add_node(lead)
 
-    # Explicitly make Charlie a lead so the algorithm targets him
     mock_flow.graph_dynamics._leads = {"Engineering": lead}
 
     mock_flow.social_graph.add_edge(responder, bestie, weight=10.0)
@@ -164,42 +116,14 @@ def test_escalation_path_logic(mock_flow):
     assert "Bob" in [node for node, role in chain.chain]
 
 
-def test_temporal_memory_isolation(mock_flow):
-    """Ensures context_for_prompt respects the day limit."""
-    from memory import Memory
-
-    mem = Memory()  # Safe: mocked by autouse fixture
-    mem._embedder.embed = MagicMock(return_value=[0.1] * 1024)
-    mem._artifacts.count_documents = MagicMock(return_value=10)
-    mem._artifacts.aggregate = MagicMock(return_value=[])
-    # recall_events chains .find().sort().limit() — mock the full cursor chain
-    mock_cursor = MagicMock()
-    mock_cursor.sort.return_value = mock_cursor
-    mock_cursor.limit.return_value = iter([])
-    mem._events.find = MagicMock(return_value=mock_cursor)
-
-    mem.context_for_prompt("incident", as_of_time="2026-03-05T13:33:51.027Z")
-
-    args, kwargs = mem._artifacts.aggregate.call_args
-    pipeline = args[0]
-
-    vector_search_stage = next(s for s in pipeline if "$vectorSearch" in s)
-    assert "filter" in vector_search_stage["$vectorSearch"]
-    assert "timestamp" in vector_search_stage["$vectorSearch"]["filter"]
-    assert vector_search_stage["$vectorSearch"]["filter"]["timestamp"] == {
-        "$lte": "2026-03-05T13:33:51.027Z"
-    }
-
 
 def test_graph_interaction_boost(mock_flow):
     """Verifies that Slack interactions boost edge weights between participants."""
     u, v = "Alice", "Bob"
-    # Ensure nodes exist and set a baseline weight
     mock_flow.social_graph.add_node(u)
     mock_flow.social_graph.add_node(v)
     mock_flow.social_graph.add_edge(u, v, weight=1.0)
 
-    # Simulate a Slack thread between them
     mock_flow.graph_dynamics.record_slack_interaction([u, v])
 
     new_weight = mock_flow.social_graph[u][v]["weight"]
@@ -283,8 +207,7 @@ def test_memory_log_event():
     from memory import Memory
     from unittest.mock import MagicMock
 
-    mem = Memory()  # Safe: mocked by autouse fixture
-    mem._embedder.embed = MagicMock(return_value=[0.1] * 1024)
+    mem = Memory()  
     mem._events.update_one = MagicMock()
 
     event = SimEvent(
@@ -300,15 +223,12 @@ def test_memory_log_event():
 
     mem.log_event(event)
 
-    # Verify in-memory state
     assert len(mem._event_log) == 1
     assert mem._event_log[0].type == "test_event"
 
-    # Verify DB call
     assert mem._events.update_one.called
     args, kwargs = mem._events.update_one.call_args
 
-    # The ID generator logic is EVT-{day}-{type}-{index}
     assert args[0] == {"_id": "EVT-1-test_event-1"}
 
 
@@ -406,10 +326,8 @@ def test_incident_sync_to_system_advances_on_call_cursor(
     system_after = mock_flow._clock.now("system")
     on_call_after = mock_flow._clock.now(on_call)
 
-    # The system clock must have advanced (tick_system was called)
     assert system_after > system_before, "tick_system did not advance system cursor"
 
-    # The on-call engineer must be at or after the incident start time
     assert on_call_after >= system_after, (
         f"on-call cursor {on_call_after} is before system clock {system_after} "
         "after sync_to_system — sync had no effect"
@@ -422,12 +340,12 @@ def test_incident_sync_to_system_advances_on_call_cursor(
 @patch("flow.Task")
 @patch("agent_factory.Agent")
 def test_postmortem_artifact_timestamp_within_actor_work_block(
-    mock_agent_class,  # Maps to @patch("agent_factory.Agent")
-    mock_task_class,  # Maps to @patch("flow.Task")
-    mock_crew_class,  # Maps to @patch("flow.Crew")
-    mock_cw_crew,  # Maps to @patch("confluence_writer.Crew")
-    mock_cw_task,  # Maps to @patch("confluence_writer.Task")
-    mock_flow,  # FIXTURE: Must be the absolute last argument
+    mock_agent_class,
+    mock_task_class,
+    mock_crew_class,
+    mock_cw_crew,
+    mock_cw_task,
+    mock_flow,
 ):
     """
     _write_postmortem uses advance_actor to compute the artifact timestamp.
@@ -439,7 +357,6 @@ def test_postmortem_artifact_timestamp_within_actor_work_block(
     mock_crew_instance = MagicMock()
     mock_crew_instance.kickoff.return_value = "## Postmortem\n\nRoot cause: OOM."
 
-    # Assign the mock instance to BOTH Crew mocks
     mock_crew_class.return_value = mock_crew_instance
     mock_cw_crew.return_value = mock_crew_instance
 
@@ -448,6 +365,8 @@ def test_postmortem_artifact_timestamp_within_actor_work_block(
     cursor_before = mock_flow._clock.now(writer)
 
     inc = MagicMock()
+    inc.actors = ["Jax", "Deepa", "Liam"]
+    writer = inc.actors[1]
     inc.ticket_id = "ORG-999"
     inc.title = "Test Incident"
     inc.root_cause = "OOM on worker node"
@@ -461,7 +380,6 @@ def test_postmortem_artifact_timestamp_within_actor_work_block(
 
     cursor_after = mock_flow._clock.now(writer)
 
-    # Grab the confluence_created SimEvent with the postmortem tag to inspect its timestamp
     all_calls = mock_flow._mem.log_event.call_args_list
     pm_evt = next(
         c.args[0]
@@ -719,17 +637,3 @@ def test_advance_incidents_state_machine(mock_flow):
     mock_flow._advance_incidents()
     assert inc.stage == "resolved"
     assert "INC-1" in mock_flow.state.resolved_incidents
-
-
-def test_build_llm_ollama_branch():
-    with (
-        patch("flow._PROVIDER", "ollama"),
-        patch("flow._PRESET", {"planner": "mock-planner"}),
-        patch("flow.OllamaLLM") as MockOllama,
-    ):
-        from flow import build_llm
-
-        build_llm("planner")
-        MockOllama.assert_called_with(
-            model="mock-planner", base_url="http://localhost:11434"
-        )

@@ -33,76 +33,6 @@ Design principles
   ``true_positive`` flag are buried in a separate ``_ground_truth.jsonl``
   file that is structurally distinct from the observable telemetry stream.
 
-Config schema (add to config.yaml)
------------------------------------
-  insider_threat:
-    enabled: false
-
-    mode: "passive"
-    # passive — behaviors injected into artifacts; no synthetic SIEM events
-    # active  — additionally emits dlp_alert SimEvents with noise mixed in
-
-    # Export format for security_telemetry/access_log files.
-    # "jsonl"  — custom JSONL (original, default for backward compat)
-    # "cef"    — Common Event Format (ArcSight, Splunk, many SIEMs)
-    # "ecs"    — Elastic Common Schema (Elastic SIEM, OpenSearch)
-    # "leef"   — Log Event Extended Format (IBM QRadar)
-    # "all"    — write all three alongside each other
-    log_format: "jsonl"
-
-    subjects:
-      - name: "Jordan"
-        threat_class: "negligent"
-        # negligent   — accidental credential leak in a PR / commit
-        # disgruntled — data hoarding, sentiment drift, reduced collaboration
-        # malicious   — deliberate exfil via email/Slack to external contact
-        onset_day: 8
-        behaviors:
-          - "secret_in_commit"       # available for: negligent, malicious
-          - "unusual_hours_access"   # available for: malicious, disgruntled
-          - "excessive_repo_cloning" # available for: malicious
-          - "sentiment_drift"        # available for: disgruntled
-          - "cross_dept_snooping"    # available for: malicious, disgruntled
-          - "data_exfil_email"       # available for: malicious
-          - "host_data_hoarding"     # available for: malicious, disgruntled
-
-    dlp_noise_ratio: 0.4
-    # Fraction of dlp_alert events that are false positives (innocent employees).
-    # Only relevant in "active" mode.  Range 0.0–1.0.
-
-    telemetry_dir: "security_telemetry"
-    # Subdirectory under the simulation export dir for telemetry output.
-
-    idp_logs: true
-    # When true, emit realistic IDP (Identity Provider) authentication events
-    # for every active employee each day.  These serve as the authentication
-    # baseline that anomaly detection agents correlate against behavioral signals.
-    # Anomalous IDP events are injected for threat subjects automatically.
-
-Public API (called from flow.py)
----------------------------------
-  injector = InsiderThreatInjector.from_config(config, export_base, all_names)
-
-  # Top of daily_cycle — decides whether today is an active threat day
-  injector.begin_day(day, state)
-
-  # After org_plan is built — may mutate agenda items for the subject
-  injector.inject_pre_planning(day, org_day_plan)
-
-  # Called by GitSimulator.create_pr — may mutate PR description in-place
-  injector.inject_pr(pr: dict, author: str, day: int) -> dict
-
-  # Called after Slack message generation — may inject anomalous messages
-  injector.inject_slack(messages: list, channel: str, day: int) -> list
-
-  # Called after email artifact write — may inject data exfil payload
-  injector.inject_email(eml_path: str, sender: str, day: int)
-
-  # End of day — flush telemetry, maybe emit dlp_alert SimEvent
-  injector.end_day(day, state, mem, clock, date_str) -> list[SimEvent]
-
-  # Always-safe check: is behavior X active for subject Y today?
-  injector.is_active(name: str, behavior: str, day: int) -> bool
 """
 
 from __future__ import annotations
@@ -122,13 +52,6 @@ from config_loader import COMPANY_DESCRIPTION, COMPANY_NAME
 logger = logging.getLogger("orgforge.security")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FAKE SECRET TEMPLATES
-# Realistic-looking but obviously synthetic — safe for training corpora.
-# Each template has a variable region generated at runtime.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def _rand_upper(n: int) -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
 
@@ -142,7 +65,6 @@ def _rand_b64ish(n: int) -> str:
     return "".join(random.choices(chars, k=n))
 
 
-# Each entry: (env_var_name, value_generator, inline_comment)
 _SECRET_TEMPLATES = [
     (
         "AWS_SECRET_ACCESS_KEY",
@@ -185,11 +107,6 @@ def _generate_fake_secret() -> tuple[str, str, str]:
     return tpl[0], tpl[1](), tpl[2]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA MODELS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 @dataclass
 class ThreatSubjectConfig:
     """Parsed from one entry under ``insider_threat.subjects``."""
@@ -199,10 +116,8 @@ class ThreatSubjectConfig:
     onset_day: int
     behaviors: List[str]
 
-    # ── Runtime state — mutated as simulation runs ───────────────────────────
     _active: bool = field(default=False, repr=False)
     _fired_behaviors: Dict[str, int] = field(default_factory=dict, repr=False)
-    # {behavior_name: last_day_fired}
 
 
 @dataclass
@@ -221,18 +136,11 @@ class TelemetryRecord:
     actor: str  # name only — no role or threat annotation
     details: Dict[str, Any]  # observable facts (repo, file_count, dest, etc.)
 
-    # Ground-truth fields — written to _ground_truth.jsonl only
     _true_positive: bool = False
     _threat_class: Optional[str] = None
     _behavior: Optional[str] = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IDP LOG HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Simulated device fingerprints — each employee "owns" a few known devices.
-# These are referenced in IDP logs to model normal vs. anomalous device usage.
 _DEVICE_OS_POOL = [
     ("macOS 14.4", "Apple"),
     ("macOS 13.6", "Apple"),
@@ -251,11 +159,10 @@ _BROWSER_POOL = [
 
 _MFA_METHODS = ["totp", "push_notification", "hardware_key", "sms"]
 
-# Known corporate IP ranges (fake RFC-5737 / documentation ranges)
 _CORP_IP_PREFIXES = ["203.0.113.", "198.51.100.", "192.0.2."]
 _RESIDENTIAL_IP_PREFIXES = ["10.0.", "172.16.", "100.64."]
 _VPN_IP_PREFIX = "192.0.2."
-_TOR_EXIT_IP_PREFIX = "198.18."  # RFC-2544 benchmark range — clearly anomalous
+_TOR_EXIT_IP_PREFIX = "198.18."
 
 _SSO_APPS = [
     "github-enterprise",
@@ -313,12 +220,6 @@ def _seed_employee_devices(name: str) -> List[Dict]:
     return devices
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HOST DATA HOARDING HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Simulated internal share paths and file categories.
-# These are plausible-sounding but obviously synthetic — no real data.
 _INTERNAL_SHARES = [
     "//fileserver01/Finance/Q-reports",
     "//fileserver01/HR/headcount",
@@ -386,11 +287,6 @@ def _gen_file_list(count: int) -> List[str]:
     ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INDUSTRY-STANDARD LOG FORMATTERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class LogFormatter:
     """
     Converts TelemetryRecord instances to industry-standard SIEM log formats.
@@ -407,7 +303,6 @@ class LogFormatter:
     in ``_ground_truth.jsonl``.
     """
 
-    # CEF severity: 0 (low) → 10 (very high)
     _CEF_SEVERITY: Dict[str, int] = {
         "high": 8,
         "medium": 5,
@@ -415,7 +310,6 @@ class LogFormatter:
         "info": 0,
     }
 
-    # ECS event.category mapping
     _ECS_CATEGORY: Dict[str, str] = {
         "commit": "configuration",
         "repo_access": "file",
@@ -426,7 +320,6 @@ class LogFormatter:
         "slack_message": "process",
     }
 
-    # ECS event.type mapping
     _ECS_TYPE: Dict[str, str] = {
         "commit": "change",
         "repo_access": "access",
@@ -492,7 +385,6 @@ class LogFormatter:
             else:
                 ext_pairs[k] = v
 
-        # Map well-known details to standard CEF field names
         if "to" in rec.details:
             ext_pairs["dst"] = rec.details["to"]
         if "access_hour" in rec.details:
@@ -554,7 +446,6 @@ class LogFormatter:
             "tags": ["orgforge", "insider_threat_sim", rec.record_type],
         }
 
-        # Record-type specific mappings
         d = rec.details
 
         if rec.record_type == "commit":
@@ -701,8 +592,6 @@ class LogFormatter:
 
         return f"LEEF:2.0|OrgForge|InsiderThreatSim|1.0|{event_id}|\t{attr_str}"
 
-    # ── Private helpers ───────────────────────────────────────────────────────
-
     @classmethod
     def _cef_severity_for(cls, rec: TelemetryRecord) -> int:
         behavior = rec._behavior or rec.details.get("policy_trigger", "")
@@ -728,20 +617,12 @@ class LogFormatter:
         return names.get(rec.record_type, "Security Telemetry Event")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BEHAVIOR REGISTRY
-# Each behavior is a plain function: (injector, subject, context) → side-effect
-# Context is a dict assembled per call-site (keys vary by surface)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 class BehaviorRegistry:
     """
     Maps behavior_name → injection function.
     Functions return a dict of observable changes (for telemetry) or None.
     """
 
-    # Minimum gap in days before the same behavior fires again
     _COOLDOWNS: Dict[str, int] = {
         "secret_in_commit": 4,
         "unusual_hours_access": 1,
@@ -762,11 +643,6 @@ class BehaviorRegistry:
     @staticmethod
     def mark_fired(subject: ThreatSubjectConfig, behavior: str, day: int):
         subject._fired_behaviors[behavior] = day
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN INJECTOR
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class InsiderThreatInjector:
@@ -802,21 +678,15 @@ class InsiderThreatInjector:
         self._domain = domain
         self._persona_helper = persona_helper
         self._worker_llm = worker_llm
-        self._log_format = log_format  # "jsonl" | "cef" | "ecs" | "leef" | "all"
+        self._log_format = log_format
         self._emit_idp_logs = emit_idp_logs
 
-        # Per-employee device profiles — seeded once, stable across the run.
         self._employee_devices: Dict[str, List[Dict]] = {
             name: _seed_employee_devices(name) for name in all_names
         }
 
-        # Per-subject host hoarding state — tracks the multi-day staging trail.
-        # {subject_name: {"staged_files": [...], "stage_day": int, ...}}
         self._hoarding_state: Dict[str, Dict] = {}
-
-        # Pending telemetry records, flushed at end_day()
         self._pending_telemetry: List[TelemetryRecord] = []
-        # Pending SimEvents to fire (returned from end_day())
         self._pending_sim_events: List[Any] = []
 
         telemetry_dir.mkdir(parents=True, exist_ok=True)
@@ -828,8 +698,6 @@ class InsiderThreatInjector:
             f"log_format={log_format}, "
             f"idp_logs={'on' if emit_idp_logs else 'off'}"
         )
-
-    # ─── FACTORY ─────────────────────────────────────────────────────────────
 
     @classmethod
     def from_config(
@@ -877,8 +745,6 @@ class InsiderThreatInjector:
             emit_idp_logs=cfg.get("idp_logs", True),
         )
 
-    # ─── DAY LIFECYCLE ───────────────────────────────────────────────────────
-
     def begin_day(self, day: int, state) -> None:
         """
         Called at the top of daily_cycle(), before planning.
@@ -908,8 +774,7 @@ class InsiderThreatInjector:
         3. In "active" mode: emits dlp_alert SimEvents (with noise).
         4. Returns a list of SimEvent objects to be logged by flow.py.
         """
-        # IDP logs first — they represent the authentication baseline for
-        # the day and should precede behavioral telemetry in timestamp order.
+
         if self._emit_idp_logs:
             self._emit_idp_day_logs(day, state, date_str)
 
@@ -922,8 +787,6 @@ class InsiderThreatInjector:
 
         self._pending_sim_events.clear()
         return sim_events
-
-    # ─── PR INJECTION ────────────────────────────────────────────────────────
 
     def inject_pr(self, pr: dict, author: str, day: int) -> dict:
         """
@@ -943,11 +806,8 @@ class InsiderThreatInjector:
         var_name, fake_value, comment = _generate_fake_secret()
         injection_context = random.choice(
             [
-                # Injected as a test fixture reference
                 f'\n\n## Test Configuration\n```python\n# Temporary test setup — remove before prod\n{var_name} = "{fake_value}"  {comment}\n```',
-                # Injected as a config snippet in the PR body
                 f"\n\n> **Local testing note:** Set `{var_name}={fake_value}` in your `.env` to reproduce. {comment}",
-                # Injected as a diff comment block
                 f"\n\n```diff\n+{var_name}={fake_value}  {comment}\n```",
             ]
         )
@@ -955,7 +815,6 @@ class InsiderThreatInjector:
         original_desc = pr.get("description", "")
         pr["description"] = original_desc + injection_context
 
-        # Record for telemetry
         self._pending_telemetry.append(
             TelemetryRecord(
                 record_type="commit",
@@ -1039,8 +898,6 @@ class InsiderThreatInjector:
 
             date_str = str(current_date.date())
 
-            # Pick a target — prefer Finance or HR leads; fall back to random
-            # active employee that isn't the subject themselves
             high_value_roles = ["finance", "hr", "payroll", "legal", "executive"]
             target = next(
                 (
@@ -1093,8 +950,6 @@ class InsiderThreatInjector:
 
         return injected
 
-    # ─── SLACK INJECTION ─────────────────────────────────────────────────────
-
     def inject_slack(
         self,
         messages: List[dict],
@@ -1113,7 +968,6 @@ class InsiderThreatInjector:
             if not subject._active:
                 continue
 
-            # ── sentiment_drift ──────────────────────────────────────────────
             if "sentiment_drift" in subject.behaviors and BehaviorRegistry.can_fire(
                 subject, "sentiment_drift", day
             ):
@@ -1145,42 +999,12 @@ class InsiderThreatInjector:
                         BehaviorRegistry.mark_fired(subject, "sentiment_drift", day)
                         break
 
-            # ── unusual_hours_access ─────────────────────────────────────────
-            # Only fires if no messages from subject exist in this channel yet
-            # (it represents a late-night check-in, not a standup override)
-            #
-            # CLOCK NOTE: This behavior intentionally bypasses SimClock entirely,
-            # and that bypass is load-bearing — not just polite.  Here is why:
-            #
-            # _enforce_business_hours() is an OVERFLOW HANDLER, not a cap.
-            # A cursor landing past 17:30 does not clamp to 17:30 — it rolls
-            # forward to 09:00 the NEXT business day.  So calling advance_actor()
-            # with an off-hours target would silently teleport the subject's cursor
-            # to tomorrow morning, corrupting every artifact timestamp they produce
-            # for the rest of today.
-            #
-            # Additionally, sync_and_advance() and sync_and_tick() both call
-            # _sync_time() internally, which pulls ALL participants up to the
-            # latest cursor among them.  An off-hours cursor on the subject would
-            # drag their colleagues to 02:00 as well — then roll everyone to
-            # next-day 09:00.
-            #
-            # Correct approach: construct the datetime directly from current_date,
-            # append it to the message list, and never let it near the cursor
-            # system.  The subject's cursor stays on the business-hours chain.
-            # Their next advance_actor() call produces e.g. 10:35, which is
-            # temporally BEFORE the 02:14 off-hours message — and that inversion
-            # is intentional.  It reflects reality: the subject acted at 2am,
-            # then showed up to standup at 9:30 as normal.  Both are real events.
             if (
                 "unusual_hours_access" in subject.behaviors
                 and BehaviorRegistry.can_fire(subject, "unusual_hours_access", day)
                 and not any(m.get("user") == subject.name for m in messages)
                 and random.random() < 0.35  # not every eligible day
             ):
-                # Build an off-hours datetime that is definitely outside the
-                # reset_to_business_start → advance_actor window (09:00–~18:00).
-                # We do NOT call clock.advance_actor() — see note above.
                 off_hour = random.choice([1, 2, 3, 22, 23])
                 off_hours_ts = current_date.replace(
                     hour=off_hour,
@@ -1202,10 +1026,6 @@ class InsiderThreatInjector:
                     "ts": off_hours_ts.isoformat(),
                     "thread_ts": off_hours_ts.isoformat(),
                     "day": day,
-                    # Flag that this message was injected outside business hours.
-                    # Stored in the Slack artifact metadata — NOT in the message text.
-                    # Detection agents reading raw Slack JSON will see this field;
-                    # agents reading only message content will miss it.
                     "_security_injected": True,
                     "is_bot": False,
                 }
@@ -1230,8 +1050,6 @@ class InsiderThreatInjector:
                 BehaviorRegistry.mark_fired(subject, "unusual_hours_access", day)
 
         return messages
-
-    # ─── EMAIL INJECTION ─────────────────────────────────────────────────────
 
     def inject_email(
         self,
@@ -1261,7 +1079,6 @@ class InsiderThreatInjector:
         if random.random() > 0.5:
             return None  # probabilistic — doesn't fire every eligible day
 
-        # Build a plausible-looking exfil email to a personal/external account
         external_domains = ["gmail.com", "protonmail.com", "outlook.com", "yahoo.com"]
         exfil_to = f"{subject.name.lower()}.personal@{random.choice(external_domains)}"
         exfil_subject = random.choice(
@@ -1274,7 +1091,6 @@ class InsiderThreatInjector:
             ]
         )
 
-        # Inline "data" is vague enough to be plausible but never genuinely sensitive
         exfil_snippets = [
             "Attaching the internal roadmap notes I mentioned.",
             "Here's a copy of the access list I was telling you about.",
@@ -1287,7 +1103,6 @@ class InsiderThreatInjector:
             f"-- {subject.name}\nSent from work\n"
         )
 
-        # Write the injected email alongside the triggering one
         base_name = os.path.basename(eml_path).replace(".eml", f"_fwd_{day}.eml")
         exfil_dir = os.path.dirname(eml_path)
         exfil_path = os.path.join(exfil_dir, base_name)
@@ -1300,11 +1115,6 @@ class InsiderThreatInjector:
             msg["From"] = f"{sender} <{sender.lower()}@{self._domain}>"
             msg["To"] = exfil_to
             msg["Subject"] = exfil_subject
-            # CLOCK NOTE: Intentional SimClock bypass — exfil emails are written
-            # directly to disk and never routed through advance_actor().
-            # Same load-bearing reason as unusual_hours_access: _enforce_business_hours()
-            # is an overflow handler that rolls past-17:30 cursors to next-day 09:00,
-            # not a clamp.  The subject's business-hours cursor is unaffected.
             msg["Date"] = current_date.replace(
                 hour=random.choice([22, 23, 0, 1]),
                 minute=random.randint(0, 59),
@@ -1343,8 +1153,6 @@ class InsiderThreatInjector:
             f"[security] 📤 data_exfil_email: {sender} → {exfil_to} ({exfil_path})"
         )
         return exfil_path
-
-    # ─── JIRA / CROSS-DEPT SNOOPING ──────────────────────────────────────────
 
     def inject_jira_access(
         self,
@@ -1385,8 +1193,6 @@ class InsiderThreatInjector:
             )
         )
 
-    # ─── REPO CLONE TELEMETRY ────────────────────────────────────────────────
-
     def inject_repo_clone(
         self,
         actor: str,
@@ -1426,8 +1232,6 @@ class InsiderThreatInjector:
         )
         BehaviorRegistry.mark_fired(subject, "excessive_repo_cloning", day)
 
-    # ─── HOST DATA HOARDING ───────────────────────────────────────────────────
-
     def inject_host_hoarding(
         self,
         actor: str,
@@ -1460,34 +1264,30 @@ class InsiderThreatInjector:
         if not BehaviorRegistry.can_fire(subject, "host_data_hoarding", day):
             return None
 
-        # Probabilistic: not every eligible day fires. Phase 1 fires more
-        # rarely than phase 2/3 (which continue the existing trail).
         state = self._hoarding_state.get(actor, {})
         current_phase = state.get("phase", 0)
 
         if current_phase == 0 and random.random() > 0.4:
-            return None  # Phase 1 is rare — drives realistic corpus density
+            return None
 
         date_str = str(current_date.date())
-        # Advance to next phase, wrapping back to 0 after phase 3
         next_phase = (current_phase % 3) + 1
 
         if next_phase == 1:
-            # ── Phase 1: Internal share access + local staging ────────────────
             shares_accessed = random.sample(_INTERNAL_SHARES, random.randint(2, 4))
             file_count = random.randint(15, 80)
             file_list = _gen_file_list(file_count)
             staged_path = _gen_staging_path(actor, use_cloud=False)
-            total_bytes = random.randint(50_000_000, 800_000_000)  # 50 MB–800 MB
+            total_bytes = random.randint(50_000_000, 800_000_000)
 
             details = {
                 "action": "bulk_file_copy",
                 "source_shares": shares_accessed,
                 "file_count": file_count,
-                "sample_files": file_list[:5],  # only 5 visible in observable stream
+                "sample_files": file_list[:5],
                 "staged_path": staged_path,
                 "total_bytes": total_bytes,
-                "access_hour": random.choice(range(18, 22)),  # after-hours but not 2am
+                "access_hour": random.choice(range(18, 22)),
                 "outside_business_hours": True,
             }
 
@@ -1526,7 +1326,6 @@ class InsiderThreatInjector:
             return {"phase": 1, "actor": actor, "staged_path": staged_path}
 
         elif next_phase == 2 and current_phase == 1:
-            # ── Phase 2: Compression of staging directory ─────────────────────
             tool = random.choice(_COMPRESSION_TOOLS)
             archive_name = random.choice(_ARCHIVE_NAMES).replace(
                 "{date}", current_date.strftime("%Y%m%d")
@@ -1582,10 +1381,6 @@ class InsiderThreatInjector:
             return {"phase": 2, "actor": actor, "archive_name": archive_name}
 
         elif next_phase == 3 and current_phase == 2:
-            # ── Phase 3: Move archive to cloud-sync or removable media ────────
-            # This is the exfil-staging breadcrumb that should correlate
-            # with a data_exfil_email, unusual_hours_access, or anomalous
-            # network transfer event on the same or following day.
             use_cloud = random.random() < 0.7
             cloud_sync_dir = _gen_staging_path(actor, use_cloud=use_cloud)
             archive_name = state.get("archive_name", "backup.zip")
@@ -1610,14 +1405,10 @@ class InsiderThreatInjector:
                 "removable_media": not use_cloud,
                 "access_hour": random.choice(range(20, 24)),
                 "outside_business_hours": True,
-                # Correlation hint: this record should be joined with the
-                # phase 1 host_event (same actor, 2 days prior) and any
-                # concurrent email_send or network transfer to external IPs.
                 "hoarding_trail_start_day": state.get("start_day", day - 2),
                 "total_bytes_staged": state.get("total_bytes", compressed_bytes),
             }
 
-            # Reset hoarding state — trail is complete, can start a new one
             self._hoarding_state[actor] = {"phase": 0}
 
             rec = TelemetryRecord(
@@ -1650,9 +1441,7 @@ class InsiderThreatInjector:
                 "destination_path": dst_path,
             }
 
-        return None  # Phase mismatch — trail out of order, skip
-
-    # ─── CONVENIENCE CHECK ───────────────────────────────────────────────────
+        return None
 
     def is_active(self, name: str, behavior: str, day: int) -> bool:
         """
@@ -1669,8 +1458,6 @@ class InsiderThreatInjector:
     def active_subject_names(self) -> Set[str]:
         """Return set of subject names that are currently active."""
         return {s.name for s in self._subjects.values() if s._active}
-
-    # ─── PRIVATE — IDP LOG EMISSION ──────────────────────────────────────────
 
     def _emit_idp_day_logs(self, day: int, state, date_str: str) -> None:
         """
@@ -1706,7 +1493,6 @@ class InsiderThreatInjector:
             subject = self._subjects.get(name)
             is_active_subject = subject and subject._active
 
-            # ── Normal morning authentication ─────────────────────────────────
             morning_hour = random.randint(8, 10)
             morning_min = random.randint(0, 59)
             auth_ts = current_date.replace(
@@ -1742,7 +1528,6 @@ class InsiderThreatInjector:
             )
             self._pending_telemetry.append(normal_auth)
 
-            # Optional mid-day re-auth (session expiry simulation)
             if random.random() < 0.4:
                 mid_hour = random.randint(12, 15)
                 mid_ts = current_date.replace(
@@ -1775,16 +1560,12 @@ class InsiderThreatInjector:
                 )
                 self._pending_telemetry.append(mid_auth)
 
-            # ── Threat subject anomalous IDP events ───────────────────────────
             if not is_active_subject:
                 continue
 
             threat_class = subject.threat_class
 
             if threat_class == "malicious" and random.random() < 0.45:
-                # Malicious: off-hours login from an unfamiliar device or
-                # anomalous IP.  Not every eligible day — just plausible enough
-                # that a behavioral baseline would flag it as unusual.
                 off_hour = random.choice([0, 1, 2, 22, 23])
                 off_ts = current_date.replace(
                     hour=off_hour, minute=random.randint(0, 59), second=0, microsecond=0
@@ -1803,7 +1584,6 @@ class InsiderThreatInjector:
                 else:
                     src_ip = corp_ip
 
-                # 20% chance of a new/unknown device
                 use_new_device = random.random() < 0.2
                 if use_new_device:
                     fake_os, fake_vendor = random.choice(_DEVICE_OS_POOL)
@@ -1840,10 +1620,6 @@ class InsiderThreatInjector:
                         "ip_type": ip_type,
                         "access_hour": off_hour,
                         "outside_business_hours": True,
-                        # Key anomaly signal: the subject authenticated at
-                        # this hour but may have no corroborating activity.
-                        # Detection agents should check for work artifacts
-                        # in the same time window.
                         "corroborating_activity_expected": False,
                     },
                     _true_positive=True,
@@ -1858,10 +1634,6 @@ class InsiderThreatInjector:
                 )
 
             elif threat_class == "disgruntled" and random.random() < 0.3:
-                # Disgruntled: off-hours login but NO work activity follows.
-                # This is the "ghost login" scenario — the employee logged in
-                # but did nothing productive, possibly browsing access lists
-                # or export settings without leaving standard work artifacts.
                 off_hour = random.choice([6, 7, 19, 20, 21])
                 off_ts = current_date.replace(
                     hour=off_hour, minute=random.randint(0, 59), second=0, microsecond=0
@@ -1887,9 +1659,6 @@ class InsiderThreatInjector:
                         "ip_type": "corporate",
                         "access_hour": off_hour,
                         "outside_business_hours": off_hour < 8 or off_hour > 18,
-                        # The detection signal: auth present, no work artifacts
-                        # in the same window.  Agents must check for absence
-                        # of correlated Jira, Confluence, or Slack events.
                         "corroborating_activity_expected": False,
                         "ghost_login": True,
                     },
@@ -1899,7 +1668,6 @@ class InsiderThreatInjector:
                 )
                 self._pending_telemetry.append(ghost_auth)
 
-                # Occasional failed MFA to simulate credential uncertainty
                 if random.random() < 0.15:
                     failed_ts = off_ts + timedelta(seconds=random.randint(30, 120))
                     failed_auth = TelemetryRecord(
@@ -2064,7 +1832,6 @@ class InsiderThreatInjector:
                 Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
             ).strip()
 
-            # Sanity check — if rewrite is empty or suspiciously short, keep original
             if len(result) < 10:
                 logger.warning(
                     "[security] sentiment_drift rewrite too short, keeping original"
@@ -2079,9 +1846,7 @@ class InsiderThreatInjector:
 
         except Exception as exc:
             logger.warning(f"[security] sentiment_drift rewrite failed: {exc}")
-            return text  # always fall back gracefully
-
-    # ─── PRIVATE — DLP ALERT EVENTS ──────────────────────────────────────────
+            return text
 
     def _generate_dlp_events(self, day: int, state, clock, date_str: str) -> List[Any]:
         """
@@ -2102,7 +1867,6 @@ class InsiderThreatInjector:
             else str(alert_time)
         )
 
-        # True positives — one alert per true-positive record today
         true_positive_records = [
             r for r in self._pending_telemetry if r._true_positive and r.day == day
         ]
@@ -2118,9 +1882,6 @@ class InsiderThreatInjector:
                     facts={
                         "alert_type": rec.record_type,
                         "details": rec.details,
-                        # NOTE: true_positive is deliberately absent from SimEvent.facts
-                        # so agents cannot trivially label it. Ground truth lives in
-                        # security_telemetry/_ground_truth.jsonl.
                         "policy_rule": self._policy_rule_for(rec._behavior or ""),
                         "severity": self._severity_for(rec._behavior or ""),
                     },
@@ -2132,7 +1893,6 @@ class InsiderThreatInjector:
                 )
             )
 
-        # False positives — noisy alerts for innocent employees
         if self._innocent_names and random.random() < self._noise_ratio:
             fp_actor = random.choice(self._innocent_names)
             fp_behavior = random.choice(
@@ -2164,7 +1924,6 @@ class InsiderThreatInjector:
                     tags=["dlp_alert", "security", "false_positive_candidate"],
                 )
             )
-            # Record the false positive in telemetry too
             self._pending_telemetry.append(
                 TelemetryRecord(
                     record_type="dlp_alert",
@@ -2246,7 +2005,6 @@ class InsiderThreatInjector:
         fmt = self._log_format.lower()
         gt_path = self._telemetry_dir / "_ground_truth.jsonl"
 
-        # Ground-truth is always written as JSONL regardless of format.
         with open(gt_path, "a") as gt_f:
             for rec in self._pending_telemetry:
                 observable_base = {
@@ -2265,7 +2023,6 @@ class InsiderThreatInjector:
                 }
                 gt_f.write(json.dumps(ground_truth) + "\n")
 
-        # Observable stream — format-specific
         write_jsonl = fmt in ("jsonl", "all")
         write_cef = fmt in ("cef", "all")
         write_ecs = fmt in ("ecs", "all")
@@ -2319,10 +2076,8 @@ class InsiderThreatInjector:
         from email.mime.text import MIMEText
         from email.mime.multipart import MIMEMultipart
 
-        # Impersonate IT helpdesk or HR — the two most exploited pretexts
         pretext_role = random.choice(["IT Helpdesk", "HR Operations", "Security Team"])
         spoofed_from_name = f"{pretext_role} <it-noreply@{self._domain}>"
-        # Reply-To is the attacker's external address — the tell
         attacker_reply_to = f"{subject.name.lower()}@{random.choice(['gmail.com', 'outlook.com', 'protonmail.com'])}"
 
         subject_lines = [
@@ -2380,7 +2135,7 @@ class InsiderThreatInjector:
 
         self._pending_telemetry.append(
             TelemetryRecord(
-                record_type="email_send",  # appears as inbound mail, not a send
+                record_type="email_send",
                 day=day,
                 date=date_str,
                 timestamp=send_ts.isoformat(),
@@ -2393,7 +2148,6 @@ class InsiderThreatInjector:
                     "originating_ip": msg["X-Originating-IP"],
                     "eml_path": str(eml_path),
                     "send_hour": send_hour,
-                    # Observable tell: Reply-To domain differs from From domain
                     "reply_to_domain_mismatch": True,
                 },
                 _true_positive=True,
@@ -2425,8 +2179,7 @@ class InsiderThreatInjector:
         going through advance_actor(), so the subject's business-hours cursor
         is unaffected.
         """
-        # Time the pretext to land during a busy window — mid-morning or
-        # right after lunch, when people are context-switching
+
         send_hour = random.choice([9, 10, 13, 14])
         send_ts = current_date.replace(
             hour=send_hour, minute=random.randint(5, 55), second=0, microsecond=0
@@ -2453,7 +2206,7 @@ class InsiderThreatInjector:
         ]
 
         message = {
-            "user": subject.name,  # appears as the subject's real name, not "IT"
+            "user": subject.name,
             "email": f"{subject.name.lower()}@{self._domain}",
             "text": random.choice(pretext_messages),
             "ts": send_ts.isoformat(),

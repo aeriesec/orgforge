@@ -100,9 +100,9 @@ class OrgLifecycleManager:
         config: dict,
         graph_dynamics: GraphDynamics,
         mem: Memory,
-        org_chart: Dict[str, List[str]],  # mutable — mutated in place
-        personas: Dict[str, dict],  # mutable — mutated in place
-        all_names: List[str],  # mutable — mutated in place
+        org_chart: Dict[str, List[str]],
+        personas: Dict[str, dict],
+        all_names: List[str],
         leads: Dict[str, str],
         worker_llm=None,
         base_export_dir: str = "",
@@ -193,7 +193,9 @@ class OrgLifecycleManager:
                         attrition_cfg = {
                             "name": candidate,
                             "reason": "voluntary",
-                            "knowledge_domains": [],
+                            "knowledge_domains": self._personas.get(candidate, {}).get(
+                                "expertise", []
+                            ),
                             "documented_pct": 0.5,
                         }
                         record = self._execute_departure(
@@ -231,48 +233,86 @@ class OrgLifecycleManager:
         date_str: str,
         state,
         timestamp: str,
-        similarity_threshold: float = 0.65,
+        author: Optional[str] = None,
     ) -> List[KnowledgeGapEvent]:
         """
-        Detect knowledge gaps using semantic similarity against departed employee
-        expertise profiles, then cross-reference the DomainRegistry for live
-        documentation coverage and orphan status.
+        Detect knowledge gaps deterministically using BM25 text search against
+        departed employee expertise profiles, then cross-reference the
+        DomainRegistry for live documentation coverage and orphan status.
 
-        Two-pass detection:
-          Pass 1 — Embedding similarity: embed the trigger text and compare
-                   against departed employees' persona_skill vectors. Catches
-                   semantic drift (e.g. "auth timeout" → "identity management").
-          Pass 2 — DomainRegistry cross-reference: for each matched domain,
-                   pull the current documentation_coverage from the registry so
-                   the SimEvent carries an accurate, mutable coverage score rather
-                   than the static documented_pct frozen at departure.
+        Two-pass detection (fully deterministic given the same index state):
+
+          Pass 1 -- BM25 text search: run the trigger text through
+                    find_expert_by_skill() which calls search_persona_skills_text()
+                    -> search_artifacts_text() with type_filter="persona_skill".
+                    Atlas Search scores using alias-weighted BM25:
+                      title boost 3x, aliases boost 2x, why_it_matters boost 1x.
+                    This catches vocabulary overlap (e.g. "auth timeout" matches
+                    aliases ["auth", "identity", "sso"] on a departed employee's
+                    persona_skill record).
+
+          Pass 2 -- DomainRegistry cross-reference: for each matched departed
+                    employee, check whether their orphaned domains have a live
+                    owner or whether the current author is in known_by. Pull
+                    documentation_coverage from the registry so the SimEvent
+                    carries an accurate, mutable coverage score rather than the
+                    static documented_pct frozen at departure.
+
+        Classification uses hardcoded thresholds on documentation_coverage:
+          - coverage < 0.3 -> "likely"
+          - coverage < 0.6 -> "possible"
+          - else -> "none"
+
+        No LLM involvement. Fully reproducible given the same Atlas Search
+        index state and domain_registry contents.
 
         Args:
-            text:                  The incident root cause or description text.
-            triggered_by:          The artifact ID (e.g., JIRA ticket) that surfaced this.
-            day:                   Current simulation day.
-            date_str:              Current date as ISO string.
-            state:                 Simulation state object.
-            timestamp:             ISO timestamp of the triggering event.
-            similarity_threshold:  Minimum vector similarity score (0–1) to consider
-                                a departed employee's expertise a match. Default 0.65
-                                is tuned for dotProduct with 1024-dim vectors.
+            text:          The content text to check for gap overlap.
+            triggered_by:  The artifact ID (e.g., CONF page) that surfaced this.
+            day:           Current simulation day.
+            date_str:      Current date as ISO string.
+            state:         Simulation state object.
+            timestamp:     ISO timestamp of the triggering event.
+            author:        Optional author name; if provided, gaps where the
+                           author is in known_by for all affected domains are
+                           suppressed (they already have coverage).
         """
         found: List[KnowledgeGapEvent] = []
 
         if not self._departed:
             return found
 
-        # ── Pass 1: embedding similarity ──────────────────────────────────────
-        expert_matches = self._mem.find_expert_by_skill(text, n=20)
+        registry = self._mem.get_domain_registry()
+        orphaned_by_former_owner: Dict[str, List[dict]] = {}
+        for rec in registry.values():
+            if rec.get("primary_owner") is not None:
+                continue
+            former_owners = set(rec.get("former_owners", [rec.get("former_owner", "")]))
+            for fo in former_owners:
+                orphaned_by_former_owner.setdefault(fo, []).append(rec)
+
+        expert_matches = self._mem.find_expert_by_skill(text, n=3)
 
         match_scores: Dict[str, float] = {}
         for match in expert_matches:
             name = match.get("name")
             score = match.get("score", 0.0)
-            if name and score >= similarity_threshold:
-                if name not in match_scores or score > match_scores[name]:
-                    match_scores[name] = score
+            if not name:
+                continue
+
+            if name not in orphaned_by_former_owner:
+                continue
+
+            if author:
+                owned_domains = orphaned_by_former_owner[name]
+                all_covered = all(
+                    author in rec.get("known_by", []) for rec in owned_domains
+                )
+                if all_covered:
+                    continue
+
+            if name not in match_scores or score > match_scores[name]:
+                match_scores[name] = score
 
         for record in self._departed:
             if record.name not in match_scores:
@@ -291,12 +331,8 @@ class OrgLifecycleManager:
 
             domain_label = ", ".join(gap_domains)
 
-            # ── Pass 2: DomainRegistry cross-reference ─────────────────────
-            # Look up live coverage for each matched domain. If the registry
-            # has been updated by Confluence writes since genesis, this will
-            # reflect partial recovery rather than the static departure value.
             registry_hits: List[dict] = []
-            live_coverage: float = record.documented_pct  # fallback to departure value
+            live_coverage: float = record.documented_pct
 
             for domain in gap_domains:
                 key = domain.lower().replace(" ", "_")
@@ -305,8 +341,6 @@ class OrgLifecycleManager:
                     registry_hits.append(reg_doc)
 
             if registry_hits:
-                # Use the lowest coverage across all matched domains — most
-                # conservative estimate, most useful for gap severity scoring.
                 live_coverage = min(r["documentation_coverage"] for r in registry_hits)
                 known_by = list(
                     {name for r in registry_hits for name in r.get("known_by", [])}
@@ -316,7 +350,7 @@ class OrgLifecycleManager:
                 ]
             else:
                 known_by = []
-                orphaned_domains = gap_domains  # assume orphaned if not in registry
+                orphaned_domains = gap_domains
 
             gap_event = KnowledgeGapEvent(
                 departed_name=record.name,
@@ -328,7 +362,6 @@ class OrgLifecycleManager:
             self._gap_events.append(gap_event)
             found.append(gap_event)
 
-            # Severity classification — used downstream by gap_detected logic
             if live_coverage < 0.3:
                 gap_classification = "likely"
             elif live_coverage < 0.6:
@@ -348,18 +381,15 @@ class OrgLifecycleManager:
                         "departed_employee": record.name,
                         "gap_areas": gap_domains,
                         "triggered_by": triggered_by,
-                        "documented_pct": record.documented_pct,  # at departure
-                        "live_documentation_coverage": round(
-                            live_coverage, 3
-                        ),  # current
+                        "documented_pct": record.documented_pct,
+                        "live_documentation_coverage": round(live_coverage, 3),
                         "days_since_departure": day - record.day,
                         "escalation_harder": True,
                         "semantic_score": round(score, 4),
-                        "detection_method": "embedding_similarity",
+                        "detection_method": "bm25_text_search",
                         "gap_classification": gap_classification,
                         "orphaned_domains": orphaned_domains,
                         "known_by": known_by,
-                        # Fields aligned with PR reviewer audit schema
                         "topics_beyond_author_expertise": gap_domains,
                         "author_domain_fit": (
                             "low"
@@ -371,8 +401,8 @@ class OrgLifecycleManager:
                     },
                     summary=(
                         f"Knowledge gap: {domain_label} (owned by ex-{record.name}, "
-                        f"similarity={score:.3f}) surfaced in {triggered_by}. "
-                        f"Coverage at departure: {int(record.documented_pct * 100)}% → "
+                        f"score={score:.3f}) surfaced in {triggered_by}. "
+                        f"Coverage at departure: {int(record.documented_pct * 100)}% -> "
                         f"live: {int(live_coverage * 100)}%."
                         + (
                             f" Orphaned: {orphaned_domains}."
@@ -410,7 +440,6 @@ class OrgLifecycleManager:
             name = next(iter(e.actors), None)
             if not name:
                 continue
-            # Avoid duplicates if called multiple times
             if any(r.name == name for r in self._departed):
                 continue
             self._departed.append(
@@ -445,7 +474,6 @@ class OrgLifecycleManager:
             else self._departed[-3:]
         )
         for d in departed_to_show:
-            # Pull live coverage from registry rather than the static departure value
             live_coverages: List[str] = []
             orphaned: List[str] = []
             for domain in d.knowledge_domains:
@@ -526,8 +554,6 @@ class OrgLifecycleManager:
     def find_hire(self, name: str) -> Optional[HireRecord]:
         return next((h for h in self._hired if h.name == name), None)
 
-    # ─── DEPARTURE ENGINE ─────────────────────────────────────────────────────
-
     def _execute_departure(
         self, dep_cfg: dict, day: int, date_str: str, state, scheduled: bool, clock
     ) -> Optional[DepartureRecord]:
@@ -547,7 +573,6 @@ class OrgLifecycleManager:
             or f"{dept} Employee"
         )
 
-        # Snapshot before any mutation
         edge_snapshot = {nb: G[name][nb].get("weight", 1.0) for nb in G.neighbors(name)}
         peak_stress = self._gd._stress.get(name, 30)
         centrality_before = dict(self._gd._get_centrality())
@@ -571,7 +596,6 @@ class OrgLifecycleManager:
         )
         timestamp_iso = departure_time.isoformat()
 
-        # Side-effects run in this exact order so each can still reference live graph:
         #   1. Incident handoff   — needs Dijkstra path through departing node
         #   2. JIRA reassignment  — reads ticket assignees from state
         #   3. Remove node        — graph mutation
@@ -592,7 +616,6 @@ class OrgLifecycleManager:
             centrality_before, name, day, date_str, timestamp_iso
         )
 
-        # Mutate org-level collections
         if dept in self._org_chart and name in self._org_chart[dept]:
             self._org_chart[dept].remove(name)
         if name in self._all_names:
@@ -664,10 +687,8 @@ class OrgLifecycleManager:
             day=day,
         )
 
-        # ── Orphan any DomainRegistry records this engineer owned ─────────────
-        # Mid-sim departures may leave primary_owner set. Null it out so
-        # scan_for_knowledge_gaps correctly treats those domains as orphaned.
         self._orphan_domains_on_departure(name, record, day)
+        self._register_domains_on_departure(name, record, day)
 
         logger.info(
             f"  [red]👋 Departure:[/red] {name} ({dept}) [{record.reason}]. "
@@ -680,7 +701,42 @@ class OrgLifecycleManager:
         )
         return record
 
-    # ── Side-effect 1: Incident handoff ──────────────────────────────────────
+    def _register_domains_on_departure(
+        self, name: str, record: DepartureRecord, day: int
+    ) -> None:
+        """
+        Insert domain_registry entries for any knowledge domains this engineer
+        owned that don't already have a record. Mirrors what seed_knowledge_gaps
+        does for pre-sim (genesis) gaps so mid-sim departures are treated
+        identically by scan_for_knowledge_gaps and get_roster_context.
+        """
+        from genesis import _domain_key, _build_system_tags
+
+        for domain in record.knowledge_domains:
+            key = _domain_key(domain)
+            if self._mem._db["domain_registry"].find_one({"_id": key}):
+                continue
+
+            system_tags = _build_system_tags(domain, record.knowledge_domains)
+            doc = {
+                "_id": key,
+                "domain": domain,
+                "primary_owner": None,
+                "former_owner": name,
+                "former_owners": [name],
+                "documentation_coverage": record.documented_pct,
+                "coverage_at_last_departure": record.documented_pct,
+                "last_updated_day": day,
+                "known_by": [],
+                "system_tags": system_tags,
+                "dept": record.dept,
+                "is_genesis_gap": False,
+            }
+            self._mem._db["domain_registry"].insert_one(doc)
+            logger.info(
+                f"    [dim]→ Domain registry: '{domain}' registered on departure of {name}. "
+                f"Coverage={int(record.documented_pct * 100)}%, orphaned.[/dim]"
+            )
 
     def _handoff_active_incidents(
         self,
@@ -703,14 +759,12 @@ class OrgLifecycleManager:
             if not jira or jira.get("assignee") != name:
                 continue
 
-            # Build chain while departing node is still in the graph
             chain = self._gd.build_escalation_chain(
                 first_responder=name,
                 domain_keywords=record.knowledge_domains or None,
             )
             new_owner = next((n for n, _ in chain.chain if n != name), dept_lead)
 
-            # Deterministic mutation — engine owns this, not the LLM
             jira["assignee"] = new_owner
             self._mem.upsert_ticket(jira)
 
@@ -749,8 +803,6 @@ class OrgLifecycleManager:
                 f"(stage={inc.stage}) {name} → {new_owner}"
             )
 
-    # ── Side-effect 2: JIRA ticket reassignment ───────────────────────────────
-
     def _reassign_jira_tickets(
         self,
         name: str,
@@ -781,9 +833,7 @@ class OrgLifecycleManager:
         for ticket in open_tickets:
             if ticket.get("assignee") != name or ticket.get("status") == "Done":
                 continue
-            # Skip tickets that were already handed off via incident handoff above
             if ticket.get("id") in record.incident_handoffs:
-                # Assignee already updated — just log and continue
                 record.reassigned_tickets.append(ticket["id"])
                 continue
 
@@ -829,8 +879,6 @@ class OrgLifecycleManager:
                 f"    [yellow]📋 Reassigned:[/yellow] "
                 f"{', '.join(record.reassigned_tickets)} → {dept_lead}"
             )
-
-    # ── Side-effect 3: Centrality vacuum ─────────────────────────────────────
 
     def _apply_centrality_vacuum(
         self,
@@ -881,7 +929,7 @@ class OrgLifecycleManager:
 
         self._mem.log_event(
             SimEvent(
-                type="knowledge_gap_detected",  # closest existing type for RAG eval
+                type="knowledge_gap_detected",
                 timestamp=clock,
                 day=day,
                 date=date_str,
@@ -907,8 +955,6 @@ class OrgLifecycleManager:
             f"Stress absorbed by: {summary_str}"
         )
 
-    # ── Domain registry maintenance ──────────────────────────────────────────
-
     def _orphan_domains_on_departure(
         self, name: str, record: DepartureRecord, day: int
     ) -> None:
@@ -926,7 +972,7 @@ class OrgLifecycleManager:
             {
                 "$set": {
                     "primary_owner": None,
-                    "coverage_at_last_departure": None,  # will be set per-doc below
+                    "coverage_at_last_departure": None,
                 },
                 "$addToSet": {"former_owners": name},
             },
@@ -934,7 +980,6 @@ class OrgLifecycleManager:
         if result.modified_count == 0:
             return
 
-        # Per-doc update to capture individual coverage values at departure
         orphaned = self._mem._db["domain_registry"].find(
             {"former_owners": name, "primary_owner": None}
         )
@@ -969,7 +1014,6 @@ class OrgLifecycleManager:
                 {"_id": key, "primary_owner": None}
             )
             if not doc:
-                # Also try system_tags match for inexact expertise names
                 doc = self._mem._db["domain_registry"].find_one(
                     {"system_tags": key, "primary_owner": None}
                 )
@@ -988,8 +1032,6 @@ class OrgLifecycleManager:
                     f"    [dim]→ Domain '{doc['domain']}' claimed by new hire {name}. "
                     f"Coverage: {int(doc.get('documentation_coverage', 0) * 100)}%.[/dim]"
                 )
-
-    # ─── HIRE ENGINE ──────────────────────────────────────────────────────────
 
     def _execute_hire(
         self, hire_cfg: dict, day: int, date_str: str, state, clock
@@ -1023,7 +1065,6 @@ class OrgLifecycleManager:
             timestamp_iso=clock.now("system").isoformat(),
         )
 
-        # Claim any orphaned DomainRegistry domains that match this hire's expertise
         self._claim_domains_on_hire(name, expertise, day)
 
         if name in G:
@@ -1040,8 +1081,6 @@ class OrgLifecycleManager:
         self._gd._stress[name] = 20
         self._gd._centrality_dirty = True
 
-        # Same-dept peers get 2× floor; cross-dept gets floor.
-        # Both are below warmup_threshold so the planner naturally proposes 1on1s.
         for other in list(G.nodes()):
             if other == name:
                 continue
@@ -1211,7 +1250,6 @@ class OrgLifecycleManager:
                     Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
                 ).strip()
 
-                # Strip markdown fences if the LLM included them anyway
                 raw = (
                     raw.strip()
                     .removeprefix("```json")

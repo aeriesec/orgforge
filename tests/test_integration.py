@@ -1237,16 +1237,18 @@ class TestCRMSimulationIntegration:
         assert "slack" in chain_snap[1]
         assert "slack" in chain_snap[2]
 
-        sim._advance_incidents()
-        sim._advance_incidents()
+        with patch("flow.random.random", return_value=0.0):
+            sim._advance_incidents()  
+            sim._advance_incidents()
 
         chain_snap = inc.causal_chain.snapshot()
         assert len(chain_snap) == 4
         assert "PR-" in chain_snap[3]
         pr_id = chain_snap[3]
 
-        sim._advance_incidents()
-        sim._advance_incidents()
+        with patch("flow.random.random", return_value=0.0):
+            sim._advance_incidents()  
+            sim._advance_incidents()
 
         final_ticket = sim._mem.get_ticket(ticket_id)
         final_chain = final_ticket.get("causal_chain", [])
